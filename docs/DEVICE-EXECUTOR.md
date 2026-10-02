@@ -104,7 +104,7 @@ longer than eight times the longest pause it has shown, and at least six samples
   a cancel is never judged. Observer teardown never cancels.
 - `terminate()` closes the channel, lets the executor stop at its next exchange, kills only a
   measured wedge, then reaps it and frees `retain_until_exit` resources. `shutdown()` asks first.
-  `Drop` does the same on a thread. If exit cannot be observed, resources are leaked, not released.
+  `Drop` does the same before returning, so a slot or reservation is released only after the exit. If exit cannot be observed, resources are leaked, not released.
 
 ## Known gaps
 

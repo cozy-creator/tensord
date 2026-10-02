@@ -1495,29 +1495,15 @@ impl Ending {
     }
 }
 
+/// Dropping the handle ends the executor before returning: whoever releases its slot or
+/// reservation next does so after its exit, on every path including early returns.
 impl Drop for DeviceExecutor {
     fn drop(&mut self) {
         if self.child.is_none() && self.retained.is_empty() {
             return;
         }
-        let parts = self.parts();
-        let ended = Arc::new(Mutex::new(Some(parts)));
-        let task = ended.clone();
-        let monitor = move || {
-            if let Some(parts) = task.lock().unwrap().take() {
-                if let Err(error) = parts.end() {
-                    eprintln!("executor teardown: {error}");
-                }
-            }
-        };
-        if let Err(error) = std::thread::Builder::new()
-            .name("executor-teardown".into())
-            .spawn(monitor)
-        {
-            eprintln!("executor teardown thread unavailable; ending synchronously: {error}");
-            if let Some(parts) = ended.lock().unwrap().take() {
-                let _ = parts.end();
-            }
+        if let Err(error) = self.parts().end() {
+            eprintln!("executor teardown: {error}");
         }
     }
 }

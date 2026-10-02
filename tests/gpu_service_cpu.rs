@@ -11,11 +11,10 @@ use serde_json::json;
 use std::{
     fs,
     process::{Command, Stdio},
-    time::Duration,
 };
 
 #[test]
-fn completed_retained_gpu_birth_is_fenced_on_restart_until_exact_exit() {
+fn restart_ends_a_retained_gpu_birth_before_admitting_gpu_work() {
     let root = std::env::temp_dir().join(format!("machine-gpu-fence-{}", uuid::Uuid::new_v4()));
     let mut child = Command::new("/usr/bin/python3")
         .args(["-I", "-c", "import sys; sys.stdin.buffer.read()"])
@@ -65,14 +64,10 @@ fn completed_retained_gpu_birth_is_fenced_on_restart_until_exact_exit() {
     complete(&mut journal, 259, &generation, birth.clone(), false);
     drop(journal);
     let service = Service::open(&state, &root.join("generations"), 1).unwrap();
-    assert_eq!(service.gpu_startup_fences(), 1);
     assert!(service.idle().unwrap()); // terminal results never authorize freeing a context
-    let epoch = service.engine.activity_epoch();
-    drop(child.stdin.take()); // normal exit of the explicitly owned CPU test process
-    assert!(child.wait().unwrap().success());
-    service
-        .engine
-        .wait_activity(epoch, Some(Duration::from_secs(5)));
+                                      // The prior machine's retained executor is killed, never adopted or waited on forever.
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
     assert_eq!(service.gpu_startup_fences(), 0);
     assert!(service.stop().unwrap());
     // Only this exited test's data is removed, never a task branch or worktree.

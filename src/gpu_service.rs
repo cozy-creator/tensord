@@ -7,7 +7,10 @@ use crate::{
     },
     execution::{process_ended, Engine},
     host_tier::{HalfOfHeadroom, HostGrant, HostTier, HostTierConfig, SealedRequest},
-    journal::{AssetBinding, Execution, Outcome, OutputChecksum, Preparation, ProcessBirth, State},
+    journal::{
+        AssetBinding, Execution, Failure, Outcome, OutputChecksum, Preparation, ProcessBirth, State,
+    },
+    launch_identity::Seal,
     memory::{
         policy::{Facts, Holding, Step, MARGIN},
         GpuMemory, MemoryConfig,
@@ -28,6 +31,13 @@ use std::{
     },
 };
 use tensorfs_core::store::Store;
+
+fn alloc_conf() -> String {
+    crate::launch_identity::DEFAULT_ALLOC_CONF.into()
+}
+fn threads() -> u32 {
+    crate::launch_identity::DEFAULT_THREADS
+}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -79,8 +89,14 @@ pub struct GpuConfig {
     pub pinned_budget_bytes: i64,
     #[serde(default)]
     pub memory: MemoryConfig,
+    /// Explicitly configured locations; the executor seal is imposed on top of them.
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
+    /// `PYTORCH_CUDA_ALLOC_CONF` and `OMP_NUM_THREADS` the seal imposes (worker defaults).
+    #[serde(default = "alloc_conf")]
+    pub alloc_conf: String,
+    #[serde(default = "threads")]
+    pub threads: u32,
     /// Explicit authority for already verified cached catalog bytes, for runs without a
     /// Hub. Published runs resolve under the owner's Hub access instead; a cache hit alone
     /// grants no private model.
@@ -141,6 +157,8 @@ struct Session {
 }
 pub struct GpuPool {
     root: PathBuf,
+    /// Scopes JIT caches to this machine run; earlier runs' scopes are removed at start.
+    incarnation: String,
     config: GpuConfig,
     store: Arc<Store>,
     reserved: AtomicBool,
@@ -197,10 +215,13 @@ impl GpuPool {
         raise_fd_limit();
         let custody =
             (!display_active(&config.devices)).then(|| Mutex::new(ResidentCustody::default()));
+        let incarnation = uuid::Uuid::new_v4().simple().to_string();
+        remove_stale_jit(root, &incarnation);
         Ok(Arc::new(Self {
             launcher: crate::child_launcher::ChildLauncher::new()?,
             root: root.to_path_buf(),
             memory: GpuMemory::start(&config.devices, &config.memory),
+            incarnation,
             config,
             store,
             reserved: AtomicBool::new(false),
@@ -514,27 +535,7 @@ impl GpuPool {
             let _permit = permit;
             let result = _permit.pool.run(&engine, &id, held, plan);
             if let Err(error) = &result {
-                let record = engine.get(&id)?;
-                if record.state == State::Starting && record.process.is_none() {
-                    engine.defer_managed(&id, format!("device startup unavailable: {error}"))?;
-                } else if record
-                    .process
-                    .as_ref()
-                    .map(process_ended)
-                    .transpose()?
-                    .unwrap_or(false)
-                {
-                    engine.finish(
-                        &id,
-                        Outcome::Failed(
-                            crate::journal::Failure::abandoned(&format!(
-                                "device executor ended: {error}"
-                            ))
-                            .encode(),
-                        ),
-                    )?;
-                }
-                // An unquiesced live/unknown birth remains charged and nonterminal.
+                settle(&engine, &id, error)?;
             }
             result
         })
@@ -728,14 +729,22 @@ impl GpuPool {
                     directory.as_raw_fd()
                 ))
             };
-            let mut environment = self.config.environment.clone();
-            environment.insert("CUDA_VISIBLE_DEVICES".into(), self.config.devices.clone());
+            let mut seal = Seal::prepare(
+                &self.root,
+                self.config.identity,
+                &self.incarnation,
+                &held.record.identity,
+                &self.config.devices,
+            )?;
+            seal.alloc_conf = self.config.alloc_conf.clone();
+            seal.threads = self.config.threads;
             let mut executor = DeviceExecutor::spawn_owned(
                 ExecutorConfig {
                     python: held.record.python.clone(),
                     root: root.clone(),
                     socket,
-                    environment,
+                    environment: self.config.environment.clone(),
+                    seal,
                     generation_hold: Some(held.retention()),
                     identity: self.config.identity,
                 },
@@ -814,11 +823,15 @@ impl GpuPool {
         }
         // Out of the map for the call: its requests may unmap or end the others.
         let mut session = sessions.remove(&plan.id).expect("session retained above");
-        let result = self.call(engine, id, &held, plan, load_cap, &mut session, sessions);
-        if result.as_ref().is_ok_and(|kept| *kept) {
-            sessions.insert(session.plan.clone(), session);
+        match self.call(engine, id, &held, plan, load_cap, &mut session, sessions) {
+            Ok(true) => {
+                sessions.insert(session.plan.clone(), session);
+                Ok(())
+            }
+            // Not reusable: gone (exit observed) before its context is released.
+            Ok(false) => session.executor.terminate().map(drop),
+            Err(error) => Err(ended_with(error, session.executor)),
         }
-        result.map(|_| ())
     }
 
     /// Load (once), grant and invoke. Ok(false): the executor must not be reused.
@@ -1181,6 +1194,68 @@ fn raise_fd_limit() {
         {
             limit.rlim_cur = limit.rlim_max;
             libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+        }
+    }
+}
+
+/// An error ends its executor; the exact exit is observed before the run settles, and a
+/// kill's measurement joins the reason.
+fn ended_with(error: io::Error, executor: DeviceExecutor) -> io::Error {
+    match executor.terminate() {
+        Ok(device_executor::Ended {
+            killed: Some(killed),
+            ..
+        }) => io::Error::other(format!("{error}; {killed}")),
+        Ok(_) => error,
+        Err(unproven) => io::Error::other(format!("{error}; executor exit unproven: {unproven}")),
+    }
+}
+
+/// Every error ends the run once its executor is gone: FAILED with the reason, or CANCELED
+/// when a cancel was journaled. Only a never-authorized attempt hit by a transient OS
+/// shortage returns to the queue; a deterministic pre-start failure is FAILED.
+fn settle(engine: &Arc<Engine>, id: &str, error: &io::Error) -> io::Result<()> {
+    let record = engine.get(id)?;
+    if record.state.terminal() {
+        return Ok(());
+    }
+    let ended = record
+        .process
+        .as_ref()
+        .map(process_ended)
+        .transpose()?
+        .unwrap_or(true);
+    if !ended {
+        return Ok(()); // exit unproven: the reservation stays charged and nonterminal
+    }
+    let transient = matches!(
+        error.raw_os_error(),
+        Some(libc::EAGAIN | libc::ENOMEM | libc::EMFILE | libc::ENFILE | libc::EINTR)
+    );
+    if record.state == State::Starting && transient {
+        return engine.defer_managed(id, format!("device startup unavailable: {error}"));
+    }
+    let outcome = if record.cancel_actor.is_some() {
+        Outcome::Canceled
+    } else if record.state == State::Starting {
+        Outcome::Failed(Failure::abandoned(&format!("device executor did not start: {error}")).encode())
+    } else {
+        Outcome::Failed(Failure::abandoned(&format!("device executor ended: {error}")).encode())
+    };
+    engine.finish(id, outcome).map(drop)
+}
+
+/// JIT scopes belong to one machine run (Runtime: one worker boot); executors of earlier
+/// runs are gone before this pool exists, so their scopes are unowned.
+fn remove_stale_jit(root: &Path, incarnation: &str) {
+    let Ok(entries) = fs::read_dir(root.join("jit")) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name() != incarnation {
+            if let Err(error) = fs::remove_dir_all(entry.path()) {
+                eprintln!("stale JIT scope {}: {error}", entry.path().display());
+            }
         }
     }
 }

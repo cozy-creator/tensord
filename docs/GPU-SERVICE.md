@@ -32,8 +32,9 @@ executor per plan; `memory::GpuMemory` decides every device byte. Acceptance, jo
 
 - One slot: GPU work dispatches only when no GPU record is active and no startup fence exists.
   CPU dispatch continues meanwhile.
-- Startup fence: every journaled GPU birth that is live or unknown, including those of completed
-  requests, blocks GPU dispatch until it exits.
+- Startup: every journaled birth still alive from a previous machine run (GPU births including
+  completed requests', and any nonterminal run's) is killed, since nothing can adopt it. GPU
+  dispatch stays fenced until each exit is observed.
 - A cold session is admitted first: its context estimate (twice the largest measured here, else
   1 GiB) and known first working set are reserved, making room by the ladder below. It is spawned by
   the pool's `ChildLauncher`, which journals the birth, then sent Start, Load (with that cap),
@@ -50,7 +51,10 @@ executor per plan; `memory::GpuMemory` decides every device byte. Acceptance, jo
 - Start happens only after `authorize_managed`.
 - Invoke must be quiescent. Then `postprocess` and `managed_result` run. A custody failure is
   `failed`.
-- On error: never started, back to queued. Birth ended, failed. Live or unknown, stays nonterminal.
+- On error the session is terminated (exit observed, wedge killed) before the run is settled:
+  CANCELED if a cancel was journaled, otherwise FAILED with the reason, including a pre-start exit
+  with its stderr tail. Only a never-authorized attempt hit by a transient OS shortage (EAGAIN,
+  ENOMEM, EMFILE, ENFILE) is requeued. An unprovable exit leaves the run charged and nonterminal.
 
 Executor requests:
 - `device_room`: idle tenants give room (unmap, then end); the answer's `cap_bytes` raises the
@@ -63,7 +67,7 @@ Executor requests:
 
 With `identity`:
 - A non-root owner may only name its own UID and GID.
-- The trampoline gets `--uid/--gid` and a new process group. Peer credentials must match.
+- The trampoline gets `--uid/--gid`. Peer credentials must match.
 - The pool root and its parent become 0710, keeping their owner. Executor dirs and per-request
   spools become identity-owned 0700.
 - The interface file and cancel marker become 0440. Journal, results and generations are never
@@ -81,5 +85,7 @@ thread.
 - Executors before `process_cap/1` get only a plane budget: their context and activations are
   estimated, not capped.
 - One Python post helper per request.
-- No separate cgroup scope.
+- No separate cgroup scope; containment is the executor's process group.
+- Seal: `alloc_conf`/`threads` config fields; `<root>/home`, `<root>/kernels` (per UID) and
+  `<root>/jit/<run>/<generation>`. Earlier runs' JIT scopes are removed at pool start.
 - `PDEATHSIG` retention after a UID drop is unverified.

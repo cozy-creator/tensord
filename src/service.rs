@@ -31,8 +31,9 @@ impl Service {
             ));
         }
         let engine = Engine::open(&root.join("execution"))?;
-        // A completed request does not prove its retained CUDA context ended.
-        // Capture prior-owner births before starting the scheduler/configuring a pool.
+        // A completed request does not prove its retained CUDA context ended. A prior
+        // machine's executor cannot be adopted (nothing can reach it), so it is ended now
+        // and GPU admission stays fenced until its exit is observed.
         let mut cursor = 0;
         let mut seen = HashSet::new();
         let mut startup_gpu_births = vec![];
@@ -46,7 +47,7 @@ impl Service {
                 if !process_ended(&birth).unwrap_or(false)
                     && seen.insert((birth.pid, birth.boot_id.clone(), birth.start_ticks))
                 {
-                    if let Err(error) = engine.watch_process(birth.clone()) {
+                    if let Err(error) = engine.end_orphan(birth.clone()) {
                         eprintln!("GPU startup birth remains fenced: {error}");
                     }
                     startup_gpu_births.push(birth);
@@ -73,7 +74,7 @@ impl Service {
                     .insert(record.id.clone(), held.retention());
             }
             if let Some(birth) = record.process {
-                service.watch_orphan(birth)?;
+                service.engine.end_orphan(birth)?;
             }
         }
         let owner = service.clone();
@@ -285,8 +286,5 @@ impl Service {
             }
         }
         Ok(())
-    }
-    fn watch_orphan(&self, birth: crate::journal::ProcessBirth) -> io::Result<()> {
-        self.engine.watch_process(birth)
     }
 }
