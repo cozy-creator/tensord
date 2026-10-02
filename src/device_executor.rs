@@ -950,7 +950,8 @@ fn write_frame(
     stream.write_all(&(bytes.len() as u32).to_be_bytes())?;
     stream.write_all(&bytes)
 }
-fn read_frame(stream: &mut std::os::unix::net::UnixStream) -> io::Result<Option<Frame>> {
+/// SDK control framing shared with the CPU source-qualification receiver.
+pub fn read_frame(stream: &mut std::os::unix::net::UnixStream) -> io::Result<Option<Frame>> {
     let mut header = [0; 4];
     if stream.read(&mut header[..1])? == 0 {
         return Ok(None);
@@ -968,6 +969,12 @@ fn read_frame(stream: &mut std::os::unix::net::UnixStream) -> io::Result<Option<
     serde_json::from_slice(&bytes)
         .map(Some)
         .map_err(io::Error::other)
+}
+pub fn write_answer(
+    stream: &mut std::os::unix::net::UnixStream,
+    answer: &Answer,
+) -> io::Result<()> {
+    write_frame(stream, answer)
 }
 fn scan(value: &Value) -> io::Result<()> {
     match value {

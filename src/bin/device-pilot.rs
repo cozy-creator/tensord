@@ -181,7 +181,7 @@ fn run() -> io::Result<()> {
     if action == "validate" {
         println!(
             "{}",
-            serde_json::json!({"validated":true,"mode":"legacy-stock-executor-pilot","model":config.binding.model_class,"snapshots":config.binding.snapshots,"requests":config.payloads.len(),"gpu_started":false})
+            serde_json::json!({"validated":true,"mode":"stock-executor-pilot","requested_model_sources":config.model_sources,"model":config.binding.model_class,"snapshots":config.binding.snapshots,"requests":config.payloads.len(),"gpu_started":false})
         );
         return Ok(());
     }
