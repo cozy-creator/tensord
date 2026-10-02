@@ -8,6 +8,7 @@ use std::{
     io::{self, Read, Write},
     os::fd::AsRawFd,
     path::Path,
+    sync::Arc,
 };
 use tensorfs_core::{
     header::Header,
@@ -56,10 +57,13 @@ struct Selection {
     allowed_objects: BTreeMap<String, ObjectRef>,
     retained_objects: Vec<ObjectRef>,
     lease: Option<ReadLease>,
+    components: Vec<String>,
+    encoded_bytes: u64,
+    manifest_length: u64,
 }
 
 pub struct ModelSources {
-    store: Store,
+    store: Arc<Store>,
     meta: Meta,
     selected: BTreeMap<String, Selection>,
 }
@@ -85,7 +89,11 @@ fn digest(value: &str) -> io::Result<&str> {
 
 impl ModelSources {
     pub fn open(root: &Path, selections: &[SelectedManifest]) -> io::Result<Self> {
-        let store = Store::open(root).map_err(failure)?;
+        Self::open_shared(Arc::new(Store::open(root).map_err(failure)?), selections)
+    }
+
+    /// Public service and its upload/custody paths use the same owned store.
+    pub fn open_shared(store: Arc<Store>, selections: &[SelectedManifest]) -> io::Result<Self> {
         let meta = Meta::open(&store).map_err(failure)?;
         let mut selected = BTreeMap::new();
         for selection in selections {
@@ -140,6 +148,7 @@ impl ModelSources {
             let components: Vec<String> = wanted.into_iter().map(str::to_owned).collect();
             let plan = read::plan_for_traversal(&header, &traversal, &components, 4 << 20)
                 .map_err(failure)?;
+            let encoded_bytes = plan.bytes;
             let mut allowed_objects = BTreeMap::new();
             for item in plan.items {
                 if let Source::Object(range) = item.source {
@@ -164,6 +173,9 @@ impl ModelSources {
                         allowed_objects,
                         retained_objects: retained_objects.into_values().collect(),
                         lease: None,
+                        components,
+                        encoded_bytes,
+                        manifest_length: length,
                     },
                 )
                 .is_some()
@@ -179,6 +191,34 @@ impl ModelSources {
             meta,
             selected,
         })
+    }
+
+    /// Selected encoded source size, not GPU-resident/allocator memory. The SDK
+    /// measures its real device footprint; callers cannot infer a fit from this.
+    pub fn selected_facts(&self, manifest: &str) -> io::Result<(Vec<String>, u64, u64)> {
+        let selected = self.selected.get(digest(manifest)?).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "manifest is outside selection",
+            )
+        })?;
+        Ok((
+            selected.components.clone(),
+            selected.encoded_bytes,
+            selected.manifest_length,
+        ))
+    }
+
+    pub fn authorized_header(&self, manifest: &str) -> io::Result<Header> {
+        self.selected
+            .get(digest(manifest)?)
+            .map(|selection| selection.header.clone())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "manifest is outside selection",
+                )
+            })
     }
 
     /// Native paths of the explicitly selected snapshot/model closure, for owned transfer.
