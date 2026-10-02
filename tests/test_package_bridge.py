@@ -10,11 +10,14 @@ from pathlib import Path
 
 import msgspec
 import pytest
+from packaging.version import Version
 
 from cozy_machine_client.execution_protocol import (
     COMMAND_DECODER, EVENT_DECODER, Cancel, Canceled, Failed, Invoke, Progress, Ready, Result,
 )
-from cozy_machine_client.packages import GenerationHold, collect, describe, install
+from cozy_machine_client.packages import GenerationHold, collect, describe, install, read_metadata
+from cozy_machine_client.package_records import GENERATION_DECODER, Generation
+from cozy_machine_client.progress import CompletedWork
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "cpu_classifier"
@@ -92,8 +95,9 @@ def test_static_description_does_not_execute_package_top_level(tmp_path):
     module = source / "cpu_classifier" / "__init__.py"
     module.write_text(module.read_text() + '\nraise RuntimeError("import must not occur")\n')
     interface = describe(source)
-    assert "classify" in json.dumps(interface)
-    assert "cpu_classifier:app" in json.dumps(interface)
+    assert isinstance(interface, msgspec.Raw)
+    assert b"classify" in bytes(interface)
+    assert b"cpu_classifier:app" in bytes(interface)
 
 
 def test_additive_peer_fields_preserve_baseline_invocation():
@@ -107,9 +111,7 @@ def test_additive_peer_fields_preserve_baseline_invocation():
 
 
 def test_only_new_completed_positions_count_as_productive_progress():
-    pytest.importorskip("cozy_runtime")
-    from cozy_runtime.author._services import ProgressFrame
-    from cozy_machine_client.runner import CompletedWork
+    ProgressFrame = pytest.importorskip("cozy_runtime.author._services").ProgressFrame
 
     work = CompletedWork()
     assert work.observe(ProgressFrame("stage", None, 1000)) is None
@@ -118,6 +120,27 @@ def test_only_new_completed_positions_count_as_productive_progress():
     assert work.observe(ProgressFrame("stage", .5, 3000, position=0, total=2)) is None
     assert work.observe(ProgressFrame("stage", 1., 3001, position=2, total=2)) == 2
     assert work.observe(ProgressFrame("another", 1., 3002, position=3, total=3)) == 5
+
+
+def test_consumed_metadata_is_typed_and_unknown_extras_are_harmless(tmp_path):
+    source = tmp_path / "metadata"
+    shutil.copytree(FIXTURE, source)
+    project = source / "pyproject.toml"
+    project.write_text(project.read_text() + '\n[future.optional]\nnested = {x = [1, 2]}\n')
+    metadata = read_metadata(source)
+    assert metadata.name == "cozy-machine-cpu-classifier"
+    assert metadata.application == "cpu_classifier:app"
+    project.write_text(project.read_text().replace('version = "0.1.0"', "version = 42"))
+    with pytest.raises(msgspec.ValidationError):
+        read_metadata(source)
+
+
+def test_sdk_interface_remains_opaque_through_generation_boundary():
+    document = msgspec.Raw(b'{"future":{"unknown":[1,true]},"entrypoints":[]}')
+    original = Generation("g", "p", "1", "p:app", "/g/env/bin/python", [], document)
+    replay = GENERATION_DECODER.decode(msgspec.json.encode(original))
+    assert isinstance(replay.interface, msgspec.Raw)
+    assert bytes(replay.interface) == bytes(document)
 
 
 def test_ready_precedes_authored_import_and_sdk_import(generation):
@@ -200,8 +223,6 @@ def test_invalid_application_fails_without_import(generation, tmp_path):
 
 def test_bound_is_preserved_and_live_generation_cannot_be_collected(generation):
     versions = {entry.name: entry.version for entry in generation.dependencies}
-    from packaging.version import Version
-
     assert Version("0.18.89") <= Version(versions["cozy-runtime"]) < Version("0.18.101")
     assert not collect(Path(generation.python).parents[2])
 

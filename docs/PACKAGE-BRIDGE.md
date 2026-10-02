@@ -10,7 +10,10 @@ author internals and need capability qualification when the SDK evolves.
 ## Environment and source description
 
 `cozy_machine_client.packages.describe(project, environment_python=None)` delegates to
-the installed Runtime's static source reader. Its AST path never imports package code.
+the installed Runtime's static source reader in a trusted SDK subprocess. Its AST path
+never imports package code. The reader's output remains opaque `msgspec.Raw` JSON; only
+consumed pyproject name/version/application fields are normalized into typed records.
+Unknown extras stay harmless and are never business-indexed through untyped dictionaries.
 The gate adds a module-level exception to the real classifier package and still obtains
 its interface. An explicit wheel build is a different operation: it may execute the
 package's build backend and must run in the packaging containment tier.
@@ -39,6 +42,9 @@ pressure; this module supplies the safe generation lifetime primitive.
 ## Engine interface
 
 Use the manifest's interpreter with `-m cozy_machine_client.runner --execution-fd N`.
+The optional SDK adapter has ordinary top-level imports in `runtime_bridge`; that trusted
+module is loaded only after Invoke authorization. The base client and runner import
+successfully without Runtime installed.
 The inherited stream carries a network-order four-byte length and typed JSON, at most
 1 MiB per envelope. Unknown advisory fields are accepted. No version equality is tested.
 
@@ -83,13 +89,14 @@ mock function or sleep. `/proc/<pid>/maps` checks cover readiness and active inf
 without CUDA/NVML library loads. The installed Runtime 0.18.99 still depends on TensorFS
 0.3.88; this slice does **not** establish removal of that package dependency.
 
-On 2026-10-02, all 12 package bridge tests passed in 25.13 s with CPython 3.12.12,
+On 2026-10-02, all 14 package bridge and 14 transport tests passed in 19.63 s with CPython 3.12.12,
 Runtime 0.18.99, TensorFS 0.3.88, sklearn 1.9.1 and NumPy 2.5.3. An independent
 package pinned Runtime **0.18.89** and ran the same real inference successfully through
 the unchanged runner, without an injected service-version floor. Bytecode compilation
-and whitespace checks passed. A broader unchanged transport test failed on this
-uv-managed CPython build because it lacks `os.memfd_create`; the system interpreter
-has that function. That interpreter/storage portability gap remains separately open.
+and whitespace checks passed. The uv CPython 3.12 build lacks `os.memfd_create`; a small
+Linux libc adapter now performs the same kernel operation and seals with preserved errno
+and fd lifetime. All 14 transport tests also passed on CPython 3.14.7, which uses its native
+os function. Direct libc tests on both interpreters verify seals, CLOEXEC and error paths.
 
 Deferred media encoding, output trees, committed/child-call artifacts, model loading,
 checkpoint publication, secrets, remote assets, subcalls, executor reuse and GPU/group
