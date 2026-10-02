@@ -138,7 +138,13 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS executions (
               id INTEGER PRIMARY KEY AUTOINCREMENT, idempotency_key TEXT NOT NULL UNIQUE,
               invocation TEXT NOT NULL, record TEXT NOT NULL, state TEXT NOT NULL,
-              updated_ms INTEGER NOT NULL);",
+              updated_ms INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS executions_nonterminal ON executions(id)
+              WHERE state IN ('queued','starting','running');
+            CREATE INDEX IF NOT EXISTS executions_active ON executions(id)
+              WHERE state IN ('starting','running');
+            CREATE INDEX IF NOT EXISTS executions_ready ON executions(id)
+              WHERE state='queued' AND json_extract(record,'$.waiting_reason') IS NULL;",
             )
             .map_err(db_error)?;
         fs::File::open(root)?.sync_all()?;
@@ -176,7 +182,7 @@ impl Journal {
             }
             return Ok(execution);
         }
-        tx.execute("INSERT INTO executions(idempotency_key,invocation,record,state,updated_ms) VALUES(?1,?2,'','queued',?3)", params![key, encoded(&invocation)?, timestamp()]).map_err(db_error)?;
+        tx.execute("INSERT INTO executions(idempotency_key,invocation,record,state,updated_ms) VALUES(?1,?2,'{}','queued',?3)", params![key, encoded(&invocation)?, timestamp()]).map_err(db_error)?;
         let execution = Execution {
             id: tx.last_insert_rowid().to_string(),
             idempotency_key: key.into(),
@@ -222,6 +228,30 @@ impl Journal {
             .map_err(db_error)?;
         let records = statement
             .query_map([], |row| row.get::<_, String>(0))
+            .map_err(db_error)?;
+        records
+            .map(|record| serde_json::from_str(&record.map_err(db_error)?).map_err(db_error))
+            .collect()
+    }
+
+    pub fn nonterminal(&self, limit: usize) -> io::Result<Vec<Execution>> {
+        self.selected("SELECT record FROM executions WHERE state IN ('queued','starting','running') ORDER BY id LIMIT ?1", limit)
+    }
+
+    pub fn active(&self, limit: usize) -> io::Result<Vec<Execution>> {
+        self.selected("SELECT record FROM executions WHERE state IN ('starting','running') ORDER BY id LIMIT ?1", limit)
+    }
+
+    pub fn ready(&self, limit: usize) -> io::Result<Vec<Execution>> {
+        self.selected("SELECT record FROM executions WHERE state='queued' AND json_extract(record,'$.waiting_reason') IS NULL ORDER BY id LIMIT ?1", limit)
+    }
+
+    fn selected(&self, query: &str, limit: usize) -> io::Result<Vec<Execution>> {
+        let mut statement = self.connection.prepare(query).map_err(db_error)?;
+        let records = statement
+            .query_map([limit.min(i64::MAX as usize) as i64], |row| {
+                row.get::<_, String>(0)
+            })
             .map_err(db_error)?;
         records
             .map(|record| serde_json::from_str(&record.map_err(db_error)?).map_err(db_error))
