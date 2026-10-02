@@ -109,6 +109,36 @@ while later invocations began with 7.06 GB: Load completion did not establish GP
 These are internal pilot timings, not full cold start or ordinary CLI comparisons. Evidence:
 `~/cozy_v2/outputs/cozy-machine-continued-20261002/gpu-runpod/legacy-sdk99/`.
 
+Root also ran paired Runtime 0.18.100/TensorFS candidate arms in the same immutable environment,
+three unchanged SDXL requests each. Descriptor mode negotiated true and received Store path `""`;
+all three actual WebP SHA-256, SDK BLAKE2b-128 identities, lengths and 1024×1024 pixels match the
+legacy arm exactly. Descriptor PID 20015 served all three, with zero model-source exports during
+each request. Its load exported 2,606 blobs (one header, four assets, 2,601 objects); owner FD
+sample peak was 2,619. This establishes real provider-path inference, not privileged-code
+containment or machine-owned host/GPU weights.
+
+| Observed phase | Candidate legacy | Descriptors |
+| --- | ---: | ---: |
+| Spawn/Hello | 0.774 s | 0.387 s |
+| Start command | 10.643 s | 4.171 s |
+| Load | 6.403 s | 21.933 s |
+| First Invoke | 5.160 s | 5.128 s |
+| Second/third Invoke | 4.696 / 4.520 s | 4.797 / 4.459 s |
+
+Descriptor Load is 15.530 s slower (3.426×). Owner source setup took 71 ms, with only 189 ms
+aggregate broker read time; control transport, receiver validation and remaining load work are
+outside that aggregate. Receiver hashing/metadata is a hypothesis under CPU profiling, not an
+attributed result. Three-run invoke means are 4.792/4.795 s and do not qualify effectively zero
+latency for streaming, 8 GB GPUs, Anima or H3. Start's first-environment import/cache difference
+confounds a whole-pilot ratio; this is not a full cold-start comparison.
+
+Both arms log 69 stage round trips per image: StageEnter encode 2, denoise 20, decode 1;
+StageExit 46 (first exit plus explicit yielded acknowledgement). Thus there are three stage
+round trips per denoise step even though model-source RPCs are zero during inference. A blanket
+no-per-step-RPC claim is false for the current stages-enabled design. Source-mode pairing does
+not measure the stage policy cost. Evidence and independent CPU verification of copied output
+bytes: `~/cozy_v2/outputs/cm-device-20261002/descriptor-comparison/`.
+
 ## CPU evidence
 
 Direct stock Python probes on both released SDKs produced identical 437-byte canonical results
