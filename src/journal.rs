@@ -33,6 +33,22 @@ pub struct SubmissionContext {
     pub publication_authorization_id: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Installation {
+    pub actor: String,
+    pub alias: String,
+    pub generation: String,
+    pub package: String,
+    pub release: String,
+    pub interface: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PublicTerminal {
+    pub outcome: Vec<u8>,
+    pub events: Vec<u8>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AdmissionError {
     WorkspaceMismatch,
@@ -109,6 +125,22 @@ pub struct Artifact {
 pub struct ResultRecord {
     pub value: Value,
     pub artifacts: Vec<Artifact>,
+    #[serde(default)]
+    pub asset_bindings: Vec<AssetBinding>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AssetBinding {
+    pub relative_path: String,
+    pub asset_ref: String,
+    pub media_type: String,
+    pub checksum: OutputChecksum,
+    pub length: u64,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct OutputChecksum {
+    pub algorithm: String,
+    pub value: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -120,6 +152,14 @@ pub struct Execution {
     pub submission: Option<SubmissionContext>,
     pub state: State,
     pub revision: u64,
+    #[serde(default)]
+    pub accepted_at_ms: u64,
+    #[serde(default)]
+    pub finished_at_ms: u64,
+    #[serde(default)]
+    pub acceptance_boot_id: String,
+    #[serde(default)]
+    pub collected: bool,
     /// Reserved observation cursor ceiling. Older stored records default to no reservation.
     #[serde(default)]
     pub revision_ceiling: u64,
@@ -215,6 +255,10 @@ impl Journal {
         }
         connection.execute_batch("CREATE TABLE IF NOT EXISTS machine_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS submission_closures(actor TEXT NOT NULL,submission_id TEXT NOT NULL,request_id TEXT NOT NULL,workspace_id TEXT NOT NULL,closed_ms INTEGER NOT NULL,PRIMARY KEY(actor,submission_id));
+            CREATE TABLE IF NOT EXISTS installations(actor TEXT NOT NULL,alias TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,alias));
+            CREATE TABLE IF NOT EXISTS public_terminals(execution INTEGER PRIMARY KEY REFERENCES executions(id),outcome BLOB NOT NULL,events BLOB NOT NULL);
+            CREATE TABLE IF NOT EXISTS native_outputs(actor TEXT NOT NULL,owner TEXT NOT NULL,source BLOB NOT NULL,PRIMARY KEY(actor,owner));
+            CREATE TABLE IF NOT EXISTS input_intakes(actor TEXT NOT NULL,retention TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,retention));
             CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_request ON executions(actor,request_id) WHERE actor IS NOT NULL;
             CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_submission ON executions(actor,submission_id) WHERE actor IS NOT NULL;
             CREATE INDEX IF NOT EXISTS executions_actor_order ON executions(actor,id) WHERE actor IS NOT NULL;").map_err(db_error)?;
@@ -251,11 +295,299 @@ impl Journal {
     pub fn workspace_id(&self) -> &str {
         &self.workspace_id
     }
+    pub fn begin_intake(
+        &mut self,
+        spec: crate::native_inputs::IntakeSpec,
+    ) -> io::Result<crate::native_inputs::IntakeState> {
+        use crate::native_inputs::IntakeState;
+        if self
+            .native_owner(&spec.retention_id)?
+            .is_some_and(|held| held != spec.actor)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "intake retention belongs to another actor",
+            ));
+        }
+        let prior: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT record FROM input_intakes WHERE actor=?1 AND retention=?2",
+                params![spec.actor, spec.retention_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        if let Some(prior) = prior {
+            let state: IntakeState = serde_json::from_str(&prior).map_err(db_error)?;
+            if encoded(&state.spec)? != encoded(&spec)? {
+                return Err(admission(AdmissionError::BindingConflict));
+            }
+            return Ok(state);
+        }
+        let state = IntakeState {
+            spec,
+            released: false,
+            receipt: None,
+        };
+        self.connection
+            .execute(
+                "INSERT INTO input_intakes(actor,retention,record) VALUES(?1,?2,?3)",
+                params![state.spec.actor, state.spec.retention_id, encoded(&state)?],
+            )
+            .map_err(db_error)?;
+        Ok(state)
+    }
+    pub fn settle_intake(
+        &mut self,
+        actor: &str,
+        retention: &str,
+        receipt: Option<Vec<u8>>,
+        abort: bool,
+    ) -> io::Result<crate::native_inputs::IntakeState> {
+        use crate::{api::pb, native_inputs::IntakeState};
+        use prost::Message;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        let raw: Option<String> = tx
+            .query_row(
+                "SELECT record FROM input_intakes WHERE actor=?1 AND retention=?2",
+                params![actor, retention],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        let mut state: IntakeState =
+            serde_json::from_str(&raw.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "input intake not bound")
+            })?)
+            .map_err(db_error)?;
+        if let Some(receipt) = receipt {
+            let result =
+                pb::NativeByteRetentionResult::decode(receipt.as_slice()).map_err(db_error)?;
+            if result.retention_id != retention || result.source.is_none() {
+                return Err(db_error("native input receipt differs from bound intake"));
+            }
+            if let Some(prior) = &state.receipt {
+                if prior != &receipt {
+                    return Err(admission(AdmissionError::BindingConflict));
+                }
+            }
+            state.receipt = Some(receipt);
+            if !state.released && !abort {
+                let source = pb::NativeByteRetentionRequest {
+                    source: result.source,
+                    retention_id: retention.into(),
+                }
+                .encode_to_vec();
+                let owner: Option<String> = tx
+                    .query_row(
+                        "SELECT actor FROM native_outputs WHERE owner=?1 LIMIT 1",
+                        [retention],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(db_error)?;
+                if owner.is_some_and(|held| held != actor) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "native intake owner belongs to another actor",
+                    ));
+                }
+                let prior: Option<Vec<u8>> = tx
+                    .query_row(
+                        "SELECT source FROM native_outputs WHERE actor=?1 AND owner=?2",
+                        params![actor, retention],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(db_error)?;
+                if prior.as_ref().is_some_and(|held| held != &source) {
+                    return Err(admission(AdmissionError::BindingConflict));
+                }
+                tx.execute(
+                    "INSERT OR IGNORE INTO native_outputs(actor,owner,source) VALUES(?1,?2,?3)",
+                    params![actor, retention, source],
+                )
+                .map_err(db_error)?;
+            }
+        }
+        state.released |= abort;
+        tx.execute(
+            "UPDATE input_intakes SET record=?1 WHERE actor=?2 AND retention=?3",
+            params![encoded(&state)?, actor, retention],
+        )
+        .map_err(db_error)?;
+        tx.commit().map_err(db_error)?;
+        Ok(state)
+    }
+
+    pub fn installation(&self, actor: &str, alias: &str) -> io::Result<Option<Installation>> {
+        let record: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT record FROM installations WHERE actor=?1 AND alias=?2",
+                params![actor, alias],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        record
+            .map(|record| serde_json::from_str(&record).map_err(db_error))
+            .transpose()
+    }
+    pub fn installation_for_generation(
+        &self,
+        actor: &str,
+        generation: &str,
+    ) -> io::Result<Option<Installation>> {
+        let record: Option<String> = self.connection.query_row("SELECT record FROM installations WHERE actor=?1 AND json_extract(record,'$.generation')=?2 LIMIT 1", params![actor,generation], |r| r.get(0)).optional().map_err(db_error)?;
+        record
+            .map(|record| serde_json::from_str(&record).map_err(db_error))
+            .transpose()
+    }
+    pub fn installations(&self, actor: &str) -> io::Result<Vec<Installation>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT record FROM installations WHERE actor=?1 ORDER BY alias")
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map([actor], |r| r.get::<_, String>(0))
+            .map_err(db_error)?;
+        rows.map(|r| serde_json::from_str(&r.map_err(db_error)?).map_err(db_error))
+            .collect()
+    }
+    pub fn bind_installation(&mut self, record: Installation) -> io::Result<Installation> {
+        validate_scope(&record.actor, &record.alias, &record.generation)?;
+        if let Some(prior) = self.installation(&record.actor, &record.alias)? {
+            if prior != record {
+                return Err(admission(AdmissionError::BindingConflict));
+            }
+            return Ok(prior);
+        }
+        self.connection
+            .execute(
+                "INSERT INTO installations(actor,alias,record) VALUES(?1,?2,?3)",
+                params![record.actor, record.alias, encoded(&record)?],
+            )
+            .map_err(db_error)?;
+        Ok(record)
+    }
+    pub fn public_terminal(&self, id: &str) -> io::Result<Option<PublicTerminal>> {
+        self.connection
+            .query_row(
+                "SELECT outcome,events FROM public_terminals WHERE execution=?1",
+                [id],
+                |row| {
+                    Ok(PublicTerminal {
+                        outcome: row.get(0)?,
+                        events: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_error)
+    }
+    pub fn acknowledge_collection(&mut self, id: &str) -> io::Result<Execution> {
+        let mut record = self.get(id)?;
+        if !record.state.terminal() {
+            return Err(db_error(
+                "collection acknowledgement requires a terminal result",
+            ));
+        }
+        if !record.collected {
+            record.collected = true;
+            self.connection
+                .execute(
+                    "UPDATE executions SET record=?1 WHERE id=?2",
+                    params![encoded(&record)?, id],
+                )
+                .map_err(db_error)?;
+        }
+        Ok(record)
+    }
+    pub fn native_output(&self, actor: &str, owner: &str) -> io::Result<Option<Vec<u8>>> {
+        self.connection
+            .query_row(
+                "SELECT source FROM native_outputs WHERE actor=?1 AND owner=?2",
+                params![actor, owner],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)
+    }
+    pub fn native_owner(&self, owner: &str) -> io::Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT actor FROM native_outputs WHERE owner=?1 LIMIT 1",
+                [owner],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_error)
+    }
+    pub fn bind_native_output(
+        &mut self,
+        actor: &str,
+        owner: &str,
+        source: &[u8],
+    ) -> io::Result<()> {
+        if self.native_owner(owner)?.is_some_and(|held| held != actor) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "native retention is already owned by another actor",
+            ));
+        }
+        if let Some(prior) = self.native_output(actor, owner)? {
+            if prior != source {
+                return Err(admission(AdmissionError::BindingConflict));
+            }
+            return Ok(());
+        }
+        self.connection
+            .execute(
+                "INSERT INTO native_outputs(actor,owner,source) VALUES(?1,?2,?3)",
+                params![actor, owner, source],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+    pub fn commit_public_terminal(
+        &mut self,
+        id: &str,
+        projection: PublicTerminal,
+    ) -> io::Result<PublicTerminal> {
+        if !self.get(id)?.state.terminal() {
+            return Err(db_error(
+                "terminal projection requires durable terminal custody",
+            ));
+        }
+        if let Some(prior) = self.public_terminal(id)? {
+            return Ok(prior);
+        }
+        self.connection
+            .execute(
+                "INSERT INTO public_terminals(execution,outcome,events) VALUES(?1,?2,?3)",
+                params![id, projection.outcome, projection.events],
+            )
+            .map_err(db_error)?;
+        Ok(projection)
+    }
 
     pub fn accept_public(
         &mut self,
         context: SubmissionContext,
         invocation: Invocation,
+    ) -> io::Result<Execution> {
+        self.accept_public_on_boot(context, invocation, "")
+    }
+    pub fn accept_public_on_boot(
+        &mut self,
+        context: SubmissionContext,
+        invocation: Invocation,
+        boot: &str,
     ) -> io::Result<Execution> {
         self.validate_workspace(&context.expected_workspace_id)?;
         validate_scope(&context.actor, &context.request_id, &context.submission_id)?;
@@ -264,7 +596,7 @@ impl Journal {
             "public:{}",
             encoded(&(context.actor.as_str(), context.submission_id.as_str()))?
         );
-        self.accept_bound(&key, invocation, Some(context))
+        self.accept_bound(&key, invocation, Some(context), boot)
     }
 
     /// A successful return is an acceptance receipt: FULL WAL commit precedes it.
@@ -276,7 +608,7 @@ impl Journal {
                 "idempotency key must contain 1..512 bytes",
             ));
         }
-        self.accept_bound(key, invocation, None)
+        self.accept_bound(key, invocation, None, "")
     }
 
     fn accept_bound(
@@ -284,6 +616,7 @@ impl Journal {
         key: &str,
         invocation: Invocation,
         context: Option<SubmissionContext>,
+        boot: &str,
     ) -> io::Result<Execution> {
         let tx = self
             .connection
@@ -334,6 +667,10 @@ impl Journal {
             submission: context,
             state: State::Queued,
             revision: 1,
+            accepted_at_ms: timestamp().max(0) as u64,
+            finished_at_ms: 0,
+            acceptance_boot_id: boot.into(),
+            collected: false,
             revision_ceiling: 1,
             attempt: 0,
             waiting_reason: None,
@@ -401,6 +738,52 @@ impl Journal {
     }
 
     /// Closure is a durable acceptance tombstone, never implicit execution cancellation.
+    pub fn actor_page(
+        &self,
+        actor: &str,
+        after: u64,
+        before: u64,
+        newest: bool,
+        states: &[String],
+        limit: usize,
+    ) -> io::Result<Vec<Execution>> {
+        let states: Vec<&str> = states
+            .iter()
+            .map(|s| {
+                if s == "succeeded" {
+                    "completed"
+                } else {
+                    s.as_str()
+                }
+            })
+            .collect();
+        let sql=format!("SELECT record FROM executions WHERE actor=?1 AND id>?2 AND (?3=0 OR id<?3) AND (?4='[]' OR state IN (SELECT value FROM json_each(?4))) ORDER BY id {} LIMIT ?5",if newest{"DESC"}else{"ASC"});
+        let mut statement = self.connection.prepare(&sql).map_err(db_error)?;
+        let records = statement
+            .query_map(
+                params![
+                    actor,
+                    after.min(i64::MAX as u64) as i64,
+                    before.min(i64::MAX as u64) as i64,
+                    encoded(&states)?,
+                    limit.min(256) as i64
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(db_error)?;
+        records
+            .map(|record| serde_json::from_str(&record.map_err(db_error)?).map_err(db_error))
+            .collect()
+    }
+    pub fn actor_head(&self, actor: &str) -> io::Result<u64> {
+        self.connection
+            .query_row(
+                "SELECT COALESCE(MAX(id),0) FROM executions WHERE actor=?1",
+                [actor],
+                |r| r.get(0),
+            )
+            .map_err(db_error)
+    }
     pub fn close_submission(
         &mut self,
         actor: &str,
@@ -521,6 +904,9 @@ impl Journal {
         let observed =
             !was_terminal && progress.is_some_and(|progress| progress.overlay(&mut record));
         if changed || observed {
+            if record.state.terminal() && record.finished_at_ms == 0 {
+                record.finished_at_ms = timestamp().max(0) as u64;
+            }
             // Every durable mutation jumps past all volatile cursors the former owner
             // could have published, even when its progress snapshot was lost.
             record.revision = record
@@ -544,6 +930,21 @@ impl Journal {
         }
         tx.commit().map_err(db_error)?;
         Ok(record)
+    }
+
+    /// Only one dispatcher can claim a never-started attempt.
+    pub fn wait_for_environment(
+        &mut self,
+        id: &str,
+        reason: Option<String>,
+    ) -> io::Result<Execution> {
+        self.update(id, |record| {
+            if record.state != State::Queued || record.waiting_reason == reason {
+                return Ok(false);
+            }
+            record.waiting_reason = reason;
+            Ok(true)
+        })
     }
 
     /// Only one dispatcher can claim a never-started attempt.
@@ -649,6 +1050,7 @@ impl Journal {
             record.cancel_actor = Some(actor.into());
             if record.state == State::Queued {
                 record.state = State::Canceled;
+                record.finished_at_ms = timestamp().max(0) as u64;
             }
             Ok(true)
         })
@@ -688,6 +1090,7 @@ impl Journal {
                     record.state = State::Canceled;
                 }
             }
+            record.finished_at_ms = timestamp().max(0) as u64;
             Ok(true)
         })
     }

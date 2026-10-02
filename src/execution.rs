@@ -27,6 +27,36 @@ use std::{
 
 pub const MAX_RUNNER_FRAME: usize = 1024 * 1024;
 
+impl crate::native_inputs::IntakeJournal for Engine {
+    fn begin_intake(
+        &self,
+        spec: crate::native_inputs::IntakeSpec,
+    ) -> io::Result<crate::native_inputs::IntakeState> {
+        self.journal.lock().unwrap().begin_intake(spec)
+    }
+    fn finish_intake(
+        &self,
+        actor: &str,
+        retention: &str,
+        receipt: Vec<u8>,
+    ) -> io::Result<crate::native_inputs::IntakeState> {
+        self.journal
+            .lock()
+            .unwrap()
+            .settle_intake(actor, retention, Some(receipt), false)
+    }
+    fn abort_intake(
+        &self,
+        actor: &str,
+        retention: &str,
+    ) -> io::Result<crate::native_inputs::IntakeState> {
+        self.journal
+            .lock()
+            .unwrap()
+            .settle_intake(actor, retention, None, true)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RunnerConfig {
     /// Trusted immutable generation interpreter, resolved by the package installer.
@@ -70,6 +100,8 @@ pub enum RunnerEvent {
         value: Value,
         #[serde(default)]
         artifacts: Vec<String>,
+        #[serde(default)]
+        asset_bindings: Vec<crate::journal::AssetBinding>,
     },
     Failed {
         execution_id: String,
@@ -166,11 +198,73 @@ impl Engine {
     pub fn workspace_id(&self) -> String {
         self.journal.lock().unwrap().workspace_id().into()
     }
+    pub fn installation(
+        &self,
+        actor: &str,
+        alias: &str,
+    ) -> io::Result<Option<crate::journal::Installation>> {
+        self.journal.lock().unwrap().installation(actor, alias)
+    }
+    pub fn installation_for_generation(
+        &self,
+        actor: &str,
+        generation: &str,
+    ) -> io::Result<Option<crate::journal::Installation>> {
+        self.journal
+            .lock()
+            .unwrap()
+            .installation_for_generation(actor, generation)
+    }
+    pub fn installations(&self, actor: &str) -> io::Result<Vec<crate::journal::Installation>> {
+        self.journal.lock().unwrap().installations(actor)
+    }
+    pub fn bind_installation(
+        &self,
+        record: crate::journal::Installation,
+    ) -> io::Result<crate::journal::Installation> {
+        self.journal.lock().unwrap().bind_installation(record)
+    }
+    pub fn public_terminal(&self, id: &str) -> io::Result<Option<crate::journal::PublicTerminal>> {
+        self.journal.lock().unwrap().public_terminal(id)
+    }
+    pub fn acknowledge_collection(&self, id: &str) -> io::Result<Execution> {
+        self.journal.lock().unwrap().acknowledge_collection(id)
+    }
+    pub fn native_output(&self, actor: &str, owner: &str) -> io::Result<Option<Vec<u8>>> {
+        self.journal.lock().unwrap().native_output(actor, owner)
+    }
+    pub fn native_owner(&self, owner: &str) -> io::Result<Option<String>> {
+        self.journal.lock().unwrap().native_owner(owner)
+    }
+    pub fn bind_native_output(&self, actor: &str, owner: &str, source: &[u8]) -> io::Result<()> {
+        self.journal
+            .lock()
+            .unwrap()
+            .bind_native_output(actor, owner, source)
+    }
+    pub fn commit_public_terminal(
+        &self,
+        id: &str,
+        record: crate::journal::PublicTerminal,
+    ) -> io::Result<crate::journal::PublicTerminal> {
+        self.journal
+            .lock()
+            .unwrap()
+            .commit_public_terminal(id, record)
+    }
 
     pub fn submit_public(
         &self,
         context: SubmissionContext,
         invocation: Invocation,
+    ) -> io::Result<Execution> {
+        self.submit_public_on_boot(context, invocation, "")
+    }
+    pub fn submit_public_on_boot(
+        &self,
+        context: SubmissionContext,
+        invocation: Invocation,
+        boot: &str,
     ) -> io::Result<Execution> {
         let owned = self.owned.lock().unwrap();
         let progress = self.progress.lock().unwrap();
@@ -178,7 +272,7 @@ impl Engine {
             .journal
             .lock()
             .unwrap()
-            .accept_public(context, invocation)?;
+            .accept_public_on_boot(context, invocation, boot)?;
         overlay_observation(&mut record, &owned, &progress);
         drop(progress);
         drop(owned);
@@ -198,6 +292,20 @@ impl Engine {
         self.select(|journal| journal.list_actor(actor, limit))
     }
 
+    pub fn actor_page(
+        &self,
+        actor: &str,
+        after: u64,
+        before: u64,
+        newest: bool,
+        states: &[String],
+        limit: usize,
+    ) -> io::Result<Vec<Execution>> {
+        self.select(|journal| journal.actor_page(actor, after, before, newest, states, limit))
+    }
+    pub fn actor_head(&self, actor: &str) -> io::Result<u64> {
+        self.journal.lock().unwrap().actor_head(actor)
+    }
     pub fn close_submission(
         &self,
         actor: &str,
@@ -233,6 +341,16 @@ impl Engine {
     }
     pub fn supervising(&self) -> usize {
         self.owned.lock().unwrap().len()
+    }
+
+    pub fn wait_for_environment(&self, id: &str, reason: Option<String>) -> io::Result<Execution> {
+        let record = self
+            .journal
+            .lock()
+            .unwrap()
+            .wait_for_environment(id, reason)?;
+        self.notify_activity();
+        Ok(record)
     }
 
     pub fn ready(&self, limit: usize) -> io::Result<Vec<Execution>> {
@@ -501,10 +619,27 @@ impl Engine {
             Ok(terminal) => {
                 let outcome = match terminal {
                     RunnerEvent::Result {
-                        value, artifacts, ..
+                        value,
+                        artifacts,
+                        asset_bindings,
+                        ..
                     } if status.success() => {
                         match self.custody(id, &output_root, value, artifacts) {
-                            Ok(result) => Outcome::Completed(result),
+                            Ok(mut result) => {
+                                let mut identities = HashSet::new();
+                                for binding in &asset_bindings {
+                                    if !identities.insert(&binding.asset_ref)
+                                        || !result.artifacts.iter().any(|a| {
+                                            a.name == binding.relative_path
+                                                && a.length == binding.length
+                                        })
+                                    {
+                                        return self.finish(id, Outcome::Failed("output binding does not name one held artifact".into())).map(|_| ());
+                                    }
+                                }
+                                result.asset_bindings = asset_bindings;
+                                Outcome::Completed(result)
+                            }
                             Err(error) => {
                                 Outcome::Failed(format!("result custody failed: {error}"))
                             }
@@ -667,7 +802,11 @@ impl Engine {
         }
         File::open(&destination)?.sync_all()?;
         File::open(self.root.join("results"))?.sync_all()?;
-        Ok(ResultRecord { value, artifacts })
+        Ok(ResultRecord {
+            value,
+            artifacts,
+            asset_bindings: vec![],
+        })
     }
 
     /// Reads validate content identity; same-UID package execution is not a security sandbox.

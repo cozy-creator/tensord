@@ -1,19 +1,5 @@
 //! Actual released Runtime executors and installed classifier package, no handler doubles.
-#[path = "../src/device_executor.rs"]
-#[allow(dead_code)]
-mod device_executor;
-#[allow(dead_code)]
-#[path = "../src/execution.rs"]
-mod execution;
-#[allow(dead_code)]
-#[path = "../src/journal.rs"]
-mod journal;
-#[allow(dead_code)]
-#[path = "../src/os.rs"]
-mod os;
-#[allow(dead_code)]
-#[path = "../src/protocol.rs"]
-mod protocol;
+use cozy_machine::device_executor;
 
 use device_executor::{
     postprocess, read_result, Baseline, Binding, Budgets, DeviceCommand, DeviceExecutor,

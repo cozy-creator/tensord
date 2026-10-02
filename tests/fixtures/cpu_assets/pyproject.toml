@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cozy-machine-cpu-assets"
+version = "0.1.0"
+requires-python = ">=3.12,<3.15"
+dependencies = ["cozy-runtime==0.18.89", "scikit-learn>=1.5,<2", "numpy>=2,<3", "msgspec>=0.18,<1"]
+
+[project.entry-points."cozy.application"]
+default = "cpu_assets:app"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cpu_assets*"]

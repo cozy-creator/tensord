@@ -39,7 +39,7 @@ struct Lease {
     host: bool,
 }
 pub struct Owner {
-    store: Store,
+    store: Arc<Store>,
     _lock: File,
     cache: HashMap<String, Cached>,
     peers: HashMap<u64, Peer>,
@@ -75,7 +75,7 @@ impl Owner {
             )
         })?;
         std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
-        let store = Store::ensure(&root.join("tensorfs")).map_err(io::Error::other)?;
+        let store = Arc::new(Store::ensure(&root.join("tensorfs")).map_err(io::Error::other)?);
         let incarnation = format!(
             "{}-{}",
             std::process::id(),
@@ -96,7 +96,7 @@ impl Owner {
             ttl,
             stopping: false,
             incarnation,
-            socket: root.join("machine.sock"),
+            socket: control_socket(root)?,
         })))
     }
     fn id(&mut self) -> u64 {
@@ -120,6 +120,9 @@ impl Owner {
             },
         );
         Ok(id)
+    }
+    pub fn store(&self) -> Arc<Store> {
+        self.store.clone()
     }
     pub fn disconnect(&mut self, peer: u64) {
         if self.leases.values().any(|lease| lease.peer == peer) {
@@ -311,12 +314,45 @@ impl Owner {
             Ok(())
         }
     }
-    pub fn stop(&mut self) -> bool {
+    pub fn idle(&mut self) -> bool {
         self.reap();
-        if !self.leases.is_empty() {
+        self.leases.is_empty()
+    }
+    pub fn stop(&mut self) -> bool {
+        if !self.idle() {
             return false;
         }
         self.stopping = true;
         true
     }
+}
+fn control_socket(root: &Path) -> io::Result<PathBuf> {
+    let path = root.join("machine.sock");
+    if std::os::unix::net::SocketAddr::from_pathname(&path).is_ok() {
+        return Ok(path);
+    }
+    let uid = unsafe { libc::geteuid() };
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(std::env::temp_dir);
+    let directory = runtime.join(format!("cozy-machine-{uid}"));
+    match std::fs::create_dir(&directory) {
+        Ok(()) => std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
+        Err(error) => return Err(error),
+    }
+    let metadata = std::fs::symlink_metadata(&directory)?;
+    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+        return Err(failure(
+            "control socket runtime directory must be owned and private",
+        ));
+    }
+    let canonical = root.canonicalize()?;
+    let identity = tensorfs_core::sha256::hex(&tensorfs_core::sha256::digest(
+        canonical.as_os_str().as_encoded_bytes(),
+    ));
+    let path = directory.join(format!("{}.sock", &identity[..24]));
+    std::os::unix::net::SocketAddr::from_pathname(&path)?;
+    Ok(path)
 }

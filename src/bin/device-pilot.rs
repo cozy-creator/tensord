@@ -1,19 +1,5 @@
 //! Explicit isolated hardware pilot; validate never launches Python or initializes a device.
-#[allow(dead_code)]
-#[path = "../device_executor.rs"]
-mod device_executor;
-#[allow(dead_code)]
-#[path = "../execution.rs"]
-mod execution;
-#[allow(dead_code)]
-#[path = "../journal.rs"]
-mod journal;
-#[allow(dead_code)]
-#[path = "../os.rs"]
-mod os;
-#[allow(dead_code)]
-#[path = "../protocol.rs"]
-mod protocol;
+use cozy_machine::device_executor;
 
 use device_executor::{
     postprocess, Answer, Baseline, Binding, Budgets, DeviceCommand, DeviceExecutor, ExecutorConfig,
