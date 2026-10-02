@@ -1,14 +1,8 @@
-#[path = "../src/model_sources.rs"]
-mod model_sources;
-#[allow(dead_code)]
-#[path = "../src/os.rs"]
-mod os;
-
-use model_sources::{ModelSources, SelectedManifest, SourceRequest, SourceRole};
+use cozy_machine::model_sources::{ModelSources, SelectedManifest, SourceRequest, SourceRole};
 use std::{
     fs,
     io::{self, Read},
-    os::unix::fs::FileExt,
+    os::{fd::AsRawFd, unix::fs::FileExt},
 };
 use tensorfs_core::{
     dtype::Dtype,
@@ -174,7 +168,11 @@ fn source_role_exports_only_trusted_manifest_components_with_exact_bytes() {
     asset.file.read_to_end(&mut bytes).unwrap();
     assert_eq!(bytes, b"static tokenizer asset");
     assert_eq!(tensorfs_core::sha256::hex_digest(&bytes), asset.sha256);
-    assert_eq!(os::seals(&asset.file).unwrap(), os::FULL_SEALS);
+    let seals = unsafe { libc::fcntl(asset.file.as_raw_fd(), libc::F_GET_SEALS) };
+    assert_eq!(
+        seals,
+        libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE
+    );
     drop(asset);
     drop(broker);
     drop(grant);

@@ -1,13 +1,6 @@
 //! CPU metadata/source gate against an explicitly selected existing snapshot.
 //! `--verify` additionally admits a copied closure into an owned target's native catalog.
-#[allow(dead_code)]
-#[path = "../model_sources.rs"]
-mod model_sources;
-#[allow(dead_code)]
-#[path = "../os.rs"]
-mod os;
-
-use model_sources::{ModelSources, SelectedManifest, SourceRequest, SourceRole};
+use cozy_machine::model_sources::{ModelSources, SelectedManifest, SourceRequest, SourceRole};
 use std::{
     fs::File,
     io::{self, Read},

@@ -4,6 +4,7 @@ pub mod device_executor;
 pub mod execution;
 pub mod journal;
 pub mod machine_api;
+pub mod model_sources;
 pub mod native_inputs;
 pub(crate) mod os;
 pub mod owner;
