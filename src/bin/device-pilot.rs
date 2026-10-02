@@ -33,6 +33,9 @@ struct Pilot {
     generation_hold: Option<PathBuf>,
     #[serde(default)]
     model_sources: SourceMode,
+    /// Auto negotiates existing stage policy; false is a fixed-allowance single-executor experiment.
+    #[serde(default)]
+    stages: Option<bool>,
     payloads: Vec<Value>,
 }
 
@@ -181,7 +184,7 @@ fn run() -> io::Result<()> {
     if action == "validate" {
         println!(
             "{}",
-            serde_json::json!({"validated":true,"mode":"stock-executor-pilot","requested_model_sources":config.model_sources,"model":config.binding.model_class,"snapshots":config.binding.snapshots,"requests":config.payloads.len(),"gpu_started":false})
+            serde_json::json!({"validated":true,"mode":"stock-executor-pilot","requested_model_sources":config.model_sources,"requested_stages":config.stages,"model":config.binding.model_class,"snapshots":config.binding.snapshots,"requests":config.payloads.len(),"gpu_started":false})
         );
         return Ok(());
     }
@@ -212,7 +215,7 @@ fn run() -> io::Result<()> {
         .get("CUDA_VISIBLE_DEVICES")
         .cloned()
         .unwrap_or_default();
-    let stages = executor.hello.offers("stage/1");
+    let stages = config.stages.unwrap_or(true) && executor.hello.offers("stage/1");
     let plane = executor.hello.offers("weight_plane/1");
     let descriptors = matches!(config.model_sources, SourceMode::Descriptors)
         && executor.hello.offers("model_sources.descriptors/1");
@@ -223,6 +226,7 @@ fn run() -> io::Result<()> {
             "tensorfs":executor.hello.tensorfs_version,
             "offered_memory":executor.hello.memory,
             "stage_turns":stages,
+            "requested_stages":config.stages,
             "weight_plane":plane,
             "legacy_residency":!plane,
             "requested_model_sources":config.model_sources,

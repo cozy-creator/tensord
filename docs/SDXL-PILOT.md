@@ -133,6 +133,11 @@ still made 69 stage round trips per image (encode 2, denoise 20, decode 1 entrie
 and yielded exchanges). Zero source RPC does not imply zero per-step policy IPC. Start timings
 are confounded by initial candidate environment imports; full-pilot ratios are unqualified.
 
+The optional typed `"stages":false` config disables negotiated stage turns for a controlled
+single-executor, fixed-allowance causal test. Omitted/default Auto preserves existing capability
+selection. Device authorization and plane/pinned budget requirements remain; this option does
+not define product policy for shared GPUs or authorize removing coordination/safety gates.
+
 ## Isolated transfer recipe
 
 When the ordinary downloader cannot address an independently acquired pod, transfer the
