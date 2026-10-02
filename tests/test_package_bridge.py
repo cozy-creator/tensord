@@ -77,9 +77,11 @@ def finish(process, sock):
     assert process.returncode == 0, (stdout, stderr)
 
 
-def terminal(sock):
+def terminal(sock, completed=None):
     while isinstance(event := read_event(sock), Progress):
         assert event.completed_units >= 0
+        if completed is not None:
+            completed.append(event.completed_units)
     return event
 
 
@@ -104,6 +106,20 @@ def test_additive_peer_fields_preserve_baseline_invocation():
     assert decoded.input == event["input"]
 
 
+def test_only_new_completed_positions_count_as_productive_progress():
+    pytest.importorskip("cozy_runtime")
+    from cozy_runtime.author._services import ProgressFrame
+    from cozy_machine_client.runner import CompletedWork
+
+    work = CompletedWork()
+    assert work.observe(ProgressFrame("stage", None, 1000)) is None
+    assert work.observe(ProgressFrame("stage", .5, 1001, position=1, total=2)) == 1
+    assert work.observe(ProgressFrame("stage", .5, 2000, position=1, total=2)) is None
+    assert work.observe(ProgressFrame("stage", .5, 3000, position=0, total=2)) is None
+    assert work.observe(ProgressFrame("stage", 1., 3001, position=2, total=2)) == 2
+    assert work.observe(ProgressFrame("another", 1., 3002, position=3, total=3)) == 5
+
+
 def test_ready_precedes_authored_import_and_sdk_import(generation):
     process, sock = spawn_runner(generation)
     maps = Path(f"/proc/{process.pid}/maps").read_text()
@@ -120,7 +136,9 @@ def test_real_sdk_inference_saved_output_and_repeated_executors(generation, tmp_
         process, sock = spawn_runner(generation)
         output = tmp_path / str(attempt)
         send_command(sock, invoke(generation, output, execution_id=str(attempt)))
-        event = terminal(sock)
+        completed = []
+        event = terminal(sock, completed)
+        assert completed == [1, 2]  # stage-open/fraction/event counters are not work
         assert isinstance(event, Result), event
         assert event.execution_id == str(attempt)
         assert len(event.artifacts) == 1
@@ -186,6 +204,28 @@ def test_bound_is_preserved_and_live_generation_cannot_be_collected(generation):
 
     assert Version("0.18.89") <= Version(versions["cozy-runtime"]) < Version("0.18.101")
     assert not collect(Path(generation.python).parents[2])
+
+
+def test_real_older_sdk_package_runs_without_peer_version_floor(generation, tmp_path):
+    source = tmp_path / "older-package"
+    shutil.copytree(FIXTURE, source)
+    project = source / "pyproject.toml"
+    project.write_text(project.read_text().replace(
+        "cozy-runtime>=0.18.89,<0.18.101", "cozy-runtime==0.18.89"))
+    client_wheel = next((Path(generation.python).parents[4] / "client").glob("*.whl"))
+    older = install(source, tmp_path / "older-generations", client_wheel)
+    versions = {dependency.name: dependency.version for dependency in older.dependencies}
+    assert versions["cozy-runtime"] == "0.18.89"
+    with GenerationHold(Path(older.python).parents[2]):
+        process, sock = spawn_runner(older)
+        output = tmp_path / "older-result"
+        send_command(sock, invoke(older, output))
+        event = terminal(sock)
+        assert isinstance(event, Result), event
+        assert event.value["predictions"] == [0, 2, 1]
+        saved = json.loads((output / event.artifacts[0]).read_bytes())
+        assert saved["probabilities"] == event.value["probabilities"]
+        finish(process, sock)
 
 
 def test_generation_collected_only_after_last_holder(tmp_path):

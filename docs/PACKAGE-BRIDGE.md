@@ -58,6 +58,15 @@ The owner validates and seals artifacts, commits durable output custody, then ac
 success. A runner result alone is tentative. A completed-unit telemetry queue is bounded
 and lossy; model code never blocks on a telemetry socket write.
 
+Runtime `ProgressFrame.advance` is an absolute **event** sequence in the qualified SDK,
+including stage-open and fraction-only frames. It is not completed work. The adapter
+accumulates positive `position` deltas with valid `total` per stage/child-attempt, ignores
+repeated or regressed positions, and bounds remembered scopes to 256. Real inference
+checks produce completed totals `[1, 2]` for two steps. The SDK lacks an identity for
+restarted same-named scopes, so their resets are conservatively uncounted. Missing lossy
+telemetry alone must never authorize a kill; richer progress identity remains a liveness
+qualification requirement.
+
 Only an attempt-matching explicit Cancel sets the Runtime cancellation callback. Parent
 socket EOF does not manufacture user cancellation or dispatch another invocation: code
 already entered may finish, and the owner must conservatively settle orphaned started
@@ -74,8 +83,10 @@ mock function or sleep. `/proc/<pid>/maps` checks cover readiness and active inf
 without CUDA/NVML library loads. The installed Runtime 0.18.99 still depends on TensorFS
 0.3.88; this slice does **not** establish removal of that package dependency.
 
-On 2026-10-02, all 10 package bridge tests passed in 18.88 s with CPython 3.12.12,
-Runtime 0.18.99, TensorFS 0.3.88, sklearn 1.9.1 and NumPy 2.5.3. Bytecode compilation
+On 2026-10-02, all 12 package bridge tests passed in 25.13 s with CPython 3.12.12,
+Runtime 0.18.99, TensorFS 0.3.88, sklearn 1.9.1 and NumPy 2.5.3. An independent
+package pinned Runtime **0.18.89** and ran the same real inference successfully through
+the unchanged runner, without an injected service-version floor. Bytecode compilation
 and whitespace checks passed. A broader unchanged transport test failed on this
 uv-managed CPython build because it lacks `os.memfd_create`; the system interpreter
 has that function. That interpreter/storage portability gap remains separately open.
