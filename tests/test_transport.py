@@ -1,4 +1,5 @@
 import array
+import errno
 import fcntl
 import os
 import socket
@@ -9,6 +10,7 @@ import pytest
 
 from cozy_machine_client.client import FULL_SEALS, GET_SEALS, ProtocolError, read_exact, receive_fd, sealed_memfd, send_record
 from cozy_machine_client.protocol import MAX_FRAME, Hello, HelloReply, ObjectRef
+from cozy_machine_client.linux import MFD_ALLOW_SEALING, MFD_CLOEXEC, libc_memfd_create
 
 
 def descriptor_count():
@@ -26,6 +28,30 @@ def test_sealed_upload_is_immutable_and_readable_from_start():
             os.pwrite(fd, b"corrupted", 0)
     finally:
         os.close(fd)
+
+
+def test_libc_memfd_uses_same_kernel_seals_and_descriptor_lifetime():
+    fd = libc_memfd_create("cozy-libc-proof", MFD_CLOEXEC | MFD_ALLOW_SEALING)
+    try:
+        assert not os.get_inheritable(fd)
+        os.write(fd, b"shared weights")
+        fcntl.fcntl(fd, 1033, FULL_SEALS)
+        assert os.pread(fd, 14, 0) == b"shared weights"
+        with pytest.raises(OSError) as failure:
+            os.pwrite(fd, b"mutation", 0)
+        assert failure.value.errno == errno.EPERM
+    finally:
+        os.close(fd)
+
+
+def test_libc_memfd_preserves_errors_without_leaking_descriptors():
+    before = descriptor_count()
+    with pytest.raises(OSError) as failure:
+        libc_memfd_create("cozy-invalid-flags", 0xFFFFFFFF)
+    assert failure.value.errno == errno.EINVAL
+    with pytest.raises(ValueError):
+        libc_memfd_create("truncated\0name", MFD_CLOEXEC)
+    assert descriptor_count() == before
 
 
 def test_json_framing_and_cloexec_fd():
