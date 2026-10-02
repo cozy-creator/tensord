@@ -251,6 +251,57 @@ fn progress_is_coalesced_without_wal_writes_and_terminal_preserves_latest() {
 }
 
 #[test]
+fn completion_wakes_owner_scheduler_to_dispatch_next_queued_package() {
+    let fixture = Fixture::new();
+    let first = fixture.submit("wait");
+    fixture.wait(&first, |record| record.completed_units == 1);
+    let next = fixture
+        .engine
+        .submit("queued-next", fixture.invocation("infer"))
+        .unwrap();
+    assert_eq!(fixture.engine.ready(8).unwrap()[0].id, next.id);
+    assert_eq!(fixture.engine.active(8).unwrap()[0].id, first);
+    assert_eq!(fixture.engine.nonterminal(1).unwrap().len(), 1);
+    let observed = fixture.engine.activity_epoch();
+    assert_eq!(
+        fixture.engine.wait_activity(observed, Some(Duration::ZERO)),
+        observed
+    );
+    assert_eq!(fixture.engine.get(&first).unwrap().state, State::Running);
+    let engine = fixture.engine.clone();
+    let config = fixture.config();
+    let first_for_scheduler = first.clone();
+    let (sent, received) = std::sync::mpsc::channel();
+    let scheduler = thread::spawn(move || {
+        let mut epoch = observed;
+        loop {
+            epoch = engine.wait_activity(epoch, None);
+            if !engine.get(&first_for_scheduler).unwrap().state.terminal() {
+                continue;
+            }
+            let ready = engine.ready(1).unwrap();
+            assert_eq!(ready.len(), 1);
+            assert!(engine.dispatch(&ready[0].id, config).unwrap());
+            sent.send(epoch).unwrap();
+            break;
+        }
+    });
+    fs::write(fixture.root.join("release"), b"complete first execution").unwrap();
+    assert!(received.recv_timeout(Duration::from_secs(15)).unwrap() > observed);
+    scheduler.join().unwrap();
+    assert_eq!(
+        fixture
+            .wait(&next.id, |record| record.state.terminal())
+            .state,
+        State::Completed
+    );
+    assert_eq!(fixture.engine.get(&first).unwrap().state, State::Completed);
+    assert!(fixture.engine.nonterminal(8).unwrap().is_empty());
+    assert!(fixture.engine.ready(8).unwrap().is_empty());
+    assert_eq!(fixture.engine.list().unwrap().len(), 2);
+}
+
+#[test]
 fn cancel_before_dispatch_is_durable_and_never_executes_package() {
     let fixture = Fixture::new();
     let mut journal = Journal::open(&fixture.root.join("queued-state")).unwrap();

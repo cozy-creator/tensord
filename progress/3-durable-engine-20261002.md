@@ -27,3 +27,8 @@ state and WAL size stay unchanged; cancel/terminal commits retain the latest cou
 Reserved status revision windows preserve monotonic cursors across actual owner death,
 and renew without cursor reuse. The optional stored ceiling defaults for older records.
 Twelve focused tests pass (0.36 s), including the allocator boundary and queued cancel.
+
+Activity follow-up: Engine publishes a bounded Condvar epoch for authoritative state changes;
+the root owns scheduling. Partial indexes support ready/active/nonterminal queries and keep
+recovery off terminal history. An actual completion wakes the owner scheduler to dispatch a
+second queued package. Thirteen focused tests pass (0.31 s); fmt and clippy pass.

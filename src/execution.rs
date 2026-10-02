@@ -21,7 +21,8 @@ use std::{
     },
     path::{Component, Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
+    time::Duration,
 };
 
 pub const MAX_RUNNER_FRAME: usize = 1024 * 1024;
@@ -122,6 +123,8 @@ pub struct Engine {
     active: Mutex<HashMap<String, Writer>>,
     owned: Mutex<HashSet<String>>,
     progress: Mutex<HashMap<String, ProgressSnapshot>>,
+    activity: Mutex<u64>,
+    activity_changed: Condvar,
 }
 
 impl Engine {
@@ -138,6 +141,8 @@ impl Engine {
             active: Mutex::new(HashMap::new()),
             owned: Mutex::new(HashSet::new()),
             progress: Mutex::new(HashMap::new()),
+            activity: Mutex::new(0),
+            activity_changed: Condvar::new(),
         }))
     }
 
@@ -146,6 +151,9 @@ impl Engine {
         let progress = self.progress.lock().unwrap();
         let mut record = self.journal.lock().unwrap().accept(key, invocation)?;
         overlay_observation(&mut record, &owned, &progress);
+        drop(progress);
+        drop(owned);
+        self.notify_activity();
         Ok(record)
     }
     pub fn get(&self, id: &str) -> io::Result<Execution> {
@@ -168,6 +176,60 @@ impl Engine {
         self.owned.lock().unwrap().len()
     }
 
+    pub fn ready(&self, limit: usize) -> io::Result<Vec<Execution>> {
+        self.select(|journal| journal.ready(limit))
+    }
+    pub fn nonterminal(&self, limit: usize) -> io::Result<Vec<Execution>> {
+        self.select(|journal| journal.nonterminal(limit))
+    }
+    pub fn active(&self, limit: usize) -> io::Result<Vec<Execution>> {
+        self.select(|journal| journal.active(limit))
+    }
+    fn select(
+        &self,
+        query: impl FnOnce(&Journal) -> io::Result<Vec<Execution>>,
+    ) -> io::Result<Vec<Execution>> {
+        let owned = self.owned.lock().unwrap();
+        let progress = self.progress.lock().unwrap();
+        let mut records = query(&self.journal.lock().unwrap())?;
+        for record in &mut records {
+            overlay_observation(record, &owned, &progress);
+        }
+        Ok(records)
+    }
+
+    /// In-process wake cursor, separate from durable execution/status revisions.
+    pub fn activity_epoch(&self) -> u64 {
+        *self.activity.lock().unwrap()
+    }
+
+    /// Optional duration bounds observation only; it never changes execution state.
+    pub fn wait_activity(&self, observed: u64, wait: Option<Duration>) -> u64 {
+        let epoch = self.activity.lock().unwrap();
+        if *epoch != observed || *epoch == u64::MAX {
+            return *epoch;
+        }
+        let epoch = match wait {
+            Some(wait) => {
+                self.activity_changed
+                    .wait_timeout_while(epoch, wait, |epoch| *epoch == observed)
+                    .unwrap()
+                    .0
+            }
+            None => self
+                .activity_changed
+                .wait_while(epoch, |epoch| *epoch == observed)
+                .unwrap(),
+        };
+        *epoch
+    }
+
+    pub fn notify_activity(&self) {
+        let mut epoch = self.activity.lock().unwrap();
+        *epoch = epoch.saturating_add(1); // never wrap or reuse a wake cursor
+        self.activity_changed.notify_all();
+    }
+
     /// Dispatch only after the owner's admission and trusted generation resolution.
     pub fn dispatch(self: &Arc<Self>, id: &str, config: RunnerConfig) -> io::Result<bool> {
         let mut owned = self.owned.lock().unwrap();
@@ -175,6 +237,7 @@ impl Engine {
             return Ok(false);
         }
         owned.insert(id.into());
+        self.notify_activity();
         let engine = self.clone();
         let id = id.to_owned();
         let thread_id = id.clone();
@@ -186,6 +249,7 @@ impl Engine {
                 }
                 engine.progress.lock().unwrap().remove(&thread_id);
                 engine.owned.lock().unwrap().remove(&thread_id);
+                engine.notify_activity();
             });
         if let Err(error) = launched {
             owned.remove(&id);
@@ -193,6 +257,7 @@ impl Engine {
                 .lock()
                 .unwrap()
                 .defer_unstarted(&id, format!("supervisor launch failed: {error}"))?;
+            self.notify_activity();
             return Err(error);
         }
         Ok(true)
@@ -212,6 +277,7 @@ impl Engine {
             overlay_observation(&mut record, &owned, &progress);
             record
         };
+        self.notify_activity();
         let writer = self.active.lock().unwrap().get(id).cloned();
         if let Some(writer) = writer {
             // Delivery failure does not revoke the already committed cancellation authority.
@@ -280,6 +346,8 @@ impl Engine {
         if record.state.terminal() {
             progress.remove(id);
         }
+        drop(progress);
+        self.notify_activity();
         Ok(record)
     }
 
@@ -288,7 +356,8 @@ impl Engine {
     pub fn reconcile(&self) -> io::Result<Vec<Execution>> {
         let owned = self.owned.lock().unwrap();
         let mut journal = self.journal.lock().unwrap();
-        for record in journal.list()? {
+        let mut changed = false;
+        for record in journal.active(usize::MAX)? {
             if !matches!(record.state, State::Starting | State::Running)
                 || owned.contains(&record.id)
             {
@@ -319,10 +388,14 @@ impl Engine {
             } else {
                 journal.finish(&record.id, Outcome::Failed("owner lost before durable result custody; exact executor birth has ended; started work will not be replayed".into()))?;
             }
+            changed = true;
         }
         drop(journal);
         drop(owned);
-        self.list()
+        if changed {
+            self.notify_activity();
+        }
+        self.nonterminal(1024)
     }
 
     fn run(&self, id: &str, config: RunnerConfig) -> io::Result<()> {
@@ -349,6 +422,7 @@ impl Engine {
                     .lock()
                     .unwrap()
                     .defer_unstarted(id, format!("runner launch failed: {error}"))?;
+                self.notify_activity();
                 return Ok(());
             }
         };
@@ -399,6 +473,7 @@ impl Engine {
                         id,
                         format!("runner ended before start authorization: {error}"),
                     )?;
+                    self.notify_activity();
                 } else {
                     self.finish(
                         id,
@@ -421,6 +496,7 @@ impl Engine {
         // Register identity immediately after spawn, before any package authorization.
         let birth = process_birth(child.id())?;
         self.journal.lock().unwrap().register_process(id, birth)?;
+        self.notify_activity();
         let ready =
             read_event(reader)?.ok_or_else(|| io::Error::other("runner EOF before Ready"))?;
         match ready {
@@ -438,6 +514,7 @@ impl Engine {
             let mut stream = writer.lock().unwrap();
             // Running means authorization may have arrived, including a lost write ack.
             self.journal.lock().unwrap().running(id)?;
+            self.notify_activity();
             write_command(
                 &mut stream,
                 &RunnerCommand::Invoke {
