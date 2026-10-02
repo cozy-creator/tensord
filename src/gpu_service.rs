@@ -7,6 +7,10 @@ use crate::{
     },
     execution::{process_ended, Engine},
     journal::{AssetBinding, Execution, Outcome, OutputChecksum, Preparation, State},
+    memory::{
+        policy::{Facts, Holding, Step, MARGIN},
+        GpuMemory, MemoryConfig,
+    },
     model_sources::{ModelSources, SelectedManifest},
     resident_custody::{HoldingFacts, HoldingKey, Offered, Reader, ResidentCustody},
     shared_host_plane::{HostConfig, HostPeer, HostScope, SharedHostPlane},
@@ -24,13 +28,6 @@ use std::{
     },
 };
 use tensorfs_core::store::Store;
-
-fn measured_budget() -> i64 {
-    -1
-}
-fn enabled() -> bool {
-    true
-}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -75,12 +72,11 @@ pub struct GpuConfig {
     #[serde(default)]
     pub source_mode: SourceMode,
     pub devices: String,
+    /// Load's device limit where NVML cannot read the device total.
     pub authorized_device_limit_bytes: Option<u64>,
-    #[serde(default = "measured_budget")]
-    pub plane_budget_bytes: i64,
     pub pinned_budget_bytes: i64,
-    #[serde(default = "enabled")]
-    pub stages: bool,
+    #[serde(default)]
+    pub memory: MemoryConfig,
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
     /// Explicit authority for already verified cached catalog bytes. Hub download/grant
@@ -140,7 +136,9 @@ pub struct GpuPool {
     config: GpuConfig,
     store: Arc<Store>,
     reserved: AtomicBool,
-    session: Mutex<Option<Session>>,
+    /// One retained executor per plan; the memory policy decides which keep weights mapped.
+    sessions: Mutex<BTreeMap<String, Session>>,
+    memory: GpuMemory,
     host: Option<Arc<SharedHostPlane>>,
     /// Degree 2: GPU weights kept across executors. None on a GPU that drives a display.
     custody: Option<Mutex<ResidentCustody>>,
@@ -199,10 +197,11 @@ impl GpuPool {
         Ok(Arc::new(Self {
             launcher: crate::child_launcher::ChildLauncher::new()?,
             root: root.to_path_buf(),
+            memory: GpuMemory::start(&config.devices, &config.memory),
             config,
             store,
             reserved: AtomicBool::new(false),
-            session: Mutex::new(None),
+            sessions: Mutex::new(BTreeMap::new()),
             host,
             custody,
         }))
@@ -227,8 +226,8 @@ impl GpuPool {
             .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "no GPU weight custody"))?;
         custody.lock().unwrap().begin_revoke(key, generation)?;
-        if let Ok(mut slot) = self.session.try_lock() {
-            if let Some(session) = slot.as_mut() {
+        if let Ok(mut sessions) = self.sessions.try_lock() {
+            for session in sessions.values_mut() {
                 if let Err(error) = release_revoked(custody, &mut session.executor) {
                     eprintln!("resident revoke left a lease charged: {error}");
                 }
@@ -529,8 +528,10 @@ impl GpuPool {
         })
     }
     pub fn stop(&self) -> io::Result<()> {
-        if let Some(session) = self.session.lock().unwrap().take() {
+        let sessions = std::mem::take(&mut *self.sessions.lock().unwrap());
+        for (plan, session) in sessions {
             session.executor.shutdown()?;
+            self.memory.with(|gpu| gpu.ended(&plan));
         }
         Ok(())
     }
@@ -541,14 +542,98 @@ impl GpuPool {
         held: HeldGeneration,
         plan: GpuPlan,
     ) -> io::Result<()> {
-        let mut slot = self.session.lock().unwrap();
-        let result = self.run_locked(engine, id, held, plan, &mut slot);
+        let mut sessions = self.sessions.lock().unwrap();
+        let key = plan.id.clone();
+        let result = self.run_locked(engine, id, held, plan, &mut sessions);
+        self.memory.finished(&key);
         if result.is_err() {
             // Broken/failed exchanges close the owner channel. Sources and the
             // journal reservation survive until the exact receiver has exited.
-            slot.take();
+            sessions.remove(&key);
+        }
+        if !sessions.contains_key(&key) {
+            self.memory.with(|gpu| gpu.ended(&key));
         }
         result
+    }
+
+    /// Custody's holdings as the memory policy reads them.
+    fn holdings(&self) -> Vec<Holding> {
+        self.resident()
+            .into_iter()
+            .map(|h| Holding {
+                id: holding_id(&h.key, h.generation),
+                bytes: h.bytes,
+                readers: h.readers.iter().map(|birth| birth.pid).collect(),
+                idle_ms: h.idle_ms,
+                revoking: h.phase == crate::resident_custody::Phase::Revoking,
+            })
+            .collect()
+    }
+
+    /// One memory step on idle executors or custody of this GPU.
+    fn carry_out(&self, step: &Step, sessions: &mut BTreeMap<String, Session>) -> io::Result<bool> {
+        let plan = match step {
+            Step::Revoke(id) => {
+                let Some(custody) = &self.custody else {
+                    return Ok(false);
+                };
+                let found = custody
+                    .lock()
+                    .unwrap()
+                    .holdings()
+                    .into_iter()
+                    .find(|h| holding_id(&h.key, h.generation) == *id);
+                let Some(holding) = found else {
+                    return Ok(false);
+                };
+                custody
+                    .lock()
+                    .unwrap()
+                    .begin_revoke(&holding.key, holding.generation)?;
+                // Every other executor is idle: each releases at once.
+                for session in sessions.values_mut() {
+                    if let Err(error) = release_revoked(custody, &mut session.executor) {
+                        eprintln!("resident revoke left a lease charged: {error}");
+                    }
+                }
+                log_released(custody.lock().unwrap().collect());
+                return Ok(true);
+            }
+            Step::Unmap(plan) => {
+                let Some(session) = sessions.get_mut(plan) else {
+                    return Ok(false);
+                };
+                if session.executor.hello.offers("weight_plane/1") {
+                    let reply = session.executor.command(
+                        &DeviceCommand::Budget {
+                            vram_bytes: 0,
+                            pinned_bytes: -1,
+                            cap_bytes: None,
+                        },
+                        &mut device_executor::Baseline,
+                    );
+                    if let Some(reply) = reply.ok().filter(|reply| reply.ok) {
+                        self.memory
+                            .observe(plan, plane_facts(reply.plane.as_ref()), Some(false));
+                        return Ok(true);
+                    }
+                }
+                plan
+            }
+            Step::End(plan) => plan,
+            Step::Shrink(..) => return Ok(false),
+        };
+        let Some(session) = sessions.remove(plan) else {
+            return Ok(false);
+        };
+        // Its context leaves the device before anything is granted in its place. Another
+        // tenant's broken channel is its own failure, never this call's.
+        if let Err(error) = session.executor.shutdown() {
+            eprintln!("memory: ending idle executor {plan}: {error}");
+        }
+        self.memory.with(|gpu| gpu.ended(plan));
+        Ok(true)
     }
 
     fn run_locked(
@@ -557,21 +642,33 @@ impl GpuPool {
         id: &str,
         held: HeldGeneration,
         plan: GpuPlan,
-        slot: &mut Option<Session>,
+        sessions: &mut BTreeMap<String, Session>,
     ) -> io::Result<()> {
         if let Some(custody) = &self.custody {
             log_released(custody.lock().unwrap().collect());
         }
-        if let Some(session) = slot.as_ref() {
+        let mut ended = vec![];
+        for (key, session) in sessions.iter() {
             if process_ended(&session.executor.birth)? {
-                slot.take();
-            } else if session.plan != plan.id {
-                // Closing the old context is observed before creating its replacement.
-                slot.take().unwrap().executor.shutdown()?;
+                ended.push(key.clone());
             }
         }
-        let cold = slot.is_none();
+        for key in ended {
+            sessions.remove(&key);
+            self.memory.with(|gpu| gpu.ended(&key));
+        }
+        let cold = !sessions.contains_key(&plan.id);
+        let mut load_cap = None;
         if cold {
+            // A context and the first working set are reserved before the process exists.
+            load_cap = self.memory.decide(
+                &plan.id,
+                true,
+                || self.holdings(),
+                |step| self.carry_out(step, sessions),
+            )?;
+            self.memory
+                .with(|gpu| gpu.starting(&plan.id, gpu.spawn_need(&plan.id)));
             let root = self.root.join(uuid::Uuid::new_v4().simple().to_string());
             fs::create_dir(&root)?;
             let directory = File::open(&root)?;
@@ -605,6 +702,7 @@ impl GpuPool {
                 },
                 &self.launcher,
                 |birth, cancel| {
+                    self.memory.with(|gpu| gpu.spawned(&plan.id, birth.pid));
                     let cancel = cancel.clone();
                     let request = id.to_string();
                     engine.register_managed(
@@ -654,17 +752,20 @@ impl GpuPool {
                     plan.binding.components.clone(),
                 )?;
             }
-            *slot = Some(Session {
-                plan: plan.id.clone(),
-                loaded: false,
-                executor,
-                sources,
-                budget_cells: vec![],
-                peer,
-                descriptors,
-            });
+            sessions.insert(
+                plan.id.clone(),
+                Session {
+                    plan: plan.id.clone(),
+                    loaded: false,
+                    executor,
+                    sources,
+                    budget_cells: vec![],
+                    peer,
+                    descriptors,
+                },
+            );
         } else {
-            let session = slot.as_ref().unwrap();
+            let session = &sessions[&plan.id];
             let cancel = session.executor.cancellation();
             let request = id.to_string();
             engine.register_managed(
@@ -677,20 +778,42 @@ impl GpuPool {
             engine.finish(id, Outcome::Canceled)?;
             return Ok(());
         }
-        let session = slot.as_mut().unwrap();
-        let stages = self.config.stages && session.executor.hello.offers("stage/1");
+        // Out of the map for the call: its requests may unmap or end the others.
+        let mut session = sessions.remove(&plan.id).expect("session retained above");
+        let result = self.call(engine, id, &held, plan, load_cap, &mut session, sessions);
+        if result.as_ref().is_ok_and(|kept| *kept) {
+            sessions.insert(session.plan.clone(), session);
+        }
+        result.map(|_| ())
+    }
+
+    /// Load (once), grant and invoke. Ok(false): the executor must not be reused.
+    #[allow(clippy::too_many_arguments)]
+    fn call(
+        &self,
+        engine: &Arc<Engine>,
+        id: &str,
+        held: &HeldGeneration,
+        plan: GpuPlan,
+        load_cap: Option<u64>,
+        session: &mut Session,
+        others: &mut BTreeMap<String, Session>,
+    ) -> io::Result<bool> {
+        let capped = session.executor.hello.offers("process_cap/1");
         let sharing = self.custody.is_some() && session.executor.hello.offers("weights.attach/1");
         let mut callbacks = Callbacks {
             engine,
             id,
             sources: &session.sources,
             cells: &mut session.budget_cells,
-            budget: self.config.plane_budget_bytes,
             completed: 0,
             host: self.host.as_ref(),
             peer: &session.peer,
             custody: self.custody.as_ref().filter(|_| sharing),
             exit: session.executor.observer_pidfd()?,
+            pool: self,
+            plan: &plan.id,
+            others,
         };
         if !session.loaded {
             let interface_path = session.executor.root_path().join("package-interface.json");
@@ -715,7 +838,8 @@ impl GpuPool {
             } else {
                 self.store.root().to_string_lossy().into()
             };
-            command_ok(session.executor.command(
+            let device_total = self.memory.sample().map(|sample| sample.total);
+            let loaded = command_ok(session.executor.command(
                 &DeviceCommand::Load {
                     construction: plan.id.clone(),
                     devices: self.config.devices.clone(),
@@ -724,23 +848,28 @@ impl GpuPool {
                     budgets: Budgets {
                         declared_weight_bytes: plan.selected_encoded_bytes,
                     },
-                    authorized_device_limit_bytes: self.config.authorized_device_limit_bytes,
+                    authorized_device_limit_bytes:
+                        device_total.or(self.config.authorized_device_limit_bytes),
                     attention_pin: String::new(),
                     host_tier: self.host.is_some()
                         && session.executor.hello.offers("host_tiers.owner/1"),
-                    stages,
+                    stages: false,
                     descriptor_sources: session.descriptors,
                     host_tier_owner: self.host.is_some()
                         && session.executor.hello.offers("host_tiers.owner/1"),
                     device_weights: sharing,
+                    cap_bytes: load_cap.filter(|_| capped),
                 },
                 &mut callbacks,
             )?)?;
+            self.memory
+                .observe(&plan.id, load_facts(loaded.facts.as_ref()), Some(false));
             if session.executor.hello.offers("weight_plane/1") {
                 command_ok(session.executor.command(
                     &DeviceCommand::Budget {
-                        vram_bytes: self.config.plane_budget_bytes,
+                        vram_bytes: -1,
                         pinned_bytes: self.config.pinned_budget_bytes,
+                        cap_bytes: None,
                     },
                     &mut callbacks,
                 )?)?;
@@ -774,6 +903,29 @@ impl GpuPool {
         } else {
             engine.staging(id)?
         };
+        // A real grant for the whole call: one tenant needs no per-stage turns.
+        let cap = self.memory.decide(
+            &plan.id,
+            false,
+            || self.holdings(),
+            |step| self.carry_out(step, callbacks.others),
+        )?;
+        let (plane_budget_bytes, cap_bytes) = match cap {
+            Some(cap) if capped => (-1, Some(cap)),
+            Some(cap) if session.executor.hello.offers("weight_plane/1") => {
+                let facts = self.memory.with(|gpu| gpu.facts(&plan.id));
+                let context = facts
+                    .context
+                    .unwrap_or(self.memory.with(|gpu| gpu.context_estimate()));
+                let plane = cap.saturating_sub(context + facts.activation.unwrap_or(0) + MARGIN);
+                (i64::try_from(plane).unwrap_or(i64::MAX), None)
+            }
+            _ => (-1, None),
+        };
+        if let Some(cap) = cap {
+            let cell = callbacks.cells.first().map(File::try_clone).transpose()?;
+            self.memory.running(&plan.id, cap, cell);
+        }
         let reply = session.executor.command(
             &DeviceCommand::Invoke {
                 request_id: id.into(),
@@ -782,13 +934,22 @@ impl GpuPool {
                 spool: spool.clone(),
                 deadline_s: None,
                 attention_kernel: String::new(),
-                plane_budget_bytes: self.config.plane_budget_bytes,
-                stages,
+                plane_budget_bytes,
+                stages: false,
+                cap_bytes,
             },
             &mut callbacks,
         )?;
+        let mut facts = plane_facts(reply.plane.as_ref());
+        facts.activation = facts.activation.or_else(|| {
+            reply
+                .metrics
+                .as_ref()
+                .and_then(|m| m.activation_peak_bytes)
+                .and_then(|v| u64::try_from(v).ok())
+        });
+        self.memory.observe(&plan.id, facts, Some(true));
         if !reply.quiescent || !reply.poisoned.is_empty() {
-            slot.take();
             return Err(io::Error::other("device reply lacks quiescence; wait for exact executor exit before releasing reservation"));
         }
         let outcome = reply
@@ -830,11 +991,66 @@ impl GpuPool {
             let released = shared.and_then(|_| release_revoked(custody, &mut session.executor));
             if let Err(error) = released {
                 eprintln!("device weights share/revoke failed; replacing the executor: {error}");
-                slot.take();
+                return Ok(false);
             }
         }
-        Ok(())
+        Ok(true)
     }
+
+    /// An executor's out-of-memory retry asks for `free_bytes` from the other tenants: idle
+    /// weights leave first, then idle processes; its cap rises into what they gave.
+    fn room_for(
+        &self,
+        plan: &str,
+        free_bytes: u64,
+        others: &mut BTreeMap<String, Session>,
+    ) -> io::Result<Option<u64>> {
+        self.memory.make_room(
+            plan,
+            free_bytes,
+            || self.holdings(),
+            |step| self.carry_out(step, others),
+        )
+    }
+}
+
+fn holding_id(key: &HoldingKey, generation: u64) -> String {
+    format!("{}/{}/{}#{generation}", key.actor, key.device, key.layout)
+}
+
+fn known(value: Option<i64>) -> Option<u64> {
+    value.and_then(|v| u64::try_from(v).ok())
+}
+
+fn plane_facts(plane: Option<&device_executor::PlaneFacts>) -> Facts {
+    plane.map_or_else(Facts::default, |plane| Facts {
+        context: known(plane.context_bytes),
+        process: known(plane.process_bytes),
+        activation: known(plane.activation_peak_bytes).filter(|v| *v > 0),
+        ..Facts::default()
+    })
+}
+
+/// A load's facts: its weights as stages count them (decoded copies included where the
+/// executor says), and the largest component's floor as its lowest rung.
+fn load_facts(facts: Option<&device_executor::LoadFacts>) -> Facts {
+    let Some(facts) = facts else {
+        return Facts::default();
+    };
+    let mut out = plane_facts(facts.plane.as_ref());
+    let layouts = facts.layouts.values();
+    if facts.layouts.is_empty() {
+        out.weights = facts.filled_bytes;
+    } else {
+        out.weights = Some(
+            layouts
+                .clone()
+                .map(device_executor::Layout::planned_total)
+                .sum(),
+        );
+        out.weights_floor = layouts.map(device_executor::Layout::planned_floor).max();
+    }
+    out
 }
 
 /// Ask the executor to release every revoked generation it reads (it is idle here).
@@ -962,13 +1178,15 @@ struct Callbacks<'a> {
     id: &'a str,
     sources: &'a Arc<Mutex<ModelSources>>,
     cells: &'a mut Vec<File>,
-    budget: i64,
     completed: u64,
     host: Option<&'a Arc<SharedHostPlane>>,
     peer: &'a HostPeer,
     custody: Option<&'a Mutex<ResidentCustody>>,
     /// The executor's pidfd: a reader lease ends when it does.
     exit: File,
+    pool: &'a GpuPool,
+    plan: &'a str,
+    others: &'a mut BTreeMap<String, Session>,
 }
 impl Services for Callbacks<'_> {
     fn device_tier(
@@ -1063,10 +1281,18 @@ impl Services for Callbacks<'_> {
                 self.cells.push(file);
                 answer.ok = true;
             }
+            // Calls never ask for turns (Invoke sends `stages: false`); keep the budget.
             Kind::StageEnter | Kind::StageExit => {
                 drop(descriptor);
                 answer.ok = true;
-                answer.budget_bytes = self.budget;
+            }
+            Kind::DeviceRoom => {
+                drop(descriptor);
+                let cap = self
+                    .pool
+                    .room_for(self.plan, frame.free_bytes, self.others)?;
+                answer.ok = true;
+                answer.cap_bytes = cap.map_or(-1, |cap| i64::try_from(cap).unwrap_or(i64::MAX));
             }
             _ => drop(descriptor),
         }

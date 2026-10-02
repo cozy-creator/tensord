@@ -180,6 +180,9 @@ pub enum DeviceCommand {
         /// Attach GPU weights the machine keeps (`weights.attach/1`).
         #[serde(skip_serializing_if = "is_false")]
         device_weights: bool,
+        /// The process's device cap (`process_cap/1`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cap_bytes: Option<u64>,
     },
     Activate {
         construction: String,
@@ -200,10 +203,14 @@ pub enum DeviceCommand {
         attention_kernel: String,
         plane_budget_bytes: i64,
         stages: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cap_bytes: Option<u64>,
     },
     Budget {
         vram_bytes: i64,
         pinned_bytes: i64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cap_bytes: Option<u64>,
     },
     Prefetch {
         construction: String,
@@ -333,6 +340,10 @@ pub struct PlaneFacts {
     pub pinned_budget_bytes: Option<i64>,
     pub pinned_bytes: Option<i64>,
     pub context_bytes: Option<i64>,
+    pub reserved_bytes: Option<i64>,
+    /// Context + torch reserved + the plane's own maps.
+    pub process_bytes: Option<i64>,
+    pub cap_bytes: Option<i64>,
     pub activation_peak_bytes: Option<i64>,
     pub resident: BTreeMap<String, i64>,
     pub streamed: BTreeMap<String, Streamed>,
@@ -383,6 +394,28 @@ pub struct LoadFacts {
     pub reserved_bytes: Option<i64>,
     pub rss_bytes: Option<i64>,
     pub plane: Option<PlaneFacts>,
+    pub layouts: BTreeMap<String, Layout>,
+}
+
+/// One weight set as the plane holds it; `planned_*` count decoded copies (Runtime 0.18.103+).
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Layout {
+    pub common: u64,
+    pub blocks: Vec<u64>,
+    pub planned_total: Option<u64>,
+    pub planned_floor: Option<u64>,
+}
+impl Layout {
+    pub fn planned_total(&self) -> u64 {
+        self.planned_total
+            .unwrap_or(self.common + self.blocks.iter().sum::<u64>())
+    }
+    /// Common and the largest block: the least a stage of it runs in.
+    pub fn planned_floor(&self) -> u64 {
+        self.planned_floor
+            .unwrap_or(self.common + self.blocks.iter().max().copied().unwrap_or(0))
+    }
 }
 
 /// One decode per frame; only consumed business fields are represented.
@@ -447,6 +480,8 @@ pub struct Answer {
     pub detail: String,
     pub held: bool,
     pub budget_bytes: i64,
+    /// A `DeviceRoom` answer: the process cap raised into the room made; -1 keeps it.
+    pub cap_bytes: i64,
     pub descriptor: bool,
     pub sha256: String,
     pub length: u64,
@@ -469,6 +504,7 @@ impl Answer {
             detail: "owner has not qualified this operation".into(),
             held: false,
             budget_bytes: -1,
+            cap_bytes: -1,
             descriptor: false,
             sha256: String::new(),
             length: 0,

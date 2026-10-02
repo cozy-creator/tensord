@@ -2,8 +2,8 @@
 
 `cozy-machine` is the machine: one Rust process that owns the API, the execution journal,
 scheduling, the TensorFS store (sole writer) and executor supervision. Package code runs in
-Python executors (cozy-runtime) inside each package environment. The machine never loads CUDA or
-NVML; executors own their device contexts.
+Python executors (cozy-runtime) inside each package environment. The machine never loads CUDA;
+executors own their device contexts. NVML is read only on each GPU's sampler thread (`memory`).
 
 Plan of record and workstream IDs (A–F):
 `~/cozy_v2/outputs/cozy-machine-takeover-20261002/PLAN.md`.
@@ -20,8 +20,9 @@ private control socket (owner protocol) ─> main.rs      ▼
                           python -m cozy_machine_client.runner (one process per request)
                          GPU ──────────────┘
                           gpu_service::GpuPool ─> device_executor::DeviceExecutor
-                            (retained cozy_runtime.internal.executor via the Runtime trampoline)
-                            answers stage, budget-cell, model-source and host-tier requests
+                            (one retained executor per plan, via the Runtime trampoline)
+                            memory::GpuMemory: admission, process caps, eviction, floor
+                            answers budget-cell, device-room, model-source and host-tier requests
 ```
 
 A request is accepted durably (`Engine::submit_public`), then `Service::dispatch_ready` resolves
@@ -47,6 +48,7 @@ by `Engine`; outputs are kept in native custody until the client acknowledges co
 | `execution.rs` | Acceptance, runner supervision, cancellation, progress coalescing, output custody, reconcile | `Engine`, `RunnerConfig` | E |
 | `journal.rs` | SQLite journal: executions, installations, preparations, receipts, process births | `Journal`, `Execution`, `State`, `ProcessBirth` | E |
 | `gpu_service.rs` | GPU pool: published package/model mapping, executor retention, request callbacks | `GpuPool`, `GpuConfig`, `GpuPlan`, `ModelGrant` | B2 (admission, grants), E (spawn/fencing), D1 (published mapping) |
+| `memory/` | Per-GPU ledger and decisions (`policy`), NVML sampler thread (`nvml`), floor watchdog | `GpuMemory`, `policy::Gpu`, `Step`, `Decision` | B2 |
 | `device_executor.rs` | Typed control seam to the Runtime device executor, per-request output encoding | `DeviceExecutor`, `ExecutorConfig`, `DeviceCommand`, `Frame`, `Answer` | E |
 | `launch_identity.rs` | Runtime trampoline command, optional sealed UID/GID | `LaunchIdentity`, `trampoline` | E |
 | `child_launcher.rs` | Pool-owned spawn thread (PDEATHSIG follows the creating thread) | `ChildLauncher` | E |
@@ -59,8 +61,7 @@ by `Engine`; outputs are kept in native custody until the client acknowledges co
 | `resident_custody.rs` | Degree 2: executor-exported GPU regions kept as driver fds (no CUDA), leases, revocation | `ResidentCustody`, `HoldingKey`, `SharedRegion` | C |
 | `boundary_json.rs` | Strict JSON parse (no duplicate keys) for boundary records | — | D1 |
 
-The memory policy module (per-GPU and per-host ledgers, admission, grants, eviction) does not
-exist yet; B2 creates it and moves the budget answers out of `gpu_service::Callbacks`.
+The host ledger (pinned tier, RSS/PSS, cgroup headroom) is not in `memory/` yet (B1, B2).
 
 ## Python package `cozy_machine_client`
 

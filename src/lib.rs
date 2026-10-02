@@ -9,6 +9,7 @@ pub mod journal;
 pub mod launch_identity;
 pub mod machine;
 pub mod machine_api;
+pub mod memory;
 pub mod model_source_driver;
 pub mod model_sources;
 pub mod native_inputs;

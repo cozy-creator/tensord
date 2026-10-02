@@ -102,6 +102,7 @@ fn prepared(version: &str, generation_path: &str) -> (DeviceExecutor, PathBuf) {
                 descriptor_sources: false,
                 host_tier_owner: false,
                 device_weights: false,
+                cap_bytes: None,
             },
             &mut Baseline,
         )
@@ -141,6 +142,7 @@ fn invoke(
                 attention_kernel: String::new(),
                 plane_budget_bytes: -1,
                 stages: false,
+                cap_bytes: None,
             },
             services,
         )
@@ -233,6 +235,7 @@ fn credential_refusal_and_result_mutation_are_operation_local() {
             &DeviceCommand::Budget {
                 vram_bytes: 0,
                 pinned_bytes: 0,
+                cap_bytes: None,
             },
             &mut Baseline,
         )
@@ -277,6 +280,7 @@ fn stock_executor_deferred_webp_reuses_sdk_encoder_and_exact_asset_binding() {
                 attention_kernel: String::new(),
                 plane_budget_bytes: -1,
                 stages: false,
+                cap_bytes: None,
             },
             &mut Baseline,
         )

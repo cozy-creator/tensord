@@ -322,6 +322,7 @@ fn run() -> io::Result<()> {
             descriptor_sources: descriptors,
             host_tier_owner: false,
             device_weights: false,
+            cap_bytes: None,
         },
         &mut turns,
     )?;
@@ -342,6 +343,7 @@ fn run() -> io::Result<()> {
             &DeviceCommand::Budget {
                 vram_bytes: config.plane_budget_bytes,
                 pinned_bytes: config.pinned_budget_bytes,
+                cap_bytes: None,
             },
             &mut turns,
         )?;
@@ -401,6 +403,7 @@ fn run() -> io::Result<()> {
                 attention_kernel: String::new(),
                 plane_budget_bytes: config.plane_budget_bytes,
                 stages,
+                cap_bytes: None,
             },
             &mut turns,
         )?;

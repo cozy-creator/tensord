@@ -1,7 +1,7 @@
 # GPU service
 
 `gpu_service.rs` (`GpuPool`) runs published, cached GPU callables through one retained device
-executor. Acceptance, journal, progress and output custody stay in `Engine`. Scheduling stays in
+executor per plan; `memory::GpuMemory` decides every device byte. Acceptance, journal, progress and output custody stay in `Engine`. Scheduling stays in
 `service.rs`.
 
 ## Configuration
@@ -12,7 +12,9 @@ executor. Acceptance, journal, progress and output custody stay in `Engine`. Sch
   authority over cached model bytes.
 - `packages: [{ package, release, distribution, generation }]`: published-package mapping.
 - `source_mode`: `auto` (descriptors if offered), `legacy`, or `descriptors` (fails if not offered).
-- `plane_budget_bytes` (default -1), `pinned_budget_bytes`, `authorized_device_limit_bytes`, `stages`.
+- `pinned_budget_bytes`; `authorized_device_limit_bytes` (Load's limit only where NVML cannot read
+  the device total).
+- `memory`: `{ floor_bytes, sample_log }`: raise the free floor; log each 1 s NVML reading.
 - `environment`: keys containing `TOKEN`, `SECRET` or `PASSWORD` are refused.
 - `host`: optional `SharedHostPlane`. `identity`: optional `{uid, gid}`.
 
@@ -32,17 +34,27 @@ executor. Acceptance, journal, progress and output custody stay in `Engine`. Sch
   CPU dispatch continues meanwhile.
 - Startup fence: every journaled GPU birth that is live or unknown, including those of completed
   requests, blocks GPU dispatch until it exits.
-- A cold session is spawned by the pool's `ChildLauncher`, which journals the birth. It then sends
-  Start, Load, `Budget` (if `weight_plane/1`) and Activate once. Each request sends PrepareRequest
-  and Invoke.
-- A different plan shuts the old executor down, waiting for its exit, before spawning.
+- A cold session is admitted first: its context estimate (twice the largest measured here, else
+  1 GiB) and known first working set are reserved, making room by the ladder below. It is spawned by
+  the pool's `ChildLauncher`, which journals the birth, then sent Start, Load (with that cap),
+  `Budget` (pinned, if `weight_plane/1`) and Activate once. Each request sends PrepareRequest and
+  Invoke. Executors of other plans stay; the policy decides what they keep on the device.
+- Each Invoke carries a real grant: `cap_bytes` (whole process: context + torch + plane) to
+  `process_cap/1` executors, else a plane budget derived from it. `stages` is false: no per-stage
+  exchanges.
+- Making room, in order: idle executors unmap (`Budget{vram 0}`, LRU), idle executors end (only
+  while the lowest rung is unmet), a running call shrinks through its budget cell. Never refused by
+  size: with nothing left, the cap is what there is.
+- Floor: 512 MiB or 1/16 of the card on a display GPU, 256 MiB otherwise. A 1 s sample below it
+  during a call lowers the call's cap through its budget cell by the deficit.
 - Start happens only after `authorize_managed`.
 - Invoke must be quiescent. Then `postprocess` and `managed_result` run. A custody failure is
   `failed`.
 - On error: never started, back to queued. Birth ended, failed. Live or unknown, stays nonterminal.
 
 Executor requests:
-- `stage_enter`/`stage_exit` are granted the static `plane_budget_bytes`.
+- `device_room`: idle tenants give room (unmap, then end); the answer's `cap_bytes` raises the
+  caller's cap into it. `stage_enter`/`stage_exit` (never asked for) keep the budget.
 - `host_tier*` goes to `SharedHostPlane`, or is acknowledged if no host plane is configured.
 - `model_source_read` goes to `ModelSources`.
 - Progress counts only `advance > 0`.
@@ -64,8 +76,10 @@ thread.
 
 ## Known gaps
 
-- One device, world one, one model slot. No adapters.
-- Static stage budget. It does not bound context or activation memory, so it is unsafe on display GPUs.
+- One device, world one, one model slot. No adapters. One call per GPU at a time.
+- No host ledger (pinned tier, RSS/PSS, cgroup headroom) in the policy yet.
+- Executors before `process_cap/1` get only a plane budget: their context and activations are
+  estimated, not capped.
 - One Python post helper per request.
 - No separate cgroup scope.
 - `PDEATHSIG` retention after a UID drop is unverified.
