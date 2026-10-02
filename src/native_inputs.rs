@@ -129,6 +129,18 @@ impl SourceIntake {
                 "input content count differs from manifest",
             ));
         }
+        let mut objects = BTreeMap::new();
+        for (_, entry) in manifest.entries() {
+            let reference = entry.blob();
+            if objects
+                .insert(reference.sha256.clone(), reference.clone())
+                .is_some_and(|prior: ObjectRef| prior.length != reference.length)
+            {
+                return Err(Status::invalid_argument(
+                    "one input object cannot declare multiple lengths",
+                ));
+            }
+        }
         let actor = sha256::hex(&actor.public_key);
         let retention_id = format!(
             "sha256:{}",
@@ -167,11 +179,6 @@ impl SourceIntake {
         );
         fs::create_dir(&directory).map_err(database)?;
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).map_err(database)?;
-        let objects = manifest
-            .entries()
-            .iter()
-            .map(|(_, entry)| (entry.blob().sha256.clone(), entry.blob().clone()))
-            .collect();
         Ok(Box::new(Self {
             store,
             journal,

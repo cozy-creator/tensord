@@ -52,6 +52,10 @@ func run(machine, output string) error {
 	if err != nil {
 		return err
 	}
+	otherPublic, otherKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return err
+	}
 	write := func(name string, body any) error {
 		raw, e := json.Marshal(body)
 		if e != nil {
@@ -59,7 +63,7 @@ func run(machine, output string) error {
 		}
 		return os.WriteFile(filepath.Join(output, name), raw, 0600)
 	}
-	if err = write("keys.json", map[string]any{"keys": []string{base64.RawURLEncoding.EncodeToString(public)}}); err != nil {
+	if err = write("keys.json", map[string]any{"keys": []string{base64.RawURLEncoding.EncodeToString(public), base64.RawURLEncoding.EncodeToString(otherPublic)}}); err != nil {
 		return err
 	}
 	if err = write("secret.json", map[string]any{"key_b64url": base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32))}); err != nil {
@@ -117,6 +121,7 @@ func run(machine, output string) error {
 		return err
 	}
 	claim := &pb.Claim{RecordOwnerEpoch: 1, WorkerId: ready.Worker, WorkerBootId: ready.Boot, WireMinor: 1, Proof: ed25519.Sign(key, proof)}
+	otherClaim := &pb.Claim{RecordOwnerEpoch: 1, WorkerId: ready.Worker, WorkerBootId: ready.Boot, Proof: ed25519.Sign(otherKey, proof)}
 	host := pb.NewPodHostClient(conn)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -222,6 +227,10 @@ func run(machine, output string) error {
 	if replay.RetentionId != held.RetentionId || replay.Released {
 		return fmt.Errorf("input commit replay differs")
 	}
+	_, err = host.RetainByteTree(ctx, &pb.NativeByteRetentionCall{Claim: otherClaim, Request: &pb.NativeByteRetentionRequest{Source: held.Source, RetentionId: "sha256:" + strings.Repeat("c", 64)}})
+	if status.Code(err) != codes.NotFound && status.Code(err) != codes.PermissionDenied {
+		return fmt.Errorf("authorized different actor retained another actor's input: %v", err)
+	}
 	consumerID := "sha256:" + strings.Repeat("b", 64)
 	request := &pb.NativeByteRetentionCall{Claim: claim, Request: &pb.NativeByteRetentionRequest{Source: held.Source, RetentionId: consumerID}}
 	retained, err := host.RetainByteTree(ctx, request)
@@ -237,6 +246,13 @@ func run(machine, output string) error {
 	}
 	if !released.Released {
 		return fmt.Errorf("explicit input abort did not release intake")
+	}
+	late, err := upload(false, false)
+	if err != nil {
+		return err
+	}
+	if !late.Released {
+		return fmt.Errorf("late input commit reopened durable abort tombstone")
 	}
 	objectDigest, _ := canonical.Raw(members[0].Digest)
 	reader, err := host.ReadByteTreeObject(ctx, &pb.NativeByteReadCall{Claim: claim, Source: &pb.NativeByteRetentionRequest{Source: retained.Source, RetentionId: retained.RetentionId}, Object: &pb.Ref{Digest: objectDigest, Length: uint64(members[0].Length)}})
@@ -271,5 +287,5 @@ func run(machine, output string) error {
 	if status.Code(err) != codes.Unauthenticated {
 		return fmt.Errorf("unsigned custody operation reached owner: %v", err)
 	}
-	return write("evidence.json", map[string]any{"checks": []string{"actual Creator CaptureTree and ParseTreeManifest", "authenticated1MiB input stream and duplicate-object dedup", "native commit replay without bytes", "independent consumer retention survives intake release", "full contiguous native readback", "explicit consumer release", "truthful Rust runtime/empty per-package inventory", "unsigned custody rejected"}, "ordinary_cli_qualified": false, "inference_qualified": false})
+	return write("evidence.json", map[string]any{"checks": []string{"actual Creator CaptureTree and ParseTreeManifest", "authenticated1MiB input stream and duplicate-object dedup", "native commit replay without bytes", "independent consumer retention survives intake release", "full contiguous native readback", "explicit consumer release", "truthful Rust runtime/empty per-package inventory", "unsigned custody rejected", "authorized cross-actor retention refused", "late commit preserves abort tombstone"}, "ordinary_cli_qualified": false, "inference_qualified": false})
 }

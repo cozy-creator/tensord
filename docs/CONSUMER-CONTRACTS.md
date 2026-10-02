@@ -30,3 +30,24 @@ typed dispatch, description/inventory, page bounds and input-frame semantics. It
 recording callback deliberately returns UNIMPLEMENTED for custody/commit; this is
 transport proof, not native custody or consumer readiness. Actual Creator capture,
 retention and readback against the service's ready native callbacks remain required.
+
+The actual Creator native consumer gate now passes against the integrated service:
+real CaptureTree/ParseTreeManifest, duplicated-object streaming/dedup, native commit
+replay, independent retention surviving intake release, full verified readback,
+consumer release, cross-actor isolation, late commit after an abort tombstone,
+truthful Rust runtime and authentication. Evidence:
+`outputs/cm-native-input-expanded-20261002/evidence.json`.
+This gate does not submit inference or run the ordinary CLI.
+
+`SourceIntake` in `src/native_inputs.rs` uses released TensorFS plus the sole service
+journal through `IntakeJournal`. Its typed immutable spec is scoped by verified actor,
+workspace, request and input. Native custody is complete before finish acknowledgement;
+the service records receipt and actor-native-source registration in one transaction.
+An abort persists a tombstone, releases only intake custody, and never cancels a run.
+Retries reconcile a native commit that preceded a missing journal reply. Input bytes
+remain disk-backed, GC is excluded during transfer, and incomplete object transfer is
+discarded on disconnect without an invented resume promise.
+
+The first long-path gate exposed publication of api-ready before private Unix binding
+failed with SUN_LEN. The gate uses a shorter owned durable path. This is a remaining
+startup/readiness integration issue; it is not a GPU or inference failure.
