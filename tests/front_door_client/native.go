@@ -330,6 +330,13 @@ func runNative(machine, output, helper, wheel, source string, assets bool) error
 		return fmt.Errorf("terminal replay unavailable: %v", err)
 	}
 	ack := &pb.AttemptOutcomeAck{WorkerBootId: terminal.WorkerBootId, RequestId: terminal.RequestId, AttemptOrdinal: terminal.AttemptOrdinal, InvocationSpecDigest: terminal.InvocationSpecDigest, OutcomeId: terminal.OutcomeId, OutcomeDigest: terminal.OutcomeDigest}
+	wrongBoot := proto.Clone(ack).(*pb.AttemptOutcomeAck)
+	wrongBoot.WorkerBootId = "different-outcome-boot"
+	if _, err = host.AcknowledgeMachineExecutionCollection(ctx, &pb.MachineExecutionCollectionAck{Execution: query, Outcome: wrongBoot}); status.Code(err) != codes.InvalidArgument {
+		return fmt.Errorf("wrong outcome boot acknowledged: %v", err)
+	}
+	// Deployed Creator omits this additive field; its authenticated Claim binds the live boot.
+	ack.WorkerBootId = ""
 	badAck := proto.Clone(ack).(*pb.AttemptOutcomeAck)
 	badAck.OutcomeId = "different-outcome"
 	if _, err = host.AcknowledgeMachineExecutionCollection(ctx, &pb.MachineExecutionCollectionAck{Execution: query, Outcome: badAck}); status.Code(err) != codes.InvalidArgument {

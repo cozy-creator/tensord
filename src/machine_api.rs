@@ -823,20 +823,23 @@ impl MachineBackend for NativeBackend {
             .into_iter()
             .find_map(|e| e.outcome)
             .ok_or_else(|| Status::data_loss("durable terminal outcome absent"))?;
+        if !ack.worker_boot_id.is_empty() && ack.worker_boot_id != outcome.worker_boot_id {
+            return Err(Status::invalid_argument(
+                "acknowledgement names a different outcome boot",
+            ));
+        }
         if (
             ack.request_id,
             ack.attempt_ordinal,
             ack.invocation_spec_digest,
             ack.outcome_id,
             ack.outcome_digest,
-            ack.worker_boot_id,
         ) != (
             outcome.request_id,
             outcome.attempt_ordinal,
             outcome.invocation_spec_digest,
             outcome.outcome_id,
             outcome.outcome_digest,
-            outcome.worker_boot_id,
         ) {
             return Err(Status::invalid_argument(
                 "acknowledgement differs from the exact retained outcome",
