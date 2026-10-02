@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cozy-machine-client"
+version = "0.1.0"
+description = "Experimental typed Unix-socket client for Cozy machine component qualification"
+requires-python = ">=3.11"
+dependencies = ["msgspec>=0.18,<1"]
+
+[project.optional-dependencies]
+test = ["numpy>=2,<3", "scikit-learn>=1.5,<2", "pytest>=8,<10"]
+
+[project.scripts]
+cozy-machine-cpu-gate = "cozy_machine_client.cpu_gate:main"
+
+[tool.setuptools.packages.find]
+where = ["python"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
