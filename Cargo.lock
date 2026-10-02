@@ -55,6 +55,7 @@ dependencies = [
  "fs2",
  "libc",
  "nix",
+ "rusqlite",
  "serde",
  "serde_json",
  "tensorfs-core",
