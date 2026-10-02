@@ -137,7 +137,8 @@ def prepare(pilot_path: Path, output: Path, port: int) -> None:
     (root / "tmp").chmod(0o1777)
     write(output / "benchmark.json", {"agent": str(sdk / "bin/cozy-machine"), "root": str(root),
           "environment": env, "port": port, "worker": worker, "pilot": str(pilot_path),
-          "controller_key": str(secret), "installation_id": installation_id})
+          "controller_key": str(secret), "installation_id": installation_id,
+          "request_prefix": worker})
     print(json.dumps({"prepared": True, "gpu_started": False, "config": str(output / "benchmark.json"),
                       "checkpoint_cache_qualified": evidence["old_worker_checkpoint_cache_qualified"]}))
 
@@ -196,6 +197,8 @@ def full(config_path: Path) -> None:
                     raise RuntimeError("workspace observer budget exhausted; agent left running") from error
                 time.sleep(0.05)
         timings["agent_start_to_workspace_ready_ms"] = (time.perf_counter() - started) * 1000
+        evidence["execution_workspace_id"] = workspace.execution_workspace_id
+        evidence["request_prefix"] = cfg.get("request_prefix", cfg["worker"])
         write(output / "description.json", documents.body(host.DescribeMachine(pb.DescribeMachineQuery(claim=claim))))
         wheel = Path(cfg["pilot"]).parent / "sdxl-2.4.0-py3-none-any.whl"
         file = pb.LocalPackageFileRef(filename=wheel.name, digest=hashlib.sha256(wheel.read_bytes()).digest(), length=wheel.stat().st_size)
@@ -238,7 +241,10 @@ def full(config_path: Path) -> None:
         timings["model_placement_prepare_ms"] = (time.perf_counter() - began) * 1000
         for index, payload in enumerate(pilot["payloads"]):
             began = time.perf_counter()
-            request = f"old-baseline-{index}"
+            # Runtime99's durable workspace belongs to the shared TensorFS store,
+            # not this fixture root. A new fixture runs new transactions; stable
+            # names within that fixture remain replayable after an observer loss.
+            request = f"{evidence['request_prefix']}-{index}"
             submission = pb.MachineExecutionSubmit(claim=claim, submission_id=request,
                 offer=pb.AttemptOffer(request_id=request), expected_execution_workspace_id=workspace.execution_workspace_id,
                 payload_canonical_bytes=canonical.write(payload), release_root=pb.ReleaseRoot(package="paul/sdxl",
@@ -257,6 +263,7 @@ def full(config_path: Path) -> None:
                     with (output / "submission-progress.jsonl").open("a") as sink:
                         sink.write(json.dumps({"request": request, "details": error.details()}) + "\n")
                     time.sleep(0.05)
+            write(output / f"receipt-{request}.json", documents.body(receipt))
             query = pb.MachineExecutionQuery(claim=claim, request_id=receipt.request_id,
                                              expected_execution_workspace_id=workspace.execution_workspace_id)
             after, outcome, products = 0, None, []
