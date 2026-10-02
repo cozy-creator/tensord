@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import configparser
 import email.parser
+import os
 import shutil
 import subprocess
 import sys
@@ -95,7 +96,6 @@ def install_captured(*, project: Path | None, wheels: list[Path], requirements: 
             source = root / "source"
             shutil.copytree(project, source)
             # UV_PROJECT_ENVIRONMENT is a standard destination configuration value.
-            import os
             environment = {**os.environ, "UV_PROJECT_ENVIRONMENT": str(root / "env")}
             subprocess.run(["uv", "sync", "--frozen", "--no-dev", "--no-editable", "--no-python-downloads",
                             "--project", str(source), "--python", python], env=environment, check=True)

@@ -1,7 +1,9 @@
 """Real captured uv installations and classifier inference; no implementation doubles."""
 import json
+import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -81,12 +83,12 @@ def test_incoherent_source_lock_overlay_and_python_mismatch_refuse_only_installa
 
 
 def test_rust_tensorfs_materialization_and_trusted_installer_run_real_classifier(capture):
-    import sys
     root, source, client, frozen = capture
     archive = root / "source.tar"
     subprocess.run(["tar", "-cf", str(archive), "-C", str(source), "pyproject.toml", "uv.lock", "package.toml", "cpu_classifier"], check=True)
     output = root / "rust-owner-install"
-    subprocess.run([str(ROOT / "target/debug/install-capture"), "--archive", str(archive), "--output", str(output),
+    target = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target"))
+    subprocess.run([str(target / "debug/install-capture"), "--archive", str(archive), "--output", str(output),
         "--helper-python", sys.executable, "--client-wheel", str(client), "--python", "3.12",
         "--package", "local/cozy-machine-cpu-classifier", "--release", "0.1.0"], check=True)
     generation = GENERATION_DECODER.decode((output / "prepared-generation.json").read_bytes())
