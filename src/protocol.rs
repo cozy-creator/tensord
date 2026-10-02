@@ -5,7 +5,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
 pub const MAX_FRAME: usize = 64 * 1024;
-pub const CAPS: &[&str] = &["weights.hosted/1", "objects.put-fd/1"];
+pub const CAPS: &[&str] = &["weights.hosted/1", "objects.put-fd/1", "execution.cpu/1"];
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Object {
@@ -38,6 +38,23 @@ pub enum Command {
         incarnation: String,
     },
     Stats,
+    Submit {
+        key: String,
+        generation: String,
+        entrypoint: String,
+        input: serde_json::Value,
+    },
+    Execution {
+        id: String,
+    },
+    Executions,
+    Cancel {
+        id: String,
+    },
+    ReadResult {
+        id: String,
+        index: usize,
+    },
     Shutdown,
     #[serde(other)]
     Unknown,
@@ -75,6 +92,16 @@ pub enum Body {
         host_budget: u64,
     },
     Shutdown,
+    Execution {
+        record: Box<crate::journal::Execution>,
+    },
+    Executions {
+        records: Vec<crate::journal::Execution>,
+    },
+    ResultArtifact {
+        id: String,
+        artifact: crate::journal::Artifact,
+    },
     Error {
         code: &'static str,
         detail: String,

@@ -33,6 +33,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+installer = [
+    { name = "packaging" },
+]
 test = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
@@ -44,10 +47,11 @@ test = [
 requires-dist = [
     { name = "msgspec", specifier = ">=0.18,<1" },
     { name = "numpy", marker = "extra == 'test'", specifier = ">=2,<3" },
+    { name = "packaging", marker = "extra == 'installer'", specifier = ">=24,<27" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8,<10" },
     { name = "scikit-learn", marker = "extra == 'test'", specifier = ">=1.5,<2" },
 ]
-provides-extras = ["test"]
+provides-extras = ["installer", "test"]
 
 [[package]]
 name = "iniconfig"

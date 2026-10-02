@@ -1,8 +1,7 @@
-mod os;
-mod owner;
-mod protocol;
-use owner::{Owner, Shared};
-use protocol::{Body, Command, Reply, CAPS};
+use cozy_machine::{
+    owner::{Owner, Shared},
+    protocol::{self, Body, Command, Reply, CAPS},
+};
 use std::{
     collections::HashSet,
     io::{self, Write},
@@ -34,22 +33,120 @@ fn run() -> io::Result<()> {
             println!("{}", serde_json::to_string(&record)?); Ok(())
         }
         Some("serve") => {
-            let mut root = None; let mut budget = 16 * 1024 * 1024; let mut ttl = 300;
-            while let Some(arg) = args.next() {
+            let mut root = None; let mut generations=None; let mut parallelism=1;
+            let mut machine_config=None; let mut listen=None; let mut gpu_config=None;
+            let mut installer_python=None; let mut client_wheel=None; let mut package_python="3.12".to_string();
+            let mut budget=16*1024*1024; let mut ttl=300;
+            while let Some(arg)=args.next() {
                 match arg.as_str() {
-                    "--state" => root = args.next().map(PathBuf::from),
-                    "--host-bytes" => budget = args.next().ok_or_else(|| io::Error::other("--host-bytes requires bytes"))?.parse().map_err(io::Error::other)?,
-                    "--cache-ttl-seconds" => ttl = args.next().ok_or_else(|| io::Error::other("--cache-ttl-seconds requires seconds"))?.parse().map_err(io::Error::other)?,
-                    _ => return Err(io::Error::other(format!("unknown argument {arg}"))),
+                    "--state"=>root=args.next().map(PathBuf::from),
+                    "--generations"=>generations=args.next().map(PathBuf::from),
+                    "--machine-config"=>machine_config=args.next().map(PathBuf::from),
+                    "--listen"=>listen=args.next(),
+                    "--gpu-config"=>gpu_config=args.next().map(PathBuf::from),
+                    "--installer-python"=>installer_python=args.next().map(PathBuf::from),
+                    "--client-wheel"=>client_wheel=args.next().map(PathBuf::from),
+                    "--package-python"=>package_python=args.next().ok_or_else(||io::Error::other("--package-python requires a Python version"))?,
+                    "--cpu-parallelism"=>parallelism=args.next().ok_or_else(||io::Error::other("--cpu-parallelism requires a count"))?.parse().map_err(io::Error::other)?,
+                    "--host-bytes"=>budget=args.next().ok_or_else(||io::Error::other("--host-bytes requires bytes"))?.parse().map_err(io::Error::other)?,
+                    "--cache-ttl-seconds"=>ttl=args.next().ok_or_else(||io::Error::other("--cache-ttl-seconds requires seconds"))?.parse().map_err(io::Error::other)?,
+                    _=>return Err(io::Error::other(format!("unknown argument {arg}"))),
                 }
             }
-            serve(Owner::new(&root.ok_or_else(|| io::Error::other("--state is required for this experimental service"))?,
-                budget, Duration::from_secs(ttl))?)
+            let root=root.ok_or_else(||io::Error::other("--state is required"))?;
+            let generations=generations.unwrap_or_else(||root.join("generations"));
+            let owner=Owner::new(&root,budget,Duration::from_secs(ttl))?;
+            let service=cozy_machine::service::Service::open(&root,&generations,parallelism)?;
+            if let Some(config)=gpu_config {
+                let gpu=cozy_machine::gpu_service::GpuPool::new(&root.join("gpu"),cozy_machine::gpu_service::GpuConfig::load(&config)?,owner.lock().unwrap().store())?;
+                service.configure_gpu(gpu)?;
+            }
+            let listener=bind_control(&owner)?;
+            match (machine_config,listen) {
+                (Some(config),Some(listen))=>start_api(&root,&generations,&config,&listen,&owner,&service,installer_python,client_wheel,package_python)?,
+                (None,None)=>(),
+                _=>return Err(io::Error::other("--machine-config and --listen are required together")),
+            }
+            serve(owner,service,listener)
         }
-        _ => Err(io::Error::other("usage: cozy-machine version --json | serve --state PATH [--host-bytes N] [--cache-ttl-seconds N]")),
+        _=>Err(io::Error::other("usage: cozy-machine version --json | serve --state PATH [--generations PATH] [--cpu-parallelism N] [--host-bytes N]")),
     }
 }
-fn serve(owner: Shared) -> io::Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn start_api(
+    root: &std::path::Path,
+    generations: &std::path::Path,
+    config: &std::path::Path,
+    listen: &str,
+    owner: &Shared,
+    service: &Arc<cozy_machine::service::Service>,
+    helper: Option<PathBuf>,
+    wheel: Option<PathBuf>,
+    python: String,
+) -> io::Result<()> {
+    use cozy_machine::{
+        api::{self, identity::MachineConfig, MachineIdentity},
+        machine_api::NativeBackend,
+    };
+    let identity = MachineIdentity::retained(&MachineConfig::load(config)?)?;
+    let store = owner.lock().unwrap().store();
+    let uploads = api::workspaces::WorkspaceUploads::open(&root.join("uploads"), store.clone())
+        .map_err(io::Error::other)?;
+    let mut backend =
+        NativeBackend::new(service.clone(), identity.authority.clone(), store, uploads);
+    backend.installer = match (helper, wheel) {
+        (Some(helper_python), Some(client_wheel)) => Some(api::install::InstallerConfig {
+            helper_python,
+            client_wheel,
+            python,
+            generations: generations.to_path_buf(),
+            staging_root: root.join("package-staging"),
+        }),
+        (None, None) => None,
+        _ => {
+            return Err(io::Error::other(
+                "--installer-python and --client-wheel are required together",
+            ))
+        }
+    };
+    let listener = std::net::TcpListener::bind(listen)?;
+    listener.set_nonblocking(true)?;
+    #[derive(serde::Serialize)]
+    struct Ready<'a> {
+        address: String,
+        worker_id: &'a str,
+        boot_id: &'a str,
+        cert_pem: &'a str,
+    }
+    let ready = serde_json::to_vec(&Ready {
+        address: listener.local_addr()?.to_string(),
+        worker_id: &identity.authority.worker_id,
+        boot_id: &identity.authority.boot_id,
+        cert_pem: &identity.cert_pem,
+    })?;
+    std::fs::write(root.join("api-ready.json"), ready)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    std::thread::Builder::new()
+        .name("machine-api".into())
+        .spawn(move || {
+            let result = runtime.block_on(async {
+                api::serve(
+                    tokio::net::TcpListener::from_std(listener)?,
+                    identity,
+                    Arc::new(backend),
+                )
+                .await
+            });
+            if let Err(error) = result {
+                eprintln!("machine API stopped: {error}");
+            }
+        })?;
+    Ok(())
+}
+fn bind_control(owner: &Shared) -> io::Result<UnixListener> {
     let path = owner.lock().unwrap().socket.clone();
     // Only the singleton owner can remove a stale socket; no active peer store is touched.
     match std::fs::remove_file(&path) {
@@ -59,6 +156,14 @@ fn serve(owner: Shared) -> io::Result<()> {
     }
     let listener = UnixListener::bind(&path)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
+}
+fn serve(
+    owner: Shared,
+    service: Arc<cozy_machine::service::Service>,
+    listener: UnixListener,
+) -> io::Result<()> {
+    let path = owner.lock().unwrap().socket.clone();
     let stopped = Arc::new(AtomicBool::new(false));
     println!("READY {}", path.display());
     io::stdout().flush()?;
@@ -84,9 +189,14 @@ fn serve(owner: Shared) -> io::Result<()> {
                 continue;
             }
         };
-        let (owner, stopped, path) = (owner.clone(), stopped.clone(), path.clone());
+        let (owner, stopped, path, service) = (
+            owner.clone(),
+            stopped.clone(),
+            path.clone(),
+            service.clone(),
+        );
         std::thread::spawn(move || {
-            let result = client(stream, peer, &owner, &stopped, &path);
+            let result = client(stream, peer, &owner, &stopped, &path, &service);
             owner.lock().unwrap().disconnect(peer);
             if let Err(error) = result {
                 eprintln!("peer {peer}: {error}");
@@ -102,6 +212,7 @@ fn client(
     owner: &Shared,
     stopped: &AtomicBool,
     path: &PathBuf,
+    service: &Arc<cozy_machine::service::Service>,
 ) -> io::Result<()> {
     let mut capabilities = HashSet::new();
     loop {
@@ -158,6 +269,11 @@ fn client(
         let required = match &request.command {
             Command::Import { .. } => Some("objects.put-fd/1"),
             Command::Attach { .. } => Some("weights.hosted/1"),
+            Command::Submit { .. }
+            | Command::Execution { .. }
+            | Command::Executions
+            | Command::Cancel { .. }
+            | Command::ReadResult { .. } => Some("execution.cpu/1"),
             _ => None,
         };
         if let Some(cap) = required {
@@ -198,10 +314,68 @@ fn client(
                 .release(peer, lease, &incarnation)
                 .map(|body| (body, None)),
             Command::Stats => Ok((owner.lock().unwrap().stats(), None)),
+            Command::Submit {
+                key,
+                generation,
+                entrypoint,
+                input,
+            } => service
+                .submit(&key, &generation, &entrypoint, input)
+                .map(|record| {
+                    (
+                        Body::Execution {
+                            record: Box::new(record),
+                        },
+                        None,
+                    )
+                }),
+            Command::Execution { id } => service.engine.get(&id).map(|record| {
+                (
+                    Body::Execution {
+                        record: Box::new(record),
+                    },
+                    None,
+                )
+            }),
+            Command::Executions => service
+                .engine
+                .list()
+                .map(|records| (Body::Executions { records }, None)),
+            Command::Cancel { id } => {
+                service
+                    .engine
+                    .cancel(&id, "local-machine-owner")
+                    .map(|record| {
+                        (
+                            Body::Execution {
+                                record: Box::new(record),
+                            },
+                            None,
+                        )
+                    })
+            }
+            Command::ReadResult { id, index } => (|| {
+                let record = service.engine.get(&id)?;
+                let artifact = record
+                    .result
+                    .as_ref()
+                    .and_then(|r| r.artifacts.get(index))
+                    .cloned()
+                    .ok_or_else(|| io::Error::other("result artifact absent"))?;
+                let file = service.engine.open_result(&id, index)?;
+                Ok((Body::ResultArtifact { id, artifact }, Some(file)))
+            })(),
             Command::Shutdown => {
-                if !owner.lock().unwrap().stop() {
-                    Err(io::Error::other("active leases prevent shutdown"))
+                // Hold the weight gate while quiescing dispatch: neither half may
+                // stop after discovering the other still has live obligations.
+                let mut weight_owner = owner.lock().unwrap();
+                if !weight_owner.idle() || !service.stop()? {
+                    Err(io::Error::other(
+                        "accepted work or active leases prevent shutdown",
+                    ))
                 } else {
+                    assert!(weight_owner.stop());
+                    drop(weight_owner);
                     let acknowledgement = protocol::write(
                         &mut stream,
                         &Reply {

@@ -1,94 +1,32 @@
 # Cozy machine
 
-Experimental standalone Rust machine service: worker orchestration, machine-agent duties and
-TensorFS belong here. Python cozy-runtime remains the executor/author SDK/model integration layer.
-The existing Runtime, TensorFS, Creator and Hub repositories and running service are untouched.
+The Rust machine: API, execution journal, scheduler, memory policy, the linked TensorFS store
+(sole writer) and executor supervision. Python cozy-runtime executors run package code. It is
+meant to replace the Go agent and Python worker; it is not yet a complete replacement and is not
+installed as anyone's machine.
 
-This is a bounded implementation of the first ownership seam, not the full replacement.
-The [program](https://github.com/cozy-creator/cozy-machine/issues/1) tracks the remaining slices.
-After the prototype, compare the old stack before deciding whether a full rewrite earns its cost.
-
-## Working CPU component
-
-- Rust links released TensorFS core v0.3.87; it is the only store writer through this service.
-- Typed length-prefixed JSON and SCM_RIGHTS use the deployed framing. Version strings do not gate
-  peers; implemented capabilities are negotiated.
-- Immutable weight memfds are shared by readers; idle LRU/TTL entries close as whole allocations.
-  These sealed objects cannot be hole-punched. Disk-backed verified descriptors are the fallback
-  when cache space is unavailable, including a zero-byte cache budget.
-- Host cache charge comes from actual allocated backing, not logical tensor length.
-- Process identity uses Linux SO_PEERPIDFD. Socket EOF alone does not release a live process's leases.
-- Python clients map the verified fd and run real NumPy classifier inference without TensorFS.
-  Live array views prevent premature unmap/release.
+- Architecture and module owners: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- Links TensorFS v0.3.93 (git tag).
+- Linux 6.5+ (`SO_PEERPIDFD`). The machine process never loads CUDA or NVML.
 
 ## Build and test
 
-A Rust toolchain and Python 3.11+ are needed. Cargo requires read access to the private upstream
-TensorFS repository. The experimental host capability currently needs Linux SO_PEERPIDFD support
-(Linux 6.5+); older kernels do not get a weaker fabricated process identity.
+Cargo needs read access to the private TensorFS repository.
 
 ```sh
 cargo build --locked
-uv sync --locked --extra test
-cargo test --locked -- --test-threads=1
-uv run --locked --extra test pytest -q
-uv run --locked --extra test cozy-machine-cpu-gate \
-  --machine target/debug/cozy-machine --output cpu-evidence --crashes 10
+cargo clippy --all-targets -- -D warnings
+cargo test --locked -- --test-threads=2
+uv run --locked --extra test --with 'cozy-runtime==0.18.102' pytest -q
 ```
 
-The last command launches its own private service and Python consumers, trains a small real
-handwritten-digit classifier, imports its weights into TensorFS, and verifies reference predictions
-across sharing, ten executor deaths, survivor/replacement reuse, LRU eviction and disk fallback.
-It also checks version/additive-field handling and that the Rust process has no CUDA/NVML mappings
-or GPU device descriptors. All generated evidence is under the requested output directory.
-
-For a manually started private service:
+## Run
 
 ```sh
-target/debug/cozy-machine serve --state /path/to/private-state --host-bytes 16777216
 target/debug/cozy-machine version --json
+target/debug/cozy-machine serve --state PATH [--generations PATH] [--host-bytes N] \
+  [--cpu-parallelism N] [--gpu-config FILE] [--machine-config FILE --listen ADDR]
 ```
 
-The gate uses a short ephemeral socket runtime directory because Unix socket paths are bounded.
-Repositories, fixture sources and result artifacts are durable. No COZY_HOME override or owner
-daemon is used.
-
-## Boundaries
-
-This is local same-UID authentication, a synchronous CPU store/cache broker and a fixture executor.
-It does not yet supervise package launches, provide a durable run journal, implement the legacy
-Runtime command vocabulary, or expose the current TLS/gRPC/Hub/browser front door. It does not
-qualify ordinary cozy run, real diffusion models, pinned memory, CUDA sharing or NCCL.
-
-Descriptors must not be forwarded or inherited by unregistered processes in this component.
-The connecting process is the tracked recipient. Recipient/descendant registration is required
-before arbitrary package execution; same-UID code is not a hostile-code sandbox. Seals prove
-immutability, not durable output custody. The cache budget does not account for all process RSS or
-OS page cache. Unsealed region/DMA reclaim and concurrent TensorFS GC need their own integration.
-
-## Design and implementation issues
-
-The [selected contract](https://github.com/cozy-creator/tracker/blob/785c808efaaae8fee8243152e4db948ea05169a7/design/rust-machine.md)
-and [A/B discussion](https://github.com/cozy-creator/tracker/blob/5ffd1431c/design/rust-machine-revision.md)
-inform this repository. A has lower migration cost; the new repo is a proof-first B experiment.
-We borrow A's conservative scope and leave its fixes with the existing owners.
-
-| Issue | Slice |
-|---|---|
-| [#1](https://github.com/cozy-creator/cozy-machine/issues/1) | Program and old-stack comparison decision gate |
-| [#2](https://github.com/cozy-creator/cozy-machine/issues/2) | CPU TensorFS owner and real Python shared-weight inference |
-| [#3](https://github.com/cozy-creator/cozy-machine/issues/3) | Durable authenticated CPU package execution and legacy adapters |
-| [#4](https://github.com/cozy-creator/cozy-machine/issues/4) | Degree 1, bounded host/disk staging and consumer/delivery gates |
-| [#5](https://github.com/cozy-creator/cozy-machine/issues/5) | Shared GPU residency after measured need and failure-isolation proof |
-| [#6](https://github.com/cozy-creator/cozy-machine/issues/6) | Deferred machine-copy research; never a first-release prerequisite |
-
-The core stays CUDA/NVML-free for the first release. Future GPU ownership must explicitly choose
-between qualified in-process actors and an isolated helper's extra-process cost; native driver
-failure must not silently wedge API/journal/release. Resident-only sharing and executor-issued
-copies precede any machine copier. Browser ICE-TCP/DTLS and old installer/update compatibility
-need early real-consumer spikes before promising full control-plane replacement.
-
-Comparison gates must use identical models/request semantics, fresh requests and matched
-CPU/RAM/VRAM/cache/thermal conditions. Compare stopped-machine submit→saved output, hot inference,
-model switches, physical memory and crash recovery. Tiny classifier attachment timings are not
-ComfyUI or old-stack performance evidence. No automatic migration or release is enabled.
+`--machine-config` with `--listen` starts the authenticated TLS/gRPC API the Cozy CLI uses.
+`--gpu-config` adds the GPU pool ([GPU service](docs/GPU-SERVICE.md)).

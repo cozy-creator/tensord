@@ -1,5 +1,7 @@
 # Cozy machine
 
+Module map and owners: `docs/ARCHITECTURE.md`.
+
 Keep implementation in this repository; the existing Runtime, TensorFS, Creator and Hub
 checkouts are concurrently owned. Use released TensorFS dependencies, not local path overrides
 or copied storage/model implementations.
