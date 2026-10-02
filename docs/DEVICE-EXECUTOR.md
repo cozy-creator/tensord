@@ -35,6 +35,20 @@ Output rows name result field IDs and asset references, not arbitrary local path
 path binding must come from the trusted SDK resolver, not a separately invented Rust grammar.
 SDK BLAKE2b-128 identities and machine SHA-256 custody are separate checks.
 
+`postprocess(codec_config, spool, reply)` runs a trusted ephemeral SDK helper, reusing
+`author._codec.encode_frame` and the selected SDK's `AttemptEngine._blob_path` resolver.
+It returns the verified canonical value and typed asset bindings (field ID, asset reference,
+exact spool name, media/kind, length, producer digest and SHA-256). Files are opened by retained
+regular-file descriptors; symlinks/special devices cannot become inputs. The helper fsyncs
+encoded outputs; Rust rechecks SHA-256 before the root seals/copies them into durable custody.
+The root must finish that custody before success. This post helper adds no persistent service.
+
+The pure legacy path resolver currently lives in the SDK worker module, imported only by this
+post helper. Its implementation is not removed from the wheel yet. An additive stock Executor
+`output_bindings` capability would remove this dependency without an SDK version floor. Encoders
+currently read whole raw/encoded buffers, matching the SDK; bounded/streaming post memory and
+strong adversarial package containment remain broader qualification work.
+
 ## GPU/bootstrap contract and open gates
 
 1. Root selects/holds an immutable package environment and statically described interface.
@@ -76,5 +90,14 @@ The three test-harness cases (two stock-executor cases plus the existing descrip
 passed in 12.25 s. Before and after inference, process maps contained no CUDA/NVML libraries.
 No local GPU calls or independent rentals occurred.
 
-The current actual-SDK tests require the explicitly prepared generation manifests from the program's
-fixture output directory; fresh-clone/CI fixture installation and portable gate CLI remain follow-up.
+The trusted post helper also passed both versions for exact file bindings, independently checked
+producer checksums and SHA-256. An installed CPU classification/image package exercised stock deferred
+WebP frames: [0,2,1] predictions produced a 32×32 WebP with the expected class colors, independently
+decoded by Pillow. The frame encoder and model code were reused, not copied. Runtime 0.18.99 with
+newer TensorFS 0.3.90 passed that image gate without an injected floor.
+
+The explicit SDK suite passed three real-process cases in 8.22 s; focused clippy and formatting pass.
+Run `cargo test --test device_executor -- --ignored --nocapture` for these gates after preparing the
+generation manifests. Default cargo tests skip external SDK fixtures rather than treating missing
+fixtures as inference qualification. Fresh-clone fixture installation and a portable gate CLI remain
+follow-up. Evidence directories retain the canonical result, named blobs and codec diagnostics.
