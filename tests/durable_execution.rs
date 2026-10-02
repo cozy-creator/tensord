@@ -1,0 +1,366 @@
+//! Real process/socket/filesystem checks, not full Runtime/CLI qualification.
+#[path = "../src/execution.rs"]
+mod execution;
+#[path = "../src/journal.rs"]
+mod journal;
+
+use execution::{process_birth, Engine, RunnerConfig};
+use journal::{Invocation, Journal, State};
+use serde_json::json;
+use std::{
+    fs,
+    io::Read,
+    path::PathBuf,
+    process::{Command, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
+    thread,
+    time::{Duration, Instant},
+};
+
+static NEXT: AtomicU64 = AtomicU64::new(0);
+
+struct Fixture {
+    root: PathBuf,
+    engine: std::sync::Arc<Engine>,
+}
+impl Fixture {
+    fn new() -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "cozy-machine-durable-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("runner_fixture.py"), RUNNER).unwrap();
+        fs::write(root.join("cpu_package.py"), PACKAGE).unwrap();
+        let engine = Engine::open(&root.join("state")).unwrap();
+        Self { root, engine }
+    }
+    fn config(&self) -> RunnerConfig {
+        RunnerConfig {
+            python: "/usr/bin/python3".into(),
+            module: "runner_fixture".into(),
+            import_paths: vec![self.root.clone()],
+            generation_hold: None,
+        }
+    }
+    fn invocation(&self, mode: &str) -> Invocation {
+        Invocation {
+            package: "fixture-cpu".into(),
+            generation: "installed-cpu-v1".into(),
+            module: "cpu_package".into(),
+            entrypoint: "infer".into(),
+            input: json!({"mode":mode,"side_effect":self.root.join("effect"),"release":self.root.join("release")}),
+        }
+    }
+    fn submit(&self, mode: &str) -> String {
+        let record = self.engine.submit(mode, self.invocation(mode)).unwrap();
+        assert!(self.engine.dispatch(&record.id, self.config()).unwrap());
+        record.id
+    }
+    fn wait(
+        &self,
+        id: &str,
+        predicate: impl Fn(&journal::Execution) -> bool,
+    ) -> journal::Execution {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let record = self.engine.get(id).unwrap();
+            if predicate(&record) {
+                return record;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "test observation deadline, record={record:?}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+#[test]
+fn actual_inference_has_one_durable_result_and_survives_observer_loss() {
+    let fixture = Fixture::new();
+    let id = fixture.submit("wait");
+    assert_eq!(fixture.engine.list().unwrap().len(), 1);
+    fixture.wait(&id, |record| record.completed_units == 1);
+    // Observation has no owned handle and dropping every observer changes nothing.
+    drop(fixture.engine.get(&id).unwrap());
+    assert_eq!(fixture.engine.get(&id).unwrap().state, State::Running);
+    let duplicate = fixture
+        .engine
+        .submit("wait", fixture.invocation("wait"))
+        .unwrap();
+    assert_eq!(duplicate.id, id);
+    assert!(!fixture.engine.dispatch(&id, fixture.config()).unwrap());
+    fs::write(fixture.root.join("release"), b"continue").unwrap();
+    let result = fixture.wait(&id, |record| record.state.terminal());
+    assert_eq!(result.state, State::Completed);
+    assert_eq!(result.result.unwrap().value, json!({"prediction": [17,39]}));
+    let mut bytes = String::new();
+    fixture
+        .engine
+        .open_result(&id, 0)
+        .unwrap()
+        .read_to_string(&mut bytes)
+        .unwrap();
+    assert_eq!(bytes, "17,39\n");
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("effect")).unwrap(),
+        "once\n"
+    );
+    drop(fixture.engine.get(&id).unwrap());
+    let reopened = Engine::open(&fixture.root.join("state")).unwrap();
+    assert_eq!(reopened.get(&id).unwrap().state, State::Completed);
+    assert_eq!(
+        reopened
+            .submit("wait", fixture.invocation("wait"))
+            .unwrap()
+            .id,
+        id
+    );
+}
+
+#[test]
+fn started_executor_crash_never_reexecutes_package_effects() {
+    let fixture = Fixture::new();
+    let id = fixture.submit("wait");
+    let running = fixture.wait(&id, |record| record.completed_units == 1);
+    let pid = running.process.unwrap().pid;
+    // Explicit test fault injection into this owned process, never an elapsed-time policy.
+    assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGKILL) }, 0);
+    assert_eq!(
+        fixture.wait(&id, |record| record.state.terminal()).state,
+        State::Failed
+    );
+    assert!(!fixture.engine.dispatch(&id, fixture.config()).unwrap());
+    assert_eq!(
+        fixture
+            .engine
+            .submit("wait", fixture.invocation("wait"))
+            .unwrap()
+            .state,
+        State::Failed
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("effect")).unwrap(),
+        "once\n"
+    );
+}
+
+#[test]
+fn cooperative_cancel_is_actor_attributed_and_not_a_timer_kill() {
+    let fixture = Fixture::new();
+    let id = fixture.submit("wait");
+    fixture.wait(&id, |record| record.completed_units == 1);
+    assert!(fixture.engine.cancel(&id, "").is_err());
+    fixture.engine.cancel(&id, "test-controller").unwrap();
+    let result = fixture.wait(&id, |record| record.state.terminal());
+    assert_eq!(result.state, State::Canceled);
+    assert_eq!(result.cancel_actor.as_deref(), Some("test-controller"));
+    assert!(result.result.is_none());
+}
+
+#[test]
+fn launch_failure_is_a_visible_wait_without_retry_churn() {
+    let fixture = Fixture::new();
+    let record = fixture
+        .engine
+        .submit("unlaunchable", fixture.invocation("infer"))
+        .unwrap();
+    let mut config = fixture.config();
+    config.python = fixture.root.join("absent-python");
+    fixture.engine.dispatch(&record.id, config).unwrap();
+    let result = fixture.wait(&record.id, |record| record.waiting_reason.is_some());
+    assert_eq!(result.state, State::Queued);
+    assert_eq!(result.attempt, 1);
+    let duplicate = fixture
+        .engine
+        .submit("unlaunchable", fixture.invocation("infer"))
+        .unwrap();
+    assert_eq!(duplicate.attempt, 1);
+    // Correct interpreter is the observed changed condition permitting an explicit retry.
+    fixture
+        .engine
+        .dispatch(&record.id, fixture.config())
+        .unwrap();
+    let result = fixture.wait(&record.id, |record| record.state.terminal());
+    assert_eq!(result.state, State::Completed);
+    assert_eq!(result.attempt, 2);
+}
+
+#[test]
+fn durable_custody_rejects_symlink_escape_and_detects_mutation() {
+    let fixture = Fixture::new();
+    let unsafe_id = fixture.submit("symlink");
+    assert_eq!(
+        fixture
+            .wait(&unsafe_id, |record| record.state.terminal())
+            .state,
+        State::Failed
+    );
+    let id = fixture.submit("infer");
+    let record = fixture.wait(&id, |record| record.state.terminal());
+    let path = fixture
+        .root
+        .join("state")
+        .join(&record.result.unwrap().artifacts[0].path);
+    // Same-UID packages are not sandboxed; detect rather than silently serving altered bytes.
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(path, b"corrupted").unwrap();
+    assert_eq!(
+        fixture.engine.open_result(&id, 0).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+}
+
+#[test]
+fn restart_settlement_waits_for_exact_process_birth_without_adoption() {
+    let fixture = Fixture::new();
+    let journal_root = fixture.root.join("restart-state");
+    let mut journal = Journal::open(&journal_root).unwrap();
+    let id = journal
+        .accept("orphan", fixture.invocation("infer"))
+        .unwrap()
+        .id;
+    assert!(journal.claim(&id).unwrap());
+    // Owned process holds actual execution lifetime until stdin EOF.
+    let mut child = Command::new("/usr/bin/python3")
+        .arg("-c")
+        .arg("import sys;sys.stdin.read()")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    journal
+        .register_process(&id, process_birth(child.id()).unwrap())
+        .unwrap();
+    journal.running(&id).unwrap();
+    drop(journal);
+    let reopened = Engine::open(&journal_root).unwrap();
+    reopened.reconcile().unwrap();
+    assert_eq!(reopened.get(&id).unwrap().state, State::Running);
+    drop(child.stdin.take());
+    assert!(child.wait().unwrap().success());
+    reopened.reconcile().unwrap();
+    assert_eq!(reopened.get(&id).unwrap().state, State::Failed);
+    assert!(!reopened.dispatch(&id, fixture.config()).unwrap());
+}
+
+#[test]
+fn never_authorized_restart_can_retry_only_after_exact_birth_ends() {
+    let fixture = Fixture::new();
+    let journal_root = fixture.root.join("restart-state");
+    let mut journal = Journal::open(&journal_root).unwrap();
+    let id = journal
+        .accept("never-invoked", fixture.invocation("infer"))
+        .unwrap()
+        .id;
+    assert!(journal.claim(&id).unwrap());
+    let mut child = Command::new("/usr/bin/python3")
+        .arg("-c")
+        .arg("import sys;sys.stdin.read()")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    journal
+        .register_process(&id, process_birth(child.id()).unwrap())
+        .unwrap();
+    drop(journal);
+    let reopened = Engine::open(&journal_root).unwrap();
+    reopened.reconcile().unwrap();
+    assert_eq!(reopened.get(&id).unwrap().state, State::Starting);
+    drop(child.stdin.take());
+    child.wait().unwrap();
+    reopened.reconcile().unwrap();
+    let record = reopened.get(&id).unwrap();
+    assert_eq!(record.state, State::Queued);
+    assert!(record.waiting_reason.is_some());
+    assert!(reopened.dispatch(&id, fixture.config()).unwrap());
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !reopened.get(&id).unwrap().state.terminal() {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(reopened.get(&id).unwrap().state, State::Completed);
+}
+
+#[test]
+fn idempotency_compares_semantics_and_additive_runner_fields_are_tolerated() {
+    let fixture = Fixture::new();
+    fixture
+        .engine
+        .submit("stable", fixture.invocation("infer"))
+        .unwrap();
+    assert_eq!(
+        fixture
+            .engine
+            .submit("stable", fixture.invocation("wait"))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    let id = fixture.submit("infer");
+    assert_eq!(
+        fixture.wait(&id, |record| record.state.terminal()).state,
+        State::Completed
+    );
+}
+
+const RUNNER: &str = r#"
+import argparse, importlib, json, os, socket, struct, threading
+p=argparse.ArgumentParser();p.add_argument('--execution-fd',type=int,required=True);a=p.parse_args()
+s=socket.socket(fileno=a.execution_fd);lock=threading.Lock();canceled=threading.Event()
+def send(value):
+    data=json.dumps(value).encode()
+    with lock:s.sendall(struct.pack('!I',len(data))+data)
+def read():
+    h=s.recv(4)
+    if not h:return None
+    while len(h)<4:h+=s.recv(4-len(h))
+    n=struct.unpack('!I',h)[0];b=b''
+    while len(b)<n:
+        piece=s.recv(n-len(b))
+        if not piece:return None
+        b+=piece
+    return json.loads(b)
+send({'kind':'ready','pid':os.getpid(),'capabilities':['runtime.author-cpu/1'],'future_field':'ignored'})
+command=read()
+if command is None:raise SystemExit(0)
+eid=command['execution_id']
+def controls():
+    while True:
+        c=read()
+        if c is None:return
+        if c['kind']=='cancel' and c['execution_id']==eid:canceled.set()
+threading.Thread(target=controls,daemon=True).start()
+try:
+    module=importlib.import_module(command['module'])
+    def progress(units):send({'kind':'progress','execution_id':eid,'completed_units':units,'detail':'matrix rows completed'})
+    value,artifacts=getattr(module,command['entrypoint'])(command['input'],command['output_root'],canceled,progress)
+    send({'kind':'canceled','execution_id':eid} if canceled.is_set() else {'kind':'result','execution_id':eid,'value':value,'artifacts':artifacts,'extra_result_field':True})
+except Exception as error:send({'kind':'failed','execution_id':eid,'code':type(error).__name__,'detail':str(error)})
+"#;
+
+const PACKAGE: &str = r#"
+from pathlib import Path
+def infer(inputs, output_root, canceled, progress):
+    with open(inputs['side_effect'],'a') as stream:stream.write('once\n')
+    progress(1)
+    if inputs['mode']=='wait':
+        while not Path(inputs['release']).exists() and not canceled.wait(0.01):pass
+    if canceled.is_set():return None,[]
+    # Actual CPU inference against fixed linear weights, with an independently checked result.
+    weights=[[1,2],[3,4]];vector=[5,6]
+    prediction=[sum(w*x for w,x in zip(row,vector)) for row in weights]
+    root=Path(output_root)
+    if inputs['mode']=='symlink':
+        (root/'prediction').symlink_to('/etc/passwd')
+    else:(root/'prediction').write_text(','.join(map(str,prediction))+'\n')
+    return {'prediction':prediction},['prediction']
+"#;
