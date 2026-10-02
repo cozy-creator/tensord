@@ -41,6 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ready_file = None;
     let mut listen = "127.0.0.1:0".to_string();
     let mut upload_root = None;
+    let mut config = None;
     while let Some(arg) = args.next() {
         let value = args.next().ok_or("every option requires a value")?;
         match arg.as_str() {
@@ -56,14 +57,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--receipt-key-file" => receipt_key = Some(std::fs::read(value)?),
             "--ready-file" => ready_file = Some(PathBuf::from(value)),
             "--upload-root" => upload_root = Some(PathBuf::from(value)),
+            "--config" => config = Some(PathBuf::from(value)),
             _ => return Err(format!("unknown argument {arg}").into()),
         }
     }
-    let identity = MachineIdentity::ephemeral(
-        worker_id.ok_or("--worker-id is required")?,
-        keys,
-        receipt_key.ok_or("--receipt-key-file is required")?,
-    )?;
+    let identity = match config {
+        Some(path) => {
+            if worker_id.is_some() || !keys.is_empty() || receipt_key.is_some() {
+                return Err("--config cannot be mixed with identity override flags".into());
+            }
+            MachineIdentity::retained(&api::identity::MachineConfig::load(&path)?)?
+        }
+        None => MachineIdentity::ephemeral(
+            worker_id.ok_or("--worker-id is required")?,
+            keys,
+            receipt_key.ok_or("--receipt-key-file is required")?,
+        )?,
+    };
     let uploads = match upload_root {
         Some(root) => Some(api::workspaces::WorkspaceUploads::open(
             &root.join("uploads"),
