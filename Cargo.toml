@@ -11,3 +11,18 @@ serde_json = "1"
 fs2 = "0.4"
 libc = "0.2"
 nix = { version = "0.31.3", default-features = false, features = ["fs", "socket", "uio", "user"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14.6", features = ["tls-ring"] }
+tonic-prost = "0.14.6"
+prost = "0.14"
+axum = "0.8"
+ed25519-dalek = "2"
+rcgen = { version = "0.14", features = ["pem", "ring"] }
+base64 = "0.22"
+hmac = "0.12"
+sha2 = "0.10"
+
+[build-dependencies]
+tonic-prost-build = "0.14.6"
+protoc-bin-vendored = "3"
