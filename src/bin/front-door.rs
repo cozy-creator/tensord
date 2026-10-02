@@ -7,10 +7,12 @@ use tonic::Status;
 
 struct InspectionBackend {
     authority: Authority,
+    uploads: Option<Arc<api::workspaces::WorkspaceUploads>>,
 }
 impl MachineBackend for InspectionBackend {
     fn workspace(
         &self,
+        _: api::auth::VerifiedActor,
         query: pb::MachineExecutionWorkspaceQuery,
     ) -> Result<pb::MachineExecutionWorkspace, Status> {
         if query.describe.is_some() {
@@ -25,6 +27,9 @@ impl MachineBackend for InspectionBackend {
             ..Default::default()
         })
     }
+    fn uploads(&self) -> Option<Arc<api::workspaces::WorkspaceUploads>> {
+        self.uploads.clone()
+    }
 }
 
 #[tokio::main]
@@ -35,6 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut worker_id = None;
     let mut ready_file = None;
     let mut listen = "127.0.0.1:0".to_string();
+    let mut upload_root = None;
     while let Some(arg) = args.next() {
         let value = args.next().ok_or("every option requires a value")?;
         match arg.as_str() {
@@ -49,6 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--receipt-key-file" => receipt_key = Some(std::fs::read(value)?),
             "--ready-file" => ready_file = Some(PathBuf::from(value)),
+            "--upload-root" => upload_root = Some(PathBuf::from(value)),
             _ => return Err(format!("unknown argument {arg}").into()),
         }
     }
@@ -57,8 +64,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         keys,
         receipt_key.ok_or("--receipt-key-file is required")?,
     )?;
+    let uploads = match upload_root {
+        Some(root) => Some(api::workspaces::WorkspaceUploads::open(
+            &root.join("uploads"),
+            Arc::new(tensorfs_core::store::Store::ensure(&root.join("store"))?),
+        )?),
+        None => None,
+    };
     let backend = Arc::new(InspectionBackend {
         authority: identity.authority.clone(),
+        uploads,
     });
     let listener = tokio::net::TcpListener::bind(listen).await?;
     #[derive(serde::Serialize)]

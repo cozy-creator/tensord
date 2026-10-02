@@ -124,7 +124,7 @@ func run(machine, output string) error {
 	e := evidence{Limits: []string{"inspection backend only; no accepted execution, package preparation, ordinary cozy run, Hub provisioning, GPU or browser qualification", "service process is an owned fixture, not the user daemon"}}
 	check := func(name string) { e.Checks = append(e.Checks, name); fmt.Println("PASS", name) }
 	protocol, err := host.ProtocolInfo(ctx, &pb.ProtocolInfoRequest{})
-	if err != nil || protocol.WireMinor != 72 {
+	if err != nil || protocol.WireMinor != 72 || protocol.MinimumWireMinor != 0 {
 		return fmt.Errorf("ProtocolInfo: %v %v", protocol, err)
 	}
 	check("real TLS/gRPC ProtocolInfo")

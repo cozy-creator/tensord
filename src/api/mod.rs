@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod backend;
 mod server;
+pub mod workspaces;
 
 pub mod pb {
     tonic::include_proto!("cozy.worker.v1");
@@ -9,4 +10,6 @@ pub mod pb {
 pub use backend::MachineBackend;
 pub use server::{serve, MachineIdentity};
 pub const WIRE_MINOR: u32 = 72;
-pub const WIRE_MINIMUM: u32 = 64;
+// Baseline identity/read operations consume their known fields at every minor.
+// Missing operations are refused individually, never through a peer version floor.
+pub const WIRE_MINIMUM: u32 = 0;
