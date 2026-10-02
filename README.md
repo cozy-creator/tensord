@@ -2,9 +2,10 @@
 
 Experimental standalone Rust machine service: worker orchestration, machine-agent duties and
 TensorFS belong here. Python cozy-runtime remains the executor/author SDK/model integration layer.
-The existing Runtime, TensorFS, Creator and Hub repositories and running service are untouched.
+Development uses owned worktrees and fixtures; the existing released stack and default
+running service remain in place. Consumer adapters are separate draft PRs.
 
-This is a bounded implementation of the first ownership seam, not the full replacement.
+This is an experimental implementation with a working CPU service and a separate GPU pilot.
 The [program](https://github.com/cozy-creator/cozy-machine/issues/1) tracks the remaining slices.
 After the prototype, compare the old stack before deciding whether a full rewrite earns its cost.
 
@@ -53,16 +54,32 @@ The gate uses a short ephemeral socket runtime directory because Unix socket pat
 Repositories, fixture sources and result artifacts are durable. No COZY_HOME override or owner
 daemon is used.
 
+## Integrated execution and GPU evidence
+
+The integrated service now has authenticated pinned-leaf TLS/gRPC, static package description,
+captured installation, a durable execution journal, explicit cancellation and native output
+custody. A task-built ordinary Creator CLI has run the real sklearn application repeatedly
+through this service using its normal default home and an explicit endpoint file. That adapter
+is opt-in; it does not install the service as the user's current local machine or rental.
+
+The separate Rust stock-executor pilot completed real SDXL on a headless RunPod A40. The normal
+descriptor-backed model path uses an empty executor store while retaining the SDK's TensorFS
+reader/GPU mechanisms. Across 48 clean matched adapter requests, 24 image pairs were byte-identical
+and warm output medians were approximately 4.8 s in both arms. This is not a matched full-stack
+speedup or proof of complete host/GPU ownership. See [GPU evidence](docs/GPU-BENCHMARK.md).
+
 ## Boundaries
 
-This is local same-UID authentication, a synchronous CPU store/cache broker and a fixture executor.
-It does not yet supervise package launches, provide a durable run journal, implement the legacy
-Runtime command vocabulary, or expose the current TLS/gRPC/Hub/browser front door. It does not
-qualify ordinary cozy run, real diffusion models, pinned memory, CUDA sharing or NCCL.
+The qualified public lane is a CPU application without asset inputs; the GPU pilot is separate
+from that public API. Hub provisioning, browser media, child calls, jobs, full public-service
+crash/OS-supervisor boundaries and old install/update consumers remain open. The service is not
+a complete machine replacement. Degree 1 memory ownership, real low-memory diffusion recovery,
+shared GPU backing, machine-issued copies and NCCL are unqualified. CPU code loads no CUDA/NVML.
 
-Descriptors must not be forwarded or inherited by unregistered processes in this component.
-The connecting process is the tracked recipient. Recipient/descendant registration is required
-before arbitrary package execution; same-UID code is not a hostile-code sandbox. Seals prove
+Descriptors must not be forwarded or inherited by unregistered processes in the shared-weight
+component. The connecting process is the tracked recipient. Recipient/descendant registration
+still needs integration before this becomes an arbitrary-package shared-weight path; same-UID
+code is not a hostile-code sandbox. Seals prove
 immutability, not durable output custody. The cache budget does not account for all process RSS or
 OS page cache. Unsealed region/DMA reclaim and concurrent TensorFS GC need their own integration.
 

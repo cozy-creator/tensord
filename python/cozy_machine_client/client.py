@@ -9,6 +9,7 @@ import struct
 
 import msgspec
 
+from .linux import memfd_create
 from .protocol import (
     CAPABILITIES, MAX_FRAME, REPLY_DECODER, Attach, Attached, ErrorReply, Hello,
     HelloReply, Import, Imported, ObjectRef, Release, Released, Stats, StatsReply,
@@ -84,7 +85,7 @@ def receive_fd(sock: socket.socket) -> int:
 
 
 def sealed_memfd(data: bytes) -> int:
-    fd = os.memfd_create("cozy-object", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+    fd = memfd_create("cozy-object")
     try:
         with os.fdopen(os.dup(fd), "wb") as writer:
             writer.write(data)
