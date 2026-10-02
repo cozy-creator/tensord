@@ -13,3 +13,12 @@
 - Authoritative CPU metadata gate: SDXL manifest
   `sha256:288440e7dc660d047b23dc72efee3d9ff4d4222a35e45b4bd640848e50bee642`
   in `/home/fidika/.tensorfs`, verified anew rather than trusted from memory.
+- Draft PR: https://github.com/cozy-creator/cozy-machine/pull/15
+- CPU checkpoint: five linked-core tests pass; selected readonly/sealed descriptors,
+  wrong-manifest/component rejection, copied closure native admission without foreign
+  SQLite, and corrupted-transfer rejection. Clippy, rustfmt and script Ruff pass.
+- Released helper `target/release/model-source-check --verify` admits 2,604 SDXL
+  selected source objects / 6,939,571,699 bytes; header/read plan and actual
+  selected object also pass candidate TensorFS native descriptor import without CUDA/NVML.
+- Not qualified: SDXL inference, cold start, host/GPU memory ownership, whole-closure
+  descriptor hard-limit behavior. Root owns hardware and rentals.
