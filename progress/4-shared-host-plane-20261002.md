@@ -18,3 +18,10 @@
 - Exact exited-recipient whole-file OFD unlock fixes retained-grant duplication before
   native release; backing reclaim is tested while copied descriptors remain open.
 - SDK typed partition registration and actual model consumer/GPU gates remain open.
+- Imported frontdoor wire/header checkpoint e9c520a as4944938; Root should integrate that
+  prerequisite separately if already present to avoid duplicate commits.
+- Typed sealed HostTierPrepare registration now authorizes selected header components and
+  native traversal/part/region planning. 8 native host +5 source gates pass; actual paired
+  SDK/Rust-owner/native host adoption proves zero recipient fills/copied source bytes.
+- Runtime dependency continuation: PR1112, fetched0d67384 +safe9eb29a1c; separate narrow SDK
+  hook and46 CPU source/skew/policy/registration gates. No GPU used.
