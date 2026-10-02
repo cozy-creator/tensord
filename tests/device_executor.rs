@@ -177,6 +177,12 @@ fn current_and_older_stock_executor_reuse_actual_classifier_and_spooled_result()
             let result = read_result(&root.join(id), &reply).unwrap();
             assert_eq!(result["predictions"], json!([0, 2, 1]));
             assert_eq!(result["call_sequence"], index + 1);
+            let metrics = reply
+                .metrics
+                .as_ref()
+                .expect("stock SDK reports attempt metrics");
+            assert_eq!(metrics.gpu_count, Some(0));
+            assert!(metrics.rss_at_end_bytes.is_some_and(|bytes| bytes > 0));
             assert_eq!(reply.outputs.len(), 1);
             assert!(reply.frames.is_empty());
             let output = &reply.outputs[0];
