@@ -52,3 +52,11 @@ Separate pod binary `stage/device-pilot-observations` SHA-256 is
 `f301a41a8cd0026f9b54524bbc0d644df5e20585d5a334ff8ddf50b963a5d28f`.
 Pod soft FD limit is 1,024; legacy native verification passed, while descriptor-source caching
 still needs its own measured FD-lifecycle gate before activation.
+
+Root's first hardware attempt stopped before CUDA because the pilot incorrectly forced
+stage-turn support on the published SDK. Source inspection proved actual 0.18.99 Hello
+offers only vacate_ranks and its Load/Invoke schemas predate stage/plane fields and Budget.
+Pilot now records negotiation and preserves legacy residency, selecting stage/plane controls
+from offered capabilities without a version floor. Unsupported Budget is operation-local;
+real inference still follows it successfully. Three actual CPU gates pass in 5.99 s.
+First logs are preserved; the next configuration uses fresh legacy-sdk99-run-2 paths.

@@ -19,6 +19,9 @@ The Rust records represent consumed command, reply, progress, output and durable
 fields; unknown advisory fields are ignored. Hello version/revision are provenance.
 `import_only`, host weight-plane and stage requests are selected by offered capabilities;
 an absent capability fails only that operation. No SDK or TensorFS version equality gate is added.
+Published Runtime 0.18.99 offers only `vacate_ranks` and predates the stage/plane command
+fields and Budget command. Legacy model load/invoke stays available; the hardware pilot
+automatically omits those optional controls instead of refusing the model request.
 
 The qualified sequence is Hello → Start → Load → Activate → PrepareRequest → Invoke.
 Preparation and invocation stay in the existing author kernel. One live executor can hold
