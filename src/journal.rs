@@ -31,6 +31,15 @@ pub struct SubmissionContext {
     pub invocation_digest: String,
     pub payload_digest: String,
     pub publication_authorization_id: String,
+    pub preparation_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Preparation {
+    pub actor: String,
+    pub id: String,
+    pub installation: String,
+    pub document: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -256,6 +265,7 @@ impl Journal {
         connection.execute_batch("CREATE TABLE IF NOT EXISTS machine_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS submission_closures(actor TEXT NOT NULL,submission_id TEXT NOT NULL,request_id TEXT NOT NULL,workspace_id TEXT NOT NULL,closed_ms INTEGER NOT NULL,PRIMARY KEY(actor,submission_id));
             CREATE TABLE IF NOT EXISTS installations(actor TEXT NOT NULL,alias TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,alias));
+            CREATE TABLE IF NOT EXISTS preparations(actor TEXT NOT NULL,id TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,id));
             CREATE TABLE IF NOT EXISTS public_terminals(execution INTEGER PRIMARY KEY REFERENCES executions(id),outcome BLOB NOT NULL,events BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS native_outputs(actor TEXT NOT NULL,owner TEXT NOT NULL,source BLOB NOT NULL,PRIMARY KEY(actor,owner));
             CREATE TABLE IF NOT EXISTS input_intakes(actor TEXT NOT NULL,retention TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,retention));
@@ -475,6 +485,42 @@ impl Journal {
             .map_err(db_error)?;
         Ok(record)
     }
+
+    pub fn preparation(&self, actor: &str, id: &str) -> io::Result<Option<Preparation>> {
+        self.connection
+            .query_row(
+                "SELECT record FROM preparations WHERE actor=?1 AND id=?2",
+                params![actor, id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(db_error)?
+            .map(|record| serde_json::from_str(&record).map_err(db_error))
+            .transpose()
+    }
+
+    pub fn bind_preparation(&mut self, record: Preparation) -> io::Result<Preparation> {
+        validate_scope(&record.actor, &record.id, &record.installation)?;
+        if self
+            .installation(&record.actor, &record.installation)?
+            .is_none()
+        {
+            return Err(admission(AdmissionError::BindingConflict));
+        }
+        if let Some(prior) = self.preparation(&record.actor, &record.id)? {
+            if prior != record {
+                return Err(admission(AdmissionError::BindingConflict));
+            }
+            return Ok(prior);
+        }
+        self.connection
+            .execute(
+                "INSERT INTO preparations(actor,id,record) VALUES(?1,?2,?3)",
+                params![record.actor, record.id, encoded(&record)?],
+            )
+            .map_err(db_error)?;
+        Ok(record)
+    }
     pub fn public_terminal(&self, id: &str) -> io::Result<Option<PublicTerminal>> {
         self.connection
             .query_row(
@@ -612,6 +658,17 @@ impl Journal {
     ) -> io::Result<Execution> {
         self.validate_workspace(&context.expected_workspace_id)?;
         validate_scope(&context.actor, &context.request_id, &context.submission_id)?;
+        if !context.preparation_id.is_empty() {
+            let preparation = self
+                .preparation(&context.actor, &context.preparation_id)?
+                .ok_or_else(|| admission(AdmissionError::BindingConflict))?;
+            let installation = self
+                .installation(&context.actor, &preparation.installation)?
+                .ok_or_else(|| admission(AdmissionError::BindingConflict))?;
+            if installation.generation != invocation.generation {
+                return Err(admission(AdmissionError::BindingConflict));
+            }
+        }
         // An escaped tuple is an unambiguous selector encoding, not a version/fingerprint gate.
         let key = format!(
             "public:{}",

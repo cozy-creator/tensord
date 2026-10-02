@@ -3,6 +3,7 @@ mod boundary_json;
 pub mod catalog;
 pub mod device_executor;
 pub mod execution;
+pub mod gpu_service;
 pub mod journal;
 pub mod machine_api;
 pub mod model_source_driver;

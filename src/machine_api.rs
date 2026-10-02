@@ -607,6 +607,7 @@ impl MachineBackend for NativeBackend {
             invocation_digest: identity(&spec)?,
             payload_digest,
             publication_authorization_id: String::new(),
+            preparation_id: String::new(),
         };
         let record = self
             .service
