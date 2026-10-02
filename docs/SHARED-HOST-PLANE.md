@@ -39,10 +39,35 @@ reclaim after exact exit while file descriptors remain open. `/proc/self/maps` a
 prove no CUDA/NVML library or NVIDIA device opens in this host-only path. Five existing
 model-source tests also pass after the released dependency update.
 
-This is not yet complete Degree 1. Existing HostTier asks carry only name/layout, so the
-SDK needs an additive authorized partition/manifest registration before first ask. Actual
-Runtime model consumption, GPU DMA/compute failures, live cooperative region revocation,
-pageable/pinned resource coordination, full machine memory accounting, SDXL/Anima/H3,
-NCCL/multi-GPU and normal public CLI qualification remain separate gates. The small CPU
-weighted fixture is source/memory lifetime evidence, not a copied production model or SDK
-GPU qualification.
+The optional SDK capability is `host_tiers.owner/1`, selected by omitted-default
+`Load.host_tier_owner`. The SDK sends its existing native construction traversal, selected
+physical parts and partition roster as `HostTierPlan` in a fully sealed memfd; only raw
+SHA-256/length and name/manifest/layout cross the small `HostTierPrepare` frame. The owner
+checks seals, exact bytes, envelope agreement, previously selected Header components and
+actual process birth, then uses native plan/select/layout/fill. Unknown advisory fields are
+harmless. Requests over 64KiB are not rejected for roster size. Native reader errors drain
+all started region tickets before partial backing is unmapped; a failed cache allocation
+must leave zero native allocations, tested with an actual invalid source range.
+
+Eight Rust host gates and five existing source gates pass. The paired Runtime 46 CPU gates
+include an actual Rust owner process, SDK `Executor._durable`, native readonly model sources
+and TensorFS `register(host_fd)` adoption: all declared bytes match, recipient host fills
+and source buffered-copy bytes are both zero. The CPU owner fixture binary is
+`host-plane-cpu-owner`, with explicit typed config; it is a qualification server, not a new
+production daemon. SDK request compatibility, sealed metadata larger than the control cap,
+corruption/authorization, source integrity/FD failure cleanup and existing policy/skew gates
+also pass. The GPU pool must still integrate these committed callbacks and qualify real
+unchanged model loads.
+
+This is not yet complete Degree 1. Existing fine/refined layouts retain the no-tier path;
+optional cache misses still allow private SDK pinned/bounce allocation. Whole active
+allocations remain charged until actual process exit: live cooperative unregister/revoke,
+per-region refill and a cross-executor DMA completion contract are not yet implemented.
+The native source ReadLease retains complete object FD closures and may hit the kernel
+hard FD limit. Verified mapped source pages/page cache, process RSS, activation/scratch,
+CUDA registrations and private staging are outside this backing ledger. Global machine
+memory admission/ownership, SDXL/Anima/H3, GPU crash safety, NCCL/multi-GPU and normal CLI
+qualification remain open. A host-only plane does not pin pages via a GPU context: each
+recipient's native plane performs its CUDA registration while sharing the same physical
+backing. The small CPU weighted fixture is source/lifetime evidence, not production model
+or GPU qualification.
