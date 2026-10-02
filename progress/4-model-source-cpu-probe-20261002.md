@@ -10,3 +10,10 @@
 - Owned files: new CPU diagnostic server, SDK probe and this progress note/documentation.
 - No package/model imports, no Start/Load, no GPU operations, no primary checkout edits.
 - Root owns all GPU operations/rentals; candidate environment remains separate from SDK99.
+- Draft PR: https://github.com/cozy-creator/cozy-machine/pull/16
+- Actual CPU gate passed complete196-tensor text_encoder fill from SDXL2884, empty store
+  path, 197 descriptors; all-thread syscall trace shows no SQLite/leases/NVIDIA opens.
+- Whole-plan profile separates RPC0.565s, nativeCtor6.558s and warmOpenSSL6.910s over
+  2601objects/6.9377GB; hardwareSHA already exists. No integrity check was skipped.
+- Ruff, Python compile and release diagnostic build pass; scripts use the coherent
+  installed candidate and the exact shared typed source grant/framing helper.
