@@ -48,6 +48,16 @@ progress cannot move an observer's numeric revision backward. Older records with
 default to no reservation. These are status cursors, separate from artifact/output event indexes;
 the window is a sequence allocation mechanism, not a duration or process-liveness condition.
 
+The owner scheduler can capture `activity_epoch()`, inspect `ready(limit)` and `active(limit)`,
+then call `wait_activity(epoch, None)`. Durable acceptance, start, cancellation, settlement,
+deferred launch and recovery notify a bounded shared Condvar epoch; the epoch check and wait
+use one mutex, so a change between inspection and waiting is not missed. No scheduler runs
+inside Engine. An optional observation wait duration never alters execution state or kills
+anything. `nonterminal(limit)`, `ready(limit)` and `active(limit)` use partial SQLite indexes
+over current obligations rather than scanning terminal history. `reconcile` examines indexed
+active records and returns at most 1,024 nonterminal snapshots; use explicit queries for queue
+and reservation views. The activity epoch is process-local, separate from durable status cursors.
+
 ## Startup and recovery
 
 1. Commit `starting`, increment attempt, then spawn a runner which waits for Invoke.
@@ -112,8 +122,8 @@ mutation, but this CPU foundation does not claim to contain untrusted packages.
 
 ## Evidence
 
-`cargo test --test durable_execution` passed twelve actual-process/socket/filesystem cases
-(0.36 s; one explicitly invoked child helper is ignored by the parent harness):
+`cargo test --test durable_execution` passed thirteen actual-process/socket/filesystem cases
+(0.31 s; one explicitly invoked child helper is ignored by the parent harness):
 CPU matrix inference and persisted output; observer-safe duplicate acceptance; explicit
 executor SIGKILL without repeated effects; actor-attributed cooperative cancel; visible
 launch failure followed by changed-interpreter retry; symlink escape and mutation detection;
@@ -130,6 +140,9 @@ execution. Actual owner death demonstrates that missing volatile progress never 
 still-live process.
 The cursor boundary test renews an exhausted reservation, retains the latest count, and
 reopens the monotonic terminal revision; an older record without the optional ceiling decodes.
+An actual two-package test blocks an owner scheduler on the activity epoch: first completion
+wakes it to dispatch the next queued CPU package, with both durable outputs completed. A zero
+observation wait leaves running state unchanged; indexed queries omit terminal history.
 
 These are supervision component checks. Ordinary Creator CLI, installed Runtime author
 bridge, full public-service crash boundaries, systemd/container reaping, browser/Hub consumers,
