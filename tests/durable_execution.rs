@@ -301,6 +301,259 @@ fn completion_wakes_owner_scheduler_to_dispatch_next_queued_package() {
     assert_eq!(fixture.engine.list().unwrap().len(), 2);
 }
 
+fn public_context(
+    engine: &Engine,
+    actor: &str,
+    request: &str,
+    submission: &str,
+) -> journal::SubmissionContext {
+    journal::SubmissionContext {
+        actor: actor.into(),
+        request_id: request.into(),
+        submission_id: submission.into(),
+        expected_workspace_id: engine.workspace_id(),
+        capture_digest: "sha256:authored-capture".into(),
+        invocation_digest: "sha256:consumed-invocation".into(),
+        payload_digest: "sha256:payload".into(),
+        publication_authorization_id: "publication-authority-id".into(),
+    }
+}
+
+fn admission_kind(error: &std::io::Error) -> &journal::AdmissionError {
+    error
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<journal::AdmissionError>()
+        .unwrap()
+}
+
+#[test]
+fn public_workspace_and_actor_request_binding_survive_reopen() {
+    let fixture = Fixture::new();
+    let workspace = fixture.engine.workspace_id();
+    assert_eq!(
+        uuid::Uuid::parse_str(&workspace).unwrap().get_version_num(),
+        4
+    );
+    assert_eq!(
+        Engine::open(&fixture.root.join("state"))
+            .unwrap()
+            .workspace_id(),
+        workspace
+    );
+    let context = public_context(
+        &fixture.engine,
+        "ed25519:key-a",
+        "same-request",
+        "same-submission",
+    );
+    let record = fixture
+        .engine
+        .submit_public(context.clone(), fixture.invocation("infer"))
+        .unwrap();
+    assert_eq!(
+        fixture
+            .engine
+            .submit_public(context.clone(), fixture.invocation("infer"))
+            .unwrap()
+            .id,
+        record.id
+    );
+    let mut changed = context.clone();
+    changed.payload_digest = "sha256:different-payload".into();
+    assert_eq!(
+        *admission_kind(
+            &fixture
+                .engine
+                .submit_public(changed, fixture.invocation("infer"))
+                .unwrap_err()
+        ),
+        journal::AdmissionError::BindingConflict
+    );
+    let other = public_context(
+        &fixture.engine,
+        "ed25519:key-b",
+        "same-request",
+        "same-submission",
+    );
+    let other_record = fixture
+        .engine
+        .submit_public(other, fixture.invocation("infer"))
+        .unwrap();
+    assert_ne!(other_record.id, record.id);
+    assert_eq!(
+        fixture
+            .engine
+            .get_public("ed25519:key-a", "same-request")
+            .unwrap()
+            .id,
+        record.id
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .get_public("record-owner-label", "same-request")
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::NotFound
+    );
+    assert_eq!(
+        fixture.engine.list_actor("ed25519:key-a", 8).unwrap().len(),
+        1
+    );
+    let reopened = Engine::open(&fixture.root.join("state")).unwrap();
+    assert_eq!(
+        reopened
+            .get_public("ed25519:key-a", "same-request")
+            .unwrap()
+            .submission
+            .as_ref(),
+        Some(&context)
+    );
+    let mut wrong_workspace = context;
+    wrong_workspace.expected_workspace_id = uuid::Uuid::new_v4().to_string();
+    assert_eq!(
+        *admission_kind(
+            &fixture
+                .engine
+                .submit_public(wrong_workspace, fixture.invocation("infer"))
+                .unwrap_err()
+        ),
+        journal::AdmissionError::WorkspaceMismatch
+    );
+    // A malformed public operation does not refuse or cancel the private baseline.
+    let private = fixture.submit("infer");
+    assert_eq!(
+        fixture
+            .wait(&private, |record| record.state.terminal())
+            .state,
+        State::Completed
+    );
+}
+
+#[test]
+fn public_close_blocks_late_acceptance_but_never_cancels_accepted_inference() {
+    let fixture = Fixture::new();
+    let closed = public_context(
+        &fixture.engine,
+        "ed25519:key-a",
+        "never-accepted",
+        "closed-submission",
+    );
+    assert!(fixture
+        .engine
+        .close_submission(
+            &closed.actor,
+            &closed.submission_id,
+            &closed.request_id,
+            &closed.expected_workspace_id
+        )
+        .unwrap()
+        .is_none());
+    let reopened = Engine::open(&fixture.root.join("state")).unwrap();
+    assert_eq!(
+        *admission_kind(
+            &reopened
+                .submit_public(closed, fixture.invocation("infer"))
+                .unwrap_err()
+        ),
+        journal::AdmissionError::SubmissionClosed
+    );
+    let context = public_context(
+        &fixture.engine,
+        "ed25519:key-a",
+        "active-request",
+        "active-submission",
+    );
+    let record = fixture
+        .engine
+        .submit_public(context.clone(), fixture.invocation("wait"))
+        .unwrap();
+    fixture
+        .engine
+        .dispatch(&record.id, fixture.config())
+        .unwrap();
+    fixture.wait(&record.id, |record| record.completed_units == 1);
+    let receipt = fixture
+        .engine
+        .close_submission(
+            &context.actor,
+            &context.submission_id,
+            &context.request_id,
+            &context.expected_workspace_id,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.id, record.id);
+    assert_eq!(receipt.state, State::Running);
+    assert!(receipt.cancel_actor.is_none());
+    assert_eq!(
+        fixture
+            .engine
+            .submit_public(context, fixture.invocation("wait"))
+            .unwrap()
+            .id,
+        record.id
+    );
+    fs::write(fixture.root.join("release"), b"finish authorized work").unwrap();
+    assert_eq!(
+        fixture
+            .wait(&record.id, |record| record.state.terminal())
+            .state,
+        State::Completed
+    );
+}
+
+#[test]
+fn public_accept_close_race_has_one_atomic_known_outcome() {
+    let fixture = Fixture::new();
+    for attempt in 0..16 {
+        let context = public_context(
+            &fixture.engine,
+            "ed25519:key-a",
+            &format!("request-{attempt}"),
+            &format!("submission-{attempt}"),
+        );
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let accepting = fixture.engine.clone();
+        let closing = fixture.engine.clone();
+        let accept_context = context.clone();
+        let close_context = context.clone();
+        let accept_barrier = barrier.clone();
+        let close_barrier = barrier.clone();
+        let invocation = fixture.invocation("infer");
+        let accepted = thread::spawn(move || {
+            accept_barrier.wait();
+            accepting.submit_public(accept_context, invocation)
+        });
+        let closed = thread::spawn(move || {
+            close_barrier.wait();
+            closing.close_submission(
+                &close_context.actor,
+                &close_context.submission_id,
+                &close_context.request_id,
+                &close_context.expected_workspace_id,
+            )
+        });
+        barrier.wait();
+        let accepted = accepted.join().unwrap();
+        let closed = closed.join().unwrap().unwrap();
+        match accepted {
+            Ok(record) => {
+                assert_eq!(closed.unwrap().id, record.id);
+                assert_eq!(record.state, State::Queued);
+            }
+            Err(error) => {
+                assert_eq!(
+                    *admission_kind(&error),
+                    journal::AdmissionError::SubmissionClosed
+                );
+                assert!(closed.is_none());
+            }
+        }
+    }
+}
+
 #[test]
 fn cancel_before_dispatch_is_durable_and_never_executes_package() {
     let fixture = Fixture::new();

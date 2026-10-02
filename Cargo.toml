@@ -11,6 +11,7 @@ serde_json = "1"
 fs2 = "0.4"
 libc = "0.2"
 rusqlite = { version = "0.32", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
 nix = { version = "0.31.3", default-features = false, features = ["fs", "socket", "uio", "user"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync"] }
 tokio-stream = { version = "0.1", features = ["net"] }
