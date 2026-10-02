@@ -11,6 +11,44 @@ use std::sync::{
 use tonic::Status;
 
 pub trait MachineBackend: Send + Sync + 'static {
+    fn describe_runtime(&self, _: VerifiedActor) -> Result<pb::MachineRuntime, Status> {
+        unsupported()
+    }
+    fn list_packages(
+        &self,
+        _: VerifiedActor,
+        _: pb::PackageListQuery,
+    ) -> Result<pb::PackageList, Status> {
+        unsupported()
+    }
+    fn list_models(
+        &self,
+        _: VerifiedActor,
+        _: pb::ModelListQuery,
+    ) -> Result<pb::ModelList, Status> {
+        unsupported()
+    }
+    fn retain_bytes(
+        &self,
+        _: VerifiedActor,
+        _: pb::NativeByteRetentionCall,
+    ) -> Result<pb::NativeByteRetentionResult, Status> {
+        unsupported()
+    }
+    fn release_bytes(
+        &self,
+        _: VerifiedActor,
+        _: pb::NativeByteRetentionCall,
+    ) -> Result<pb::NativeByteRetentionResult, Status> {
+        unsupported()
+    }
+    fn begin_input_tree(
+        &self,
+        _: VerifiedActor,
+        _: pb::InputTreeImportHeader,
+    ) -> Result<Box<dyn InputTreeReceiver>, Status> {
+        unsupported()
+    }
     fn workspace(
         &self,
         _: VerifiedActor,
@@ -58,6 +96,14 @@ pub trait MachineBackend: Send + Sync + 'static {
         _: pb::MachineExecutionListQuery,
     ) -> Result<pb::MachineExecutionList, Status> {
         unsupported()
+    }
+    fn list_observed(
+        &self,
+        actor: VerifiedActor,
+        request: pb::MachineExecutionListQuery,
+        _: Observation,
+    ) -> Result<pb::MachineExecutionList, Status> {
+        self.list(actor, request)
     }
     fn close_submission(
         &self,
@@ -110,6 +156,17 @@ pub trait MachineBackend: Send + Sync + 'static {
 }
 pub type NativeByteStream =
     Box<dyn Iterator<Item = Result<pb::NativeByteReadChunk, Status>> + Send>;
+
+/// One bounded native-input transfer. The store/journal owner validates identity,
+/// membership, contiguous offsets, native custody and durable commit/abort semantics.
+/// Dropping a disconnected transfer never supplies execution cancellation authority.
+pub trait InputTreeReceiver: Send {
+    fn blob(&mut self, blob: pb::InputTreeImportBlob) -> Result<(), Status>;
+    fn commit(
+        self: Box<Self>,
+        commit: pb::InputTreeImportCommit,
+    ) -> Result<pb::NativeByteRetentionResult, Status>;
+}
 
 /// Observation cancellation only: it carries no durable run-control authority.
 #[derive(Clone, Default)]
