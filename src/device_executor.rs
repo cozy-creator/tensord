@@ -20,7 +20,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 pub const MAX_DEVICE_FRAME: usize = 64 * 1024;
@@ -453,6 +453,7 @@ pub trait Services {
         Ok((Answer::unavailable(frame.seq), None))
     }
 }
+
 pub struct Baseline;
 impl Services for Baseline {}
 
@@ -465,6 +466,8 @@ pub struct DeviceExecutor {
     socket: PathBuf,
     _generation_hold: Option<Arc<File>>,
     codec: CodecConfig,
+    exit: Option<File>,
+    retained: Vec<Box<dyn Send>>,
 }
 
 #[derive(Clone)]
@@ -685,6 +688,8 @@ impl DeviceExecutor {
             socket: config.socket,
             _generation_hold: config.generation_hold,
             codec,
+            exit: Some(pidfd),
+            retained: Vec::new(),
         };
         let hello = executor.command(&DeviceCommand::Hello, &mut Baseline)?;
         if !hello.ok || hello.hello.pid != executor.birth.pid {
@@ -697,6 +702,12 @@ impl DeviceExecutor {
     }
     pub fn codec(&self) -> CodecConfig {
         self.codec.clone()
+    }
+
+    /// Retain a source/resource until this exact receiver exits, including owner-handle loss.
+    /// Observer lifetimes must never own the DeviceExecutor handle.
+    pub fn retain_until_exit(&mut self, resource: impl Send + 'static) {
+        self.retained.push(Box::new(resource));
     }
 
     pub fn command(
@@ -822,6 +833,68 @@ impl DeviceExecutor {
             )));
         }
         Ok(())
+    }
+}
+
+impl Drop for DeviceExecutor {
+    fn drop(&mut self) {
+        // Close the private owner channel, without writing the explicit cancel marker.
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        if self.retained.is_empty() {
+            return;
+        }
+        let Some(exit) = self.exit.take() else {
+            return;
+        };
+        let held = Arc::new(Mutex::new(Some((exit, std::mem::take(&mut self.retained)))));
+        let task = Arc::clone(&held);
+        let monitor = move || {
+            let Some((exit, resources)) = task.lock().unwrap().take() else {
+                return;
+            };
+            if let Err(error) = wait_exit(&exit) {
+                // An unobservable receiver is not authority to release its sources.
+                eprintln!("receiver-exit observation failed; retaining sources: {error}");
+                std::mem::forget(resources);
+            }
+        };
+        if let Err(error) = std::thread::Builder::new()
+            .name("device-source-custody".into())
+            .spawn(monitor)
+        {
+            eprintln!("receiver monitor unavailable; observing exit synchronously: {error}");
+            // The original Arc retains resources if thread creation discards its closure.
+            if let Some((exit, resources)) = held.lock().unwrap().take() {
+                if let Err(error) = wait_exit(&exit) {
+                    eprintln!("receiver-exit observation failed; retaining sources: {error}");
+                    std::mem::forget(resources);
+                }
+            }
+        }
+    }
+}
+
+fn wait_exit(exit: &File) -> io::Result<()> {
+    let mut poll = libc::pollfd {
+        fd: exit.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let result = unsafe { libc::poll(&mut poll, 1, -1) };
+        if result > 0 && poll.revents & libc::POLLIN != 0 {
+            return Ok(());
+        }
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if poll.revents != 0 {
+            return Err(io::Error::other("receiver pidfd is not observable"));
+        }
     }
 }
 

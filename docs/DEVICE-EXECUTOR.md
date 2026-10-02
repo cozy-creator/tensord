@@ -73,17 +73,41 @@ strong adversarial package containment remain broader qualification work.
    an authored deadline only, and its plane allowance. No smaller substitute request is generated.
 6. The root finalizes/retains output blobs and their exact SDK binding before successful custody.
 
-GPU allocation/copy mechanisms still belong to the stock executor in this baseline. Current
-published GPU preparation opens TensorFS Store/ReadLease/ReadPlan. Adopted host memfds do not
-remove that dependency or prove one writer. A separately qualified descriptor/header/plan provider
-is necessary before the no-TensorFS-import or sole-writer claims. Degree 2 and multi-GPU/NCCL
-qualification remain root-coordinated gates; this component makes no GPU/model performance claim.
+GPU allocation/copy mechanisms still belong to the stock executor in this baseline. Published
+GPU preparation opens TensorFS Store/ReadLease/ReadPlan. The candidate descriptor provider removes
+normal executor Store/catalog/GC/writer calls; it deliberately retains native TensorFS plane, header,
+fit and read-plan mechanisms. It does not satisfy the original literal no-TensorFS-import claim:
+that would require packaging these retained mechanisms into Runtime. Neither source descriptors
+nor adopted host memfds prove machine-owned host/GPU weights. Degree 2 and multi-GPU/NCCL remain
+separate root-coordinated gates.
+The hardware pilot runs a trusted published package as root on the isolated pod. A readonly
+descriptor/provider is not a security boundary against same-UID or privileged package code
+reopening store paths. UID/capability/seccomp/lifetime isolation must be qualified before any
+security-enforced sole-writer or arbitrary-package containment claim.
 
 SDXL and Anima save deferred WebP host frames. The first-party generic encoder is
 `cozy_runtime.author._codec.encode_frame`; reuse it in the post path, then verify/seal encoded bytes.
 The author-session kernel currently cannot supply model registry state or encode these frames.
-Actual GPU load, output encoding/custody, model switching, fault recovery and ordinary CLI/Hub/browser
-consumer tests must pass before declaring the machine replacement complete.
+GPU load/output encoding passed the scoped legacy SDXL pilot below. Model switching, fault
+recovery, descriptor inference and ordinary CLI/Hub/browser consumer gates remain necessary
+before declaring the machine replacement complete.
+
+The driver can retain a broker/resource through kernel-observed exit of its exact receiver.
+Losing the private owner handle closes its channel and moves retained custody to a pidfd observer;
+it does not write the explicit cancellation marker or release sources from elapsed time. A monitor
+creation failure observes death synchronously; an unobservable pidfd retains rather than frees
+resources. The machine supervisor, not any UI observer, must own the driver handle.
+
+## Root's scoped GPU evidence
+
+Root ran the original published SDXL 2.4.0 package on its owned non-display A40: three consecutive
+1024×1024/20-step requests produced independently verified WebP images through one executor PID
+6912. Shutdown left no executor/device memory. Runtime 0.18.99/TensorFS 0.3.90 used the legacy
+store/residency path. Its Start command took 4096 ms and Load 5129 ms; Start timing excluded
+fork/Hello. Invoke times were 5186/4290/4310 ms. The first invocation began with 181 MB allocated
+while later invocations began with 7.06 GB: Load completion did not establish GPU residency.
+These are internal pilot timings, not full cold start or ordinary CLI comparisons. Evidence:
+`~/cozy_v2/outputs/cozy-machine-continued-20261002/gpu-runpod/legacy-sdk99/`.
 
 ## CPU evidence
 
