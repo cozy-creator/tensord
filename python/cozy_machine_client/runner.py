@@ -17,6 +17,7 @@ import struct
 import sys
 import threading
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import msgspec
 
@@ -25,6 +26,32 @@ from .execution_protocol import (
     Result,
 )
 from .packages import GenerationHold
+
+if TYPE_CHECKING:
+    from cozy_runtime.author._services import ProgressFrame
+
+
+class CompletedWork:
+    """Count completed step positions, never SDK event sequence or stage-open churn."""
+
+    def __init__(self):
+        self.positions: dict[tuple[str, str | None, int | None], int] = {}
+        self.units = 0
+        self.lock = threading.Lock()
+
+    def observe(self, frame: ProgressFrame) -> int | None:
+        position, total = frame.position, frame.total
+        if (type(position) is not int or type(total) is not int
+                or not 0 < position <= total):
+            return None
+        key = (frame.stage, frame.call_request, frame.call_attempt)
+        with self.lock:
+            previous = self.positions.get(key, 0)
+            if position <= previous or (key not in self.positions and len(self.positions) >= 256):
+                return None
+            self.positions[key] = position
+            self.units += position - previous
+            return self.units
 
 
 def receive(sock: socket.socket):
@@ -127,9 +154,13 @@ def _execute_author(command: Invoke, canceled: threading.Event, writer: EventWri
         raise ValueError("output_root must be an absolute owned directory")
     spool.mkdir(parents=True, exist_ok=True)
 
+    completed = CompletedWork()
+
     def progress(frame):
         if isinstance(frame, ProgressFrame):
-            writer.progress(Progress(command.execution_id, frame.advance, frame.stage))
+            units = completed.observe(frame)
+            if units is not None:
+                writer.progress(Progress(command.execution_id, units, frame.stage))
 
     prepared = prepare(registration, command.input)
     record = Attempt(command.execution_id, spool, sink=progress)
