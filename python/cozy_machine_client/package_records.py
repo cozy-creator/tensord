@@ -46,6 +46,11 @@ class Describe(msgspec.Struct, tag="describe", tag_field="kind"):
     environment_python: str | None = None
 
 
+class DescribeInstalled(msgspec.Struct, tag="describe_installed", tag_field="kind"):
+    distribution: str
+    environment_python: str
+
+
 class Described(msgspec.Struct, tag="described", tag_field="kind"):
     interface: msgspec.Raw
 

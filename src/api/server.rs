@@ -388,7 +388,15 @@ impl<B: MachineBackend> pb::pod_host_server::PodHost for Api<B> {
                 .and_then(|q| q.claim.as_ref()),
         )?;
         let request = request.into_inner();
-        self.call(move |backend| backend.events(actor, request))
+        let observation = super::backend::Observation::default();
+        struct ReaderGuard(super::backend::Observation);
+        impl Drop for ReaderGuard {
+            fn drop(&mut self) {
+                self.0.cancel();
+            }
+        }
+        let _reader = ReaderGuard(observation.clone());
+        self.call(move |backend| backend.events_observed(actor, request, observation))
             .await
     }
     async fn control_machine_execution(
@@ -460,12 +468,21 @@ impl<B: MachineBackend> pb::pod_host_server::PodHost for Api<B> {
         let actor = self.auth(request.get_ref().claim.as_ref())?;
         let request = request.into_inner();
         let chunks = self
-            .call(move |backend| backend.read_bytes(actor, request))
+            .call(move |backend| backend.read_stream(actor, request))
             .await?
             .into_inner();
-        Ok(Response::new(Box::pin(tokio_stream::iter(
-            chunks.into_iter().map(Ok),
-        ))))
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        tokio::task::spawn_blocking(move || {
+            for chunk in chunks {
+                let failed = chunk.is_err();
+                if sender.blocking_send(chunk).is_err() || failed {
+                    break;
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(receiver),
+        )))
     }
 }
 

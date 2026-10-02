@@ -49,6 +49,26 @@ def read_metadata(project: Path) -> PackageMetadata:
                            metadata.entry_points.application.default)
 
 
+def publish_generation(root: Path, metadata: PackageMetadata, interface: msgspec.Raw) -> Generation:
+    interpreter = root / "env" / "bin" / "python"
+    inventory = subprocess.check_output(["uv", "pip", "list", "--python", str(interpreter), "--format", "json"])
+    dependencies = msgspec.json.decode(inventory, type=list[Dependency])
+    generation = Generation(root.name, metadata.name, metadata.version, metadata.application,
+                            str(interpreter), dependencies, interface)
+    with (root / ".generation.json.new").open("wb") as output:
+        output.write(msgspec.json.encode(generation))
+        output.flush()
+        os.fsync(output.fileno())
+    (root / ".generation.json.new").replace(root / "generation.json")
+    for directory in [root, root.parent]:
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    return generation
+
+
 class GenerationHold:
     """One shared generation lease; collectors may only take exclusive ownership."""
 
@@ -113,24 +133,8 @@ def install(project: Path, generations: Path, client_wheel: Path, *,
             # no service-version floor or SDK upgrade is inserted into this solve.
             subprocess.run(["uv", "pip", "install", "--python", str(interpreter),
                             str(wheels[0]), str(client_wheel)], check=True)
-            inventory = subprocess.check_output(
-                ["uv", "pip", "list", "--python", str(interpreter), "--format", "json"])
-            dependencies = msgspec.json.decode(inventory, type=list[Dependency])
             interface = describe(project, interpreter)
-            generation = Generation(identity, metadata.name, metadata.version, metadata.application,
-                                    str(interpreter), dependencies, interface)
-            manifest = root / ".generation.json.new"
-            with manifest.open("wb") as output:
-                output.write(msgspec.json.encode(generation))
-                output.flush()
-                os.fsync(output.fileno())
-            manifest.replace(root / "generation.json")
-            directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
-            return generation
+            return publish_generation(root, metadata, interface)
     except BaseException:
         # This uniquely owned unpublished generation has never been dispatched.
         shutil.rmtree(root)
@@ -147,7 +151,25 @@ def main():
     setup.add_argument("--generations", type=Path, required=True)
     setup.add_argument("--client-wheel", type=Path, required=True)
     setup.add_argument("--python", default=sys.executable)
+    captured = commands.add_parser("install-captured")
+    captured.add_argument("--project", type=Path)
+    captured.add_argument("--wheel", action="append", type=Path, default=[])
+    captured.add_argument("--requirements", type=Path)
+    captured.add_argument("--distribution", required=True)
+    captured.add_argument("--release", required=True)
+    captured.add_argument("--python-requires", default="")
+    captured.add_argument("--python-version", default="")
+    captured.add_argument("--generations", type=Path, required=True)
+    captured.add_argument("--client-wheel", type=Path, required=True)
+    captured.add_argument("--python", default=sys.executable)
     args = parser.parse_args()
+    if args.command == "install-captured":
+        from .captured_packages import install_captured
+        result = install_captured(project=args.project, wheels=args.wheel, requirements=args.requirements,
+            distribution=args.distribution, release=args.release, python_requires=args.python_requires,
+            python_version=args.python_version, generations=args.generations, client_wheel=args.client_wheel, python=args.python)
+        print(msgspec.json.encode(result).decode())
+        return
     result = (describe(args.project) if args.command == "describe" else
               install(args.project, args.generations, args.client_wheel, python=args.python))
     print(msgspec.json.encode(result).decode())

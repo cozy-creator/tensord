@@ -3,16 +3,18 @@ import sys
 from pathlib import Path
 
 import msgspec
-from cozy_runtime.internal.static_interface import build
+from cozy_runtime.internal import static_interface
 
-from .package_records import Describe, Described, DescribeFailed
+from .package_records import Describe, DescribeInstalled, Described, DescribeFailed
 
 
 def main():
-    request = msgspec.json.decode(sys.stdin.buffer.read(), type=Describe)
+    request = msgspec.json.decode(sys.stdin.buffer.read(), type=Describe | DescribeInstalled)
     try:
-        document = build(Path(request.project), environment_python=(
-            Path(request.environment_python) if request.environment_python is not None else None))
+        document = (static_interface.build_installed(request.distribution, environment_python=Path(request.environment_python))
+                    if isinstance(request, DescribeInstalled) else
+                    static_interface.build(Path(request.project), environment_python=(
+                        Path(request.environment_python) if request.environment_python is not None else None)))
         reply = Described(msgspec.Raw(msgspec.json.encode(document)))
     except Exception as exc:
         reply = DescribeFailed(getattr(exc, "code", type(exc).__name__), str(exc))
