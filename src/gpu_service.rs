@@ -8,6 +8,7 @@ use crate::{
     execution::{process_ended, Engine},
     journal::{AssetBinding, Execution, Outcome, OutputChecksum, Preparation, State},
     model_sources::{ModelSources, SelectedManifest},
+    shared_host_plane::{HostConfig, HostPeer, HostScope, SharedHostPlane},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -30,6 +31,15 @@ fn enabled() -> bool {
     true
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceMode {
+    #[default]
+    Auto,
+    Legacy,
+    Descriptors,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct ModelGrant {
     pub package: String,
@@ -49,9 +59,18 @@ pub struct PublishedPackage {
     pub generation: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub struct HostOptions {
+    pub budget_bytes: u64,
+    pub readers: usize,
+    pub max_entries: usize,
+}
+
 /// Root-sealed configuration, never peer-controlled paths or environment logic switches.
 #[derive(Clone, Debug, Deserialize)]
 pub struct GpuConfig {
+    #[serde(default)]
+    pub source_mode: SourceMode,
     pub devices: String,
     pub authorized_device_limit_bytes: Option<u64>,
     #[serde(default = "measured_budget")]
@@ -66,6 +85,8 @@ pub struct GpuConfig {
     pub models: Vec<ModelGrant>,
     #[serde(default)]
     pub packages: Vec<PublishedPackage>,
+    #[serde(default)]
+    pub host: Option<HostOptions>,
 }
 impl GpuConfig {
     pub fn load(path: &Path) -> io::Result<Self> {
@@ -108,6 +129,8 @@ struct Session {
     executor: DeviceExecutor,
     sources: Arc<Mutex<ModelSources>>,
     budget_cells: Vec<File>,
+    peer: HostPeer,
+    descriptors: bool,
 }
 pub struct GpuPool {
     root: PathBuf,
@@ -115,6 +138,7 @@ pub struct GpuPool {
     store: Arc<Store>,
     reserved: AtomicBool,
     session: Mutex<Option<Session>>,
+    host: Option<Arc<SharedHostPlane>>,
 }
 struct Permit {
     pool: Arc<GpuPool>,
@@ -140,12 +164,27 @@ impl Drop for WakeOnExit {
 impl GpuPool {
     pub fn new(root: &Path, config: GpuConfig, store: Arc<Store>) -> io::Result<Arc<Self>> {
         fs::create_dir_all(root)?;
+        let host = config
+            .host
+            .as_ref()
+            .map(|options| {
+                SharedHostPlane::new(
+                    store.root(),
+                    HostConfig {
+                        budget_bytes: options.budget_bytes,
+                        readers: options.readers,
+                        max_entries: options.max_entries,
+                    },
+                )
+            })
+            .transpose()?;
         Ok(Arc::new(Self {
             root: root.to_path_buf(),
             config,
             store,
             reserved: AtomicBool::new(false),
             session: Mutex::new(None),
+            host,
         }))
     }
     pub fn config(&self) -> &GpuConfig {
@@ -514,11 +553,18 @@ impl GpuPool {
             )?;
             executor.retain_until_exit(directory);
             executor.retain_until_exit(WakeOnExit(Arc::downgrade(engine)));
-            if !executor.hello.offers("model_sources.descriptors/1") {
-                executor.shutdown()?;
-                engine.defer_managed(id, "held SDK lacks the descriptor-source operation; other CPU operations remain usable".into())?;
-                return Ok(());
-            }
+            let descriptors = match self.config.source_mode {
+                SourceMode::Legacy => false,
+                SourceMode::Auto => executor.hello.offers("model_sources.descriptors/1"),
+                SourceMode::Descriptors if executor.hello.offers("model_sources.descriptors/1") => {
+                    true
+                }
+                SourceMode::Descriptors => {
+                    executor.shutdown()?;
+                    engine.finish(id, Outcome::Failed("requested descriptor-source operation is unavailable; automatic or legacy mode remains available".into()))?;
+                    return Ok(());
+                }
+            };
             let sources = Arc::new(Mutex::new(ModelSources::open_shared(
                 self.store.clone(),
                 &[SelectedManifest {
@@ -527,12 +573,32 @@ impl GpuPool {
                 }],
             )?));
             executor.retain_until_exit(sources.clone());
+            let peer = HostPeer {
+                actor: plan.actor.clone(),
+                plan: plan.id.clone(),
+                birth: executor.birth.clone(),
+            };
+            if let Some(host) = &self.host {
+                host.register_peer(peer.clone(), executor.observer_pidfd()?)?;
+                let sources = sources.lock().unwrap();
+                host.authorize(
+                    HostScope {
+                        actor: plan.actor.clone(),
+                        plan: plan.id.clone(),
+                    },
+                    plan.binding.snapshot.clone(),
+                    sources.authorized_header(&plan.binding.snapshot)?,
+                    plan.binding.components.clone(),
+                )?;
+            }
             *slot = Some(Session {
                 plan: plan.id.clone(),
                 loaded: false,
                 executor,
                 sources,
                 budget_cells: vec![],
+                peer,
+                descriptors,
             });
         } else {
             let session = slot.as_ref().unwrap();
@@ -557,6 +623,8 @@ impl GpuPool {
             cells: &mut session.budget_cells,
             budget: self.config.plane_budget_bytes,
             completed: 0,
+            host: self.host.as_ref(),
+            peer: &session.peer,
         };
         if !session.loaded {
             let interface_path = session.executor.root_path().join("package-interface.json");
@@ -573,7 +641,11 @@ impl GpuPool {
             )?)?;
             let mut binding = plan.binding.clone();
             binding.package_interface = interface_path.to_string_lossy().into();
-            binding.store.clear();
+            binding.store = if session.descriptors {
+                String::new()
+            } else {
+                self.store.root().to_string_lossy().into()
+            };
             command_ok(session.executor.command(
                 &DeviceCommand::Load {
                     construction: plan.id.clone(),
@@ -585,10 +657,12 @@ impl GpuPool {
                     },
                     authorized_device_limit_bytes: self.config.authorized_device_limit_bytes,
                     attention_pin: String::new(),
-                    host_tier: false,
+                    host_tier: self.host.is_some()
+                        && session.executor.hello.offers("host_tiers.owner/1"),
                     stages,
-                    descriptor_sources: true,
-                    host_tier_owner: false,
+                    descriptor_sources: session.descriptors,
+                    host_tier_owner: self.host.is_some()
+                        && session.executor.hello.offers("host_tiers.owner/1"),
                 },
                 &mut callbacks,
             )?)?;
@@ -718,6 +792,8 @@ struct Callbacks<'a> {
     cells: &'a mut Vec<File>,
     budget: i64,
     completed: u64,
+    host: Option<&'a Arc<SharedHostPlane>>,
+    peer: &'a HostPeer,
 }
 impl Services for Callbacks<'_> {
     fn progress(&mut self, frame: &Frame) {
@@ -733,6 +809,22 @@ impl Services for Callbacks<'_> {
         frame: &Frame,
         descriptor: Option<File>,
     ) -> io::Result<(Answer, Option<File>)> {
+        if matches!(frame.kind, Kind::HostTier | Kind::HostTierPrepare) {
+            if let Some(host) = self.host {
+                return host.request(self.peer, frame, descriptor).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "host-tier operation unavailable",
+                    )
+                })?;
+            }
+            drop(descriptor);
+            let mut answer = Answer::unavailable(frame.seq);
+            answer.ok = true;
+            answer.code.clear();
+            answer.detail.clear();
+            return Ok((answer, None));
+        }
         if frame.kind == Kind::ModelSourceRead {
             drop(descriptor);
             let (answer, file) =

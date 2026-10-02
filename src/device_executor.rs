@@ -629,6 +629,15 @@ impl DeviceExecutor {
         fs::set_permissions(&config.socket, fs::Permissions::from_mode(0o600))?;
         let mut command = Command::new(config.python);
         command
+            .args([
+                "-I",
+                "-m",
+                "cozy_runtime.internal.trampoline",
+                "--expect-parent",
+            ])
+            .arg(std::process::id().to_string())
+            .args(["--oom-adj", "1000", "--scope-backend", "inherit", "--"])
+            .arg(&codec.python)
             .args(["-I", "-m", "cozy_runtime.internal.executor", "--socket"])
             .arg(&config.socket)
             .arg("--root")

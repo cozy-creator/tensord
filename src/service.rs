@@ -1,12 +1,12 @@
 //! The machine's sole CPU dispatch policy; the engine only journals/supervises.
 use crate::{
     catalog::Catalog,
-    execution::Engine,
-    journal::{Execution, State, SubmissionContext},
+    execution::{process_ended, Engine},
+    journal::{Execution, ProcessBirth, State, SubmissionContext},
 };
 use serde_json::Value;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
     io,
     path::Path,
@@ -20,6 +20,7 @@ pub struct Service {
     stopped: Mutex<bool>,
     retained: Mutex<HashMap<String, Arc<File>>>,
     gpu: Mutex<Option<Arc<crate::gpu_service::GpuPool>>>,
+    startup_gpu_births: Mutex<Vec<ProcessBirth>>,
 }
 impl Service {
     pub fn open(root: &Path, generations: &Path, parallelism: usize) -> io::Result<Arc<Self>> {
@@ -29,13 +30,37 @@ impl Service {
                 "CPU parallelism must be positive",
             ));
         }
+        let engine = Engine::open(&root.join("execution"))?;
+        // A completed request does not prove its retained CUDA context ended.
+        // Capture prior-owner births before starting the scheduler/configuring a pool.
+        let mut cursor = 0;
+        let mut seen = HashSet::new();
+        let mut startup_gpu_births = vec![];
+        loop {
+            let page = engine.gpu_births_after(cursor, 256)?;
+            if page.is_empty() {
+                break;
+            }
+            for (id, birth) in page {
+                cursor = id;
+                if !process_ended(&birth).unwrap_or(false)
+                    && seen.insert((birth.pid, birth.boot_id.clone(), birth.start_ticks))
+                {
+                    if let Err(error) = engine.watch_process(birth.clone()) {
+                        eprintln!("GPU startup birth remains fenced: {error}");
+                    }
+                    startup_gpu_births.push(birth);
+                }
+            }
+        }
         let service = Arc::new(Self {
-            engine: Engine::open(&root.join("execution"))?,
+            engine,
             catalog: Catalog::new(generations)?,
             parallelism,
             stopped: Mutex::new(false),
             retained: Mutex::new(HashMap::new()),
             gpu: Mutex::new(None),
+            startup_gpu_births: Mutex::new(startup_gpu_births),
         });
         service.engine.reconcile()?;
         // Keep queued generations alive, including accepted work from a prior boot.
@@ -59,6 +84,12 @@ impl Service {
     }
     pub fn gpu(&self) -> Option<Arc<crate::gpu_service::GpuPool>> {
         self.gpu.lock().unwrap().clone()
+    }
+    /// Observation only. Unknown births stay reserved; CPU dispatch stays available.
+    pub fn gpu_startup_fences(&self) -> usize {
+        let mut births = self.startup_gpu_births.lock().unwrap();
+        births.retain(|birth| !process_ended(birth).unwrap_or(false));
+        births.len()
     }
     pub fn configure_gpu(&self, gpu: Arc<crate::gpu_service::GpuPool>) -> io::Result<()> {
         let mut current = self.gpu.lock().unwrap();
@@ -181,7 +212,7 @@ impl Service {
                 .as_ref()
                 .is_some_and(|s| !s.preparation_id.is_empty())
         };
-        let mut gpu_active = active.iter().any(is_gpu);
+        let mut gpu_active = self.gpu_startup_fences() != 0 || active.iter().any(is_gpu);
         let mut room = self
             .parallelism
             .saturating_sub(active.iter().filter(|r| !is_gpu(r)).count());

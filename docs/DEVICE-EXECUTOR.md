@@ -8,7 +8,12 @@ These are provenance, not admission floors. The root owns GPU locking and the re
 ## Lifecycle and control
 
 `DeviceExecutor::spawn(ExecutorConfig)` starts the installed generation interpreter with
-`-I -m cozy_runtime.internal.executor --socket PATH --root ROOT`. It waits for an actual
+`-I -m cozy_runtime.internal.trampoline --expect-parent PID --oom-adj 1000
+--scope-backend inherit -- PYTHON -I -m cozy_runtime.internal.executor --socket PATH
+--root ROOT`. The existing SDK applies parent-death, no_new_privs and OOM victim ordering
+before the executor imports. This scoped implementation inherits the service's actual
+cgroup/UID/PGID; it does not create or qualify a separate executor containment scope.
+It waits for an actual
 connection or kernel-observed child termination using pidfd/poll, without a clock-based kill.
 SO_PEERCRED must identify the launched PID and UID. The generation shared hold survives exec
 and parent death; the installed environment is never updated. Root journal authorization
