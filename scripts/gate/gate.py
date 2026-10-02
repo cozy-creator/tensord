@@ -240,6 +240,9 @@ class Gate:
                "wall_s": verified - start, "cli_s": finished - submit, "offset": self.offset,
                # Pod clock only, free of controller noise: machine birth (or acceptance) to outcome.
                "machine_s": (outcome - (t0 if t0 is not None else accepted)) if outcome and accepted else None,
+               # Outcome on the pod until the client noticed it: the result path (request plane, daemon, network).
+               "result_lag_s": (seen["client.machine_work_finished"] - (outcome - self.offset))
+               if outcome and "client.machine_work_finished" in seen else None,
                "controller_load": os.getloadavg()[0],
                "execution_ms": show.get("execution_ms"), "stages": show.get("stages"), "steps": show.get("steps"),
                "disk_read_bytes": after["cg"]["read_bytes"] - before["cg"]["read_bytes"],
@@ -335,6 +338,7 @@ def report(out: Path) -> dict:
         for s in SCENARIOS:
             cell[s] = spread([r["wall_s"] for r in mine if r["scenario"] == s])
             cell[s + "_from_submit"] = spread([r["cli_s"] for r in mine if r["scenario"] == s])
+            cell[s + "_result_lag"] = spread([r["result_lag_s"] for r in mine if r["scenario"] == s and r.get("result_lag_s") is not None])
             cell[s + "_machine"] = spread([r["machine_s"] for r in mine if r["scenario"] == s and r.get("machine_s")])
             cell[s + "_disk_gib"] = spread([r["disk_read_bytes"] / 2**30 for r in mine if r["scenario"] == s])
         cell["switch_pair"] = spread([sum(r["wall_s"] for r in mine if r["cycle"] == c and r["scenario"] in
