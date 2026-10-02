@@ -3,6 +3,15 @@
 GPU work and RunPod rentals are authorized, with a $20 total cap for this task. The root
 agent owns acquisition, accounting and teardown. The first owned headless A40 pilot completed
 three real SDXL requests; its isolated legacy loader is distinct from Degree 1 qualification.
+Two subsequent clean alternating adapter pairs completed 48 requests (22 warm samples per
+arm). All 24 paired images had identical SHA-256 hashes. Warm prepare→encoded-output medians
+were 4.831/4.856 s (Python/Rust) and 4.885/4.883 s. These two cycles support feasibility,
+not a statistically established zero-overhead claim or a full-stack improvement.
+The independent whole-device NVIDIA sample peaked at 11.68–11.94 GiB, whereas Runtime's
+allocator-derived peak was about 8.96 GiB. Admission must include allocator reservations,
+contexts and external allocations. The exact split is unmeasured, and sampled peaks may
+miss brief higher allocations. These resident A40 runs do not qualify 8 GB operation or
+the optional machine-copy/streamed-weight latency claim.
 Other live rentals and GPU processes are independently owned. The display-driving 8 GB
 RTX 4070 is available for ordinary inference; fault and memory pressure tests use RunPod.
 
