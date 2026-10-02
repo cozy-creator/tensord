@@ -491,21 +491,42 @@ impl Journal {
             .map_err(db_error)
     }
     pub fn acknowledge_collection(&mut self, id: &str) -> io::Result<Execution> {
+        self.acknowledge_collection_events(id, None)
+    }
+    pub fn acknowledge_collection_events(
+        &mut self,
+        id: &str,
+        events: Option<&[u8]>,
+    ) -> io::Result<Execution> {
         let mut record = self.get(id)?;
         if !record.state.terminal() {
             return Err(db_error(
                 "collection acknowledgement requires a terminal result",
             ));
         }
+        let transaction = self.connection.transaction().map_err(db_error)?;
+        if let Some(events) = events {
+            if transaction
+                .execute(
+                    "UPDATE public_terminals SET events=?1 WHERE execution=?2",
+                    params![events, id],
+                )
+                .map_err(db_error)?
+                != 1
+            {
+                return Err(db_error("terminal projection absent during collection"));
+            }
+        }
         if !record.collected {
             record.collected = true;
-            self.connection
+            transaction
                 .execute(
                     "UPDATE executions SET record=?1 WHERE id=?2",
                     params![encoded(&record)?, id],
                 )
                 .map_err(db_error)?;
         }
+        transaction.commit().map_err(db_error)?;
         Ok(record)
     }
     pub fn native_output(&self, actor: &str, owner: &str) -> io::Result<Option<Vec<u8>>> {

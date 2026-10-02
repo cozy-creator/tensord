@@ -348,6 +348,19 @@ func runNative(machine, output, helper, wheel, source string, assets bool) error
 			return fmt.Errorf("collection acknowledgement not durable: %v", e)
 		}
 	}
+	released, err := host.ListMachineExecutionEvents(ctx, &pb.MachineExecutionEventsQuery{Execution: query})
+	if err != nil {
+		return fmt.Errorf("release event replay failed: %v", err)
+	}
+	releaseCount := 0
+	for _, event := range released.Events {
+		if event.Kind == "retention_released" {
+			releaseCount++
+		}
+	}
+	if releaseCount != 1 || released.HeadSequence != page.HeadSequence+1 {
+		return fmt.Errorf("final request retention was not released once: count=%d", releaseCount)
+	}
 	if _, err = read(product.Content, 0); err != nil {
 		return fmt.Errorf("collection acknowledgement destroyed native hold: %v", err)
 	}

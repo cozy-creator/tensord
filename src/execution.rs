@@ -230,6 +230,16 @@ impl Engine {
     pub fn acknowledge_collection(&self, id: &str) -> io::Result<Execution> {
         self.journal.lock().unwrap().acknowledge_collection(id)
     }
+    pub fn acknowledge_collection_events(
+        &self,
+        id: &str,
+        events: Option<&[u8]>,
+    ) -> io::Result<Execution> {
+        self.journal
+            .lock()
+            .unwrap()
+            .acknowledge_collection_events(id, events)
+    }
     pub fn native_output(&self, actor: &str, owner: &str) -> io::Result<Option<Vec<u8>>> {
         self.journal.lock().unwrap().native_output(actor, owner)
     }

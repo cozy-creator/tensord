@@ -845,11 +845,50 @@ impl MachineBackend for NativeBackend {
                 "acknowledgement differs from the exact retained outcome",
             ));
         }
+        let events = if !ack.retain_work {
+            // This slice admits no asset inputs. A canceled terminal has no result/native
+            // output binding, and terminal settlement has already ended its runner hold.
+            // Output trees of completed runs retain their explicit source-release authority.
+            let _guard = self.projection.lock().unwrap();
+            let held = self
+                .service
+                .engine
+                .public_terminal(&record.id)
+                .map_err(problem)?
+                .ok_or_else(|| Status::data_loss("terminal projection absent"))?;
+            let mut page = pb::MachineExecutionEventPage::decode(held.events.as_slice())
+                .map_err(|_| Status::data_loss("terminal event projection corrupt"))?;
+            if !page
+                .events
+                .iter()
+                .any(|event| event.kind == "retention_released")
+            {
+                let sequence = page
+                    .head_sequence
+                    .checked_add(1)
+                    .ok_or_else(|| Status::resource_exhausted("event cursor exhausted"))?;
+                page.events.push(pb::MachineExecutionEvent {
+                    sequence,
+                    attempt_ordinal: record.attempt.max(1) as u64,
+                    at_ms: record.finished_at_ms,
+                    kind: "retention_released".into(),
+                    body_canonical_bytes: canonical(
+                        &json!({"reason":"final custody acknowledged"}),
+                    )?,
+                    ..Default::default()
+                });
+                page.head_sequence = sequence;
+                page.next_after = sequence;
+            }
+            Some(page.encode_to_vec())
+        } else {
+            None
+        };
         self.state(
             &self
                 .service
                 .engine
-                .acknowledge_collection(&record.id)
+                .acknowledge_collection_events(&record.id, events.as_deref())
                 .map_err(problem)?,
         )
     }
