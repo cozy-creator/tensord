@@ -8,6 +8,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+// Status observation cursor allocation, not a duration or liveness policy.
+const REVISION_WINDOW: u64 = 1 << 32;
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Invocation {
     pub package: String,
@@ -72,6 +75,9 @@ pub struct Execution {
     pub invocation: Invocation,
     pub state: State,
     pub revision: u64,
+    /// Reserved observation cursor ceiling. Older stored records default to no reservation.
+    #[serde(default)]
+    pub revision_ceiling: u64,
     #[serde(default)]
     pub attempt: u32,
     #[serde(default)]
@@ -82,6 +88,26 @@ pub struct Execution {
     pub progress: Option<String>,
     pub result: Option<ResultRecord>,
     pub failure: Option<String>,
+}
+
+/// Coalesced observation; persisted only as part of an authoritative transition.
+#[derive(Clone, Debug)]
+pub struct ProgressSnapshot {
+    pub completed_units: u64,
+    pub detail: String,
+    pub revision: u64,
+}
+
+impl ProgressSnapshot {
+    pub fn overlay(&self, record: &mut Execution) -> bool {
+        if self.completed_units <= record.completed_units {
+            return false;
+        }
+        record.completed_units = self.completed_units;
+        record.progress = Some(self.detail.clone());
+        record.revision = record.revision.max(self.revision);
+        true
+    }
 }
 
 pub struct Journal {
@@ -157,6 +183,7 @@ impl Journal {
             invocation,
             state: State::Queued,
             revision: 1,
+            revision_ceiling: 1,
             attempt: 0,
             waiting_reason: None,
             process: None,
@@ -206,6 +233,15 @@ impl Journal {
         id: &str,
         change: impl FnOnce(&mut Execution) -> io::Result<bool>,
     ) -> io::Result<Execution> {
+        self.update_observed(id, None, change)
+    }
+
+    fn update_observed(
+        &mut self,
+        id: &str,
+        progress: Option<&ProgressSnapshot>,
+        change: impl FnOnce(&mut Execution) -> io::Result<bool>,
+    ) -> io::Result<Execution> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -221,8 +257,26 @@ impl Journal {
                 io::Error::new(io::ErrorKind::NotFound, "execution does not exist")
             })?)
             .map_err(db_error)?;
-        if change(&mut record)? {
-            record.revision += 1;
+        let was_terminal = record.state.terminal();
+        let changed = change(&mut record)?;
+        let observed =
+            !was_terminal && progress.is_some_and(|progress| progress.overlay(&mut record));
+        if changed || observed {
+            // Every durable mutation jumps past all volatile cursors the former owner
+            // could have published, even when its progress snapshot was lost.
+            record.revision = record
+                .revision
+                .max(record.revision_ceiling)
+                .checked_add(1)
+                .ok_or_else(|| db_error("execution observation cursor exhausted"))?;
+            record.revision_ceiling = if record.state == State::Running {
+                record
+                    .revision
+                    .checked_add(REVISION_WINDOW)
+                    .ok_or_else(|| db_error("execution observation cursor exhausted"))?
+            } else {
+                record.revision
+            };
             tx.execute(
                 "UPDATE executions SET record=?1,state=?2,updated_ms=?3 WHERE id=?4",
                 params![encoded(&record)?, record.state.name(), timestamp(), id],
@@ -296,14 +350,40 @@ impl Journal {
         })
     }
 
+    /// Reserve another cursor window only when the previous one is exhausted.
+    /// This rare allocation commit is not a per-event telemetry write.
+    pub fn reserve_observations(
+        &mut self,
+        id: &str,
+        progress: Option<&ProgressSnapshot>,
+    ) -> io::Result<Execution> {
+        self.update_observed(id, progress, |record| {
+            if record.state != State::Running {
+                return Err(db_error(
+                    "only running executions reserve observation cursors",
+                ));
+            }
+            Ok(true)
+        })
+    }
+
     pub fn cancel(&mut self, id: &str, actor: &str) -> io::Result<Execution> {
+        self.cancel_observed(id, actor, None)
+    }
+
+    pub fn cancel_observed(
+        &mut self,
+        id: &str,
+        actor: &str,
+        progress: Option<&ProgressSnapshot>,
+    ) -> io::Result<Execution> {
         if actor.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "cancellation requires an actor",
             ));
         }
-        self.update(id, |record| {
+        self.update_observed(id, progress, |record| {
             if record.state.terminal() || record.cancel_actor.is_some() {
                 return Ok(false);
             }
@@ -315,22 +395,18 @@ impl Journal {
         })
     }
 
-    /// Counts actual completed work, never mere enqueues or repeated retry churn.
-    pub fn progress(&mut self, id: &str, completed_units: u64, detail: String) -> io::Result<()> {
-        self.update(id, |record| {
-            if record.state.terminal() || completed_units <= record.completed_units {
-                return Ok(false);
-            }
-            record.completed_units = completed_units;
-            record.progress = Some(detail);
-            Ok(true)
-        })?;
-        Ok(())
-    }
-
     /// Caller must prove process termination and durable artifact custody first.
     pub fn finish(&mut self, id: &str, outcome: Outcome) -> io::Result<Execution> {
-        self.update(id, |record| {
+        self.finish_observed(id, outcome, None)
+    }
+
+    pub fn finish_observed(
+        &mut self,
+        id: &str,
+        outcome: Outcome,
+        progress: Option<&ProgressSnapshot>,
+    ) -> io::Result<Execution> {
+        self.update_observed(id, progress, |record| {
             if record.state.terminal() {
                 return Ok(false);
             }
