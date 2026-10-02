@@ -1,6 +1,10 @@
 //! Deployed ClaimProof/1. Wire versions are observations, never authorization.
 use super::pb::Claim;
 use ed25519_dalek::{Signature, VerifyingKey};
+use std::{
+    sync::{Arc, RwLock},
+    time::{Duration, Instant},
+};
 use tensorfs_core::{canon, sha256};
 use tonic::Status;
 
@@ -9,7 +13,59 @@ pub struct Authority {
     pub worker_id: String,
     pub boot_id: String,
     pub leaf_digest: [u8; 32],
-    pub keys: Vec<VerifyingKey>,
+    pub keys: Keys,
+}
+
+/// The keys whose Claims this machine admits, shared by every clone of its Authority. A
+/// rental's set is a Hub lease: its granted boot value holds until the Hub first answers,
+/// then each lease holds until it expires; a transport failure neither revokes nor extends
+/// it, a denial revokes it at once. Losing authority never cancels accepted work.
+#[derive(Clone)]
+pub struct Keys(Arc<RwLock<KeyState>>);
+struct KeyState {
+    keys: Vec<VerifyingKey>,
+    until: Option<Instant>,
+    leased: bool,
+}
+impl Keys {
+    pub fn fixed(keys: Vec<VerifyingKey>) -> Self {
+        Self(Arc::new(RwLock::new(KeyState {
+            keys,
+            until: None,
+            leased: false,
+        })))
+    }
+    pub fn renew(&self, keys: Vec<VerifyingKey>, lease: Duration) {
+        *self.0.write().unwrap() = KeyState {
+            keys,
+            until: Some(Instant::now() + lease),
+            leased: true,
+        };
+    }
+    pub fn revoke(&self) {
+        *self.0.write().unwrap() = KeyState {
+            keys: vec![],
+            until: None,
+            leased: true,
+        };
+    }
+    /// The keys that may authorize a new control now: none without a current lease.
+    pub fn admitted(&self) -> Vec<VerifyingKey> {
+        match self.current() {
+            (keys, true) => keys,
+            (_, false) => vec![],
+        }
+    }
+    fn current(&self) -> (Vec<VerifyingKey>, bool) {
+        let state = self.0.read().unwrap();
+        let live = !state.leased || state.until.is_some_and(|until| Instant::now() < until);
+        (state.keys.clone(), live)
+    }
+}
+impl From<Vec<VerifyingKey>> for Keys {
+    fn from(keys: Vec<VerifyingKey>) -> Self {
+        Self::fixed(keys)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,11 +84,16 @@ impl Authority {
         let bytes = self.transcript(claim.record_owner_epoch)?;
         let signature = Signature::from_slice(&claim.proof)
             .map_err(|_| Status::unauthenticated("Claim signature must be 64 bytes"))?;
-        if let Some(key) = self
-            .keys
+        let (keys, live) = self.keys.current();
+        if let Some(key) = keys
             .iter()
             .find(|key| key.verify_strict(&bytes, &signature).is_ok())
         {
+            if !live {
+                return Err(Status::unavailable(
+                    "rental_authority_unavailable: no current rental authority lease",
+                ));
+            }
             Ok(VerifiedActor {
                 public_key: key.to_bytes(),
             })
@@ -92,7 +153,7 @@ mod tests {
             worker_id: "wrk-4070".into(),
             boot_id: "boot-9f21".into(),
             leaf_digest: raw,
-            keys: vec![],
+            keys: vec![].into(),
         };
         assert_eq!(
             auth.transcript(41).unwrap(),
@@ -107,7 +168,7 @@ mod tests {
             worker_id: "cpu-private".into(),
             boot_id: "boot".into(),
             leaf_digest: [9; 32],
-            keys: vec![key.verifying_key()],
+            keys: vec![key.verifying_key()].into(),
         };
         let mut claim = Claim {
             worker_id: auth.worker_id.clone(),

@@ -27,6 +27,10 @@ pub struct MachineIdentity {
     pub cert_der: Vec<u8>,
     pub readiness: Arc<Readiness>,
     pub started_at_ms: u64,
+    /// A rental's idle ledger; None on development front doors.
+    pub lifecycle: Option<Arc<crate::machine::lifecycle::Lifecycle>>,
+    /// The Hubs this machine is registered with: (origin, worker id there).
+    pub hubs: Vec<(String, String)>,
 }
 
 impl MachineIdentity {
@@ -48,7 +52,7 @@ impl MachineIdentity {
             worker_id,
             boot_id,
             leaf_digest: tensorfs_core::sha256::digest(&cert_der),
-            keys,
+            keys: keys.into(),
         };
         authority.transcript(1)?;
         Ok(Self {
@@ -58,6 +62,8 @@ impl MachineIdentity {
             cert_der,
             readiness: Readiness::open(None, Some(receipt_key), false)?,
             started_at_ms: now_ms(),
+            lifecycle: None,
+            hubs: vec![],
         })
     }
 }
@@ -224,8 +230,32 @@ impl<B: MachineBackend> Api<B> {
     fn description(&self) -> pb::MachineDescription {
         pb::MachineDescription { worker_id: self.identity.authority.worker_id.clone(), worker_boot_id: self.identity.authority.boot_id.clone(),
             host: Some(pb::MachineHost { version: env!("CARGO_PKG_VERSION").into(), wire_minor: WIRE_MINOR, minimum_wire_minor: WIRE_MINIMUM,
-                platform: format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH), phase: "ready".into(), started_at_unix_ms: self.identity.started_at_ms, ..Default::default() }),
+                platform: format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH), phase: self.phase().into(), started_at_unix_ms: self.identity.started_at_ms,
+                idle_deadline_unix_ms: self.identity.lifecycle.as_ref().map_or(0, |l| l.deadline_ms().max(0) as u64),
+                hubs: self.identity.hubs.iter().map(|(origin, machine_id)| pb::MachineHub { origin: origin.clone(), machine_id: machine_id.clone() }).collect(),
+                ..Default::default() }),
             runtime_absent: "CPU front door: package SDK measurements are supplied by the execution backend; full Runtime inventory is not implemented".into(), ..Default::default() }
+    }
+    fn phase(&self) -> &'static str {
+        match &self.identity.lifecycle {
+            Some(lifecycle) if lifecycle.released() => "releasing",
+            _ => "ready",
+        }
+    }
+    /// Holds a rental's idle release while a call that may start work runs.
+    fn admit(&self) -> Result<Option<crate::machine::lifecycle::Admission>, Status> {
+        self.identity
+            .lifecycle
+            .as_ref()
+            .map(|l| l.admit())
+            .transpose()
+    }
+    fn worked(&self) {
+        if let Some(lifecycle) = &self.identity.lifecycle {
+            if let Err(error) = lifecycle.work() {
+                eprintln!("cozy-machine: idle ledger: {error}");
+            }
+        }
     }
     async fn call<T: Send + 'static>(
         &self,
@@ -262,7 +292,7 @@ impl<B: MachineBackend> Api<B> {
         let Some(key) = crate::hub::verify_capability(
             token,
             &authority.worker_id,
-            &authority.keys,
+            &authority.keys.admitted(),
             now_ms() as i64 / 1000,
             crate::hub::ACTION,
         ) else {
@@ -455,12 +485,14 @@ impl<B: MachineBackend> pb::pod_host_server::PodHost for Api<B> {
             }
         };
         let actor = self.auth(header.claim.as_ref())?;
+        let held = self.admit()?;
         let uploads = self.backend.uploads().ok_or_else(|| {
             Status::unimplemented("capability_unavailable: package carrier ingress is unavailable")
         })?;
         let authority = self.identity.authority.clone();
         let (sender, receiver) = tokio::sync::mpsc::channel(4);
         tokio::spawn(async move {
+            let _held = held; // an upload in flight holds idle release
             let begin_header = header.clone();
             let begin =
                 tokio::task::spawn_blocking(move || uploads.begin(actor, &begin_header)).await;
@@ -554,6 +586,7 @@ impl<B: MachineBackend> pb::pod_host_server::PodHost for Api<B> {
         request: Request<pb::PrepareLocalPackageCall>,
     ) -> Result<Response<ResponseStream<pb::PrepareEvent>>, Status> {
         let actor = self.auth(request.get_ref().claim.as_ref())?;
+        let _held = self.admit()?;
         let request = request.into_inner();
         let events = self
             .call(move |backend| {
@@ -568,6 +601,7 @@ impl<B: MachineBackend> pb::pod_host_server::PodHost for Api<B> {
             })
             .await?
             .into_inner();
+        self.worked();
         Ok(Response::new(Box::pin(tokio_stream::iter(
             events.into_iter().map(Ok),
         ))))
@@ -614,9 +648,38 @@ impl<B: MachineBackend> pb::pod_host_server::PodHost for Api<B> {
         request: Request<pb::MachineExecutionSubmit>,
     ) -> Result<Response<pb::MachineExecutionReceipt>, Status> {
         let actor = self.auth(request.get_ref().claim.as_ref())?;
+        let _held = self.admit()?;
         let request = request.into_inner();
-        self.call(move |backend| backend.submit(actor, request))
-            .await
+        let receipt = self
+            .call(move |backend| backend.submit(actor, request))
+            .await?;
+        self.worked();
+        Ok(receipt)
+    }
+    async fn keep_rental_alive(
+        &self,
+        request: Request<pb::KeepRentalAliveRequest>,
+    ) -> Result<Response<pb::KeepRentalAliveResult>, Status> {
+        self.auth(request.get_ref().claim.as_ref())?;
+        let request = request.into_inner();
+        let lifecycle = self
+            .identity
+            .lifecycle
+            .as_ref()
+            .ok_or_else(|| Status::unimplemented("this machine has no rental lifecycle"))?;
+        if request.request_id.is_empty() || request.request_id.len() > 128 {
+            return Err(Status::invalid_argument(
+                "a keepalive names one bounded request_id",
+            ));
+        }
+        let (acknowledged, deadline) = lifecycle.keepalive(&request.request_id)?;
+        Ok(Response::new(pb::KeepRentalAliveResult {
+            request_id: request.request_id,
+            worker_id: self.identity.authority.worker_id.clone(),
+            worker_boot_id: self.identity.authority.boot_id.clone(),
+            acknowledged_at_unix_ms: acknowledged,
+            idle_deadline_unix_ms: deadline,
+        }))
     }
     async fn get_machine_execution(
         &self,

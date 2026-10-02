@@ -75,7 +75,7 @@ impl Machine {
             worker_id: ready["worker_id"].as_str().unwrap().into(),
             boot_id: ready["boot_id"].as_str().unwrap().into(),
             leaf_digest: tensorfs_core::sha256::digest(der.as_ref()),
-            keys: vec![],
+            keys: vec![].into(),
         };
         let claim = pb::Claim {
             worker_id: authority.worker_id.clone(),

@@ -15,9 +15,14 @@ libc = "0.2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
 nix = { version = "0.31.3", default-features = false, features = ["fs", "socket", "uio", "user"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+webpki-roots = "1"
 tonic = { version = "0.14.6", features = ["tls-ring"] }
 tonic-prost = "0.14.6"
 prost = "0.14"

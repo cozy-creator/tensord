@@ -112,16 +112,47 @@ fn run_machine(mut grant: cozy_machine::machine::grant::Grant) -> io::Result<()>
             ));
         }
     }
-    let identity = cozy_machine::api::MachineIdentity::machine(
+    let fresh = readiness.attested().is_none();
+    let keys = cozy_machine::api::auth::Keys::fixed(grant.authorized.clone());
+    let mut identity = cozy_machine::api::MachineIdentity::machine(
         grant.worker_id.clone(),
-        grant.authorized.clone(),
+        keys.clone(),
         lifetime,
         readiness,
     )?;
+    let lifecycle = cozy_machine::machine::lifecycle::Lifecycle::open(
+        layout.state.join("idle.json"),
+        rental,
+        fresh,
+    )?;
+    identity.lifecycle = Some(lifecycle.clone());
     let engine = layout.engine();
     let generations = engine.join("generations");
     let owner = Owner::new(&engine, 16 * 1024 * 1024, Duration::from_secs(300))?;
     let service = cozy_machine::service::Service::open(&engine, &generations, 1)?;
+    if let Some(hub) = grant.hub.clone().filter(|_| rental) {
+        identity.hubs = vec![(hub.origin.clone(), hub.worker_id.clone())];
+        let hub = Arc::new(cozy_machine::machine::hub::Hub::new(hub)?);
+        let service = service.clone();
+        std::thread::Builder::new()
+            .name("rental-lifecycle".into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a lifecycle runtime");
+                runtime.block_on(async {
+                    tokio::spawn(cozy_machine::machine::lifecycle::keep_authority(
+                        hub.clone(),
+                        keys,
+                    ));
+                    let busy = move || !service.idle().unwrap_or(false);
+                    cozy_machine::machine::lifecycle::release_when_idle(lifecycle, hub, busy).await;
+                });
+                // The Hub accepted the release: this rental ends, and this process with it.
+                std::process::exit(0);
+            })?;
+    }
     let control = bind_control(&owner)?;
     let api = std::net::TcpListener::bind((grant.listen_host, grant.worker_port))?;
     let python = layout.root.join("opt/cozy/python/bin/python3");

@@ -156,7 +156,7 @@ impl MachineIdentity {
             worker_id: retained.worker_id,
             boot_id,
             leaf_digest: tensorfs_core::sha256::digest(&cert_der),
-            keys,
+            keys: keys.into(),
         };
         authority.transcript(1).map_err(other)?;
         Ok(Self {
@@ -169,6 +169,8 @@ impl MachineIdentity {
                 .duration_since(UNIX_EPOCH)
                 .map_err(other)?
                 .as_millis() as u64,
+            lifecycle: None,
+            hubs: vec![],
         })
     }
 }
@@ -178,7 +180,7 @@ impl MachineIdentity {
     /// grant (a rental's Hub lease replaces them) and this boot's readiness receipt.
     pub fn machine(
         worker_id: String,
-        keys: Vec<VerifyingKey>,
+        keys: super::auth::Keys,
         lifetime: crate::machine::identity::Lifetime,
         readiness: std::sync::Arc<crate::machine::receipt::Readiness>,
     ) -> io::Result<Self> {
@@ -199,6 +201,8 @@ impl MachineIdentity {
                 .duration_since(UNIX_EPOCH)
                 .map_err(other)?
                 .as_millis() as u64,
+            lifecycle: None,
+            hubs: vec![],
         })
     }
 }
