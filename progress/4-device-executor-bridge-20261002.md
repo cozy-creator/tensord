@@ -83,3 +83,14 @@ receives empty Store path while owner broker uses original selected store. Trust
 scope, normal SDK no-Store path versus literal TensorFS imports/security authority, retained
 native reader/GPU mechanisms, owner whole-closure FD bound and host/GPU ownership are explicit.
 Root's earlier three SDXL A40 images are documented as legacy inference proof only.
+
+Root's paired candidate legacy/descriptor GPU runs each completed three full 1024×1024/20-step
+SDXL images. Independent CPU revalidation on pod and after copying outputs checks WebP dimensions,
+variance, exact producer BLAKE2b-128/length/SHA-256; all three images match byte-for-byte across
+source modes. Descriptor Store path is empty, capability true; PID20015 reused; model-source
+exports during all three requests are0. Native owner exported2,606 blobs; sampled owner FD peak
+2,619. Load regressed21.933s vs6.403s (+15.530s/3.426x), setup71ms/read189ms. Receiver attribution
+pending B CPU profile; Start10.643vs4.171s confounds full total comparison. Both modes still use
+69 stage round trips/image:2encode+20denoise+1decode entries and46exit/yielded acknowledgements.
+The no-per-step-RPC blanket claim is false despite no hot source RPC. Evidence in
+outputs/cm-device-20261002/descriptor-comparison/independent-cpu-verification.json and event-counts.

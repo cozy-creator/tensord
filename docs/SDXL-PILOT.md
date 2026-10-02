@@ -132,6 +132,14 @@ The pilot's trusted package runs as root on the isolated pod. Normal SDK executi
 in descriptor mode, but filesystem/catalog mutation by privileged package code is not fenced.
 Product UID/capability/seccomp isolation remains a separate gate; no security sole-writer claim.
 
+The matched candidate GPU arms completed three full SDXL images each. Empty-Store descriptor
+mode matched every legacy output hash and produced zero source exports during inference, but
+its Load took 21.933 s versus 6.403 s: 15.530 s extra. Source setup/read totals were only
+71/189 ms. Receiver work is being profiled; no faster-cold-start claim is justified. Both arms
+still made 69 stage round trips per image (encode 2, denoise 20, decode 1 entries plus 46 exit
+and yielded exchanges). Zero source RPC does not imply zero per-step policy IPC. Start timings
+are confounded by initial candidate environment imports; full-pilot ratios are unqualified.
+
 ## Isolated transfer recipe
 
 When the ordinary downloader cannot address an independently acquired pod, transfer the
