@@ -1,51 +1,71 @@
-# Cached GPU application service checkpoint
+# GPU service
 
-The authenticated native machine API can submit a published callable using a root-configured,
-verified cached package/model mapping. It uses the same Engine acceptance, journal, scheduler,
-actor authority, progress and output custody as CPU applications. There is one retained device
-executor slot, world one and one declared model slot; class/slot/component use are derived from
-the actual SDK static interface. No SDXL/Anima source or business planner is copied into Rust.
-The root-sealed config explicitly maps qualified package to installed distribution and immutable
-Catalog generation. Missing published mapping, uncached sources and unsupported operations return
-operation errors; no SDK version floor is applied.
+`gpu_service.rs` (`GpuPool`) runs published, cached GPU callables through one retained device
+executor. Acceptance, journal, progress and output custody stay in `Engine`. Scheduling stays in
+`service.rs`.
 
-`serve --gpu-config FILE` adds typed GpuConfig to the existing retained TLS service. `source_mode`
-is `auto` (default), `legacy` or `descriptors`. Auto negotiates `model_sources.descriptors/1` and
-falls back to the existing SDK/TensorFS store path. Legacy comparison still allows SDK metadata
-writers and is not sole-writer/complete Degree1 proof. Explicit descriptors mode fails only that
-operation when unavailable; it never holds an older SDK in an endless queued wait.
+## Configuration
 
-Host-owner configuration is optional and experimental. When configured, the native machine
-service authorizes the selected immutable header/components and exact actor/plan/process birth
-before accepting the sealed SDK partition FD. Grants survive observer/socket loss until actual
-recipient exit. Live revocation, disk-backed misses, initial pinned budget and refined-layout
-reuse are not qualified. Without it, the existing SDK host tier owns its allocations.
+`cozy-machine serve --gpu-config <json>` loads a root-sealed `GpuConfig`:
+- `devices`: exactly one device, exported as `CUDA_VISIBLE_DEVICES`.
+- `models: [ModelGrant { package, slot, repository, release, lane, manifest, components }]`: the only
+  authority over cached model bytes.
+- `packages: [{ package, release, distribution, generation }]`: published-package mapping.
+- `source_mode`: `auto` (descriptors if offered), `legacy`, or `descriptors` (fails if not offered).
+- `plane_budget_bytes` (default -1), `pinned_budget_bytes`, `authorized_device_limit_bytes`, `stages`.
+- `environment`: keys containing `TOKEN`, `SECRET` or `PASSWORD` are refused.
+- `host`: optional `SharedHostPlane`. `identity`: optional `{uid, gid}`.
 
-Executors launch through the installed SDK trampoline with expected parent, parent-death,
-no_new_privs and OOM score. Current scope is inherited from the launched service, without a new
-executor cgroup/UID/PGID. Birth is committed before Start imports authored code. Changing models
-requires the old context process to exit before another is spawned. On restart, bounded journal
-pages include completed retained GPU request births: live/unknown prior-owner processes fence
-all new GPU dispatch until exact exit, while CPU dispatch remains available. No timer kills,
-telemetry estimate or terminal event releases that reservation. Running work is not adopted or
-reconnected across upgrades; an authorized started attempt is never silently re-executed.
+## Preparation
 
-Results are encoded with the existing SDK codec and then copied/hashed into Engine custody,
-projected with actual schemas into native trees/outcomes. Encoding currently starts a Python
-helper for every request. Stage acknowledgements currently supply a static configured weight
-budget, not adaptive full-memory grants. A weight ceiling does not bound context, allocator,
-activation, workspace or display memory; this is not safe display-GPU admission.
+`prepare_root` reads only the installed static interface.
+- The entrypoint must declare exactly one model at `<entrypoint>.models.<param>`.
+- Choices with `source`, `profiles` or `adapters` are unsupported.
+- Exactly one `ModelGrant` must match. Declared `component_use` must be within its components.
+- The `GpuPlan` id hashes {actor, generation, entrypoint, binding}. It is journaled as a
+  `Preparation`, and `submit` records `preparation_id`.
+- An empty `installation_id` binds a `published-<hash>` installation from `packages`.
 
-CPU evidence: 35 focused process/store/auth/native tests passed, including a restart with 258
-completed requests sharing one live retained birth (one fence until actual exit), plus all-target
-clippy. An actual SDK100 trampoline CPU probe established parent-death SIGKILL, no_new_privs,
-OOMscore1000 and equal inherited cgroup with no CUDA/NVML mappings. These are component gates,
-not inference, GPU memory or ordinary CLI GPU qualification.
+## Dispatch
 
-Typed comparison templates and concrete launch/cache/consumer prerequisites are in
-`/home/fidika/cozy_v2/outputs/cozy-machine-continued-20261002/gpu-public-service/`.
-The next decision gate is a matched ordinary Creator CLI comparison on the owned headless rental:
-same client, SDK/TFS, dependency roster, weights, request, cgroups, allocator and cache states.
-Source mode and host ownership remain separate axes. Full Degree1 still needs dynamic GPU/host
-admission, context room and measured progress escalation, initial pinned limits, reclaim/cache
-policy, low-memory recovery, boot refresh, callee/input/deadline and Hub/rental/media parity.
+- One slot: GPU work dispatches only when no GPU record is active and no startup fence exists.
+  CPU dispatch continues meanwhile.
+- Startup fence: every journaled GPU birth that is live or unknown, including those of completed
+  requests, blocks GPU dispatch until it exits.
+- A cold session is spawned by the pool's `ChildLauncher`, which journals the birth. It then sends
+  Start, Load, `Budget` (if `weight_plane/1`) and Activate once. Each request sends PrepareRequest
+  and Invoke.
+- A different plan shuts the old executor down, waiting for its exit, before spawning.
+- Start happens only after `authorize_managed`.
+- Invoke must be quiescent. Then `postprocess` and `managed_result` run. A custody failure is
+  `failed`.
+- On error: never started, back to queued. Birth ended, failed. Live or unknown, stays nonterminal.
+
+Executor requests:
+- `stage_enter`/`stage_exit` are granted the static `plane_budget_bytes`.
+- `host_tier*` goes to `SharedHostPlane`, or is acknowledged if no host plane is configured.
+- `model_source_read` goes to `ModelSources`.
+- Progress counts only `advance > 0`.
+
+## Launch identity
+
+With `identity`:
+- A non-root owner may only name its own UID and GID.
+- The trampoline gets `--uid/--gid` and a new process group. Peer credentials must match.
+- The pool root and its parent become 0710, keeping their owner. Executor dirs and per-request
+  spools become identity-owned 0700.
+- The interface file and cancel marker become 0440. Journal, results and generations are never
+  changed.
+- The socket path is `<root>/executor` and at most 107 bytes. Without an identity it is
+  `/proc/<pid>/fd/<dirfd>/executor`.
+
+`ChildLauncher` spawns from one pool-owned thread, because Linux ties `PDEATHSIG` to the creating
+thread.
+
+## Known gaps
+
+- One device, world one, one model slot. No adapters.
+- Static stage budget. It does not bound context or activation memory, so it is unsafe on display GPUs.
+- One Python post helper per request.
+- No separate cgroup scope.
+- `PDEATHSIG` retention after a UID drop is unverified.
