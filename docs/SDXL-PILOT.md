@@ -83,3 +83,55 @@ The SDK's separate file receiver is required: socket Handoff/Tier are different 
 Headers/assets move through fds/spool, never an oversized control frame; SDK computes the
 existing read plan locally. These are amortized load exchanges, not step/block RPC.
 The dependency hook and native SourceDescriptor are undergoing independent qualification.
+
+## Isolated transfer recipe
+
+When the ordinary downloader cannot address an independently acquired pod, transfer the
+native-derived closure from an already verified local store. Do not transfer its SQLite
+catalog. On a new owned target, run `tfs store init TARGET` **before** copying CAS files;
+the destination's catalog must be constructed from its own verified bytes.
+
+The original published `sdxl-2.4.0-py3-none-any.whl` was recovered through the existing
+package index, without rebuilding or extracting model code into this repository. Its
+SHA-256 is `457f829c2170be7f5cd207d147e76578b2c41b493b4f001e3c2cc2c89967cfb3`, matching the
+captured installation lock. Copy this wheel and its static `package-interface.json`.
+Create a new environment, leaving the existing installation unchanged:
+
+```sh
+uv venv --python python3 /workspace/cozy-machine-pilot/sdk99
+uv pip install --python /workspace/cozy-machine-pilot/sdk99/bin/python \
+  --constraint /workspace/cozy-machine-pilot/stage/sdxl-sdk99-constraints.txt \
+  /workspace/cozy-machine-pilot/stage/sdxl-2.4.0-py3-none-any.whl \
+  'cozy-runtime[media]==0.18.99' 'tensorfs==0.3.90'
+uv pip list --python /workspace/cozy-machine-pilot/sdk99/bin/python --format json
+```
+
+The constraint file pins the other 68 captured distributions, including Torch 2.14.0,
+Diffusers 0.40.0 and Transformers 5.16.1. The captured local installation used Runtime
+0.18.67 and TensorFS 0.3.74; those two changes must be reported and matched in a comparison
+that isolates the Rust adapter. These are qualified fixture versions, not service-wide
+version floors. Package-declared dependency bounds remain authoritative.
+
+`model-source-check` derives `closure-files.txt` through the linked native core: 2,605
+relative files (one manifest plus 2,604 selected blobs). Use `rsync --files-from=...` from
+the source store into the initialized target; preserve partials on failure. The owned
+pod's sustained SSH upload failed without rate limiting, while `--bwlimit=4096` resumed
+steadily. This transport limit does not rewrite or refuse an inference request.
+After transfer, independently verify and admit the destination closure in one CPU process:
+
+```sh
+model-source-check --verify /workspace/cozy-machine-pilot/store-qualified \
+  sha256:288440e7dc660d047b23dc72efee3d9ff4d4222a35e45b4bd640848e50bee642 \
+  unet,text_encoder,text_encoder_2,vae \
+  /workspace/cozy-machine-pilot/source-qualification
+```
+
+The prepared pod configuration is `/workspace/cozy-machine-pilot/stage/sdxl-pilot.json`.
+It points at that store, the separate `sdk99` environment, its `.hold`, and a fresh output
+root. CPU `device-pilot validate` passed there with `gpu_started:false`; validation alone
+does not qualify the unfinished transfer or any CUDA/model execution.
+
+For a whole old-stack baseline, launch its actual Go machine agent: `cozy-machine run`
+owns the Runtime guardian and host handoff. The fixed `cozy-runtime-worker` takes no argv
+and needs the agent-provided configuration plus lifetime/storage fds. Launching a Python
+worker or Executor directly cannot stand in for ordinary CLI submit-to-output latency.

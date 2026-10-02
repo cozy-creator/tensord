@@ -28,3 +28,11 @@ the owned non-display rental, measured reservations and actual installed paths b
 pilot deliberately labels legacy store/single-writer/host ownership and normal API gates unqualified.
 The descriptor-source control shape is additive and world-one capability gated; SourceBlob transfers
 must be readonly regular fds. Latest explicit SDK suite 3 passed (6.47 s); pilot/SDK clippy and fmt pass.
+
+Owned A40 pod preparation is CPU-only: recovered original published SDXL 2.4.0 wheel matches
+the captured lock SHA-256; isolated sdk99 has Runtime 0.18.99/TFS 0.3.90 with 68 other distributions
+restored to captured versions. Remote pilot binary and wheel checksums match local artifacts,
+and remote `device-pilot validate` passes without launching a device. Native-derived 6.94GB
+closure transfer resumes with 4MiB/s after uncapped SSH burst failures; destination was initialized
+independently before copying files, no foreign SQLite. Root owns all model/GPU execution and
+ordinary old-stack baseline. Transfer completion and target admission remain required gates.
