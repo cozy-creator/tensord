@@ -4,6 +4,33 @@
 not implement a second scheduler, package installer, public API or authentication system.
 The machine owner admits work and resolves an immutable environment before dispatch.
 
+## Public acceptance scope
+
+The same SQLite journal generates one persistent v4 workspace UUID. `workspace_id()`
+survives service restart; a mismatched expected workspace fails that public operation.
+Private `submit(key, invocation)` remains unchanged. No second journal owns public receipts.
+
+`submit_public(SubmissionContext, invocation)` commits the verified actor key ID, request,
+submission, expected workspace and authored capture/invocation/payload/publication identities
+with acceptance. Actor/request and actor/submission have unique indexes. Equivalent retries
+return the exact receipt; changed immutable bindings conflict without replacing accepted work.
+`publication_authorization_id` is an immutable deployed reference; changing it requires a new
+submission. Credentials, refreshed source credentials and grant secret values do not belong
+in this context or journal. The API authenticator supplies the verified actor; a capture's
+`record_owner` label never selects authority.
+
+`get_public(actor, request_id)` and `list_actor(actor, limit)` use actor-scoped indexed rows.
+`close_submission(actor, submission_id, request_id, expected_workspace)` commits an acceptance
+tombstone. If acceptance already won, it returns the exact existing receipt and never cancels
+the run. If closure won, later acceptance is refused as that closed operation. Request/submission
+rebinding conflicts. Acceptance and closure share one immediate transaction boundary; no controller
+disconnect or mere closure acts as cancellation. Typed `AdmissionError` values are carried inside
+`io::Error` for adapters to map workspace mismatch, binding conflict and closed submission.
+
+Digest references bind consumed authored content/custody, not deployment versions or source SHAs.
+The public adapter must validate their meaning and authorization before calling this foundation;
+it must not pass credential/grant values as Invocation inputs.
+
 ## Owner API
 
 ```rust
@@ -122,8 +149,8 @@ mutation, but this CPU foundation does not claim to contain untrusted packages.
 
 ## Evidence
 
-`cargo test --test durable_execution` passed thirteen actual-process/socket/filesystem cases
-(0.31 s; one explicitly invoked child helper is ignored by the parent harness):
+`cargo test --test durable_execution` passed sixteen actual-process/socket/filesystem cases
+(2.10 s; one explicitly invoked child helper is ignored by the parent harness):
 CPU matrix inference and persisted output; observer-safe duplicate acceptance; explicit
 executor SIGKILL without repeated effects; actor-attributed cooperative cancel; visible
 launch failure followed by changed-interpreter retry; symlink escape and mutation detection;
@@ -143,6 +170,10 @@ reopens the monotonic terminal revision; an older record without the optional ce
 An actual two-package test blocks an owner scheduler on the activity epoch: first completion
 wakes it to dispatch the next queued CPU package, with both durable outputs completed. A zero
 observation wait leaves running state unchanged; indexed queries omit terminal history.
+Public cases verify stable workspace identity, operation-local mismatch, actor isolation,
+immutable binding conflicts and reopen. Closing a running CPU inference leaves it running and
+it completes normally; closing absent acceptance blocks a late submit. Sixteen concurrent
+accept/close races each produce exactly one durable known outcome.
 
 These are supervision component checks. Ordinary Creator CLI, installed Runtime author
 bridge, full public-service crash boundaries, systemd/container reaping, browser/Hub consumers,

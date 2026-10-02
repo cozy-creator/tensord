@@ -32,3 +32,9 @@ Activity follow-up: Engine publishes a bounded Condvar epoch for authoritative s
 the root owns scheduling. Partial indexes support ready/active/nonterminal queries and keep
 recovery off terminal history. An actual completion wakes the owner scheduler to dispatch a
 second queued package. Thirteen focused tests pass (0.31 s); fmt and clippy pass.
+
+Public acceptance follow-up: persistent journal-owned workspace UUID, verified actor/request/
+submission context, indexed scoped reads, immutable binding checks and atomic close tombstones.
+Closure returns existing receipts without canceling accepted work. No credentials/grant values
+are stored. Sixteen focused cases pass (2.10 s), including real inference through a close and
+sixteen concurrent acceptance/closure races. UUID v4 uses the standard `uuid` dependency.

@@ -20,6 +20,49 @@ pub struct Invocation {
     pub input: Value,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SubmissionContext {
+    pub actor: String,
+    pub request_id: String,
+    pub submission_id: String,
+    pub expected_workspace_id: String,
+    pub capture_digest: String,
+    pub invocation_digest: String,
+    pub payload_digest: String,
+    pub publication_authorization_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AdmissionError {
+    WorkspaceMismatch,
+    BindingConflict,
+    SubmissionClosed,
+}
+impl std::fmt::Display for AdmissionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::WorkspaceMismatch => {
+                "expected workspace differs from this durable machine workspace"
+            }
+            Self::BindingConflict => {
+                "request or submission is already bound to different authored semantics"
+            }
+            Self::SubmissionClosed => "submission was durably closed before acceptance",
+        })
+    }
+}
+impl std::error::Error for AdmissionError {}
+
+fn admission(error: AdmissionError) -> io::Error {
+    let kind = match error {
+        AdmissionError::WorkspaceMismatch => io::ErrorKind::InvalidInput,
+        AdmissionError::BindingConflict => io::ErrorKind::AlreadyExists,
+        AdmissionError::SubmissionClosed => io::ErrorKind::PermissionDenied,
+    };
+    io::Error::new(kind, error)
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum State {
@@ -73,6 +116,8 @@ pub struct Execution {
     pub id: String,
     pub idempotency_key: String,
     pub invocation: Invocation,
+    #[serde(default)]
+    pub submission: Option<SubmissionContext>,
     pub state: State,
     pub revision: u64,
     /// Reserved observation cursor ceiling. Older stored records default to no reservation.
@@ -112,6 +157,7 @@ impl ProgressSnapshot {
 
 pub struct Journal {
     connection: Connection,
+    workspace_id: String,
 }
 
 fn db_error(error: impl std::fmt::Display) -> io::Error {
@@ -147,8 +193,78 @@ impl Journal {
               WHERE state='queued' AND json_extract(record,'$.waiting_reason') IS NULL;",
             )
             .map_err(db_error)?;
+        // Add consumed index columns without rewriting any older private records.
+        let columns: Vec<String> = {
+            let mut statement = connection
+                .prepare("PRAGMA table_info(executions)")
+                .map_err(db_error)?;
+            let rows = statement
+                .query_map([], |row| row.get(1))
+                .map_err(db_error)?;
+            rows.collect::<Result<_, _>>().map_err(db_error)?
+        };
+        for column in ["actor", "request_id", "submission_id"] {
+            if !columns.iter().any(|existing| existing == column) {
+                connection
+                    .execute(
+                        &format!("ALTER TABLE executions ADD COLUMN {column} TEXT"),
+                        [],
+                    )
+                    .map_err(db_error)?;
+            }
+        }
+        connection.execute_batch("CREATE TABLE IF NOT EXISTS machine_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS submission_closures(actor TEXT NOT NULL,submission_id TEXT NOT NULL,request_id TEXT NOT NULL,workspace_id TEXT NOT NULL,closed_ms INTEGER NOT NULL,PRIMARY KEY(actor,submission_id));
+            CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_request ON executions(actor,request_id) WHERE actor IS NOT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_submission ON executions(actor,submission_id) WHERE actor IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS executions_actor_order ON executions(actor,id) WHERE actor IS NOT NULL;").map_err(db_error)?;
+        let existing: Option<String> = connection
+            .query_row(
+                "SELECT value FROM machine_metadata WHERE key='workspace_id'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        if existing.is_none() {
+            connection
+                .execute(
+                    "INSERT OR IGNORE INTO machine_metadata(key,value) VALUES('workspace_id',?1)",
+                    [uuid::Uuid::new_v4().to_string()],
+                )
+                .map_err(db_error)?;
+        }
+        let workspace_id = connection
+            .query_row(
+                "SELECT value FROM machine_metadata WHERE key='workspace_id'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
         fs::File::open(root)?.sync_all()?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            workspace_id,
+        })
+    }
+
+    pub fn workspace_id(&self) -> &str {
+        &self.workspace_id
+    }
+
+    pub fn accept_public(
+        &mut self,
+        context: SubmissionContext,
+        invocation: Invocation,
+    ) -> io::Result<Execution> {
+        self.validate_workspace(&context.expected_workspace_id)?;
+        validate_scope(&context.actor, &context.request_id, &context.submission_id)?;
+        // An escaped tuple is an unambiguous selector encoding, not a version/fingerprint gate.
+        let key = format!(
+            "public:{}",
+            encoded(&(context.actor.as_str(), context.submission_id.as_str()))?
+        );
+        self.accept_bound(&key, invocation, Some(context))
     }
 
     /// A successful return is an acceptance receipt: FULL WAL commit precedes it.
@@ -160,11 +276,20 @@ impl Journal {
                 "idempotency key must contain 1..512 bytes",
             ));
         }
+        self.accept_bound(key, invocation, None)
+    }
+
+    fn accept_bound(
+        &mut self,
+        key: &str,
+        invocation: Invocation,
+        context: Option<SubmissionContext>,
+    ) -> io::Result<Execution> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_error)?;
-        let prior: Option<String> = tx
+        let mut prior: Option<String> = tx
             .query_row(
                 "SELECT record FROM executions WHERE idempotency_key=?1",
                 [key],
@@ -172,9 +297,22 @@ impl Journal {
             )
             .optional()
             .map_err(db_error)?;
+        if let Some(context) = &context {
+            if prior.is_none() {
+                prior = public_prior(
+                    &tx,
+                    &context.actor,
+                    &context.request_id,
+                    &context.submission_id,
+                )?;
+            }
+        }
         if let Some(prior) = prior {
             let execution: Execution = serde_json::from_str(&prior).map_err(db_error)?;
-            if execution.invocation != invocation {
+            if execution.invocation != invocation || execution.submission != context {
+                if context.is_some() {
+                    return Err(admission(AdmissionError::BindingConflict));
+                }
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     "idempotency key already identifies a different invocation",
@@ -182,11 +320,18 @@ impl Journal {
             }
             return Ok(execution);
         }
-        tx.execute("INSERT INTO executions(idempotency_key,invocation,record,state,updated_ms) VALUES(?1,?2,'{}','queued',?3)", params![key, encoded(&invocation)?, timestamp()]).map_err(db_error)?;
+        if let Some(context) = &context {
+            let closed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM submission_closures WHERE actor=?1 AND submission_id=?2)", params![context.actor,context.submission_id], |row| row.get(0)).map_err(db_error)?;
+            if closed {
+                return Err(admission(AdmissionError::SubmissionClosed));
+            }
+        }
+        tx.execute("INSERT INTO executions(idempotency_key,invocation,record,state,updated_ms,actor,request_id,submission_id) VALUES(?1,?2,'{}','queued',?3,?4,?5,?6)", params![key, encoded(&invocation)?, timestamp(),context.as_ref().map(|context|context.actor.as_str()),context.as_ref().map(|context|context.request_id.as_str()),context.as_ref().map(|context|context.submission_id.as_str())]).map_err(db_error)?;
         let execution = Execution {
             id: tx.last_insert_rowid().to_string(),
             idempotency_key: key.into(),
             invocation,
+            submission: context,
             state: State::Queued,
             revision: 1,
             revision_ceiling: 1,
@@ -219,6 +364,90 @@ impl Journal {
         let value = value
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "execution does not exist"))?;
         serde_json::from_str(&value).map_err(db_error)
+    }
+
+    pub fn get_public(&self, actor: &str, request_id: &str) -> io::Result<Execution> {
+        let value: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT record FROM executions WHERE actor=?1 AND request_id=?2",
+                params![actor, request_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        serde_json::from_str(&value.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "public execution does not exist for this actor",
+            )
+        })?)
+        .map_err(db_error)
+    }
+
+    pub fn list_actor(&self, actor: &str, limit: usize) -> io::Result<Vec<Execution>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT record FROM executions WHERE actor=?1 ORDER BY id LIMIT ?2")
+            .map_err(db_error)?;
+        let records = statement
+            .query_map(params![actor, limit.min(i64::MAX as usize) as i64], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(db_error)?;
+        records
+            .map(|record| serde_json::from_str(&record.map_err(db_error)?).map_err(db_error))
+            .collect()
+    }
+
+    /// Closure is a durable acceptance tombstone, never implicit execution cancellation.
+    pub fn close_submission(
+        &mut self,
+        actor: &str,
+        submission_id: &str,
+        request_id: &str,
+        expected_workspace_id: &str,
+    ) -> io::Result<Option<Execution>> {
+        self.validate_workspace(expected_workspace_id)?;
+        validate_scope(actor, request_id, submission_id)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        let existing = public_prior(&tx, actor, request_id, submission_id)?;
+        let existing: Option<Execution> = existing
+            .map(|record| serde_json::from_str(&record).map_err(db_error))
+            .transpose()?;
+        if let Some(record) = &existing {
+            let context = record
+                .submission
+                .as_ref()
+                .ok_or_else(|| admission(AdmissionError::BindingConflict))?;
+            if context.request_id != request_id || context.submission_id != submission_id {
+                return Err(admission(AdmissionError::BindingConflict));
+            }
+        }
+        let prior: Option<String> = tx
+            .query_row(
+                "SELECT request_id FROM submission_closures WHERE actor=?1 AND submission_id=?2",
+                params![actor, submission_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        if prior.is_some_and(|prior| prior != request_id) {
+            return Err(admission(AdmissionError::BindingConflict));
+        }
+        tx.execute("INSERT OR IGNORE INTO submission_closures(actor,submission_id,request_id,workspace_id,closed_ms) VALUES(?1,?2,?3,?4,?5)", params![actor,submission_id,request_id,expected_workspace_id,timestamp()]).map_err(db_error)?;
+        tx.commit().map_err(db_error)?;
+        Ok(existing)
+    }
+
+    fn validate_workspace(&self, expected: &str) -> io::Result<()> {
+        if expected != self.workspace_id {
+            return Err(admission(AdmissionError::WorkspaceMismatch));
+        }
+        Ok(())
     }
 
     pub fn list(&self) -> io::Result<Vec<Execution>> {
@@ -468,4 +697,43 @@ pub enum Outcome {
     Completed(ResultRecord),
     Failed(String),
     Canceled,
+}
+
+fn validate_scope(actor: &str, request_id: &str, submission_id: &str) -> io::Result<()> {
+    if [actor, request_id, submission_id]
+        .iter()
+        .any(|value| value.is_empty() || value.len() > 512)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "actor, request and submission identities must contain 1..512 bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn public_prior(
+    tx: &rusqlite::Transaction<'_>,
+    actor: &str,
+    request_id: &str,
+    submission_id: &str,
+) -> io::Result<Option<String>> {
+    let request: Option<String> = tx
+        .query_row(
+            "SELECT record FROM executions WHERE actor=?1 AND request_id=?2",
+            params![actor, request_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db_error)?;
+    if request.is_some() {
+        return Ok(request);
+    }
+    tx.query_row(
+        "SELECT record FROM executions WHERE actor=?1 AND submission_id=?2",
+        params![actor, submission_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(db_error)
 }
