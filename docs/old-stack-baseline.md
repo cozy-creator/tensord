@@ -123,3 +123,13 @@ V3's CPU `selection` action was checked against the actual installed interface a
 repository, with Torch absent and no GPU calls. Fresh fixture config uses an independent
 identity, root `old-stack-sdk99-3` and port 18444, retaining the same SDK environment. The
 parent explicitly stops the previous idle fixture before running it; old failure logs remain.
+
+V3 then completed model preparation but its first accepted execution returned a durable
+REFUSED outcome before executor activation: the owned benchmark root made the standard
+placement socket 118 bytes before its NUL terminator. Released SDK99 uses
+`<root>/run/cozy/worker/placements/<24hex>/executor.sock` (`session.py:1306–1308`,
+`child.py:439`), guarded against Linux's 108-byte capacity (`child.py:90–103`). V4 keeps
+that source unchanged and prepares the shorter root `/workspace/cm-old4/root`, port 18445,
+with a new machine/key identity and the same SDK/store/requests. Its CPU preparation calls
+the actual SDK socket guard before creating files and records the prospective socket length.
+Every terminal, including refusals, is now retained before the driver checks success.
