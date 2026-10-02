@@ -22,6 +22,7 @@ rcgen = { version = "0.14", features = ["pem", "ring"] }
 base64 = "0.22"
 hmac = "0.12"
 sha2 = "0.10"
+tar = "0.4"
 
 [build-dependencies]
 tonic-prost-build = "0.14.6"

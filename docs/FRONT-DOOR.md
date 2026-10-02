@@ -11,6 +11,8 @@ worker-protocol schema. Every implemented operation verifies the current client'
 Ed25519 ClaimProof bound to worker identity, boot identity and TLS leaf. ProtocolInfo
 and the HMAC-authenticated bootstrap receipt are the existing bootstrap exceptions.
 Version numbers report provenance; no accepted operation refuses a peer by version.
+The service advertises baseline minimum 0 so an old controller does not refuse
+the connection through a reported floor. Missing capabilities affect one operation.
 
 First qualification: private fixture endpoints, real Go protobuf clients and TLS pins,
 valid/invalid signatures, old/new/additive peers, identity/readiness, Control ClaimAck,
@@ -33,6 +35,9 @@ as unsupported. A completed/disconnected observer never cancels a durable run.
 
 `MachineBackend` is a typed adapter into the single execution engine. Supported
 run methods validate their direct or nested Claim before invoking that backend.
+Every backend operation receives `VerifiedActor`, derived from the verified
+Ed25519 public key. Claim's caller-selected `record_owner_id` is not signed by
+ClaimProof and is never resource authority. Upload operations are owner-key-scoped.
 It owns no scheduler/journal/store; unsupported backend operations return
 UNIMPLEMENTED for that operation. Blocking storage operations run outside Tokio's
 network threads. Mutation completion is independent of observer liveness. A future
@@ -73,7 +78,60 @@ ClaimProof document. The latest evidence belongs under
 `outputs/cozy-machine-continued-20261002/front-door-gate/`.
 
 This is a real transport/auth gate, not an ordinary `cozy run` or inference gate.
-Full CLI intake still requires LocalPackageUpload, PrepareLocalPackage/PackageSet,
+Full CLI execution still requires engine-backed PrepareLocalPackage/PackageSet,
 workspace identity, captured offers, native input custody, long-poll execution
 events, products/outcomes and output collection backed by the execution engine.
 Hub/browser/installer/update and old binary consumers remain separate gates.
+
+## Source ingress and real Creator capture
+
+`WorkspaceUploads` implements the deployed LocalPackageUpload header/chunk stream,
+with a durable prefix acknowledged after each bounded chunk. It retains prefixes
+across disconnect/restart, refuses a changed known identity under the same owner
+operation, and serializes concurrent writers with an actual operation file lock.
+Schema transfer bounds apply to source carriers, wheels, chunk sizes and inventories.
+These are control/source transport limits, not inference memory admission minima.
+
+The standard tar crate validates source archives statically: safe unique regular
+members, no links/devices/traversal, bounded expansion/extension records, and root
+pyproject.toml/uv.lock. Package code is never imported or executed for this scan.
+TensorFS's released source-artifact importer verifies and durably retains carriers
+before VERIFIED. No store, tar format or hash implementation is copied. CAS hashes
+establish custody; the source digest stays absent on the deployed wire and never
+becomes a package/deployment fingerprint.
+
+The installer receives `UploadedPackage` with typed `RootSet` metadata and verified
+object descriptors. It opens bytes through TensorFS verified descriptors; no caller
+path chooses machine files. RootSet compares only consumed typed metadata for an
+operation replay, tolerating unknown optional fields. `prepare_local` remains
+UNIMPLEMENTED until an actual installer/engine backend implements it. After durable
+environment materialization, the installer can release transfer custody explicitly.
+Global abandoned-upload cache pressure/reclamation still needs integration.
+
+`tests/creator_capture_client` imports the current Creator helpers read-only:
+WriteSourceArchive, LocalPackageSelection, canonical ClaimProof and UploadFile.
+It transfers a 3.8 MB real source archive, interrupts after a durable 1 MiB prefix,
+then uses Creator's actual pipelined uploader to resume and verify it. Replaying a
+verified header works without the laptop carrier or its unsigned owner label.
+Preparation correctly returns UNIMPLEMENTED from the inspection backend.
+
+The fixture uses a temporary module configuration in the evidence directory with
+a read-only Creator path replacement, preserving the source checkout. This is
+consumer-source reuse for qualification, not a shipped local-path dependency:
+
+```sh
+cd tests/creator_capture_client
+cp go.mod /path/to/evidence/gate.mod
+go mod edit -modfile /path/to/evidence/gate.mod \
+  -replace github.com/cozy-creator/cozy=/path/to/readonly/cozy-creator
+GOPRIVATE=github.com/cozy-creator/* GONOSUMDB=github.com/cozy-creator/* \
+  go mod tidy -modfile /path/to/evidence/gate.mod
+go run -p 2 -modfile /path/to/evidence/gate.mod . \
+  --machine ../../target/debug/front-door --output /path/to/owned/evidence
+```
+
+Evidence: `outputs/cozy-machine-continued-20261002/creator-capture-gate/results.json`;
+read-only Creator source head `84830df01e132e9197346e1c62cba2536f54989f`.
+The separate real filesystem/TensorFS tests cover restart/resume, owner isolation,
+native verification, archive safety, checksum refusal and installer cleanup. These
+qualify source intake; they do not establish installation or inference correctness.

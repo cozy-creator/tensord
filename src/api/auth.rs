@@ -12,8 +12,13 @@ pub struct Authority {
     pub keys: Vec<VerifyingKey>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VerifiedActor {
+    pub public_key: [u8; 32],
+}
+
 impl Authority {
-    pub fn verify(&self, claim: Option<&Claim>) -> Result<(), Status> {
+    pub fn verify(&self, claim: Option<&Claim>) -> Result<VerifiedActor, Status> {
         let claim = claim.ok_or_else(|| Status::unauthenticated("the call carries no Claim"))?;
         if claim.worker_id != self.worker_id || claim.worker_boot_id != self.boot_id {
             return Err(Status::unauthenticated(
@@ -23,12 +28,14 @@ impl Authority {
         let bytes = self.transcript(claim.record_owner_epoch)?;
         let signature = Signature::from_slice(&claim.proof)
             .map_err(|_| Status::unauthenticated("Claim signature must be 64 bytes"))?;
-        if self
+        if let Some(key) = self
             .keys
             .iter()
-            .any(|key| key.verify_strict(&bytes, &signature).is_ok())
+            .find(|key| key.verify_strict(&bytes, &signature).is_ok())
         {
-            Ok(())
+            Ok(VerifiedActor {
+                public_key: key.to_bytes(),
+            })
         } else {
             Err(Status::unauthenticated(
                 "Claim is not signed by an authorized machine key",
