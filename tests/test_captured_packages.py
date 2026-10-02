@@ -7,9 +7,10 @@ from pathlib import Path
 import pytest
 import tomllib
 
-from cozy_machine_client.captured_packages import install_captured
+from cozy_machine_client.captured_packages import install_captured, installed_description
 from cozy_machine_client.packages import GenerationHold, PackageError
 from cozy_machine_client.execution_protocol import Result
+from cozy_machine_client.package_records import GENERATION_DECODER
 from test_package_bridge import FIXTURE, ROOT, spawn_runner, send_command, invoke, terminal, finish
 
 
@@ -77,3 +78,40 @@ def test_incoherent_source_lock_overlay_and_python_mismatch_refuse_only_installa
             distribution="cozy-machine-cpu-classifier", release="0.1.0", python_requires="", python_version="3.11",
             generations=root / "unsupported", client_wheel=client, python="3.12")
     assert_inference(generation, root / "surviving-result")
+
+
+def test_rust_tensorfs_materialization_and_trusted_installer_run_real_classifier(capture):
+    import sys
+    root, source, client, frozen = capture
+    archive = root / "source.tar"
+    subprocess.run(["tar", "-cf", str(archive), "-C", str(source), "pyproject.toml", "uv.lock", "package.toml", "cpu_classifier"], check=True)
+    output = root / "rust-owner-install"
+    subprocess.run([str(ROOT / "target/debug/install-capture"), "--archive", str(archive), "--output", str(output),
+        "--helper-python", sys.executable, "--client-wheel", str(client), "--python", "3.12",
+        "--package", "local/cozy-machine-cpu-classifier", "--release", "0.1.0"], check=True)
+    generation = GENERATION_DECODER.decode((output / "prepared-generation.json").read_bytes())
+    assert json.loads((output / "package-interface.json").read_bytes()) == json.loads(bytes(generation.interface))
+    assert {row.name: row.version for row in generation.dependencies}["cozy-runtime"] == "0.18.89"
+    assert_inference(generation, root / "rust-owner-result")
+
+
+def test_installer_only_helper_uses_locked_sdk_and_static_reader_skips_pth(capture):
+    root, source, client, frozen = capture
+    helper = root / "installer-only-helper"
+    subprocess.run(["uv", "venv", "--python", "3.14", str(helper)], check=True)
+    python = helper / "bin/python"
+    subprocess.run(["uv", "pip", "install", "--python", str(python), str(client), "packaging"], check=True)
+    subprocess.run([str(python), "-c", "import importlib.util;assert importlib.util.find_spec('cozy_runtime') is None"], check=True)
+    process = subprocess.run([str(python), "-m", "cozy_machine_client.packages", "install-captured",
+        "--project", str(source), "--generations", str(root / "minimal-helper-generations"), "--client-wheel", str(client),
+        "--distribution", "cozy-machine-cpu-classifier", "--release", "0.1.0", "--python", "3.12"], check=True, capture_output=True)
+    generation = GENERATION_DECODER.decode(process.stdout)
+    assert {row.name: row.version for row in generation.dependencies}["cozy-runtime"] == "0.18.89"
+    site = next(Path(generation.python).parents[1].glob("lib/python*/site-packages"))
+    sentinel = root / "pth-must-not-run-during-static-description"
+    pth = site / "authored-startup.pth"
+    pth.write_text(f"import pathlib;pathlib.Path({str(sentinel)!r}).write_text('executed')\n")
+    installed_description(generation.package, Path(generation.python))
+    assert not sentinel.exists()
+    pth.unlink()  # uniquely owned authored test fixture, not user source/work
+    assert_inference(generation, root / "minimal-helper-result")
