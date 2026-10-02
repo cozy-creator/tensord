@@ -119,8 +119,9 @@ Total wall time starts inside the run entry point; it is not stopped-machine/SSH
 Source exports/bytes and aggregate broker read time are recorded, with per-request export counts
 to reveal lazy source work during the first invocation. Broker read time excludes control
 transport and receiver verification; Load/request wall time includes them. Receiver cache hits
-remain unknown without its own telemetry. `owner_fd_peak` is sampled at admission/each export,
-not continuous process-wide maximum.
+remain unknown without its own telemetry. `owner_fd_peak` is sampled at admission, completed
+load/request and shutdown boundaries, with `owner_fd_samples` recording coverage; it is not a
+continuous process-wide maximum. No object grant scans the complete owner descriptor table.
 
 The released owner native ReadLease retains one verified FD per selected object and raises its
 soft limit toward its hard limit; this pilot reports that existing behavior rather than applying
@@ -144,6 +145,12 @@ The optional typed `"stages":false` config disables negotiated stage turns for a
 single-executor, fixed-allowance causal test. Omitted/default Auto preserves existing capability
 selection. Device authorization and plane/pinned budget requirements remain; this option does
 not define product policy for shared GPUs or authorize removing coordination/safety gates.
+
+The initial descriptor Load timing includes a pilot instrumentation defect: a full owner-FD
+scan after every grant, about 6.8 million enumerated entries. The efficient-observation binary
+keeps exact exports/bytes and every integrity check, sampling FD counts at six phase boundaries
+for three requests. Its hardware rerun must establish source cost before the initial regression
+is attributed to the design. Native source constructor/SHA work remains separately measured.
 
 ## Isolated transfer recipe
 

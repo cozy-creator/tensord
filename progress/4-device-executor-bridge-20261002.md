@@ -99,3 +99,9 @@ Typed optional stages:false now selects a controlled single-executor, fixed-allo
 absent/default Auto preserves negotiation. Device authorization and plane/pinned budgets stay
 unchanged. Fresh no-stages candidate legacy config preserves requests/snapshots/dependencies.
 No GPU execution by this agent; Root decides/owns warm legacy and stage-cost runs.
+
+B identified the pilot's per-grant FD scan as quadratic instrumentation: 2,606 exports times
+about 2,604 open descriptors, ~6.8 million entries outside broker read timing. Removed that scan;
+exact grant/byte counters and all integrity checks stay unchanged. Owner sampled FD peak now
+uses admission/load/three request completions/shutdown only, with six samples explicitly counted.
+Initial 21.933 s Load regression is observer-confounded, pending Root's same-profile rerun.

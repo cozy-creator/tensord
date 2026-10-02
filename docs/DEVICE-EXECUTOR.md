@@ -132,6 +132,15 @@ attributed result. Three-run invoke means are 4.792/4.795 s and do not qualify e
 latency for streaming, 8 GB GPUs, Anima or H3. Start's first-environment import/cache difference
 confounds a whole-pilot ratio; this is not a full cold-start comparison.
 
+Those initial Load values are also observer-confounded: the pilot scanned about 2,604 owner
+FD entries after each of 2,606 exports (about 6.8 million entries), outside `read_wall_ms`.
+The fix preserves all source/integrity work and exact counters, sampling FDs only at admission,
+completed load/request and shutdown boundaries. Its `owner_fd_samples` reports coverage; the
+peak is sampled, not reconstructed. The reduced-observation hardware rerun is still required
+before assigning the 15.530 s gap to the source design. Separate profiling measured source
+construction/verification at 6.558 s over 6.938 GB on CPU; same-FD OpenSSL hashing took 6.910 s,
+so replacing the already-dispatched SHA implementation has no demonstrated benefit.
+
 Both arms log 69 stage round trips per image: StageEnter encode 2, denoise 20, decode 1;
 StageExit 46 (first exit plus explicit yielded acknowledgement). Thus there are three stage
 round trips per denoise step even though model-source RPCs are zero during inference. A blanket

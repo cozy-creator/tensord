@@ -58,6 +58,7 @@ struct SourceEvidence {
     exported_bytes: u64,
     read_wall_ms: f64,
     owner_fd_peak: usize,
+    owner_fd_samples: u64,
     // The provider's cache is private; absence of an RPC is not a measured cache hit.
     receiver_cache_hits: Option<u64>,
 }
@@ -69,6 +70,16 @@ struct Turns {
     phase: String,
     sources: Option<Arc<Mutex<ModelSources>>>,
     source_evidence: SourceEvidence,
+}
+impl Turns {
+    fn sample_source_fds(&mut self) -> io::Result<()> {
+        if self.sources.is_some() {
+            self.source_evidence.owner_fd_peak =
+                self.source_evidence.owner_fd_peak.max(fd_count()?);
+            self.source_evidence.owner_fd_samples += 1;
+        }
+        Ok(())
+    }
 }
 impl Services for Turns {
     fn progress(&mut self, frame: &Frame) {
@@ -99,7 +110,6 @@ impl Services for Turns {
                 device_executor::SourceRole::Object => evidence.objects += 1,
                 device_executor::SourceRole::Unknown => (),
             }
-            evidence.owner_fd_peak = evidence.owner_fd_peak.max(fd_count()?);
             // Caller transfers one readonly descriptor and closes this duplicate immediately.
             return Ok((answer, Some(file)));
         }
@@ -265,6 +275,7 @@ fn run() -> io::Result<()> {
         turns.source_evidence.selected_objects = objects as u64;
         turns.source_evidence.selected_bytes = bytes;
         turns.source_evidence.owner_fd_peak = fd_count()?;
+        turns.source_evidence.owner_fd_samples = 1;
         let sources = Arc::new(Mutex::new(sources));
         executor.retain_until_exit(Arc::clone(&sources));
         turns.sources = Some(sources);
@@ -318,6 +329,7 @@ fn run() -> io::Result<()> {
             loaded.code, loaded.detail
         )));
     }
+    turns.sample_source_fds()?;
     fs::write(
         config.root.join("load-facts.json"),
         serde_json::to_vec_pretty(&loaded.facts)?,
@@ -393,6 +405,7 @@ fn run() -> io::Result<()> {
         let start = Instant::now();
         let (result, bindings) = postprocess(&executor.codec(), &spool, &reply)?;
         let post_ms = start.elapsed().as_secs_f64() * 1000.;
+        turns.sample_source_fds()?;
         results.push(RunEvidence {
             id,
             pid: executor.birth.pid,
@@ -416,6 +429,7 @@ fn run() -> io::Result<()> {
     }
     let shutdown_started = Instant::now();
     executor.shutdown()?;
+    turns.sample_source_fds()?;
     timings.insert(
         "shutdown_ms",
         shutdown_started.elapsed().as_secs_f64() * 1000.,
