@@ -1,6 +1,7 @@
 //! Compile the standalone native intake module without adding a second service owner.
 pub use cozy_machine::api;
 #[path = "../src/native_inputs.rs"]
+#[allow(dead_code)] // Standalone type-check mirror; production Engine uses the real module.
 mod native_inputs;
 
 #[test]
