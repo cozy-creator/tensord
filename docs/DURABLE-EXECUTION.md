@@ -82,7 +82,9 @@ Only after the executor terminates successfully does the machine copy declared r
 files into its private results tree, hash them with TensorFS SHA-256, fsync bytes/permissions,
 rename, and fsync destination directories. Paths are opened component-by-component using
 `openat` plus `O_NOFOLLOW`; absolute paths, parent escapes and symlinks are rejected.
-The journal's completed record then commits the result and content identities. Incomplete
+Final inodes are inspected with `O_PATH` before reopening the retained regular file, so a
+declared FIFO cannot block custody and a special-device artifact cannot make the core open
+a driver. The journal's completed record then commits the result and content identities. Incomplete
 copies and uncommitted files cannot produce a successful receipt; replay cannot acknowledge
 new bytes for an old completion. Reads verify the stored digest and length before exposure.
 
@@ -94,13 +96,15 @@ mutation, but this CPU foundation does not claim to contain untrusted packages.
 
 ## Evidence
 
-`cargo test --test durable_execution` passed eight actual-process/socket/filesystem cases:
+`cargo test --test durable_execution` checks actual-process/socket/filesystem cases:
 CPU matrix inference and persisted output; observer-safe duplicate acceptance; explicit
 executor SIGKILL without repeated effects; actor-attributed cooperative cancel; visible
 launch failure followed by changed-interpreter retry; symlink escape and mutation detection;
 live exact-birth retention after journal reopen; and never-authorized restart retry after
-exact termination. Test deadlines only bound observations; they never kill a package.
+exact termination. An actual Rust-owner SIGKILL case also keeps a live orphan's obligation,
+then settles failure after that exact birth ends without repeating effects. Test deadlines
+only bound observations; they never kill a package.
 
 These are supervision component checks. Ordinary Creator CLI, installed Runtime author
-bridge, actual service crash boundaries, systemd/container reaping, browser/Hub consumers,
+bridge, full public-service crash boundaries, systemd/container reaping, browser/Hub consumers,
 child calls and diffusion/GPU/NCCL qualification remain separate required gates.
