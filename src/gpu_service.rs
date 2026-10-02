@@ -834,8 +834,9 @@ struct Callbacks<'a> {
 }
 impl Services for Callbacks<'_> {
     fn progress(&mut self, frame: &Frame) {
-        if frame.request_id.is_empty() || frame.request_id == self.id {
-            self.completed = self.completed.saturating_add(frame.advance.max(1));
+        // Zero-advance frames are telemetry (stage/position), not completed work.
+        if frame.advance > 0 && (frame.request_id.is_empty() || frame.request_id == self.id) {
+            self.completed = self.completed.saturating_add(frame.advance);
             let _ = self
                 .engine
                 .observe_progress(self.id, self.completed, frame.stage.clone());
