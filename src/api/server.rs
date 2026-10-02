@@ -1,11 +1,9 @@
 use super::{auth::Authority, backend::MachineBackend, pb, WIRE_MINIMUM, WIRE_MINOR};
+use crate::machine::receipt::{self, Readiness};
 use axum::{
     http::{HeaderMap, StatusCode},
     routing::get,
 };
-use base64::{engine::general_purpose::STANDARD, Engine};
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 use std::{
     pin::Pin,
     sync::{
@@ -25,7 +23,7 @@ pub struct MachineIdentity {
     pub cert_pem: String,
     pub key_pem: String,
     pub cert_der: Vec<u8>,
-    pub receipt_key: Vec<u8>,
+    pub readiness: Arc<Readiness>,
     pub started_at_ms: u64,
 }
 
@@ -56,41 +54,8 @@ impl MachineIdentity {
             cert_pem: cert.pem(),
             key_pem: signing_key.serialize_pem(),
             cert_der,
-            receipt_key,
+            readiness: Readiness::open(None, Some(receipt_key), false)?,
             started_at_ms: now_ms(),
-        })
-    }
-
-    fn receipt(&self, port: u16) -> Result<Vec<u8>, serde_json::Error> {
-        #[derive(serde::Serialize)]
-        struct Receipt<'a> {
-            pod_boot_id: &'a str,
-            worker_internal_port: u16,
-            tls_certificate_der_base64: String,
-            runtime_gpus: Vec<serde_json::Value>,
-            machine_version: &'a str,
-            machine_capabilities: Vec<&'a str>,
-        }
-        #[derive(serde::Serialize)]
-        struct Envelope {
-            payload: String,
-            hmac_sha256: String,
-        }
-        let payload = serde_json::to_vec(&Receipt {
-            pod_boot_id: &self.authority.boot_id,
-            worker_internal_port: port,
-            tls_certificate_der_base64: STANDARD.encode(&self.cert_der),
-            runtime_gpus: vec![],
-            machine_version: env!("CARGO_PKG_VERSION"),
-            machine_capabilities: vec![],
-        })?;
-        let mut mac =
-            Hmac::<Sha256>::new_from_slice(&self.receipt_key).expect("HMAC admits any key size");
-        mac.update(b"cozy.pod-readiness/1\0");
-        mac.update(&payload);
-        serde_json::to_vec(&Envelope {
-            payload: STANDARD.encode(payload),
-            hmac_sha256: tensorfs_core::sha256::hex(&mac.finalize().into_bytes()),
         })
     }
 }
@@ -101,7 +66,12 @@ pub async fn serve<B: MachineBackend>(
     backend: Arc<B>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let port = listener.local_addr()?.port();
-    let receipt = Arc::new(identity.receipt(port)?);
+    let readiness = identity.readiness.clone();
+    tokio::spawn(prove_readiness(
+        port,
+        readiness.clone(),
+        MeasuredIdentity::of(&identity),
+    ));
     let tls =
         ServerTlsConfig::new().identity(Identity::from_pem(&identity.cert_pem, &identity.key_pem));
     let service = Api {
@@ -135,15 +105,17 @@ pub async fn serve<B: MachineBackend>(
         .route(
             "/v1/bootstrap/receipt",
             get(move || {
-                let receipt = receipt.clone();
+                let envelope = readiness.envelope();
                 async move {
-                    (
-                        [
-                            ("content-type", "application/json"),
-                            ("cache-control", "no-store"),
-                        ],
-                        receipt.as_ref().clone(),
-                    )
+                    let headers = [
+                        ("content-type", "application/json"),
+                        ("cache-control", "no-store"),
+                    ];
+                    match envelope {
+                        Some(body) => (StatusCode::OK, headers, body),
+                        // The Hub probes again on 503 until this boot has proved itself.
+                        None => (StatusCode::SERVICE_UNAVAILABLE, headers, vec![]),
+                    }
                 }
             }),
         );
@@ -154,6 +126,61 @@ pub async fn serve<B: MachineBackend>(
         .serve_with_incoming(TcpListenerStream::new(listener))
         .await?;
     Ok(())
+}
+
+struct MeasuredIdentity {
+    worker_id: String,
+    boot_id: String,
+    cert_pem: String,
+    cert_der: Vec<u8>,
+}
+impl MeasuredIdentity {
+    fn of(identity: &MachineIdentity) -> Self {
+        Self {
+            worker_id: identity.authority.worker_id.clone(),
+            boot_id: identity.authority.boot_id.clone(),
+            cert_pem: identity.cert_pem.clone(),
+            cert_der: identity.cert_der.clone(),
+        }
+    }
+}
+
+/// Observes this listener as the Hub requires and seals the result once. A retained envelope
+/// of this boot is kept as is; a measurement that contradicts it is reported, never signed.
+async fn prove_readiness(port: u16, readiness: Arc<Readiness>, id: MeasuredIdentity) {
+    let listener_bound = crate::machine::probe::presents_leaf(port, &id.cert_der).await;
+    let foreign_credential_refused = crate::machine::probe::refuses_foreign_claim(
+        port,
+        &id.cert_pem,
+        &id.worker_id,
+        &id.boot_id,
+    )
+    .await;
+    let gpus = match readiness.measures_gpus() {
+        false => Ok(vec![]),
+        true => tokio::task::spawn_blocking(receipt::gpus)
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e))),
+    };
+    let result = gpus.and_then(|gpus| {
+        readiness.seal(
+            receipt::Measured {
+                boot_id: &id.boot_id,
+                worker_port: port,
+                cert_der: &id.cert_der,
+                gpus,
+                listener_bound,
+                foreign_credential_refused,
+                capabilities: crate::machine::CAPABILITIES,
+            }
+            .payload(),
+        )
+    });
+    match result {
+        Ok(true) => eprintln!("cozy-machine: readiness sealed (listener {listener_bound}, foreign Claim refused {foreign_credential_refused})"),
+        Ok(false) => eprintln!("cozy-machine: this boot's retained readiness still holds"),
+        Err(error) => eprintln!("cozy-machine: readiness not proved: {error}"),
+    }
 }
 
 struct Api<B> {
@@ -651,7 +678,24 @@ impl<B: MachineBackend> pb::worker_control_server::WorkerControl for Api<B> {
             Some(pb::record_owner_frame::Msg::Claim(claim)) => claim,
             _ => return Err(Status::unauthenticated("Control requires a Claim first")),
         };
-        self.auth(Some(&claim))?;
+        if let Err(status) = self.auth(Some(&claim)) {
+            if status.code() != tonic::Code::Unauthenticated {
+                return Err(status);
+            }
+            // The deployed answer to a foreign credential, observed by readiness.
+            let refused = pb::WorkerFrame {
+                msg: Some(pb::worker_frame::Msg::ClaimAck(pb::ClaimAck {
+                    accepted: false,
+                    rejection: pb::ClaimRejection::Unauthenticated as i32,
+                    record_owner_epoch: claim.record_owner_epoch,
+                    worker_id: self.identity.authority.worker_id.clone(),
+                    worker_boot_id: self.identity.authority.boot_id.clone(),
+                    wire_minor: WIRE_MINOR,
+                    ..Default::default()
+                })),
+            };
+            return Ok(Response::new(Box::pin(tokio_stream::iter([Ok(refused)]))));
+        }
         let epoch = self.control_epoch.fetch_add(1, Ordering::Relaxed) + 1;
         let ack = pb::WorkerFrame {
             msg: Some(pb::worker_frame::Msg::ClaimAck(pb::ClaimAck {

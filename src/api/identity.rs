@@ -164,7 +164,37 @@ impl MachineIdentity {
             cert_pem: retained.certificate_pem,
             key_pem: retained.private_key_pem,
             cert_der,
-            receipt_key,
+            readiness: crate::machine::receipt::Readiness::open(None, Some(receipt_key), false)?,
+            started_at_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(other)?
+                .as_millis() as u64,
+        })
+    }
+}
+
+impl MachineIdentity {
+    /// The pod or computer machine: its lifetime files under the machine root, keys from its
+    /// grant (a rental's Hub lease replaces them) and this boot's readiness receipt.
+    pub fn machine(
+        worker_id: String,
+        keys: Vec<VerifyingKey>,
+        lifetime: crate::machine::identity::Lifetime,
+        readiness: std::sync::Arc<crate::machine::receipt::Readiness>,
+    ) -> io::Result<Self> {
+        let authority = Authority {
+            worker_id,
+            boot_id: lifetime.boot_id,
+            leaf_digest: tensorfs_core::sha256::digest(&lifetime.cert_der),
+            keys,
+        };
+        authority.transcript(1).map_err(other)?;
+        Ok(Self {
+            authority,
+            cert_pem: lifetime.cert_pem,
+            key_pem: lifetime.key_pem,
+            cert_der: lifetime.cert_der,
+            readiness,
             started_at_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(other)?

@@ -26,6 +26,12 @@ fn main() {
 fn run() -> io::Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
+        // The image entrypoint and the CLI's machine launcher: no arguments, a grant in the
+        // environment (read before any thread starts; the one-shot key leaves the environment).
+        None | Some("run") if args.len() == 0 => match cozy_machine::machine::grant::from_process()? {
+            Some(grant) => run_machine(grant),
+            None => Err(io::Error::other("this process has no machine grant (COZY_WORKER_ID and the rest of a pod's environment)")),
+        },
         Some("version") => {
             #[derive(serde::Serialize)]
             struct Version { name: &'static str, version: &'static str, tensorfs: &'static str, capabilities: &'static [&'static str] }
@@ -63,7 +69,10 @@ fn run() -> io::Result<()> {
             }
             let listener=bind_control(&owner)?;
             match (machine_config,listen) {
-                (Some(config),Some(listen))=>start_api(&root,&generations,&config,&listen,&owner,&service,installer_python,client_wheel,package_python)?,
+                (Some(config),Some(listen))=>{
+                    let identity=cozy_machine::api::MachineIdentity::retained(&cozy_machine::api::identity::MachineConfig::load(&config)?)?;
+                    start_api(&root,&generations,identity,std::net::TcpListener::bind(listen)?,&owner,&service,installer_python,client_wheel,package_python)?
+                }
                 (None,None)=>(),
                 _=>return Err(io::Error::other("--machine-config and --listen are required together")),
             }
@@ -72,23 +81,78 @@ fn run() -> io::Result<()> {
         _=>Err(io::Error::other("usage: cozy-machine version --json | serve --state PATH [--generations PATH] [--cpu-parallelism N] [--host-bytes N]")),
     }
 }
+/// Runs the machine from its grant: identity and readiness under the machine root, the engine
+/// under `var/lib/cozy/machine/engine`, the API on the granted port.
+fn run_machine(mut grant: cozy_machine::machine::grant::Grant) -> io::Result<()> {
+    use cozy_machine::machine::{grant::Lifetime, identity, receipt};
+    for name in &grant.ignored {
+        eprintln!("cozy-machine: ignoring {name}, which this machine does not read");
+    }
+    let layout = grant.layout.clone();
+    let lifetime = identity::open(&layout)?;
+    let rental = grant.lifetime == Lifetime::Rental;
+    let readiness = receipt::Readiness::open(
+        Some(layout.bootstrap.join("readiness-envelope.json")),
+        grant.receipt_key.take(),
+        rental,
+    )?;
+    if let Some(attested) = readiness.attested() {
+        if receipt::boot_id(&attested).as_deref() != Some(lifetime.boot_id.as_str()) {
+            return Err(io::Error::other(
+                "the retained readiness envelope names another boot than this machine root",
+            ));
+        }
+    }
+    let identity = cozy_machine::api::MachineIdentity::machine(
+        grant.worker_id.clone(),
+        grant.authorized.clone(),
+        lifetime,
+        readiness,
+    )?;
+    let engine = layout.engine();
+    let generations = engine.join("generations");
+    let owner = Owner::new(&engine, 16 * 1024 * 1024, Duration::from_secs(300))?;
+    let service = cozy_machine::service::Service::open(&engine, &generations, 1)?;
+    let control = bind_control(&owner)?;
+    let api = std::net::TcpListener::bind((grant.listen_host, grant.worker_port))?;
+    let python = layout.root.join("opt/cozy/python/bin/python3");
+    let wheel = std::fs::read_dir(layout.root.join("opt/cozy/machine"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|e| e == "whl"));
+    let installer = match (python.exists(), wheel) {
+        (true, Some(wheel)) => (Some(python), Some(wheel)),
+        _ => (None, None),
+    };
+    start_api(
+        &engine,
+        &generations,
+        identity,
+        api,
+        &owner,
+        &service,
+        installer.0,
+        installer.1,
+        "3.12".into(),
+    )?;
+    serve(owner, service, control)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn start_api(
     root: &std::path::Path,
     generations: &std::path::Path,
-    config: &std::path::Path,
-    listen: &str,
+    identity: cozy_machine::api::MachineIdentity,
+    listener: std::net::TcpListener,
     owner: &Shared,
     service: &Arc<cozy_machine::service::Service>,
     helper: Option<PathBuf>,
     wheel: Option<PathBuf>,
     python: String,
 ) -> io::Result<()> {
-    use cozy_machine::{
-        api::{self, identity::MachineConfig, MachineIdentity},
-        machine_api::NativeBackend,
-    };
-    let identity = MachineIdentity::retained(&MachineConfig::load(config)?)?;
+    use cozy_machine::{api, machine_api::NativeBackend};
     let store = owner.lock().unwrap().store();
     let uploads = api::workspaces::WorkspaceUploads::open(&root.join("uploads"), store.clone())
         .map_err(io::Error::other)?;
@@ -109,7 +173,6 @@ fn start_api(
             ))
         }
     };
-    let listener = std::net::TcpListener::bind(listen)?;
     listener.set_nonblocking(true)?;
     #[derive(serde::Serialize)]
     struct Ready<'a> {

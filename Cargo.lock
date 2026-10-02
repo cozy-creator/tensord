@@ -261,6 +261,7 @@ dependencies = [
  "tensorfs-plane",
  "time",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tonic",
  "tonic-prost",
