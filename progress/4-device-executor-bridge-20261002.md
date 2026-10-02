@@ -10,3 +10,14 @@
 - Owned new files: `src/device_executor.rs`, `tests/device_executor.rs`, `docs/DEVICE-EXECUTOR.md`
 - Existing Runtime, TensorFS, Creator, Hub and authored packages remain read-only.
 - Root owns GPU locking/rental budget. This agent makes no GPU calls or rentals independently.
+
+Initial checkpoint: `2b6c66f`, draft PR https://github.com/cozy-creator/cozy-machine/pull/13.
+Qualified unchanged stock Runtime 0.18.89/0.18.99: three invocations per executor, real sklearn
+classification, exact spooled result metadata, stale-cancel isolation and local credential/result
+errors. Process maps showed no CUDA/NVML before/after inference.
+
+Post helper follow-up: exact SDK output resolver plus generic SDK encoder, typed producer BLAKE2b128
+and independent CAS SHA-256 facts. A real installed classifier/image package passed deferred WebP
+encoding and independent pixel/dimension inspection. Explicit SDK suite: 3 passed in 8.22 s; fmt
+and focused clippy pass. Current image generation used Runtime 0.18.99 with TensorFS 0.3.90.
+Legacy worker-module resolver dependency and whole-buffer encoder memory are documented limits.
