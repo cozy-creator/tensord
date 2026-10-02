@@ -1,7 +1,8 @@
 # GPU qualification and comparison
 
 GPU work and RunPod rentals are authorized, with a $20 total cap for this task. The root
-agent owns acquisition, accounting and teardown. No rental has been started by this task.
+agent owns acquisition, accounting and teardown. The first owned headless A40 pilot completed
+three real SDXL requests; its isolated legacy loader is distinct from Degree 1 qualification.
 Other live rentals and GPU processes are independently owned. The display-driving 8 GB
 RTX 4070 is available for ordinary inference; fault and memory pressure tests use RunPod.
 

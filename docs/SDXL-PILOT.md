@@ -1,8 +1,15 @@
 # Isolated stock-executor SDXL hardware pilot
 
-Root owns the non-display GPU/rental and the $20 total budget. The harness is prepared;
-no GPU run has occurred in this agent. Do not run the local validation configuration on
-the laptop/display GPU.
+Root owns the non-display GPU/rental and the $20 total budget. On 2026-10-02, root ran
+three unchanged 1024×1024/20-step SDXL requests on a RunPod A40 with one executor PID.
+Independent decoding, dimensions, producer hashes and visual inspection passed for all three.
+Warm invocation took 4.290–4.310 s, or 4.757–4.790 s including prepare and WebP postprocessing.
+Start-command import/initialization took 4.096 s and Load took 5.129 s; the original timer
+excluded process spawn/Hello and cannot establish stopped-machine cold start.
+The published SDK still opened its own TensorFS store, so this qualifies the Rust stock-executor
+bridge rather than single-writer custody, host ownership, the full service or old/new speedup.
+Evidence: `~/cozy_v2/outputs/cozy-machine-continued-20261002/gpu-runpod/legacy-sdk99/`.
+Do not run the local validation configuration on the laptop/display GPU.
 
 ## Build and run
 
