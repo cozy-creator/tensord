@@ -46,10 +46,13 @@ func main() {
 	helper := flag.String("native-helper", "", "trusted installer interpreter for integrated service gate")
 	wheel := flag.String("native-wheel", "", "built machine client wheel")
 	source := flag.String("native-source", "", "frozen real classifier source")
+	assets := flag.Bool("native-assets", false, "qualify scalar and list file results")
 	flag.Parse()
 	gate := run
 	if *helper != "" {
-		gate = func(machine, output string) error { return runNative(machine, output, *helper, *wheel, *source) }
+		gate = func(machine, output string) error {
+			return runNative(machine, output, *helper, *wheel, *source, *assets)
+		}
 	}
 	if *retained {
 		gate = runRetained

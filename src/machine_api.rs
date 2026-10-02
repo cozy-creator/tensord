@@ -98,10 +98,12 @@ impl NativeBackend {
             .submission
             .as_ref()
             .ok_or_else(|| Status::internal("public submission context absent"))?;
+        let sequence=self.service.engine.public_terminal(&record.id).map_err(problem)?.map(|held|pb::MachineExecutionEventPage::decode(held.events.as_slice()).map(|page|page.head_sequence).map_err(|_|Status::data_loss("durable event projection corrupt"))).transpose()?.unwrap_or(record.revision).max(record.revision);
         Ok(pb::MachineExecutionState {
             request_id: context.request_id.clone(),
             attempt_ordinal: record.attempt.max(1) as u64,
             generation: record.attempt as u64,
+            collected: record.collected,
             state: match record.state {
                 State::Completed => "succeeded",
                 State::Failed => "failed",
@@ -111,7 +113,7 @@ impl NativeBackend {
                 State::Running => "running",
             }
             .into(),
-            sequence: record.revision,
+            sequence,
             worker_id: self.authority.worker_id.clone(),
             worker_boot_id: self.authority.boot_id.clone(),
             execution_workspace_id: self.workspace_id(),
@@ -230,7 +232,17 @@ impl NativeBackend {
                 );
             }
             if let Some(value) = &mut value {
-                rewrite_assets(value, "", &references, &mut products)?;
+                rewrite_assets(
+                    value,
+                    declaration
+                        .get("result")
+                        .ok_or_else(|| Status::data_loss("result schema absent"))?,
+                    "",
+                    pb::RunProductOp::Set,
+                    0,
+                    &references,
+                    &mut products,
+                )?;
             }
         }
         let mut events = vec![];
@@ -244,6 +256,7 @@ impl NativeBackend {
                 attempt_ordinal: record.attempt.max(1) as u64,
                 at_ms: record.finished_at_ms,
                 kind: "product".into(),
+                body_canonical_bytes: product_document(&product)?,
                 product: Some(product),
                 ..Default::default()
             });
@@ -593,6 +606,75 @@ impl MachineBackend for NativeBackend {
     fn uploads(&self) -> Option<Arc<WorkspaceUploads>> {
         Some(self.uploads.clone())
     }
+    fn collect(
+        &self,
+        actor: VerifiedActor,
+        request: pb::MachineExecutionCollect,
+    ) -> Result<pb::AttemptOutcome, Status> {
+        let record = self.query(
+            actor,
+            request
+                .execution
+                .ok_or_else(|| Status::invalid_argument("execution query absent"))?,
+        )?;
+        if request.attempt_ordinal != 0 && request.attempt_ordinal != record.attempt.max(1) as u64 {
+            return Err(Status::not_found(
+                "requested attempt is not retained by this execution",
+            ));
+        }
+        self.terminal(&record)?
+            .events
+            .into_iter()
+            .find_map(|e| e.outcome)
+            .ok_or_else(|| Status::data_loss("durable terminal outcome absent"))
+    }
+    fn ack_collection(
+        &self,
+        actor: VerifiedActor,
+        request: pb::MachineExecutionCollectionAck,
+    ) -> Result<pb::MachineExecutionState, Status> {
+        let record = self.query(
+            actor,
+            request
+                .execution
+                .ok_or_else(|| Status::invalid_argument("execution query absent"))?,
+        )?;
+        let ack = request
+            .outcome
+            .ok_or_else(|| Status::invalid_argument("outcome acknowledgement absent"))?;
+        let outcome = self
+            .terminal(&record)?
+            .events
+            .into_iter()
+            .find_map(|e| e.outcome)
+            .ok_or_else(|| Status::data_loss("durable terminal outcome absent"))?;
+        if (
+            ack.request_id,
+            ack.attempt_ordinal,
+            ack.invocation_spec_digest,
+            ack.outcome_id,
+            ack.outcome_digest,
+            ack.worker_boot_id,
+        ) != (
+            outcome.request_id,
+            outcome.attempt_ordinal,
+            outcome.invocation_spec_digest,
+            outcome.outcome_id,
+            outcome.outcome_digest,
+            outcome.worker_boot_id,
+        ) {
+            return Err(Status::invalid_argument(
+                "acknowledgement differs from the exact retained outcome",
+            ));
+        }
+        self.state(
+            &self
+                .service
+                .engine
+                .acknowledge_collection(&record.id)
+                .map_err(problem)?,
+        )
+    }
     fn prepare_local(
         &self,
         actor: VerifiedActor,
@@ -863,50 +945,125 @@ type AssetSources = std::collections::HashMap<
 >;
 fn rewrite_assets(
     value: &mut Value,
+    schema: &Value,
     path: &str,
+    op: pb::RunProductOp,
+    index: u32,
     sources: &AssetSources,
     products: &mut Vec<pb::RunProduct>,
 ) -> Result<(), Status> {
-    match value {
-        Value::Object(object) => {
-            if let Some(reference) = object.get("asset_ref").and_then(Value::as_str) {
-                let (artifact, mime, source) = sources.get(reference).ok_or_else(|| {
-                    Status::failed_precondition(
-                        "executor did not provide native output binding for this asset",
-                    )
-                })?;
-                object.insert(
-                    "digest".into(),
-                    json!(format!("sha256:{}", artifact.sha256)),
-                );
-                products.push(pb::RunProduct {
-                    output: path.into(),
-                    op: pb::RunProductOp::Set as i32,
-                    content: Some(pb::Ref {
-                        digest: digest_bytes(&format!("sha256:{}", artifact.sha256))?,
-                        length: artifact.length,
-                    }),
-                    media_type: mime.clone(),
-                    source: Some(source.clone()),
-                    ..Default::default()
-                });
+    if value.is_null() {
+        return Ok(());
+    }
+    if schema.get("asset").is_some() {
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| Status::data_loss("asset result differs from declared schema"))?;
+        if let Some(reference) = object.get("asset_ref").and_then(Value::as_str) {
+            let (artifact, mime, source) = sources.get(reference).ok_or_else(|| {
+                Status::failed_precondition(
+                    "executor did not provide native output binding for this asset",
+                )
+            })?;
+            object.insert(
+                "digest".into(),
+                json!(format!("sha256:{}", artifact.sha256)),
+            );
+            products.push(pb::RunProduct {
+                output: path.into(),
+                op: op as i32,
+                index,
+                content: Some(pb::Ref {
+                    digest: digest_bytes(&format!("sha256:{}", artifact.sha256))?,
+                    length: artifact.length,
+                }),
+                media_type: mime.clone(),
+                source: Some(source.clone()),
+                ..Default::default()
+            });
+        } else {
+            return Err(Status::data_loss("declared asset has no reference"));
+        }
+    } else if let Some(fields) = schema.get("fields").and_then(Value::as_array) {
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| Status::data_loss("result record differs from declared schema"))?;
+        for field in fields {
+            let name = field
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Status::data_loss("result field name absent"))?;
+            if let Some(child) = object.get_mut(name) {
+                let path = if path.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{path}.{name}")
+                };
+                rewrite_assets(
+                    child,
+                    field
+                        .get("type")
+                        .ok_or_else(|| Status::data_loss("result field type absent"))?,
+                    &path,
+                    op,
+                    index,
+                    sources,
+                    products,
+                )?;
+            }
+        }
+    } else if let Some(element) = schema.get("list") {
+        let items = value
+            .as_array_mut()
+            .ok_or_else(|| Status::data_loss("result list differs from declared schema"))?;
+        for (position, child) in items.iter_mut().enumerate() {
+            if element.get("asset").is_some() {
+                rewrite_assets(
+                    child,
+                    element,
+                    path,
+                    pb::RunProductOp::Append,
+                    position.try_into().map_err(|_| {
+                        Status::out_of_range("list output index is outside deployed protocol")
+                    })?,
+                    sources,
+                    products,
+                )?;
             } else {
-                for (key, child) in object {
-                    let child_path = if path.is_empty() {
-                        key.clone()
-                    } else {
-                        format!("{path}.{key}")
-                    };
-                    rewrite_assets(child, &child_path, sources, products)?;
-                }
+                rewrite_assets(
+                    child,
+                    element,
+                    &format!("{path}[{position}]"),
+                    op,
+                    index,
+                    sources,
+                    products,
+                )?;
             }
         }
-        Value::Array(items) => {
-            for (index, child) in items.iter_mut().enumerate() {
-                rewrite_assets(child, &format!("{path}[{index}]"), sources, products)?;
-            }
-        }
-        _ => (),
     }
     Ok(())
+}
+fn product_document(product: &pb::RunProduct) -> Result<Vec<u8>, Status> {
+    let content = product
+        .content
+        .as_ref()
+        .ok_or_else(|| Status::data_loss("product content absent"))?;
+    let source = product
+        .source
+        .as_ref()
+        .ok_or_else(|| Status::data_loss("product source absent"))?;
+    let tree = source
+        .source
+        .as_ref()
+        .ok_or_else(|| Status::data_loss("product tree absent"))?;
+    let manifest = tree
+        .manifest
+        .as_ref()
+        .ok_or_else(|| Status::data_loss("product manifest absent"))?;
+    let mut document = json!({"format":"cozy.worker.v1.RunProduct/1","output":product.output,"op":product.op,"content":{"digest":format!("sha256:{}",sha256::hex(&content.digest)),"length":content.length},"media_type":product.media_type,"source":{"retention_id":source.retention_id,"source":{"producer_root_id":tree.producer_root_id,"receipt_digest":format!("sha256:{}",sha256::hex(&tree.receipt_digest)),"manifest":{"digest":format!("sha256:{}",sha256::hex(&manifest.digest)),"length":manifest.length},"content_bytes":tree.content_bytes}}});
+    if product.index != 0 {
+        document["index"] = json!(product.index);
+    }
+    canonical(&document)
 }

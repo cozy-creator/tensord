@@ -194,6 +194,9 @@ impl Engine {
     pub fn public_terminal(&self, id: &str) -> io::Result<Option<crate::journal::PublicTerminal>> {
         self.journal.lock().unwrap().public_terminal(id)
     }
+    pub fn acknowledge_collection(&self, id: &str) -> io::Result<Execution> {
+        self.journal.lock().unwrap().acknowledge_collection(id)
+    }
     pub fn native_output(&self, actor: &str, owner: &str) -> io::Result<Option<Vec<u8>>> {
         self.journal.lock().unwrap().native_output(actor, owner)
     }

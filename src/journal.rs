@@ -158,6 +158,8 @@ pub struct Execution {
     pub finished_at_ms: u64,
     #[serde(default)]
     pub acceptance_boot_id: String,
+    #[serde(default)]
+    pub collected: bool,
     /// Reserved observation cursor ceiling. Older stored records default to no reservation.
     #[serde(default)]
     pub revision_ceiling: u64,
@@ -348,6 +350,24 @@ impl Journal {
             .optional()
             .map_err(db_error)
     }
+    pub fn acknowledge_collection(&mut self, id: &str) -> io::Result<Execution> {
+        let mut record = self.get(id)?;
+        if !record.state.terminal() {
+            return Err(db_error(
+                "collection acknowledgement requires a terminal result",
+            ));
+        }
+        if !record.collected {
+            record.collected = true;
+            self.connection
+                .execute(
+                    "UPDATE executions SET record=?1 WHERE id=?2",
+                    params![encoded(&record)?, id],
+                )
+                .map_err(db_error)?;
+        }
+        Ok(record)
+    }
     pub fn native_output(&self, actor: &str, owner: &str) -> io::Result<Option<Vec<u8>>> {
         self.connection
             .query_row(
@@ -494,6 +514,7 @@ impl Journal {
             accepted_at_ms: timestamp().max(0) as u64,
             finished_at_ms: 0,
             acceptance_boot_id: boot.into(),
+            collected: false,
             revision_ceiling: 1,
             attempt: 0,
             waiting_reason: None,

@@ -31,7 +31,7 @@ import (
 
 // Production work has no test deadlines or implicit cancellation. These budgets
 // only bound this observer; cleanup releases this gate's own fixture process.
-func runNative(machine, output, helper, wheel, source string) error {
+func runNative(machine, output, helper, wheel, source string, assets bool) error {
 	if wheel == "" || source == "" {
 		return fmt.Errorf("native wheel and frozen source required")
 	}
@@ -159,6 +159,9 @@ func runNative(machine, output, helper, wheel, source string) error {
 		return err
 	}
 	packageMetadata := &pb.DevelopmentPackage{Package: "local/cozy-machine-cpu-classifier", Release: "0.1.0", InstallationId: "install-native-classifier"}
+	if assets {
+		packageMetadata.Package = "local/cozy-machine-cpu-assets"
+	}
 	header := &pb.LocalPackageUploadHeader{Claim: claim, OperationId: "native-source", File: &pb.LocalPackageFileRef{Filename: "source.tar", Length: uint64(archive.Len())}}
 	upload, err := host.LocalPackageUpload(ctx)
 	if err != nil {
@@ -205,6 +208,7 @@ func runNative(machine, output, helper, wheel, source string) error {
 	query := &pb.MachineExecutionQuery{Claim: claim, RequestId: receipt.RequestId, ExpectedExecutionWorkspaceId: workspace.ExecutionWorkspaceId}
 	var terminal *pb.AttemptOutcome
 	var product *pb.RunProduct
+	var products []*pb.RunProduct
 	var after uint64
 	for terminal == nil {
 		page, e := host.ListMachineExecutionEvents(ctx, &pb.MachineExecutionEventsQuery{Execution: query, After: after, Wait: true})
@@ -214,6 +218,10 @@ func runNative(machine, output, helper, wheel, source string) error {
 		for _, event := range page.Events {
 			if event.Product != nil {
 				product = event.Product
+				if len(event.BodyCanonicalBytes) == 0 {
+					return fmt.Errorf("product canonical document absent")
+				}
+				products = append(products, product)
 			}
 			if event.Outcome != nil {
 				terminal = event.Outcome
@@ -246,6 +254,20 @@ func runNative(machine, output, helper, wheel, source string) error {
 	}
 	if err = os.WriteFile(filepath.Join(output, "result.json"), value, 0600); err != nil {
 		return err
+	}
+	if assets {
+		if len(products) != 3 || products[0].Output != "report" || products[0].Op != pb.RunProductOp_RUN_PRODUCT_OP_SET || products[1].Output != "reports" || products[1].Op != pb.RunProductOp_RUN_PRODUCT_OP_APPEND || products[1].Index != 0 || products[2].Output != "reports" || products[2].Index != 1 {
+			return fmt.Errorf("declared scalar/list fold differs: %v", products)
+		}
+		var result struct {
+			Opaque map[string]string `json:"opaque"`
+		}
+		if err = json.Unmarshal(value, &result); err != nil {
+			return err
+		}
+		if result.Opaque["asset_ref"] != "authored user metadata" || result.Opaque["digest"] != "unchanged" {
+			return fmt.Errorf("opaque user data was treated as an asset")
+		}
 	}
 	if product == nil || product.Source == nil || product.Content == nil {
 		return fmt.Errorf("native product absent")
@@ -306,6 +328,21 @@ func runNative(machine, output, helper, wheel, source string) error {
 	page, err := host.ListMachineExecutionEvents(ctx, &pb.MachineExecutionEventsQuery{Execution: query})
 	if err != nil || len(page.Events) < 2 {
 		return fmt.Errorf("terminal replay unavailable: %v", err)
+	}
+	ack := &pb.AttemptOutcomeAck{WorkerBootId: terminal.WorkerBootId, RequestId: terminal.RequestId, AttemptOrdinal: terminal.AttemptOrdinal, InvocationSpecDigest: terminal.InvocationSpecDigest, OutcomeId: terminal.OutcomeId, OutcomeDigest: terminal.OutcomeDigest}
+	badAck := proto.Clone(ack).(*pb.AttemptOutcomeAck)
+	badAck.OutcomeId = "different-outcome"
+	if _, err = host.AcknowledgeMachineExecutionCollection(ctx, &pb.MachineExecutionCollectionAck{Execution: query, Outcome: badAck}); status.Code(err) != codes.InvalidArgument {
+		return fmt.Errorf("wrong acknowledgement accepted: %v", err)
+	}
+	for index := 0; index < 2; index++ {
+		state, e := host.AcknowledgeMachineExecutionCollection(ctx, &pb.MachineExecutionCollectionAck{Execution: query, Outcome: ack})
+		if e != nil || !state.Collected {
+			return fmt.Errorf("collection acknowledgement not durable: %v", e)
+		}
+	}
+	if _, err = read(product.Content, 0); err != nil {
+		return fmt.Errorf("collection acknowledgement destroyed native hold: %v", err)
 	}
 	return writeJSON("evidence.json", map[string]any{"receipt": receipt, "report_sha256": hex.EncodeToString(reportDigest[:]), "checks": []string{"retained pinned TLS", "older peer wire minor1", "frozen source preparation", "SDK real classifier inference", "same-key label change remains same actor", "identical durable replay receipt", "outcome content identity", "native manifest/full/suffix readback", "wrong-key refusal", "terminal log replay"}, "gpu_qualified": false, "ordinary_cli_qualified": false})
 }
