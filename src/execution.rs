@@ -1,6 +1,7 @@
 //! CPU runner supervision. Scheduling policy remains with the machine owner.
 use crate::journal::{
-    Artifact, Execution, Invocation, Journal, Outcome, ProcessBirth, ResultRecord, State,
+    Artifact, Execution, Invocation, Journal, Outcome, ProcessBirth, ProgressSnapshot,
+    ResultRecord, State,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -120,6 +121,7 @@ pub struct Engine {
     journal: Mutex<Journal>,
     active: Mutex<HashMap<String, Writer>>,
     owned: Mutex<HashSet<String>>,
+    progress: Mutex<HashMap<String, ProgressSnapshot>>,
 }
 
 impl Engine {
@@ -135,17 +137,32 @@ impl Engine {
             journal: Mutex::new(Journal::open(root)?),
             active: Mutex::new(HashMap::new()),
             owned: Mutex::new(HashSet::new()),
+            progress: Mutex::new(HashMap::new()),
         }))
     }
 
     pub fn submit(&self, key: &str, invocation: Invocation) -> io::Result<Execution> {
-        self.journal.lock().unwrap().accept(key, invocation)
+        let owned = self.owned.lock().unwrap();
+        let progress = self.progress.lock().unwrap();
+        let mut record = self.journal.lock().unwrap().accept(key, invocation)?;
+        overlay_observation(&mut record, &owned, &progress);
+        Ok(record)
     }
     pub fn get(&self, id: &str) -> io::Result<Execution> {
-        self.journal.lock().unwrap().get(id)
+        let owned = self.owned.lock().unwrap();
+        let progress = self.progress.lock().unwrap();
+        let mut record = self.journal.lock().unwrap().get(id)?;
+        overlay_observation(&mut record, &owned, &progress);
+        Ok(record)
     }
     pub fn list(&self) -> io::Result<Vec<Execution>> {
-        self.journal.lock().unwrap().list()
+        let owned = self.owned.lock().unwrap();
+        let progress = self.progress.lock().unwrap();
+        let mut records = self.journal.lock().unwrap().list()?;
+        for record in &mut records {
+            overlay_observation(record, &owned, &progress);
+        }
+        Ok(records)
     }
     pub fn supervising(&self) -> usize {
         self.owned.lock().unwrap().len()
@@ -167,6 +184,7 @@ impl Engine {
                 if let Err(error) = engine.run(&thread_id, config) {
                     eprintln!("execution {thread_id}: {error}");
                 }
+                engine.progress.lock().unwrap().remove(&thread_id);
                 engine.owned.lock().unwrap().remove(&thread_id);
             });
         if let Err(error) = launched {
@@ -182,7 +200,18 @@ impl Engine {
 
     /// The durable actor record precedes delivery. Transport loss never calls this.
     pub fn cancel(&self, id: &str, actor: &str) -> io::Result<Execution> {
-        let record = self.journal.lock().unwrap().cancel(id, actor)?;
+        let record = {
+            let owned = self.owned.lock().unwrap();
+            let mut progress = self.progress.lock().unwrap();
+            let mut record =
+                self.journal
+                    .lock()
+                    .unwrap()
+                    .cancel_observed(id, actor, progress.get(id))?;
+            progress.remove(id);
+            overlay_observation(&mut record, &owned, &progress);
+            record
+        };
         let writer = self.active.lock().unwrap().get(id).cloned();
         if let Some(writer) = writer {
             // Delivery failure does not revoke the already committed cancellation authority.
@@ -190,6 +219,66 @@ impl Engine {
                 &mut writer.lock().unwrap(),
                 &RunnerCommand::Cancel { execution_id: id },
             );
+        }
+        Ok(record)
+    }
+
+    fn observe_progress(
+        &self,
+        id: &str,
+        completed_units: u64,
+        mut detail: String,
+    ) -> io::Result<()> {
+        // This map has at most one entry per supervised execution, never an event history.
+        if !self.owned.lock().unwrap().contains(id) {
+            return Ok(());
+        }
+        const MAX_DETAIL_BYTES: usize = 2048;
+        if detail.len() > MAX_DETAIL_BYTES {
+            let mut end = MAX_DETAIL_BYTES;
+            while !detail.is_char_boundary(end) {
+                end -= 1;
+            }
+            detail.truncate(end);
+        }
+        let mut progress = self.progress.lock().unwrap();
+        let mut journal = self.journal.lock().unwrap();
+        let mut record = journal.get(id)?;
+        if record.state.terminal() {
+            return Ok(());
+        }
+        if let Some(snapshot) = progress.get(id) {
+            snapshot.overlay(&mut record);
+        }
+        if completed_units <= record.completed_units {
+            return Ok(());
+        }
+        if record.revision >= record.revision_ceiling {
+            record = journal.reserve_observations(id, progress.get(id))?;
+        }
+        progress.insert(
+            id.into(),
+            ProgressSnapshot {
+                completed_units,
+                detail,
+                revision: record
+                    .revision
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("execution observation cursor exhausted"))?,
+            },
+        );
+        Ok(())
+    }
+
+    fn finish(&self, id: &str, outcome: Outcome) -> io::Result<Execution> {
+        let mut progress = self.progress.lock().unwrap();
+        let record = self
+            .journal
+            .lock()
+            .unwrap()
+            .finish_observed(id, outcome, progress.get(id))?;
+        if record.state.terminal() {
+            progress.remove(id);
         }
         Ok(record)
     }
@@ -231,14 +320,16 @@ impl Engine {
                 journal.finish(&record.id, Outcome::Failed("owner lost before durable result custody; exact executor birth has ended; started work will not be replayed".into()))?;
             }
         }
-        journal.list()
+        drop(journal);
+        drop(owned);
+        self.list()
     }
 
     fn run(&self, id: &str, config: RunnerConfig) -> io::Result<()> {
         let _generation_hold = config.generation_hold.clone();
         let record = self.get(id)?;
         if record.cancel_actor.is_some() {
-            self.journal.lock().unwrap().finish(id, Outcome::Canceled)?;
+            self.finish(id, Outcome::Canceled)?;
             return Ok(());
         }
         let output_root = self.root.join("staging").join(id);
@@ -300,7 +391,7 @@ impl Engine {
                     ),
                     _ => Outcome::Failed("runner ended without a terminal result".into()),
                 };
-                self.journal.lock().unwrap().finish(id, outcome)?;
+                self.finish(id, outcome)?;
             }
             Err(error) => {
                 if self.get(id)?.state == State::Starting {
@@ -309,7 +400,7 @@ impl Engine {
                         format!("runner ended before start authorization: {error}"),
                     )?;
                 } else {
-                    self.journal.lock().unwrap().finish(
+                    self.finish(
                         id,
                         Outcome::Failed(format!("executor ended {status}: {error}")),
                     )?;
@@ -389,11 +480,7 @@ impl Engine {
                     completed_units,
                     detail,
                     ..
-                } => self
-                    .journal
-                    .lock()
-                    .unwrap()
-                    .progress(id, completed_units, detail)?,
+                } => self.observe_progress(id, completed_units, detail)?,
                 terminal => return Ok(terminal),
             }
         }
@@ -482,6 +569,24 @@ impl Engine {
         use std::io::Seek;
         file.rewind()?;
         Ok(file)
+    }
+}
+
+fn overlay_observation(
+    record: &mut Execution,
+    owned: &HashSet<String>,
+    progress: &HashMap<String, ProgressSnapshot>,
+) {
+    if record.state.terminal() {
+        return;
+    }
+    if !owned.contains(&record.id) && record.state == State::Running {
+        // A new owner cannot reproduce lost volatile events. Its snapshot advances to
+        // the old reservation ceiling so clients' numeric cursors never move backward.
+        record.revision = record.revision.max(record.revision_ceiling);
+    }
+    if let Some(snapshot) = progress.get(&record.id) {
+        snapshot.overlay(record);
     }
 }
 

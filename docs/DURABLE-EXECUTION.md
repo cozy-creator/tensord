@@ -32,6 +32,22 @@ is a monotonic observation cursor; cancellation actor, actual completed units, f
 and waiting reason are typed fields. A repeated key with equivalent invocation returns
 the same record; different semantics return conflict. Map ordering does not change equality.
 
+Productive progress coalesces into one in-memory snapshot per supervised execution,
+with detail capped at 2 KiB; duplicate/regressed counts produce no update. Queries and
+duplicate receipts overlay this snapshot without SQLite writes. Cancellation and terminal
+settlement merge the latest snapshot in the same FULL-WAL transaction as their authority.
+Ordinary progress produces no fsync, event history or new dispatch loop. Losing observational
+telemetry is not evidence of process death or permission to replay/kill an execution.
+
+Each authoritative transition into `running`, including explicit cancellation, reserves
+a window of 2^32 observation revisions in `revision_ceiling`. Volatile progress uses cursors
+inside that window. Exhaustion reserves another window in a rare allocation commit; checked
+arithmetic never wraps/reuses a cursor. Durable transitions jump beyond the reserved high-water.
+A new owner's snapshot of a still-live former executor advances to the old ceiling, so lost
+progress cannot move an observer's numeric revision backward. Older records without the field
+default to no reservation. These are status cursors, separate from artifact/output event indexes;
+the window is a sequence allocation mechanism, not a duration or process-liveness condition.
+
 ## Startup and recovery
 
 1. Commit `starting`, increment attempt, then spawn a runner which waits for Invoke.
@@ -96,8 +112,8 @@ mutation, but this CPU foundation does not claim to contain untrusted packages.
 
 ## Evidence
 
-`cargo test --test durable_execution` passed nine actual-process/socket/filesystem cases
-(2.68 s; one explicitly invoked child helper is ignored by the parent harness):
+`cargo test --test durable_execution` passed twelve actual-process/socket/filesystem cases
+(0.36 s; one explicitly invoked child helper is ignored by the parent harness):
 CPU matrix inference and persisted output; observer-safe duplicate acceptance; explicit
 executor SIGKILL without repeated effects; actor-attributed cooperative cancel; visible
 launch failure followed by changed-interpreter retry; symlink escape and mutation detection;
@@ -105,6 +121,15 @@ live exact-birth retention after journal reopen; and never-authorized restart re
 exact termination. An actual Rust-owner SIGKILL case also keeps a live orphan's obligation,
 then settles failure after that exact birth ends without repeating effects. Test deadlines
 only bound observations; they never kill a package.
+
+The coalescing gate publishes 257 completed units through actual socket frames: live queries,
+list and duplicate receipts observe them while an independent SQLite reader and WAL size
+remain unchanged. Terminal custody persists the latest count/revision; explicit cancellation
+likewise commits the latest progress. A canceled queued run survives reopen without package
+execution. Actual owner death demonstrates that missing volatile progress never settles a
+still-live process.
+The cursor boundary test renews an exhausted reservation, retains the latest count, and
+reopens the monotonic terminal revision; an older record without the optional ceiling decodes.
 
 These are supervision component checks. Ordinary Creator CLI, installed Runtime author
 bridge, full public-service crash boundaries, systemd/container reaping, browser/Hub consumers,
