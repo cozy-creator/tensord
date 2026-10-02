@@ -30,7 +30,10 @@ def versions(python: str) -> dict[str, str]:
 
 def inspect(pilot: dict) -> dict:
     measured = versions(pilot["python"])
-    if measured != {"cozy-runtime": "0.18.99", "tensorfs": "0.3.90", "sdxl": "2.4.0"}:
+    expected = pilot.get("expected_versions", {
+        "cozy-runtime": "0.18.99", "tensorfs": "0.3.90", "sdxl": "2.4.0",
+    })
+    if measured != expected:
         raise ValueError(f"benchmark package selection changed: {measured}")
     code = (
         "import tensorfs,json; s=tensorfs.Store.open(" + repr(pilot["binding"]["store"]) + "); "
