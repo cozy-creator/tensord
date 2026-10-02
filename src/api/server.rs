@@ -199,9 +199,117 @@ impl<B: MachineBackend> Api<B> {
 }
 
 type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
+struct ReaderGuard(super::backend::Observation);
+impl Drop for ReaderGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
 
 #[tonic::async_trait]
 impl<B: MachineBackend> pb::pod_host_server::PodHost for Api<B> {
+    async fn import_input_tree(
+        &self,
+        request: Request<tonic::Streaming<pb::InputTreeImportFrame>>,
+    ) -> Result<Response<pb::NativeByteRetentionResult>, Status> {
+        let mut incoming = request.into_inner();
+        let first = incoming
+            .message()
+            .await?
+            .ok_or_else(|| Status::unauthenticated("input transfer requires a signed header"))?;
+        let header = match first.body {
+            Some(pb::input_tree_import_frame::Body::Header(header)) => header,
+            _ => {
+                return Err(Status::unauthenticated(
+                    "input transfer requires a signed header",
+                ))
+            }
+        };
+        let actor = self.auth(header.claim.as_ref())?;
+        if header.manifest_canonical_bytes.len() > 1 << 20 {
+            return Err(Status::invalid_argument(
+                "input manifest exceeds its control record bound",
+            ));
+        }
+        let mut receiver = self
+            .call(move |backend| backend.begin_input_tree(actor, header))
+            .await?
+            .into_inner();
+        loop {
+            match incoming.message().await?.and_then(|frame| frame.body) {
+                Some(pb::input_tree_import_frame::Body::Blob(blob)) => {
+                    if blob.data.len() > 1 << 20 {
+                        return Err(Status::invalid_argument(
+                            "input blob exceeds its transport chunk bound",
+                        ));
+                    }
+                    receiver = tokio::task::spawn_blocking(move || {
+                        receiver.blob(blob)?;
+                        Ok::<_, Status>(receiver)
+                    })
+                    .await
+                    .map_err(|_| Status::internal("input transfer storage task stopped"))??;
+                }
+                Some(pb::input_tree_import_frame::Body::Commit(commit)) => {
+                    if incoming.message().await?.is_some() {
+                        return Err(Status::invalid_argument(
+                            "input commit must be the final transfer frame",
+                        ));
+                    }
+                    return tokio::task::spawn_blocking(move || receiver.commit(commit))
+                        .await
+                        .map_err(|_| Status::internal("input commit storage task stopped"))?
+                        .map(Response::new);
+                }
+                Some(pb::input_tree_import_frame::Body::Header(_)) => {
+                    return Err(Status::invalid_argument(
+                        "input header must appear exactly once",
+                    ))
+                }
+                None => {
+                    return Err(Status::invalid_argument(
+                        "input transfer ended before an explicit commit",
+                    ))
+                }
+            }
+        }
+    }
+    async fn retain_byte_tree(
+        &self,
+        request: Request<pb::NativeByteRetentionCall>,
+    ) -> Result<Response<pb::NativeByteRetentionResult>, Status> {
+        let actor = self.auth(request.get_ref().claim.as_ref())?;
+        let request = request.into_inner();
+        self.call(move |backend| backend.retain_bytes(actor, request))
+            .await
+    }
+    async fn release_byte_tree(
+        &self,
+        request: Request<pb::NativeByteRetentionCall>,
+    ) -> Result<Response<pb::NativeByteRetentionResult>, Status> {
+        let actor = self.auth(request.get_ref().claim.as_ref())?;
+        let request = request.into_inner();
+        self.call(move |backend| backend.release_bytes(actor, request))
+            .await
+    }
+    async fn list_packages(
+        &self,
+        request: Request<pb::PackageListQuery>,
+    ) -> Result<Response<pb::PackageList>, Status> {
+        let actor = self.auth(request.get_ref().claim.as_ref())?;
+        let request = request.into_inner();
+        self.call(move |backend| backend.list_packages(actor, request))
+            .await
+    }
+    async fn list_models(
+        &self,
+        request: Request<pb::ModelListQuery>,
+    ) -> Result<Response<pb::ModelList>, Status> {
+        let actor = self.auth(request.get_ref().claim.as_ref())?;
+        let request = request.into_inner();
+        self.call(move |backend| backend.list_models(actor, request))
+            .await
+    }
     async fn local_package_upload(
         &self,
         request: Request<tonic::Streaming<pb::LocalPackageUploadFrame>>,
@@ -347,8 +455,23 @@ impl<B: MachineBackend> pb::pod_host_server::PodHost for Api<B> {
         &self,
         request: Request<pb::DescribeMachineQuery>,
     ) -> Result<Response<pb::MachineDescription>, Status> {
-        let _actor = self.auth(request.get_ref().claim.as_ref())?;
-        Ok(Response::new(self.description()))
+        let actor = self.auth(request.get_ref().claim.as_ref())?;
+        let mut description = self.description();
+        match self
+            .call(move |backend| backend.describe_runtime(actor))
+            .await
+        {
+            Ok(runtime) => {
+                description.runtime = Some(runtime.into_inner());
+                description.runtime_absent.clear();
+            }
+            Err(status) if status.code() == tonic::Code::Unimplemented => {
+                description.runtime_absent =
+                    "this backend does not implement machine runtime observations".into();
+            }
+            Err(status) => return Err(status),
+        }
+        Ok(Response::new(description))
     }
     async fn get_machine_execution_workspace(
         &self,
@@ -387,14 +510,13 @@ impl<B: MachineBackend> pb::pod_host_server::PodHost for Api<B> {
                 .as_ref()
                 .and_then(|q| q.claim.as_ref()),
         )?;
-        let request = request.into_inner();
+        let mut request = request.into_inner();
+        request.limit = if request.limit == 0 {
+            256
+        } else {
+            request.limit.min(256)
+        };
         let observation = super::backend::Observation::default();
-        struct ReaderGuard(super::backend::Observation);
-        impl Drop for ReaderGuard {
-            fn drop(&mut self) {
-                self.0.cancel();
-            }
-        }
         let _reader = ReaderGuard(observation.clone());
         self.call(move |backend| backend.events_observed(actor, request, observation))
             .await
@@ -419,8 +541,16 @@ impl<B: MachineBackend> pb::pod_host_server::PodHost for Api<B> {
         request: Request<pb::MachineExecutionListQuery>,
     ) -> Result<Response<pb::MachineExecutionList>, Status> {
         let actor = self.auth(request.get_ref().claim.as_ref())?;
-        let request = request.into_inner();
-        self.call(move |backend| backend.list(actor, request)).await
+        let mut request = request.into_inner();
+        request.limit = if request.limit == 0 {
+            64
+        } else {
+            request.limit.min(256)
+        };
+        let observation = super::backend::Observation::default();
+        let _reader = ReaderGuard(observation.clone());
+        self.call(move |backend| backend.list_observed(actor, request, observation))
+            .await
     }
     async fn close_machine_submission(
         &self,
@@ -488,6 +618,18 @@ impl<B: MachineBackend> pb::pod_host_server::PodHost for Api<B> {
 
 #[tonic::async_trait]
 impl<B: MachineBackend> pb::worker_control_server::WorkerControl for Api<B> {
+    async fn list_packages(
+        &self,
+        request: Request<pb::PackageListQuery>,
+    ) -> Result<Response<pb::PackageList>, Status> {
+        <Self as pb::pod_host_server::PodHost>::list_packages(self, request).await
+    }
+    async fn list_models(
+        &self,
+        request: Request<pb::ModelListQuery>,
+    ) -> Result<Response<pb::ModelList>, Status> {
+        <Self as pb::pod_host_server::PodHost>::list_models(self, request).await
+    }
     async fn control(
         &self,
         request: Request<tonic::Streaming<pb::RecordOwnerFrame>>,
