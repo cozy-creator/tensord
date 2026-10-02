@@ -50,7 +50,7 @@ Go launcher runs with a persistent, loopback-only, authorized-key grant and type
 policy `startup_update: off`, `agent: bundled`. The second command actually starts that
 Go agent and Python worker, connects through pinned TLS and signed ClaimProof, uploads the
 real wheel, calls PrepareLocalPackage and PreparePrivatePlacement, then submits each
-ReleaseRoot and reads durable events and verified native PNGs. Standard worker probes and
+ReleaseRoot and reads durable events and verified native image outputs. Standard worker probes and
 qualification are left enabled. This is a full **RPC** stack gate; default-home Creator CLI,
 browser and Hub provisioning remain unqualified.
 
@@ -108,3 +108,18 @@ manufactured repository records, credentials, public listener or global Hub conf
 are used. A full old-stack RPC measurement still cannot be divided by a partial Rust pilot
 and called a whole-architecture latency comparison; equivalent new public-front-door
 execution is a separate gate.
+
+The first full v2 fixture reached authenticated readiness in 2.853 seconds and reused-package
+preparation in 4.545 seconds, then correctly refused model preparation before any inference.
+Its client driver omitted `lane` while naming release 1.0.0; released Runtime99 requires both
+labels together (`package_prepare.py:1293`). V3 derives the unique lane from actual native
+repository bytes and confirms it through `Store.resolve_release`, then carries the same
+lane into both DownloadModelRef and ModelChoice. It validates the serving slot against the
+returned installed interface. The observed lane is **bf16**; checkpoint bytes are unchanged.
+The SDXL interface declares **image/webp**, so artifacts retain their actual MIME extension.
+No source/SDK upgrade or old Runtime workaround is part of this fix.
+
+V3's CPU `selection` action was checked against the actual installed interface and native
+repository, with Torch absent and no GPU calls. Fresh fixture config uses an independent
+identity, root `old-stack-sdk99-3` and port 18444, retaining the same SDK environment. The
+parent explicitly stops the previous idle fixture before running it; old failure logs remain.
