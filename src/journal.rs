@@ -258,6 +258,7 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS installations(actor TEXT NOT NULL,alias TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,alias));
             CREATE TABLE IF NOT EXISTS public_terminals(execution INTEGER PRIMARY KEY REFERENCES executions(id),outcome BLOB NOT NULL,events BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS native_outputs(actor TEXT NOT NULL,owner TEXT NOT NULL,source BLOB NOT NULL,PRIMARY KEY(actor,owner));
+            CREATE TABLE IF NOT EXISTS input_intakes(actor TEXT NOT NULL,retention TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,retention));
             CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_request ON executions(actor,request_id) WHERE actor IS NOT NULL;
             CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_submission ON executions(actor,submission_id) WHERE actor IS NOT NULL;
             CREATE INDEX IF NOT EXISTS executions_actor_order ON executions(actor,id) WHERE actor IS NOT NULL;").map_err(db_error)?;
@@ -293,6 +294,134 @@ impl Journal {
 
     pub fn workspace_id(&self) -> &str {
         &self.workspace_id
+    }
+    pub fn begin_intake(
+        &mut self,
+        spec: crate::native_inputs::IntakeSpec,
+    ) -> io::Result<crate::native_inputs::IntakeState> {
+        use crate::native_inputs::IntakeState;
+        if self
+            .native_owner(&spec.retention_id)?
+            .is_some_and(|held| held != spec.actor)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "intake retention belongs to another actor",
+            ));
+        }
+        let prior: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT record FROM input_intakes WHERE actor=?1 AND retention=?2",
+                params![spec.actor, spec.retention_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        if let Some(prior) = prior {
+            let state: IntakeState = serde_json::from_str(&prior).map_err(db_error)?;
+            if encoded(&state.spec)? != encoded(&spec)? {
+                return Err(admission(AdmissionError::BindingConflict));
+            }
+            return Ok(state);
+        }
+        let state = IntakeState {
+            spec,
+            released: false,
+            receipt: None,
+        };
+        self.connection
+            .execute(
+                "INSERT INTO input_intakes(actor,retention,record) VALUES(?1,?2,?3)",
+                params![state.spec.actor, state.spec.retention_id, encoded(&state)?],
+            )
+            .map_err(db_error)?;
+        Ok(state)
+    }
+    pub fn settle_intake(
+        &mut self,
+        actor: &str,
+        retention: &str,
+        receipt: Option<Vec<u8>>,
+        abort: bool,
+    ) -> io::Result<crate::native_inputs::IntakeState> {
+        use crate::{api::pb, native_inputs::IntakeState};
+        use prost::Message;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        let raw: Option<String> = tx
+            .query_row(
+                "SELECT record FROM input_intakes WHERE actor=?1 AND retention=?2",
+                params![actor, retention],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        let mut state: IntakeState =
+            serde_json::from_str(&raw.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "input intake not bound")
+            })?)
+            .map_err(db_error)?;
+        if let Some(receipt) = receipt {
+            let result =
+                pb::NativeByteRetentionResult::decode(receipt.as_slice()).map_err(db_error)?;
+            if result.retention_id != retention || result.source.is_none() {
+                return Err(db_error("native input receipt differs from bound intake"));
+            }
+            if let Some(prior) = &state.receipt {
+                if prior != &receipt {
+                    return Err(admission(AdmissionError::BindingConflict));
+                }
+            }
+            state.receipt = Some(receipt);
+            if !state.released && !abort {
+                let source = pb::NativeByteRetentionRequest {
+                    source: result.source,
+                    retention_id: retention.into(),
+                }
+                .encode_to_vec();
+                let owner: Option<String> = tx
+                    .query_row(
+                        "SELECT actor FROM native_outputs WHERE owner=?1 LIMIT 1",
+                        [retention],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(db_error)?;
+                if owner.is_some_and(|held| held != actor) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "native intake owner belongs to another actor",
+                    ));
+                }
+                let prior: Option<Vec<u8>> = tx
+                    .query_row(
+                        "SELECT source FROM native_outputs WHERE actor=?1 AND owner=?2",
+                        params![actor, retention],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(db_error)?;
+                if prior.as_ref().is_some_and(|held| held != &source) {
+                    return Err(admission(AdmissionError::BindingConflict));
+                }
+                tx.execute(
+                    "INSERT OR IGNORE INTO native_outputs(actor,owner,source) VALUES(?1,?2,?3)",
+                    params![actor, retention, source],
+                )
+                .map_err(db_error)?;
+            }
+        }
+        state.released |= abort;
+        tx.execute(
+            "UPDATE input_intakes SET record=?1 WHERE actor=?2 AND retention=?3",
+            params![encoded(&state)?, actor, retention],
+        )
+        .map_err(db_error)?;
+        tx.commit().map_err(db_error)?;
+        Ok(state)
     }
 
     pub fn installation(&self, actor: &str, alias: &str) -> io::Result<Option<Installation>> {

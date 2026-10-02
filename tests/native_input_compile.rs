@@ -1,7 +1,5 @@
 //! Compile the standalone native intake module without adding a second service owner.
-pub use cozy_machine::api;
-#[path = "../src/native_inputs.rs"]
-mod native_inputs;
+use cozy_machine::native_inputs;
 
 #[test]
 fn journal_boundary_records_are_typed_and_tolerate_added_members() {

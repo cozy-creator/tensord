@@ -27,6 +27,36 @@ use std::{
 
 pub const MAX_RUNNER_FRAME: usize = 1024 * 1024;
 
+impl crate::native_inputs::IntakeJournal for Engine {
+    fn begin_intake(
+        &self,
+        spec: crate::native_inputs::IntakeSpec,
+    ) -> io::Result<crate::native_inputs::IntakeState> {
+        self.journal.lock().unwrap().begin_intake(spec)
+    }
+    fn finish_intake(
+        &self,
+        actor: &str,
+        retention: &str,
+        receipt: Vec<u8>,
+    ) -> io::Result<crate::native_inputs::IntakeState> {
+        self.journal
+            .lock()
+            .unwrap()
+            .settle_intake(actor, retention, Some(receipt), false)
+    }
+    fn abort_intake(
+        &self,
+        actor: &str,
+        retention: &str,
+    ) -> io::Result<crate::native_inputs::IntakeState> {
+        self.journal
+            .lock()
+            .unwrap()
+            .settle_intake(actor, retention, None, true)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RunnerConfig {
     /// Trusted immutable generation interpreter, resolved by the package installer.

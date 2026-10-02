@@ -340,6 +340,20 @@ impl NativeBackend {
     }
 }
 impl MachineBackend for NativeBackend {
+    fn begin_input_tree(
+        &self,
+        actor: VerifiedActor,
+        header: pb::InputTreeImportHeader,
+    ) -> Result<Box<dyn crate::api::backend::InputTreeReceiver>, Status> {
+        crate::native_inputs::SourceIntake::begin(
+            self.store.clone(),
+            self.service.engine.clone(),
+            &self.service.engine.root.join("input-staging"),
+            &self.workspace_id(),
+            actor,
+            header,
+        )
+    }
     fn describe_runtime(&self, _: VerifiedActor) -> Result<pb::MachineRuntime, Status> {
         Ok(pb::MachineRuntime {
             wire_minor: crate::api::WIRE_MINOR,

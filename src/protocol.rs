@@ -93,14 +93,14 @@ pub enum Body {
     },
     Shutdown,
     Execution {
-        record: Box<cozy_machine::journal::Execution>,
+        record: Box<crate::journal::Execution>,
     },
     Executions {
-        records: Vec<cozy_machine::journal::Execution>,
+        records: Vec<crate::journal::Execution>,
     },
     ResultArtifact {
         id: String,
-        artifact: cozy_machine::journal::Artifact,
+        artifact: crate::journal::Artifact,
     },
     Error {
         code: &'static str,

@@ -1,8 +1,7 @@
-mod os;
-mod owner;
-mod protocol;
-use owner::{Owner, Shared};
-use protocol::{Body, Command, Reply, CAPS};
+use cozy_machine::{
+    owner::{Owner, Shared},
+    protocol::{self, Body, Command, Reply, CAPS},
+};
 use std::{
     collections::HashSet,
     io::{self, Write},
