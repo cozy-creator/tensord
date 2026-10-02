@@ -12,3 +12,4 @@ pub(crate) mod os;
 pub mod owner;
 pub mod protocol;
 pub mod service;
+pub mod shared_host_plane;
