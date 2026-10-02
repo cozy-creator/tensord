@@ -157,6 +157,22 @@ pub fn prepare_uploaded(
     uploaded: &UploadedPackage,
 ) -> Result<PreparedGeneration, Status> {
     let materialized = materialize_uploaded(uploaded, &config.staging_root)?;
+    let captured_python = &materialized.root_set.python_version;
+    let python = if !captured_python.is_empty() {
+        let parts: Vec<_> = captured_python.split('.').collect();
+        if !(2..=3).contains(&parts.len())
+            || parts
+                .iter()
+                .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            return Err(Status::invalid_argument(
+                "captured Python selection must be a numeric major.minor[.patch]",
+            ));
+        }
+        captured_python
+    } else {
+        &config.python
+    };
     let mut command = Command::new(&config.helper_python);
     command
         .arg("-m")
@@ -167,7 +183,7 @@ pub fn prepare_uploaded(
         .arg("--client-wheel")
         .arg(&config.client_wheel)
         .arg("--python")
-        .arg(&config.python)
+        .arg(python)
         .arg("--distribution")
         .arg(
             materialized
@@ -214,6 +230,20 @@ pub fn prepare_uploaded(
     std::io::copy(&mut stdout, &mut std::io::sink()).map_err(storage)?;
     let exited = child.wait().map_err(storage)?;
     if !exited.success() {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename = "install_failed")]
+        struct InstallationFailure {
+            code: String,
+            detail: String,
+        }
+        if let Ok(failure) = serde_json::from_slice::<InstallationFailure>(&output) {
+            let message = format!("{}: {}", failure.code, failure.detail);
+            return Err(if failure.code.ends_with("_unsupported") {
+                Status::unimplemented(message)
+            } else {
+                Status::failed_precondition(message)
+            });
+        }
         return Err(Status::failed_precondition("package_installation_failed: trusted Python/uv installer did not complete the captured operation"));
     }
     if output.len() > 8 << 20 {
