@@ -87,10 +87,15 @@ Root's earlier three SDXL A40 images are documented as legacy inference proof on
 Root's paired candidate legacy/descriptor GPU runs each completed three full 1024×1024/20-step
 SDXL images. Independent CPU revalidation on pod and after copying outputs checks WebP dimensions,
 variance, exact producer BLAKE2b-128/length/SHA-256; all three images match byte-for-byte across
-source modes. Descriptor Store path is empty, capability true; PID20015 reused; model-source
-exports during all three requests are0. Native owner exported2,606 blobs; sampled owner FD peak
-2,619. Load regressed21.933s vs6.403s (+15.530s/3.426x), setup71ms/read189ms. Receiver attribution
-pending B CPU profile; Start10.643vs4.171s confounds full total comparison. Both modes still use
-69 stage round trips/image:2encode+20denoise+1decode entries and46exit/yielded acknowledgements.
+source modes. Descriptor Store path is empty, capability true; PID 20015 reused; model-source
+exports during all three requests are 0. Native owner exported 2,606 blobs; sampled owner FD peak
+2,619. Load regressed 21.933s vs 6.403s (+15.530s/3.426x), setup 71ms/read 189ms. Receiver attribution
+pending B CPU profile; Start 10.643 vs 4.171s confounds full total comparison. Both modes still use
+69 stage round trips/image: 2 encode + 20 denoise + 1 decode entries and 46 exit/yielded acknowledgements.
 The no-per-step-RPC blanket claim is false despite no hot source RPC. Evidence in
 outputs/cm-device-20261002/descriptor-comparison/independent-cpu-verification.json and event-counts.
+
+Typed optional stages:false now selects a controlled single-executor, fixed-allowance benchmark;
+absent/default Auto preserves negotiation. Device authorization and plane/pinned budgets stay
+unchanged. Fresh no-stages candidate legacy config preserves requests/snapshots/dependencies.
+No GPU execution by this agent; Root decides/owns warm legacy and stage-cost runs.
