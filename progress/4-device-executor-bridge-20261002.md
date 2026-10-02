@@ -21,3 +21,10 @@ and independent CAS SHA-256 facts. A real installed classifier/image package pas
 encoding and independent pixel/dimension inspection. Explicit SDK suite: 3 passed in 8.22 s; fmt
 and focused clippy pass. Current image generation used Runtime 0.18.99 with TensorFS 0.3.90.
 Legacy worker-module resolver dependency and whole-buffer encoder memory are documented limits.
+
+Isolated `device-pilot validate|run CONFIG.json` now builds optimized. CPU-only validation passed
+the actual published SDXL interface and coherent bf16 manifest. No GPU run occurred. Root supplies
+the owned non-display rental, measured reservations and actual installed paths before run. The
+pilot deliberately labels legacy store/single-writer/host ownership and normal API gates unqualified.
+The descriptor-source control shape is additive and world-one capability gated; SourceBlob transfers
+must be readonly regular fds. Latest explicit SDK suite 3 passed (6.47 s); pilot/SDK clippy and fmt pass.

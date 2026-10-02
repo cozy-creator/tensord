@@ -112,6 +112,7 @@ fn prepared(version: &str, generation_path: &str) -> (DeviceExecutor, PathBuf) {
                 attention_pin: String::new(),
                 host_tier: false,
                 stages: false,
+                descriptor_sources: false,
             },
             &mut Baseline,
         )
