@@ -202,16 +202,16 @@ fn client(
                 if !owner.lock().unwrap().stop() {
                     Err(io::Error::other("active leases prevent shutdown"))
                 } else {
-                    protocol::write(
+                    let acknowledgement = protocol::write(
                         &mut stream,
                         &Reply {
                             seq,
                             body: Body::Shutdown,
                         },
-                    )?;
+                    );
                     stopped.store(true, Ordering::Release);
                     let _ = UnixStream::connect(path);
-                    return Ok(());
+                    return acknowledgement;
                 }
             }
             _ => Ok((

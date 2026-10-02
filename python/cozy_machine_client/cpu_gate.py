@@ -12,6 +12,9 @@ import time
 
 import msgspec
 import numpy as np
+from sklearn.datasets import load_digits
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
 
 from .client import Client, MachineError
 from .protocol import CAPABILITIES, HelloReply, ObjectRef, Shutdown, ShutdownReply
@@ -84,9 +87,6 @@ def encode_line(record: msgspec.Struct, pipe):
 
 
 def make_fixture(path: Path) -> Fixture:
-    from sklearn.datasets import load_digits
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.model_selection import train_test_split
 
     digits = load_digits()
     samples = digits.data.astype("float64") / 16
