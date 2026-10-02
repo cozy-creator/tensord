@@ -306,3 +306,36 @@ fn stock_executor_deferred_webp_reuses_sdk_encoder_and_exact_asset_binding() {
     }
     executor.shutdown().unwrap();
 }
+
+#[test]
+#[ignore = "actual SDK receiver custody gate needs installed current generation"]
+fn retained_source_is_released_only_after_actual_receiver_exit() {
+    use cozy_machine::execution::process_ended;
+    use fs2::FileExt;
+    use std::time::{Duration, Instant};
+    let (mut executor, root) = prepared(
+        "0.18.99",
+        "current-generations/72c4d77b275a474b8c828de950020e18/generation.json",
+    );
+    let birth = executor.birth.clone();
+    let path = root.join("retained-source.hold");
+    let source = Arc::new(File::create(&path).unwrap());
+    source.lock_exclusive().unwrap();
+    executor.retain_until_exit(Arc::clone(&source));
+    drop(source);
+    let observer = File::open(&path).unwrap();
+    assert!(observer.try_lock_exclusive().is_err());
+    assert!(!process_ended(&birth).unwrap());
+    // Loss of the private owner handle detaches its source custody from that handle.
+    drop(executor);
+    let observed = Instant::now();
+    loop {
+        if observer.try_lock_exclusive().is_ok() {
+            assert!(process_ended(&birth).unwrap());
+            break;
+        }
+        // Test observation bound, not authority to terminate or release any receiver.
+        assert!(observed.elapsed() < Duration::from_secs(10));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}

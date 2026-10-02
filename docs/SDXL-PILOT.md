@@ -103,6 +103,35 @@ Headers/assets move through fds/spool, never an oversized control frame; SDK com
 existing read plan locally. These are amortized load exchanges, not step/block RPC.
 The dependency hook and native SourceDescriptor are undergoing independent qualification.
 
+Set the typed pilot option `"model_sources":"descriptors"` to prefer the source broker;
+`"legacy"` remains the default. An older peer missing the descriptor capability selects legacy
+residency and records that selection in negotiation.json. The broker derives its selected
+manifest/component authority from the unchanged Binding, acquires native source custody before
+exporting bytes, and is retained through exact receiver death even if the private driver handle
+is lost. Each exported duplicate closes after SCM_RIGHTS transfer. Descriptor Load deliberately
+receives an empty Store path after the broker opens the real authoritative store: successful
+inference must obtain model bytes through the negotiated provider. Legacy fallback preserves
+the original path. This tests the normal execution path, not privileged-code containment.
+
+The next pilot records fork/Hello `spawn_ms`, command-only `start_ms`, model source selection and
+admission/setup time, `load_ms`, first/subsequent request times and shutdown/total wall time.
+Total wall time starts inside the run entry point; it is not stopped-machine/SSH/CLI latency.
+Source exports/bytes and aggregate broker read time are recorded, with per-request export counts
+to reveal lazy source work during the first invocation. Broker read time excludes control
+transport and receiver verification; Load/request wall time includes them. Receiver cache hits
+remain unknown without its own telemetry. `owner_fd_peak` is sampled at admission/each export,
+not continuous process-wide maximum.
+
+The released owner native ReadLease retains one verified FD per selected object and raises its
+soft limit toward its hard limit; this pilot reports that existing behavior rather than applying
+an extra ulimit workaround. A bounded owner hold needs a separate TensorFS contract. The candidate
+consumer instead keeps readonly private mappings and closes transient FDs, preserving immutable
+inode custody without per-block source RPC. Mapping count/address/RSS limits still need testing.
+These source exports prove neither machine-owned host nor GPU weight allocations.
+The pilot's trusted package runs as root on the isolated pod. Normal SDK execution avoids Store
+in descriptor mode, but filesystem/catalog mutation by privileged package code is not fenced.
+Product UID/capability/seccomp isolation remains a separate gate; no security sole-writer claim.
+
 ## Isolated transfer recipe
 
 When the ordinary downloader cannot address an independently acquired pod, transfer the

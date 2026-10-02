@@ -1,5 +1,6 @@
 //! Explicit isolated hardware pilot; validate never launches Python or initializes a device.
 use cozy_machine::device_executor;
+use cozy_machine::model_sources::{ModelSources, SelectedManifest};
 
 use device_executor::{
     postprocess, Answer, Baseline, Binding, Budgets, DeviceCommand, DeviceExecutor, ExecutorConfig,
@@ -12,7 +13,7 @@ use std::{
     fs::{self, File},
     io::{self, Write},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Instant,
 };
 
@@ -30,7 +31,32 @@ struct Pilot {
     pinned_budget_bytes: i64,
     #[serde(default)]
     generation_hold: Option<PathBuf>,
+    #[serde(default)]
+    model_sources: SourceMode,
     payloads: Vec<Value>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SourceMode {
+    #[default]
+    Legacy,
+    Descriptors,
+}
+
+#[derive(Default, Serialize)]
+struct SourceEvidence {
+    selected_objects: u64,
+    selected_bytes: u64,
+    exports: u64,
+    headers: u64,
+    assets: u64,
+    objects: u64,
+    exported_bytes: u64,
+    read_wall_ms: f64,
+    owner_fd_peak: usize,
+    // The provider's cache is private; absence of an RPC is not a measured cache hit.
+    receiver_cache_hits: Option<u64>,
 }
 
 struct Turns {
@@ -38,6 +64,8 @@ struct Turns {
     held: Vec<File>,
     events: File,
     phase: String,
+    sources: Option<Arc<Mutex<ModelSources>>>,
+    source_evidence: SourceEvidence,
 }
 impl Services for Turns {
     fn progress(&mut self, frame: &Frame) {
@@ -50,6 +78,28 @@ impl Services for Turns {
         descriptor: Option<File>,
     ) -> io::Result<(Answer, Option<File>)> {
         let mut answer = Answer::unavailable(frame.seq);
+        if frame.kind == Kind::ModelSourceRead {
+            drop(descriptor);
+            let Some(sources) = &self.sources else {
+                return Ok((answer, None));
+            };
+            let started = Instant::now();
+            let (answer, file) =
+                cozy_machine::model_source_driver::answer(&mut sources.lock().unwrap(), frame)?;
+            let evidence = &mut self.source_evidence;
+            evidence.read_wall_ms += started.elapsed().as_secs_f64() * 1000.;
+            evidence.exports += 1;
+            evidence.exported_bytes += answer.length;
+            match frame.role {
+                device_executor::SourceRole::Header => evidence.headers += 1,
+                device_executor::SourceRole::Asset => evidence.assets += 1,
+                device_executor::SourceRole::Object => evidence.objects += 1,
+                device_executor::SourceRole::Unknown => (),
+            }
+            evidence.owner_fd_peak = evidence.owner_fd_peak.max(fd_count()?);
+            // Caller transfers one readonly descriptor and closes this duplicate immediately.
+            return Ok((answer, Some(file)));
+        }
         match frame.kind {
             Kind::BudgetCell => {
                 let descriptor =
@@ -89,6 +139,8 @@ struct RunEvidence {
     bindings: Vec<device_executor::AssetBinding>,
     metrics: Option<device_executor::Metrics>,
     plane: Option<device_executor::PlaneFacts>,
+    source_exports: u64,
+    source_read_ms: f64,
 }
 
 fn main() {
@@ -98,6 +150,7 @@ fn main() {
     }
 }
 fn run() -> io::Result<()> {
+    let total_started = Instant::now();
     let mut args = std::env::args().skip(1);
     let action = args
         .next()
@@ -144,6 +197,7 @@ fn run() -> io::Result<()> {
             Ok::<_, io::Error>(Arc::new(file))
         })
         .transpose()?;
+    let spawn_started = Instant::now();
     let mut executor = DeviceExecutor::spawn(ExecutorConfig {
         python: config.python,
         root: config.root.clone(),
@@ -151,6 +205,7 @@ fn run() -> io::Result<()> {
         environment: config.environment,
         generation_hold: hold,
     })?;
+    let spawn_ms = spawn_started.elapsed().as_secs_f64() * 1000.;
     let devices = executor
         .hello
         .sealed
@@ -159,6 +214,8 @@ fn run() -> io::Result<()> {
         .unwrap_or_default();
     let stages = executor.hello.offers("stage/1");
     let plane = executor.hello.offers("weight_plane/1");
+    let descriptors = matches!(config.model_sources, SourceMode::Descriptors)
+        && executor.hello.offers("model_sources.descriptors/1");
     fs::write(
         config.root.join("negotiation.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
@@ -168,7 +225,9 @@ fn run() -> io::Result<()> {
             "stage_turns":stages,
             "weight_plane":plane,
             "legacy_residency":!plane,
-            "descriptor_sources":false
+            "requested_model_sources":config.model_sources,
+            "descriptor_sources":descriptors,
+            "executor_store_path":if descriptors { "" } else { &config.binding.store }
         }))?,
     )?;
     let mut turns = Turns {
@@ -176,8 +235,36 @@ fn run() -> io::Result<()> {
         held: Vec::new(),
         events: File::create(config.root.join("events.jsonl"))?,
         phase: "start".into(),
+        sources: None,
+        source_evidence: SourceEvidence::default(),
     };
     let mut timings = BTreeMap::new();
+    timings.insert("spawn_ms", spawn_ms);
+    if descriptors {
+        let selection_started = Instant::now();
+        let selections = selected_sources(&config.binding)?;
+        let mut sources = ModelSources::open(&PathBuf::from(&config.binding.store), &selections)?;
+        timings.insert(
+            "source_selection_ms",
+            selection_started.elapsed().as_secs_f64() * 1000.,
+        );
+        let admission_started = Instant::now();
+        let (objects, bytes) = sources.verify_selected()?;
+        timings.insert(
+            "source_admission_ms",
+            admission_started.elapsed().as_secs_f64() * 1000.,
+        );
+        timings.insert(
+            "source_setup_ms",
+            selection_started.elapsed().as_secs_f64() * 1000.,
+        );
+        turns.source_evidence.selected_objects = objects as u64;
+        turns.source_evidence.selected_bytes = bytes;
+        turns.source_evidence.owner_fd_peak = fd_count()?;
+        let sources = Arc::new(Mutex::new(sources));
+        executor.retain_until_exit(Arc::clone(&sources));
+        turns.sources = Some(sources);
+    }
     let start = Instant::now();
     let started = executor.command(
         &DeviceCommand::Start {
@@ -198,12 +285,17 @@ fn run() -> io::Result<()> {
     }
     turns.phase = "load".into();
     let start = Instant::now();
+    let mut load_binding = config.binding;
+    if descriptors {
+        // The negotiated provider receives all bytes through the owner, not a local Store path.
+        load_binding.store.clear();
+    }
     let loaded = executor.command(
         &DeviceCommand::Load {
             construction: "pilot-model".into(),
             devices,
             sequence_parallel_degree: 1,
-            binding: Box::new(config.binding),
+            binding: Box::new(load_binding),
             budgets: Budgets {
                 declared_weight_bytes: config.logical_weight_bytes,
             },
@@ -211,7 +303,7 @@ fn run() -> io::Result<()> {
             attention_pin: String::new(),
             host_tier: false,
             stages,
-            descriptor_sources: false,
+            descriptor_sources: descriptors,
         },
         &mut turns,
     )?;
@@ -259,6 +351,8 @@ fn run() -> io::Result<()> {
         turns.phase = id.clone();
         let spool = config.root.join(&id);
         fs::create_dir(&spool)?;
+        let source_exports_before = turns.source_evidence.exports;
+        let source_read_before = turns.source_evidence.read_wall_ms;
         let all = Instant::now();
         let start = Instant::now();
         let prepared = executor.command(
@@ -306,13 +400,66 @@ fn run() -> io::Result<()> {
             bindings,
             metrics: reply.metrics,
             plane: reply.plane,
+            source_exports: turns.source_evidence.exports - source_exports_before,
+            source_read_ms: turns.source_evidence.read_wall_ms - source_read_before,
         });
         fs::write(
             config.root.join("results.json"),
             serde_json::to_vec_pretty(
-                &serde_json::json!({"qualification":"legacy pilot; store writer/host ownership/full machine API unqualified","stage_turns":stages,"weight_plane":plane,"timings":timings,"runs":results}),
+                &serde_json::json!({"qualification":"stock executor pilot; machine host/GPU ownership/full machine API unqualified","stage_turns":stages,"weight_plane":plane,"descriptor_sources":descriptors,"timings":timings,"sources":turns.source_evidence,"runs":results}),
             )?,
         )?;
     }
-    executor.shutdown()
+    let shutdown_started = Instant::now();
+    executor.shutdown()?;
+    timings.insert(
+        "shutdown_ms",
+        shutdown_started.elapsed().as_secs_f64() * 1000.,
+    );
+    timings.insert(
+        "total_wall_ms",
+        total_started.elapsed().as_secs_f64() * 1000.,
+    );
+    fs::write(
+        config.root.join("results.json"),
+        serde_json::to_vec_pretty(
+            &serde_json::json!({"qualification":"stock executor pilot; machine host/GPU ownership/full machine API unqualified","stage_turns":stages,"weight_plane":plane,"descriptor_sources":descriptors,"timings":timings,"sources":turns.source_evidence,"runs":results}),
+        )?,
+    )?;
+    Ok(())
+}
+
+fn fd_count() -> io::Result<usize> {
+    Ok(fs::read_dir("/proc/self/fd")?.count())
+}
+
+fn selected_sources(binding: &Binding) -> io::Result<Vec<SelectedManifest>> {
+    let components = if binding.components.is_empty() {
+        vec![binding.component.clone()]
+    } else {
+        binding.components.clone()
+    };
+    let mut grouped = BTreeMap::<String, Vec<String>>::new();
+    for component in components {
+        let manifest = binding
+            .snapshots
+            .get(&component)
+            .unwrap_or(&binding.snapshot);
+        if component.is_empty() || manifest.is_empty() {
+            return Err(io::Error::other(
+                "descriptor selection requires actual component/snapshot bindings",
+            ));
+        }
+        let selected = grouped.entry(manifest.clone()).or_default();
+        if !selected.contains(&component) {
+            selected.push(component);
+        }
+    }
+    Ok(grouped
+        .into_iter()
+        .map(|(manifest, components)| SelectedManifest {
+            manifest,
+            components,
+        })
+        .collect())
 }

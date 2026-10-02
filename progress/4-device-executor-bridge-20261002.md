@@ -69,3 +69,17 @@ clears only variant, keeps the exact manifest/payloads, and passes static valida
 header parsing (no package/model execution) proves all 2,641 logical tensors are f16 even
 though the catalog label is bf16. Evidence: outputs/cm-device-20261002/sdxl-header-types.json.
 Root owns the rerun; run1/run2 logs are preserved, no GPU calls by this agent.
+
+Optional source pilot followup integrates committed Root2035bbd (merge5aaead0 preserves all
+ancestry/current root Engine changes) and shared broker export d22f316 (localc1625a4).
+Typed model_sources selector defaults legacy and prefers descriptor capability when requested;
+older peers fall back. Shared model_source_driver::answer maps exact source grants for the GPU
+pilot and CPU diagnostic consumer. Source custody is acquired before export and retained until
+kernel-observed exact receiver exit; each transferred duplicate closes promptly. Four actual
+SDK/process gates pass in10.94s, including resource custody through receiver-handle loss; five
+native broker gates pass. Added spawn/source-selection/admission/read/export/FD/shutdown/total
+timing evidence and per-run source counts; receiver cache hits remain unknown. Descriptor Load
+receives empty Store path while owner broker uses original selected store. Trusted-root package
+scope, normal SDK no-Store path versus literal TensorFS imports/security authority, retained
+native reader/GPU mechanisms, owner whole-closure FD bound and host/GPU ownership are explicit.
+Root's earlier three SDXL A40 images are documented as legacy inference proof only.
