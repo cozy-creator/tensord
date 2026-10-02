@@ -59,6 +59,12 @@ interface. Model class is `SdxlModel`, binding path `generate.models.model`, par
 `model`, application `sdxl:app`. Source-only inspection and the cached published interface
 confirm this contract. Configuration/tokenizer assets belong to the same model closure.
 Do not combine arbitrary component lanes or override the package's dependency bounds.
+`Binding.variant` is a hardware derivation variant, not the catalog lane: leave it empty
+so the SDK derives `sm<actual device>` from measured hardware. The selected manifest's
+native header actually declares `f16` for all 2,641 logical tensors (196 text_encoder,
+517 text_encoder_2, 1,680 unet, 248 vae), although the catalog lane is named `bf16`.
+The manifest and tensor bytes remain authoritative and unchanged; do not infer numerical
+representation from the lane label or rewrite their dtype.
 
 The local CPU-only template is
 `~/cozy_v2/outputs/cm-device-20261002/sdxl-pilot-local-validate.json`. Copy its shape, replacing

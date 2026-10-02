@@ -60,3 +60,12 @@ Pilot now records negotiation and preserves legacy residency, selecting stage/pl
 from offered capabilities without a version floor. Unsupported Budget is operation-local;
 real inference still follows it successfully. Three actual CPU gates pass in 5.99 s.
 First logs are preserved; the next configuration uses fresh legacy-sdk99-run-2 paths.
+
+Root's second hardware attempt stopped before allocation because the prototype template
+incorrectly put the catalog lane bf16 into Binding.variant. Published SDK executor.py
+2127–2143 already measures its own device and derives an sm variant when this field is empty;
+the SDK explicitly distinguishes repository lane from hardware claims. Fresh run3 metadata
+clears only variant, keeps the exact manifest/payloads, and passes static validation. Native
+header parsing (no package/model execution) proves all 2,641 logical tensors are f16 even
+though the catalog label is bf16. Evidence: outputs/cm-device-20261002/sdxl-header-types.json.
+Root owns the rerun; run1/run2 logs are preserved, no GPU calls by this agent.

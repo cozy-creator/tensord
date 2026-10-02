@@ -93,6 +93,7 @@ pub struct Binding {
     pub store: String,
     pub snapshot: String,
     pub release: String,
+    /// Hardware derivation variant, e.g. sm86; empty lets the SDK measure it. Never a catalog lane.
     pub variant: String,
     pub development: bool,
     pub custody: String,
