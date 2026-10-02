@@ -171,7 +171,7 @@ impl<B> Clone for Api<B> {
     }
 }
 impl<B: MachineBackend> Api<B> {
-    fn auth(&self, claim: Option<&pb::Claim>) -> Result<(), Status> {
+    fn auth(&self, claim: Option<&pb::Claim>) -> Result<super::auth::VerifiedActor, Status> {
         self.identity.authority.verify(claim)
     }
     fn protocol(&self) -> pb::ProtocolInfoResult {
@@ -202,6 +202,141 @@ type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + '
 
 #[tonic::async_trait]
 impl<B: MachineBackend> pb::pod_host_server::PodHost for Api<B> {
+    async fn local_package_upload(
+        &self,
+        request: Request<tonic::Streaming<pb::LocalPackageUploadFrame>>,
+    ) -> Result<Response<ResponseStream<pb::LocalPackageFileStatus>>, Status> {
+        let mut incoming = request.into_inner();
+        let first = incoming
+            .message()
+            .await?
+            .ok_or_else(|| Status::unauthenticated("package upload requires a signed header"))?;
+        let header = match first.body {
+            Some(pb::local_package_upload_frame::Body::Header(header)) => header,
+            _ => {
+                return Err(Status::unauthenticated(
+                    "package upload requires a signed header",
+                ))
+            }
+        };
+        let actor = self.auth(header.claim.as_ref())?;
+        let uploads = self.backend.uploads().ok_or_else(|| {
+            Status::unimplemented("capability_unavailable: package carrier ingress is unavailable")
+        })?;
+        let authority = self.identity.authority.clone();
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(async move {
+            let begin_header = header.clone();
+            let begin =
+                tokio::task::spawn_blocking(move || uploads.begin(actor, &begin_header)).await;
+            let mut session = match begin {
+                Ok(Ok(session)) => session,
+                Ok(Err(error)) => {
+                    let _ = sender.send(Err(error)).await;
+                    return;
+                }
+                Err(_) => {
+                    let _ = sender
+                        .send(Err(Status::internal("upload storage task stopped")))
+                        .await;
+                    return;
+                }
+            };
+            let report = |session: &super::workspaces::UploadSession| {
+                let file = header.file.as_ref().expect("begin validated one file");
+                pb::LocalPackageFileStatus {
+                    record_owner_epoch: header
+                        .claim
+                        .as_ref()
+                        .expect("verified claim")
+                        .record_owner_epoch,
+                    worker_boot_id: authority.boot_id.clone(),
+                    operation_id: header.operation_id.clone(),
+                    digest: file.digest.clone(),
+                    filename: file.filename.clone(),
+                    length: file.length,
+                    received_bytes: session.received(),
+                    state: if session.verified() {
+                        pb::LocalPackageFileState::Verified as i32
+                    } else {
+                        pb::LocalPackageFileState::Receiving as i32
+                    },
+                    ..Default::default()
+                }
+            };
+            if sender.send(Ok(report(&session))).await.is_err() || session.verified() {
+                return;
+            }
+            loop {
+                let chunk = match incoming.message().await {
+                    Ok(Some(pb::LocalPackageUploadFrame {
+                        body: Some(pb::local_package_upload_frame::Body::Chunk(chunk)),
+                    })) => chunk,
+                    Ok(None) => return,
+                    Ok(Some(_)) => {
+                        let _ = sender
+                            .send(Err(Status::invalid_argument(
+                                "only chunks follow a package upload header",
+                            )))
+                            .await;
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Err(error)).await;
+                        return;
+                    }
+                };
+                let appended = tokio::task::spawn_blocking(move || {
+                    let result = session.append(chunk);
+                    (session, result)
+                })
+                .await;
+                session = match appended {
+                    Ok((session, Ok(()))) => session,
+                    Ok((_, Err(error))) => {
+                        let _ = sender.send(Err(error)).await;
+                        return;
+                    }
+                    Err(_) => {
+                        let _ = sender
+                            .send(Err(Status::internal("upload storage task stopped")))
+                            .await;
+                        return;
+                    }
+                };
+                if sender.send(Ok(report(&session))).await.is_err() || session.verified() {
+                    return;
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(receiver),
+        )))
+    }
+
+    async fn prepare_local_package(
+        &self,
+        request: Request<pb::PrepareLocalPackageCall>,
+    ) -> Result<Response<ResponseStream<pb::PrepareEvent>>, Status> {
+        let actor = self.auth(request.get_ref().claim.as_ref())?;
+        let request = request.into_inner();
+        let events = self
+            .call(move |backend| {
+                let selected = request.local_package_set.as_ref().ok_or_else(|| {
+                    Status::invalid_argument("local package selection is required")
+                })?;
+                let uploaded = match backend.uploads() {
+                    Some(uploads) => uploads.package(actor, selected)?,
+                    None => None,
+                };
+                backend.prepare_local(actor, request, uploaded)
+            })
+            .await?
+            .into_inner();
+        Ok(Response::new(Box::pin(tokio_stream::iter(
+            events.into_iter().map(Ok),
+        ))))
+    }
     async fn protocol_info(
         &self,
         _: Request<pb::ProtocolInfoRequest>,
@@ -212,38 +347,40 @@ impl<B: MachineBackend> pb::pod_host_server::PodHost for Api<B> {
         &self,
         request: Request<pb::DescribeMachineQuery>,
     ) -> Result<Response<pb::MachineDescription>, Status> {
-        self.auth(request.get_ref().claim.as_ref())?;
+        let _actor = self.auth(request.get_ref().claim.as_ref())?;
         Ok(Response::new(self.description()))
     }
     async fn get_machine_execution_workspace(
         &self,
         request: Request<pb::MachineExecutionWorkspaceQuery>,
     ) -> Result<Response<pb::MachineExecutionWorkspace>, Status> {
-        self.auth(request.get_ref().claim.as_ref())?;
+        let actor = self.auth(request.get_ref().claim.as_ref())?;
         let request = request.into_inner();
-        self.call(move |backend| backend.workspace(request)).await
+        self.call(move |backend| backend.workspace(actor, request))
+            .await
     }
     async fn submit_machine_execution(
         &self,
         request: Request<pb::MachineExecutionSubmit>,
     ) -> Result<Response<pb::MachineExecutionReceipt>, Status> {
-        self.auth(request.get_ref().claim.as_ref())?;
+        let actor = self.auth(request.get_ref().claim.as_ref())?;
         let request = request.into_inner();
-        self.call(move |backend| backend.submit(request)).await
+        self.call(move |backend| backend.submit(actor, request))
+            .await
     }
     async fn get_machine_execution(
         &self,
         request: Request<pb::MachineExecutionQuery>,
     ) -> Result<Response<pb::MachineExecutionState>, Status> {
-        self.auth(request.get_ref().claim.as_ref())?;
+        let actor = self.auth(request.get_ref().claim.as_ref())?;
         let request = request.into_inner();
-        self.call(move |backend| backend.get(request)).await
+        self.call(move |backend| backend.get(actor, request)).await
     }
     async fn list_machine_execution_events(
         &self,
         request: Request<pb::MachineExecutionEventsQuery>,
     ) -> Result<Response<pb::MachineExecutionEventPage>, Status> {
-        self.auth(
+        let actor = self.auth(
             request
                 .get_ref()
                 .execution
@@ -251,13 +388,14 @@ impl<B: MachineBackend> pb::pod_host_server::PodHost for Api<B> {
                 .and_then(|q| q.claim.as_ref()),
         )?;
         let request = request.into_inner();
-        self.call(move |backend| backend.events(request)).await
+        self.call(move |backend| backend.events(actor, request))
+            .await
     }
     async fn control_machine_execution(
         &self,
         request: Request<pb::MachineExecutionControl>,
     ) -> Result<Response<pb::MachineExecutionState>, Status> {
-        self.auth(
+        let actor = self.auth(
             request
                 .get_ref()
                 .execution
@@ -265,30 +403,31 @@ impl<B: MachineBackend> pb::pod_host_server::PodHost for Api<B> {
                 .and_then(|q| q.claim.as_ref()),
         )?;
         let request = request.into_inner();
-        self.call(move |backend| backend.control(request)).await
+        self.call(move |backend| backend.control(actor, request))
+            .await
     }
     async fn list_machine_executions(
         &self,
         request: Request<pb::MachineExecutionListQuery>,
     ) -> Result<Response<pb::MachineExecutionList>, Status> {
-        self.auth(request.get_ref().claim.as_ref())?;
+        let actor = self.auth(request.get_ref().claim.as_ref())?;
         let request = request.into_inner();
-        self.call(move |backend| backend.list(request)).await
+        self.call(move |backend| backend.list(actor, request)).await
     }
     async fn close_machine_submission(
         &self,
         request: Request<pb::MachineSubmissionClose>,
     ) -> Result<Response<pb::MachineSubmissionClosure>, Status> {
-        self.auth(request.get_ref().claim.as_ref())?;
+        let actor = self.auth(request.get_ref().claim.as_ref())?;
         let request = request.into_inner();
-        self.call(move |backend| backend.close_submission(request))
+        self.call(move |backend| backend.close_submission(actor, request))
             .await
     }
     async fn collect_machine_execution(
         &self,
         request: Request<pb::MachineExecutionCollect>,
     ) -> Result<Response<pb::AttemptOutcome>, Status> {
-        self.auth(
+        let actor = self.auth(
             request
                 .get_ref()
                 .execution
@@ -296,13 +435,14 @@ impl<B: MachineBackend> pb::pod_host_server::PodHost for Api<B> {
                 .and_then(|q| q.claim.as_ref()),
         )?;
         let request = request.into_inner();
-        self.call(move |backend| backend.collect(request)).await
+        self.call(move |backend| backend.collect(actor, request))
+            .await
     }
     async fn acknowledge_machine_execution_collection(
         &self,
         request: Request<pb::MachineExecutionCollectionAck>,
     ) -> Result<Response<pb::MachineExecutionState>, Status> {
-        self.auth(
+        let actor = self.auth(
             request
                 .get_ref()
                 .execution
@@ -310,17 +450,17 @@ impl<B: MachineBackend> pb::pod_host_server::PodHost for Api<B> {
                 .and_then(|q| q.claim.as_ref()),
         )?;
         let request = request.into_inner();
-        self.call(move |backend| backend.ack_collection(request))
+        self.call(move |backend| backend.ack_collection(actor, request))
             .await
     }
     async fn read_byte_tree_object(
         &self,
         request: Request<pb::NativeByteReadCall>,
     ) -> Result<Response<ResponseStream<pb::NativeByteReadChunk>>, Status> {
-        self.auth(request.get_ref().claim.as_ref())?;
+        let actor = self.auth(request.get_ref().claim.as_ref())?;
         let request = request.into_inner();
         let chunks = self
-            .call(move |backend| backend.read_bytes(request))
+            .call(move |backend| backend.read_bytes(actor, request))
             .await?
             .into_inner();
         Ok(Response::new(Box::pin(tokio_stream::iter(
