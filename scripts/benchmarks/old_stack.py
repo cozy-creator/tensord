@@ -46,6 +46,36 @@ def inspect(pilot: dict) -> dict:
             "snapshot": pilot["binding"]["snapshot"], "store": pilot["binding"]["store"]}
 
 
+def model_selection(pilot: dict, interface_bytes: bytes) -> dict:
+    """Read the declared slot and native repository selection; never invent lane labels."""
+    import tensorfs
+    from cozy_runtime.internal import package_interface
+    interface = package_interface.parse(interface_bytes, "returned installed benchmark interface")
+    binding = pilot["binding"]
+    if interface.application != binding["application"]:
+        raise ValueError("received installed interface names another benchmark application")
+    slots = [(entry.name, model) for entry in interface.entrypoints for model in entry.models
+             if model.path == binding["model_binding_path"] and model.class_name == binding["model_class"]]
+    if len(slots) != 1:
+        raise ValueError("actual installed interface does not declare one selected serving Model slot")
+    repository, release = binding["model"].rsplit("@", 1)
+    org, name = repository.split("/")
+    store = tensorfs.Store.open(binding["store"])
+    repo = json.loads(store.repo_get(org, name))  # TensorFS already validates this native document.
+    matching = [lane["lane"] for row in repo["releases"] if row["version"] == release and not row.get("yanked", False)
+                for lane in row["lanes"] if lane["manifest"]["sha256"] == binding["snapshot"][7:]]
+    if len(matching) != 1:
+        raise ValueError("exact retained benchmark checkpoint has no unique repository release lane")
+    native = store.resolve_release(org, name, release, matching[0])
+    if native["manifest_digest"] != binding["snapshot"] or native["manifest_length"] <= 0:
+        raise ValueError("native release resolver returned a different benchmark checkpoint")
+    entrypoint, slot = slots[0]
+    return {"repository": repository, "release": native["version"], "lane": native["lane"],
+            "manifest": native["manifest_digest"], "length": native["manifest_length"],
+            "entrypoint": entrypoint, "slot": slot.path, "parameter": slot.parameter,
+            "local_repository_revision": native["revision"]}
+
+
 def prepare(pilot_path: Path, output: Path, port: int) -> None:
     pilot = json.loads(pilot_path.read_text())
     output.mkdir(parents=True, exist_ok=False)
@@ -81,7 +111,8 @@ def prepare(pilot_path: Path, output: Path, port: int) -> None:
     secret.chmod(0o600)
     public = base64.urlsafe_b64encode(key.public_key().public_bytes(
         serialization.Encoding.Raw, serialization.PublicFormat.Raw)).decode().rstrip("=")
-    worker = "old-stack-a40-sdk99-baseline"
+    worker = "old-stack-a40-sdk99-" + key.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()[:12]
     env = {**pilot["environment"], "COZY_MACHINE_ROOT": str(root),
            "COZY_MACHINE_LIFETIME": "persistent", "COZY_TENSORFS_ROOT": pilot["binding"]["store"],
            "COZY_LISTEN_HOST": "127.0.0.1", "COZY_WORKER_ID": worker,
@@ -182,28 +213,29 @@ def full(config_path: Path) -> None:
                 package=pb.DevelopmentPackage(package="paul/sdxl", release="2.4.0", installation_id=cfg["installation_id"]),
                 files=[file], python_requires=">=3.12", python_version="3.12"))))
         timings["reused_package_prepare_ms"] = (time.perf_counter() - began) * 1000
-        snapshot = pilot["binding"]["snapshot"]
+        selected = model_selection(pilot, installed.installed_package.package_interface)
+        evidence["model_selection"] = selected
+        snapshot = selected["manifest"]
         delegated, _ = documents.identity(pb.DownloadDelegation(expires_at_unix=int(time.time()) + 3600,
             worker_id=cfg["worker"], worker_boot_id=boot, worker_tls_certificate_digest=hashlib.sha256(leaf).digest(),
-            models=[pb.DownloadModelRef(package="paul/sdxl", slot="generate.models.model", model="paul/sdxl",
-                                       release="1.0.0", manifest=snapshot)]))
+            models=[pb.DownloadModelRef(package=pilot["binding"]["package"], slot=selected["slot"],
+                model=selected["repository"], release=selected["release"], lane=selected["lane"], manifest=snapshot)]))
         began = time.perf_counter()
         prepared(host.PreparePrivatePlacement(pb.PreparePrivatePlacementCall(claim=claim,
             private_placement_set=pb.DesiredPrivatePlacementSet(operation_id=header.operation_id,
                 installation_id=cfg["installation_id"], download_delegation=delegated,
                 download_delegation_signature=key.sign(delegated)))))
         timings["model_placement_prepare_ms"] = (time.perf_counter() - began) * 1000
-        # Actual same checkpoint; length is observed with released TensorFS, not invented.
-        import tensorfs
-        manifest_length = len(tensorfs.Store.open(pilot["binding"]["store"]).manifest(snapshot)["manifest"])
         for index, payload in enumerate(pilot["payloads"]):
             began = time.perf_counter()
             request = f"old-baseline-{index}"
             submission = pb.MachineExecutionSubmit(claim=claim, submission_id=request,
                 offer=pb.AttemptOffer(request_id=request), expected_execution_workspace_id=workspace.execution_workspace_id,
                 payload_canonical_bytes=canonical.write(payload), release_root=pb.ReleaseRoot(package="paul/sdxl",
-                    installation_id=cfg["installation_id"], entrypoint="generate", models=[pb.ModelChoice(parameter="model",
-                        repository="paul/sdxl", release="1.0.0", manifest=pb.Ref(digest=bytes.fromhex(snapshot[7:]), length=manifest_length))]))
+                    installation_id=cfg["installation_id"], entrypoint=selected["entrypoint"],
+                    models=[pb.ModelChoice(parameter=selected["parameter"], repository=selected["repository"],
+                        release=selected["release"], lane=selected["lane"],
+                        manifest=pb.Ref(digest=bytes.fromhex(snapshot[7:]), length=selected["length"]))]))
             while True:
                 try:
                     receipt = host.SubmitMachineExecution(submission)
@@ -240,7 +272,10 @@ def full(config_path: Path) -> None:
             for product_index, product in enumerate(products):
                 if product.parts or not product.HasField("source"):
                     raise RuntimeError("baseline expects an ordinary single SDXL image source")
-                path = run / f"product-{product_index}.png"
+                extension = {"image/png": ".png", "image/webp": ".webp", "image/jpeg": ".jpg"}.get(product.media_type)
+                if extension is None:
+                    raise RuntimeError(f"benchmark image media type unsupported: {product.media_type}")
+                path = run / f"product-{product_index}{extension}"
                 digest, length = hashlib.sha256(), 0
                 with path.open("wb") as sink:
                     for chunk in host.ReadByteTreeObject(pb.NativeByteReadCall(claim=claim, source=product.source, object=product.content)):
@@ -249,7 +284,8 @@ def full(config_path: Path) -> None:
                         sink.write(chunk.data); digest.update(chunk.data); length += len(chunk.data)
                 if length != product.content.length or digest.digest() != product.content.digest:
                     raise RuntimeError("native output checksum differs")
-                saved.append({"path": str(path), "length": length, "sha256": digest.hexdigest()})
+                saved.append({"path": str(path), "length": length, "sha256": digest.hexdigest(),
+                              "media_type": product.media_type})
             if not saved:
                 raise RuntimeError("successful run carried no verified image")
             rows.append({"request": request, "wall_ms": (time.perf_counter() - began) * 1000,
@@ -279,13 +315,27 @@ def full(config_path: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("inspect", "prepare", "run"))
+    parser.add_argument("action", choices=("inspect", "selection", "prepare", "run"))
     parser.add_argument("path", type=Path, help="pilot JSON for inspect/prepare; benchmark.json for run")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--port", type=int, default=18443)
+    parser.add_argument("--interface", type=Path, help="selection: actual received installed interface file")
     args = parser.parse_args()
     if args.action == "inspect":
         print(json.dumps(inspect(json.loads(args.path.read_text())), indent=2))
+    elif args.action == "selection":
+        pilot = json.loads(args.path.read_text())
+        interface = args.interface or Path(pilot["package_interface"])
+        selected = model_selection(pilot, interface.read_bytes())
+        from cozy_runtime.protocol import documents, worker_pb2 as pb
+        model = pb.DownloadModelRef(package=pilot["binding"]["package"], slot=selected["slot"],
+            model=selected["repository"], release=selected["release"], lane=selected["lane"], manifest=selected["manifest"])
+        from cozy_runtime.internal.worker.package_prepare import selections
+        parsed = selections([model])[0]
+        if not parsed.release or not parsed.lane:
+            raise ValueError("released worker requires release and lane as a pair")
+        print(json.dumps({"selection": selected, "download_model_ref": documents.body(model),
+                          "gpu_started": False, "torch_loaded": "torch" in sys.modules}, indent=2))
     elif args.action == "prepare":
         if args.output is None or not args.output.is_absolute():
             parser.error("prepare requires an absolute, new --output directory")
