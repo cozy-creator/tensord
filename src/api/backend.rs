@@ -153,6 +153,14 @@ pub trait MachineBackend: Send + Sync + 'static {
     ) -> Result<Vec<pb::PrepareEvent>, Status> {
         unsupported()
     }
+    /// One kept log's bytes, oldest first (wire 72). A log not written yet is empty.
+    fn read_machine_log(
+        &self,
+        _: VerifiedActor,
+        _: pb::MachineLogQuery,
+    ) -> Result<Vec<u8>, Status> {
+        unsupported()
+    }
 }
 pub type NativeByteStream =
     Box<dyn Iterator<Item = Result<pb::NativeByteReadChunk, Status>> + Send>;

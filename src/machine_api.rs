@@ -373,6 +373,36 @@ impl MachineBackend for NativeBackend {
             ..Default::default()
         })
     }
+    fn read_machine_log(
+        &self,
+        _: VerifiedActor,
+        request: pb::MachineLogQuery,
+    ) -> Result<Vec<u8>, Status> {
+        if request.log != pb::MachineLog::TensorfsTransport as i32 {
+            return Err(Status::not_found(format!(
+                "this machine keeps no log {}",
+                request.log
+            )));
+        }
+        // TensorFS appends here and rotates to one older file.
+        let logs = self.store.root().join("logs");
+        let mut data = vec![];
+        for name in ["transport.log.1", "transport.log"] {
+            match std::fs::read(logs.join(name)) {
+                Ok(kept) => data.extend(kept),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(Status::internal(format!("read {name}: {error}"))),
+            }
+        }
+        let tail = request.tail_bytes as usize;
+        if tail > 0 && data.len() > tail {
+            data.drain(..data.len() - tail);
+            if let Some(line) = data.iter().position(|b| *b == b'\n') {
+                data.drain(..=line);
+            }
+        }
+        Ok(data)
+    }
     fn list_packages(
         &self,
         actor: VerifiedActor,

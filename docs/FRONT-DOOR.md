@@ -52,7 +52,7 @@ The bootstrap receipt is `{payload, hmac_sha256}`, where the HMAC covers
 is required. Hooks: `describe_runtime`, `list_packages`, `list_models`, `retain_bytes`,
 `release_bytes`, `begin_input_tree`, `workspace`, `submit`, `get`, `events[_observed]`,
 `control`, `list[_observed]`, `close_submission`, `collect`, `ack_collection`,
-`read_bytes`/`read_stream`, `uploads`, `prepare_local`.
+`read_bytes`/`read_stream`, `uploads`, `prepare_local`, `read_machine_log`.
 
 - `Observation` is set when the reader goes away. It only ends a wait. It has no run-control authority.
 - Event pages: default and max 256. Execution lists: default 64, max 256.
@@ -66,6 +66,9 @@ is required. Hooks: `describe_runtime`, `list_packages`, `list_models`, `retain_
   invocation digests itself. A callable that declares models needs the GPU pool, which prepares
   and binds a preparation. An empty `installation_id` resolves a published installation through
   the GPU pool.
+- `read_machine_log` serves `MACHINE_LOG_TENSORFS_TRANSPORT`: the store's `logs/transport.log.1`
+  then `transport.log`, optionally the newest `tail_bytes` from a line start, in 64 KiB chunks.
+  Any other log is `NOT_FOUND`.
 - `events` with `wait` blocks up to 30 s on the engine activity epoch. Terminal pages come from the
   durable `public_terminals` projection.
 - `control`: `Cancel` only, with an optional `expected_generation` check.

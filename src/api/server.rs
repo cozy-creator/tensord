@@ -618,6 +618,27 @@ impl<B: MachineBackend> pb::pod_host_server::PodHost for Api<B> {
         self.call(move |backend| backend.ack_collection(actor, request))
             .await
     }
+    async fn read_machine_log(
+        &self,
+        request: Request<pb::MachineLogQuery>,
+    ) -> Result<Response<ResponseStream<pb::MachineLogChunk>>, Status> {
+        const CHUNK: usize = 64 << 10; // MaxMachineLogChunkBytes
+        let actor = self.auth(request.get_ref().claim.as_ref())?;
+        let request = request.into_inner();
+        let data = self
+            .call(move |backend| backend.read_machine_log(actor, request))
+            .await?
+            .into_inner();
+        let chunks: Vec<_> = data
+            .chunks(CHUNK)
+            .map(|data| {
+                Ok(pb::MachineLogChunk {
+                    data: data.to_vec(),
+                })
+            })
+            .collect();
+        Ok(Response::new(Box::pin(tokio_stream::iter(chunks))))
+    }
     async fn read_byte_tree_object(
         &self,
         request: Request<pb::NativeByteReadCall>,
