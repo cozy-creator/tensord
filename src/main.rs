@@ -124,7 +124,7 @@ fn start_api(
         boot_id: &identity.authority.boot_id,
         cert_pem: &identity.cert_pem,
     })?;
-    std::fs::write(root.join("api-ready.json"), ready)?;
+    cozy_machine::machine::identity::write_atomic(&root.join("api-ready.json"), &ready, 0o600)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()

@@ -62,7 +62,7 @@ impl MachineConfig {
 }
 
 impl MachineIdentity {
-    /// One stable worker/leaf, a fresh process boot, and current configured keys.
+    /// One stable worker, leaf and machine lifetime (boot id), and current configured keys.
     /// Failure never replaces an existing identity or touches the execution journal.
     pub fn retained(config: &MachineConfig) -> io::Result<Self> {
         config.validate()?;
@@ -151,9 +151,7 @@ impl MachineIdentity {
         if receipt_key.len() < 32 || receipt_key.len() > 4096 {
             return Err(invalid("readiness HMAC key must contain 32..4096 bytes"));
         }
-        let boot_id = fs::read_to_string("/proc/sys/kernel/random/uuid")?
-            .trim()
-            .to_owned();
+        let boot_id = retained_boot_id(&config.identity_directory)?;
         let authority = Authority {
             worker_id: retained.worker_id,
             boot_id,
@@ -172,6 +170,35 @@ impl MachineIdentity {
                 .map_err(other)?
                 .as_millis() as u64,
         })
+    }
+}
+
+/// The boot id names this machine lifetime: Claims signed for it stay valid across restarts,
+/// and records accepted before a restart remain addressable. Format as the Hub requires.
+fn retained_boot_id(directory: &Path) -> io::Result<String> {
+    let path = directory.join("boot-id");
+    match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+    {
+        Ok(file) => {
+            check_file(&file, true)?;
+            let mut text = String::new();
+            file.take(64).read_to_string(&mut text)?;
+            if URL_SAFE_NO_PAD.decode(text.trim()).map(|raw| raw.len()) != Ok(32) {
+                return Err(invalid(
+                    "retained boot id must be unpadded base64url for 32 bytes",
+                ));
+            }
+            Ok(text.trim().to_owned())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let boot_id = URL_SAFE_NO_PAD.encode(crate::machine::identity::random::<32>()?);
+            crate::machine::identity::write_atomic(&path, boot_id.as_bytes(), 0o600)?;
+            Ok(boot_id)
+        }
+        Err(error) => Err(error),
     }
 }
 

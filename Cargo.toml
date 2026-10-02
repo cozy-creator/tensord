@@ -30,6 +30,10 @@ blake2 = "0.10"
 tar = "0.4"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 rustls-pemfile = "2"
+time = "0.3"
+
+[dev-dependencies]
+x509-parser = "0.18"
 
 [build-dependencies]
 tonic-prost-build = "0.14.6"

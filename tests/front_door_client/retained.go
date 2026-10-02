@@ -165,14 +165,14 @@ func runRetained(machine, output string) error {
 	if err != nil {
 		return err
 	}
-	if first.Cert != second.Cert || first.WorkerID != second.WorkerID || first.BootID == second.BootID {
-		return fmt.Errorf("retained leaf/worker or fresh boot invariant failed")
+	if first.Cert != second.Cert || first.WorkerID != second.WorkerID || first.BootID != second.BootID {
+		return fmt.Errorf("retained leaf, worker or machine lifetime invariant failed")
 	}
 	if _, err = host.ProtocolInfo(ctx, &pb.ProtocolInfoRequest{}, grpc.WaitForReady(true)); err != nil {
 		return err
 	}
-	if _, err = host.DescribeMachine(ctx, &pb.DescribeMachineQuery{Claim: stale}); status.Code(err) != codes.Unauthenticated {
-		return fmt.Errorf("stale boot not fenced: %v", err)
+	if _, err = host.DescribeMachine(ctx, &pb.DescribeMachineQuery{Claim: stale}); err != nil {
+		return fmt.Errorf("a Claim signed before the restart was refused: %v", err)
 	}
 	fresh := author(second, keyA)
 	if _, err = host.DescribeMachine(ctx, &pb.DescribeMachineQuery{Claim: fresh}); err != nil {
@@ -226,7 +226,7 @@ func runRetained(machine, output string) error {
 	if err != nil || complete.State != pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_VERIFIED {
 		return fmt.Errorf("key refresh destroyed earlier native custody: %v %v", complete, err)
 	}
-	body := map[string]any{"checks": []string{"retained P256 leaf and worker identity across four real service processes", "same grpc connection reconnects under original exact leaf pin", "fresh boot UUID each process", "stale signed boot rejected", "native TensorFS package custody survives restart", "configured key refresh accepts new key and rejects retired key", "reauthorizing original owner recovers retained native custody"}, "limits": []string{"native source custody, not execution-journal restart qualification", "key rotation is applied by explicit process restart; no automatic ownership transfer between keys", "manual current-claim bootstrap does not prove existing Creator daemon automatically refreshes its cached boot claim"}}
+	body := map[string]any{"checks": []string{"retained P256 leaf and worker identity across four real service processes", "same grpc connection reconnects under original exact leaf pin", "one machine lifetime (boot id) across processes", "Claims signed before a restart stay valid", "native TensorFS package custody survives restart", "configured key refresh accepts new key and rejects retired key", "reauthorizing original owner recovers retained native custody"}, "limits": []string{"native source custody, not execution-journal restart qualification", "key rotation is applied by explicit process restart; no automatic ownership transfer between keys", "manual current-claim bootstrap does not prove existing Creator daemon automatically refreshes its cached boot claim"}}
 	raw, _ := json.MarshalIndent(body, "", "  ")
 	if err = os.WriteFile(filepath.Join(output, "results.json"), append(raw, '\n'), 0600); err != nil {
 		return err

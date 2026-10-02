@@ -13,6 +13,6 @@ pub mod pb {
 pub use backend::MachineBackend;
 pub use server::{serve, MachineIdentity};
 pub const WIRE_MINOR: u32 = 72;
-// Baseline identity/read operations consume their known fields at every minor.
-// Missing operations are refused individually, never through a peer version floor.
-pub const WIRE_MINIMUM: u32 = 0;
+// The deployed baseline the Go agent reports; released CLIs read 0 as "no usable range".
+// This machine still refuses no peer by version: a missing operation fails alone.
+pub const WIRE_MINIMUM: u32 = 64;

@@ -62,19 +62,26 @@ fn claim(identity: &MachineIdentity, key: &SigningKey) -> pb::Claim {
 }
 
 #[test]
-fn pinned_leaf_survives_restart_boot_fences_old_claims_and_keys_refresh() {
+fn pinned_leaf_and_lifetime_survive_restart_and_keys_refresh() {
     let area = Area::new();
     let key = SigningKey::from_bytes(&[1; 32]);
     let config = area.config(&key);
     let journal = area.0.join("execution-journal-witness");
     fs::write(&journal, b"durable engine is owned elsewhere").unwrap();
     let first = MachineIdentity::retained(&config).unwrap();
-    let stale = claim(&first, &key);
+    let before = claim(&first, &key);
     let next = MachineIdentity::retained(&config).unwrap();
     assert_eq!(first.cert_der, next.cert_der);
     assert_eq!(first.key_pem, next.key_pem);
-    assert_ne!(first.authority.boot_id, next.authority.boot_id);
-    assert!(next.authority.verify(Some(&stale)).is_err());
+    assert_eq!(first.authority.boot_id, next.authority.boot_id);
+    assert_eq!(
+        URL_SAFE_NO_PAD
+            .decode(&next.authority.boot_id)
+            .unwrap()
+            .len(),
+        32
+    );
+    next.authority.verify(Some(&before)).unwrap();
     next.authority.verify(Some(&claim(&next, &key))).unwrap();
     let new_key = SigningKey::from_bytes(&[2; 32]);
     private(
