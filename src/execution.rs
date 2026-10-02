@@ -879,7 +879,7 @@ fn process_stat(pid: u32) -> io::Result<(u64, char)> {
 }
 
 /// Walk relative components using openat+NOFOLLOW: no symlink or parent escape races.
-fn open_artifact(root: &Path, path: &Path) -> io::Result<File> {
+pub(crate) fn open_artifact(root: &Path, path: &Path) -> io::Result<File> {
     let parts: Vec<_> = path
         .components()
         .map(|component| match component {
