@@ -1,7 +1,7 @@
 //! The machine's sole CPU dispatch policy; the engine only journals/supervises.
 use crate::{
     catalog::Catalog,
-    execution::{process_ended, Engine},
+    execution::Engine,
     journal::{Execution, State, SubmissionContext},
 };
 use serde_json::Value;
@@ -9,7 +9,6 @@ use std::{
     collections::HashMap,
     fs::File,
     io,
-    os::fd::{AsRawFd, FromRawFd},
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -188,47 +187,6 @@ impl Service {
         Ok(())
     }
     fn watch_orphan(&self, birth: crate::journal::ProcessBirth) -> io::Result<()> {
-        if process_ended(&birth)? {
-            return Ok(());
-        }
-        // Read birth on both sides of pidfd_open so PID reuse cannot watch or
-        // reclaim a different process. A kernel exit event only wakes reconciliation.
-        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, birth.pid, 0) } as i32;
-        if raw < 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ESRCH) {
-                self.engine.notify_activity();
-                return Ok(());
-            }
-            return Err(error);
-        }
-        let pidfd = unsafe { File::from_raw_fd(raw) };
-        if process_ended(&birth)? {
-            self.engine.notify_activity();
-            return Ok(());
-        }
-        let engine = self.engine.clone();
-        std::thread::Builder::new()
-            .name(format!("orphan-{}", birth.pid))
-            .spawn(move || {
-                let mut item = libc::pollfd {
-                    fd: pidfd.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                loop {
-                    let result = unsafe { libc::poll(&mut item, 1, -1) };
-                    if result >= 0 {
-                        engine.notify_activity();
-                        return;
-                    }
-                    let error = io::Error::last_os_error();
-                    if error.kind() != io::ErrorKind::Interrupted {
-                        eprintln!("orphan kernel observation: {error}");
-                        return;
-                    }
-                }
-            })?;
-        Ok(())
+        self.engine.watch_process(birth)
     }
 }

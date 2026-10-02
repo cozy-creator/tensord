@@ -152,11 +152,17 @@ type Writer = Arc<Mutex<UnixStream>>;
 pub struct Engine {
     pub root: PathBuf,
     journal: Mutex<Journal>,
-    active: Mutex<HashMap<String, Writer>>,
+    active: Mutex<HashMap<String, ActiveRun>>,
     owned: Mutex<HashSet<String>>,
     progress: Mutex<HashMap<String, ProgressSnapshot>>,
     activity: Mutex<u64>,
     activity_changed: Condvar,
+}
+
+#[derive(Clone)]
+enum ActiveRun {
+    Protocol(Writer),
+    Managed(Arc<dyn Fn() -> io::Result<()> + Send + Sync>),
 }
 
 impl Engine {
@@ -223,6 +229,27 @@ impl Engine {
         record: crate::journal::Installation,
     ) -> io::Result<crate::journal::Installation> {
         self.journal.lock().unwrap().bind_installation(record)
+    }
+
+    pub fn preparation(
+        &self,
+        actor: &str,
+        id: &str,
+    ) -> io::Result<Option<crate::journal::Preparation>> {
+        self.journal.lock().unwrap().preparation(actor, id)
+    }
+
+    pub fn bind_preparation(
+        &self,
+        record: crate::journal::Preparation,
+    ) -> io::Result<crate::journal::Preparation> {
+        self.journal.lock().unwrap().bind_preparation(record)
+    }
+
+    pub(crate) fn defer_managed(&self, id: &str, reason: String) -> io::Result<()> {
+        self.journal.lock().unwrap().defer_unstarted(id, reason)?;
+        self.notify_activity();
+        Ok(())
     }
     pub fn public_terminal(&self, id: &str) -> io::Result<Option<crate::journal::PublicTerminal>> {
         self.journal.lock().unwrap().public_terminal(id)
@@ -419,6 +446,15 @@ impl Engine {
 
     /// Dispatch only after the owner's admission and trusted generation resolution.
     pub fn dispatch(self: &Arc<Self>, id: &str, config: RunnerConfig) -> io::Result<bool> {
+        self.dispatch_managed(id, move |engine, id| engine.run(&id, config))
+    }
+
+    /// Trusted adapters share one claim, supervisor reservation and journal. They
+    /// register the exact process birth before authorizing any authored code.
+    pub(crate) fn dispatch_managed<F>(self: &Arc<Self>, id: &str, run: F) -> io::Result<bool>
+    where
+        F: FnOnce(Arc<Self>, String) -> io::Result<()> + Send + 'static,
+    {
         let mut owned = self.owned.lock().unwrap();
         if !self.journal.lock().unwrap().claim(id)? {
             return Ok(false);
@@ -431,8 +467,14 @@ impl Engine {
         let launched = std::thread::Builder::new()
             .name(format!("execution-{id}"))
             .spawn(move || {
-                if let Err(error) = engine.run(&thread_id, config) {
+                if let Err(error) = run(engine.clone(), thread_id.clone()) {
                     eprintln!("execution {thread_id}: {error}");
+                }
+                if engine
+                    .get(&thread_id)
+                    .is_ok_and(|record| !matches!(record.state, State::Starting | State::Running))
+                {
+                    engine.active.lock().unwrap().remove(&thread_id);
                 }
                 engine.progress.lock().unwrap().remove(&thread_id);
                 engine.owned.lock().unwrap().remove(&thread_id);
@@ -465,18 +507,24 @@ impl Engine {
             record
         };
         self.notify_activity();
-        let writer = self.active.lock().unwrap().get(id).cloned();
-        if let Some(writer) = writer {
+        if record.state.terminal() {
+            return Ok(record);
+        }
+        let active = self.active.lock().unwrap().get(id).cloned();
+        if let Some(active) = active {
             // Delivery failure does not revoke the already committed cancellation authority.
-            let _ = write_command(
-                &mut writer.lock().unwrap(),
-                &RunnerCommand::Cancel { execution_id: id },
-            );
+            let _ = match active {
+                ActiveRun::Protocol(writer) => write_command(
+                    &mut writer.lock().unwrap(),
+                    &RunnerCommand::Cancel { execution_id: id },
+                ),
+                ActiveRun::Managed(cancel) => cancel(),
+            };
         }
         Ok(record)
     }
 
-    fn observe_progress(
+    pub(crate) fn observe_progress(
         &self,
         id: &str,
         completed_units: u64,
@@ -523,7 +571,7 @@ impl Engine {
         Ok(())
     }
 
-    fn finish(&self, id: &str, outcome: Outcome) -> io::Result<Execution> {
+    pub(crate) fn finish(&self, id: &str, outcome: Outcome) -> io::Result<Execution> {
         let mut progress = self.progress.lock().unwrap();
         let record = self
             .journal
@@ -536,6 +584,106 @@ impl Engine {
         drop(progress);
         self.notify_activity();
         Ok(record)
+    }
+
+    pub(crate) fn watch_process(
+        self: &Arc<Self>,
+        birth: crate::journal::ProcessBirth,
+    ) -> io::Result<()> {
+        if process_ended(&birth)? {
+            return Ok(());
+        }
+        // Read birth on both sides of pidfd_open so PID reuse cannot watch or
+        // reclaim a different process. A kernel exit event only wakes reconciliation.
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, birth.pid, 0) } as i32;
+        if raw < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                self.notify_activity();
+                return Ok(());
+            }
+            return Err(error);
+        }
+        let pidfd = unsafe { File::from_raw_fd(raw) };
+        if process_ended(&birth)? {
+            self.notify_activity();
+            return Ok(());
+        }
+        let engine = self.clone();
+        std::thread::Builder::new()
+            .name(format!("orphan-{}", birth.pid))
+            .spawn(move || {
+                let mut item = libc::pollfd {
+                    fd: pidfd.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                loop {
+                    let result = unsafe { libc::poll(&mut item, 1, -1) };
+                    if result >= 0 {
+                        engine.notify_activity();
+                        return;
+                    }
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::Interrupted {
+                        eprintln!("orphan kernel observation: {error}");
+                        return;
+                    }
+                }
+            })?;
+        Ok(())
+    }
+
+    pub(crate) fn register_managed(
+        self: &Arc<Self>,
+        id: &str,
+        birth: ProcessBirth,
+        cancel: Arc<dyn Fn() -> io::Result<()> + Send + Sync>,
+    ) -> io::Result<()> {
+        self.journal
+            .lock()
+            .unwrap()
+            .register_process(id, birth.clone())?;
+        self.watch_process(birth)?;
+        self.active
+            .lock()
+            .unwrap()
+            .insert(id.into(), ActiveRun::Managed(cancel.clone()));
+        self.notify_activity();
+        if self.get(id)?.cancel_actor.is_some() {
+            let _ = cancel();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn authorize_managed(&self, id: &str) -> io::Result<bool> {
+        match self.journal.lock().unwrap().running(id) {
+            Ok(_) => {
+                self.notify_activity();
+                Ok(true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn staging(&self, id: &str) -> io::Result<PathBuf> {
+        let root = self.root.join("staging").join(id);
+        fs::create_dir_all(&root)?;
+        Ok(root)
+    }
+
+    pub(crate) fn managed_result(
+        &self,
+        id: &str,
+        value: Value,
+        bindings: Vec<crate::journal::AssetBinding>,
+    ) -> io::Result<Execution> {
+        let mut paths: Vec<_> = bindings.iter().map(|b| b.relative_path.clone()).collect();
+        paths.sort();
+        paths.dedup();
+        let result = self.bound_custody(id, &self.staging(id)?, value, paths, bindings)?;
+        self.finish(id, Outcome::Completed(result))
     }
 
     /// Reconcile a previous service incarnation without adopting or repeating authored work.
@@ -580,6 +728,10 @@ impl Engine {
         drop(journal);
         drop(owned);
         if changed {
+            self.active.lock().unwrap().retain(|id, _| {
+                self.get(id)
+                    .is_ok_and(|record| matches!(record.state, State::Starting | State::Running))
+            });
             self.notify_activity();
         }
         self.nonterminal(1024)
@@ -634,22 +786,9 @@ impl Engine {
                         asset_bindings,
                         ..
                     } if status.success() => {
-                        match self.custody(id, &output_root, value, artifacts) {
-                            Ok(mut result) => {
-                                let mut identities = HashSet::new();
-                                for binding in &asset_bindings {
-                                    if !identities.insert(&binding.asset_ref)
-                                        || !result.artifacts.iter().any(|a| {
-                                            a.name == binding.relative_path
-                                                && a.length == binding.length
-                                        })
-                                    {
-                                        return self.finish(id, Outcome::Failed("output binding does not name one held artifact".into())).map(|_| ());
-                                    }
-                                }
-                                result.asset_bindings = asset_bindings;
-                                Outcome::Completed(result)
-                            }
+                        match self.bound_custody(id, &output_root, value, artifacts, asset_bindings)
+                        {
+                            Ok(result) => Outcome::Completed(result),
                             Err(error) => {
                                 Outcome::Failed(format!("result custody failed: {error}"))
                             }
@@ -730,7 +869,7 @@ impl Engine {
             self.active
                 .lock()
                 .unwrap()
-                .insert(id.into(), writer.clone());
+                .insert(id.into(), ActiveRun::Protocol(writer.clone()));
         }
         if self.get(id)?.cancel_actor.is_some() {
             write_command(
@@ -765,6 +904,33 @@ impl Engine {
                 terminal => return Ok(terminal),
             }
         }
+    }
+
+    fn bound_custody(
+        &self,
+        id: &str,
+        output_root: &Path,
+        value: Value,
+        paths: Vec<String>,
+        bindings: Vec<crate::journal::AssetBinding>,
+    ) -> io::Result<ResultRecord> {
+        let mut result = self.custody(id, output_root, value, paths)?;
+        let mut identities = HashSet::new();
+        for binding in &bindings {
+            if !identities.insert(&binding.asset_ref)
+                || !result
+                    .artifacts
+                    .iter()
+                    .any(|a| a.name == binding.relative_path && a.length == binding.length)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "output binding does not name one held artifact",
+                ));
+            }
+        }
+        result.asset_bindings = bindings;
+        Ok(result)
     }
 
     fn custody(
