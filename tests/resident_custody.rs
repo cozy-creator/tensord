@@ -52,6 +52,7 @@ fn explicit_cancel_keeps_the_file_and_live_process_obligations() {
             invocation_digest: "invocation".into(),
             payload_digest: "payload".into(),
             publication_authorization_id: "publication".into(),
+            preparation_id: String::new(),
         };
         let record = journal
             .accept_public(
@@ -147,6 +148,7 @@ fn wrong_fd_cannot_substitute_for_a_process_lifetime() {
             invocation_digest: "invoke".into(),
             payload_digest: "payload".into(),
             publication_authorization_id: "publication".into(),
+            preparation_id: String::new(),
         };
         let record = journal
             .accept_public(
