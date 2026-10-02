@@ -39,6 +39,15 @@ Detailed records, exact inputs, excluded cohorts, counters and qualification lim
 Other live rentals and GPU processes are independently owned. The display-driving 8 GB
 RTX 4070 is available for ordinary inference; fault and memory pressure tests use RunPod.
 
+The old A40 Runtime descriptor candidate must not be used for local 8 GB inference:
+the later source audit found missing compute-stream quiesce, measured retry-progress,
+context-room and bind-OOM recovery fixes. Native failed-copy drain alone is insufficient
+before Runtime unmaps a resident set used by compute. A separate latest-safe Runtime/
+TensorFS descriptor candidate is being CPU-qualified before root's local run. Neither
+fixed grants nor a single executor establish safety. The reviewer handoff and new local
+evidence are in `outputs/cozy-machine-local-sdxl-20261002/`; A40 results retain their
+original head/condition boundaries.
+
 The first unchanged real SDXL loading/inference milestone has passed on a non-display GPU.
 The next integration gate is that same request through the new authenticated public machine
 API and ordinary Creator CLI, with normal preparation, events, output custody and collection.
