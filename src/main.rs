@@ -34,22 +34,27 @@ fn run() -> io::Result<()> {
             println!("{}", serde_json::to_string(&record)?); Ok(())
         }
         Some("serve") => {
-            let mut root = None; let mut budget = 16 * 1024 * 1024; let mut ttl = 300;
-            while let Some(arg) = args.next() {
+            let mut root = None; let mut generations=None; let mut parallelism=1;
+            let mut budget=16*1024*1024; let mut ttl=300;
+            while let Some(arg)=args.next() {
                 match arg.as_str() {
-                    "--state" => root = args.next().map(PathBuf::from),
-                    "--host-bytes" => budget = args.next().ok_or_else(|| io::Error::other("--host-bytes requires bytes"))?.parse().map_err(io::Error::other)?,
-                    "--cache-ttl-seconds" => ttl = args.next().ok_or_else(|| io::Error::other("--cache-ttl-seconds requires seconds"))?.parse().map_err(io::Error::other)?,
-                    _ => return Err(io::Error::other(format!("unknown argument {arg}"))),
+                    "--state"=>root=args.next().map(PathBuf::from),
+                    "--generations"=>generations=args.next().map(PathBuf::from),
+                    "--cpu-parallelism"=>parallelism=args.next().ok_or_else(||io::Error::other("--cpu-parallelism requires a count"))?.parse().map_err(io::Error::other)?,
+                    "--host-bytes"=>budget=args.next().ok_or_else(||io::Error::other("--host-bytes requires bytes"))?.parse().map_err(io::Error::other)?,
+                    "--cache-ttl-seconds"=>ttl=args.next().ok_or_else(||io::Error::other("--cache-ttl-seconds requires seconds"))?.parse().map_err(io::Error::other)?,
+                    _=>return Err(io::Error::other(format!("unknown argument {arg}"))),
                 }
             }
-            serve(Owner::new(&root.ok_or_else(|| io::Error::other("--state is required for this experimental service"))?,
-                budget, Duration::from_secs(ttl))?)
+            let root=root.ok_or_else(||io::Error::other("--state is required"))?;
+            let owner=Owner::new(&root,budget,Duration::from_secs(ttl))?;
+            let service=cozy_machine::service::Service::open(&root,&generations.unwrap_or_else(||root.join("generations")),parallelism)?;
+            serve(owner,service)
         }
-        _ => Err(io::Error::other("usage: cozy-machine version --json | serve --state PATH [--host-bytes N] [--cache-ttl-seconds N]")),
+        _=>Err(io::Error::other("usage: cozy-machine version --json | serve --state PATH [--generations PATH] [--cpu-parallelism N] [--host-bytes N]")),
     }
 }
-fn serve(owner: Shared) -> io::Result<()> {
+fn serve(owner: Shared, service: Arc<cozy_machine::service::Service>) -> io::Result<()> {
     let path = owner.lock().unwrap().socket.clone();
     // Only the singleton owner can remove a stale socket; no active peer store is touched.
     match std::fs::remove_file(&path) {
@@ -84,9 +89,14 @@ fn serve(owner: Shared) -> io::Result<()> {
                 continue;
             }
         };
-        let (owner, stopped, path) = (owner.clone(), stopped.clone(), path.clone());
+        let (owner, stopped, path, service) = (
+            owner.clone(),
+            stopped.clone(),
+            path.clone(),
+            service.clone(),
+        );
         std::thread::spawn(move || {
-            let result = client(stream, peer, &owner, &stopped, &path);
+            let result = client(stream, peer, &owner, &stopped, &path, &service);
             owner.lock().unwrap().disconnect(peer);
             if let Err(error) = result {
                 eprintln!("peer {peer}: {error}");
@@ -102,6 +112,7 @@ fn client(
     owner: &Shared,
     stopped: &AtomicBool,
     path: &PathBuf,
+    service: &Arc<cozy_machine::service::Service>,
 ) -> io::Result<()> {
     let mut capabilities = HashSet::new();
     loop {
@@ -158,6 +169,11 @@ fn client(
         let required = match &request.command {
             Command::Import { .. } => Some("objects.put-fd/1"),
             Command::Attach { .. } => Some("weights.hosted/1"),
+            Command::Submit { .. }
+            | Command::Execution { .. }
+            | Command::Executions
+            | Command::Cancel { .. }
+            | Command::ReadResult { .. } => Some("execution.cpu/1"),
             _ => None,
         };
         if let Some(cap) = required {
@@ -198,6 +214,37 @@ fn client(
                 .release(peer, lease, &incarnation)
                 .map(|body| (body, None)),
             Command::Stats => Ok((owner.lock().unwrap().stats(), None)),
+            Command::Submit {
+                key,
+                generation,
+                entrypoint,
+                input,
+            } => service
+                .submit(&key, &generation, &entrypoint, input)
+                .map(|record| (Body::Execution { record }, None)),
+            Command::Execution { id } => service
+                .engine
+                .get(&id)
+                .map(|record| (Body::Execution { record }, None)),
+            Command::Executions => service
+                .engine
+                .list()
+                .map(|records| (Body::Executions { records }, None)),
+            Command::Cancel { id } => service
+                .engine
+                .cancel(&id, "local-machine-owner")
+                .map(|record| (Body::Execution { record }, None)),
+            Command::ReadResult { id, index } => (|| {
+                let record = service.engine.get(&id)?;
+                let artifact = record
+                    .result
+                    .as_ref()
+                    .and_then(|r| r.artifacts.get(index))
+                    .cloned()
+                    .ok_or_else(|| io::Error::other("result artifact absent"))?;
+                let file = service.engine.open_result(&id, index)?;
+                Ok((Body::ResultArtifact { id, artifact }, Some(file)))
+            })(),
             Command::Shutdown => {
                 if !owner.lock().unwrap().stop() {
                     Err(io::Error::other("active leases prevent shutdown"))
