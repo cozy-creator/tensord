@@ -307,6 +307,16 @@ impl Journal {
             .map(|record| serde_json::from_str(&record).map_err(db_error))
             .transpose()
     }
+    pub fn installation_for_generation(
+        &self,
+        actor: &str,
+        generation: &str,
+    ) -> io::Result<Option<Installation>> {
+        let record: Option<String> = self.connection.query_row("SELECT record FROM installations WHERE actor=?1 AND json_extract(record,'$.generation')=?2 LIMIT 1", params![actor,generation], |r| r.get(0)).optional().map_err(db_error)?;
+        record
+            .map(|record| serde_json::from_str(&record).map_err(db_error))
+            .transpose()
+    }
     pub fn bind_installation(&mut self, record: Installation) -> io::Result<Installation> {
         validate_scope(&record.actor, &record.alias, &record.generation)?;
         if let Some(prior) = self.installation(&record.actor, &record.alias)? {
@@ -551,6 +561,52 @@ impl Journal {
     }
 
     /// Closure is a durable acceptance tombstone, never implicit execution cancellation.
+    pub fn actor_page(
+        &self,
+        actor: &str,
+        after: u64,
+        before: u64,
+        newest: bool,
+        states: &[String],
+        limit: usize,
+    ) -> io::Result<Vec<Execution>> {
+        let states: Vec<&str> = states
+            .iter()
+            .map(|s| {
+                if s == "succeeded" {
+                    "completed"
+                } else {
+                    s.as_str()
+                }
+            })
+            .collect();
+        let sql=format!("SELECT record FROM executions WHERE actor=?1 AND id>?2 AND (?3=0 OR id<?3) AND (?4='[]' OR state IN (SELECT value FROM json_each(?4))) ORDER BY id {} LIMIT ?5",if newest{"DESC"}else{"ASC"});
+        let mut statement = self.connection.prepare(&sql).map_err(db_error)?;
+        let records = statement
+            .query_map(
+                params![
+                    actor,
+                    after.min(i64::MAX as u64) as i64,
+                    before.min(i64::MAX as u64) as i64,
+                    encoded(&states)?,
+                    limit.min(256) as i64
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(db_error)?;
+        records
+            .map(|record| serde_json::from_str(&record.map_err(db_error)?).map_err(db_error))
+            .collect()
+    }
+    pub fn actor_head(&self, actor: &str) -> io::Result<u64> {
+        self.connection
+            .query_row(
+                "SELECT COALESCE(MAX(id),0) FROM executions WHERE actor=?1",
+                [actor],
+                |r| r.get(0),
+            )
+            .map_err(db_error)
+    }
     pub fn close_submission(
         &mut self,
         actor: &str,
@@ -671,6 +727,9 @@ impl Journal {
         let observed =
             !was_terminal && progress.is_some_and(|progress| progress.overlay(&mut record));
         if changed || observed {
+            if record.state.terminal() && record.finished_at_ms == 0 {
+                record.finished_at_ms = timestamp().max(0) as u64;
+            }
             // Every durable mutation jumps past all volatile cursors the former owner
             // could have published, even when its progress snapshot was lost.
             record.revision = record

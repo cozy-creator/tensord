@@ -43,8 +43,14 @@ func main() {
 	machine := flag.String("machine", "", "path to front-door fixture binary")
 	output := flag.String("output", "", "owned evidence directory")
 	retained := flag.Bool("retained-restart", false, "qualify retained pin and key refresh across owned fixture restarts")
+	helper := flag.String("native-helper", "", "trusted installer interpreter for integrated service gate")
+	wheel := flag.String("native-wheel", "", "built machine client wheel")
+	source := flag.String("native-source", "", "frozen real classifier source")
 	flag.Parse()
 	gate := run
+	if *helper != "" {
+		gate = func(machine, output string) error { return runNative(machine, output, *helper, *wheel, *source) }
+	}
 	if *retained {
 		gate = runRetained
 	}

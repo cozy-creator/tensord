@@ -93,7 +93,7 @@ pub enum Body {
     },
     Shutdown,
     Execution {
-        record: cozy_machine::journal::Execution,
+        record: Box<cozy_machine::journal::Execution>,
     },
     Executions {
         records: Vec<cozy_machine::journal::Execution>,

@@ -175,6 +175,16 @@ impl Engine {
     ) -> io::Result<Option<crate::journal::Installation>> {
         self.journal.lock().unwrap().installation(actor, alias)
     }
+    pub fn installation_for_generation(
+        &self,
+        actor: &str,
+        generation: &str,
+    ) -> io::Result<Option<crate::journal::Installation>> {
+        self.journal
+            .lock()
+            .unwrap()
+            .installation_for_generation(actor, generation)
+    }
     pub fn bind_installation(
         &self,
         record: crate::journal::Installation,
@@ -243,6 +253,20 @@ impl Engine {
         self.select(|journal| journal.list_actor(actor, limit))
     }
 
+    pub fn actor_page(
+        &self,
+        actor: &str,
+        after: u64,
+        before: u64,
+        newest: bool,
+        states: &[String],
+        limit: usize,
+    ) -> io::Result<Vec<Execution>> {
+        self.select(|journal| journal.actor_page(actor, after, before, newest, states, limit))
+    }
+    pub fn actor_head(&self, actor: &str) -> io::Result<u64> {
+        self.journal.lock().unwrap().actor_head(actor)
+    }
     pub fn close_submission(
         &self,
         actor: &str,

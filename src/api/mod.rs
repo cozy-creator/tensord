@@ -5,6 +5,7 @@ pub mod install;
 mod server;
 pub mod workspaces;
 
+#[allow(clippy::large_enum_variant)] // generated protobuf message shapes
 pub mod pb {
     tonic::include_proto!("cozy.worker.v1");
 }

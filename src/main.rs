@@ -35,11 +35,18 @@ fn run() -> io::Result<()> {
         }
         Some("serve") => {
             let mut root = None; let mut generations=None; let mut parallelism=1;
+            let mut machine_config=None; let mut listen=None;
+            let mut installer_python=None; let mut client_wheel=None; let mut package_python="3.12".to_string();
             let mut budget=16*1024*1024; let mut ttl=300;
             while let Some(arg)=args.next() {
                 match arg.as_str() {
                     "--state"=>root=args.next().map(PathBuf::from),
                     "--generations"=>generations=args.next().map(PathBuf::from),
+                    "--machine-config"=>machine_config=args.next().map(PathBuf::from),
+                    "--listen"=>listen=args.next(),
+                    "--installer-python"=>installer_python=args.next().map(PathBuf::from),
+                    "--client-wheel"=>client_wheel=args.next().map(PathBuf::from),
+                    "--package-python"=>package_python=args.next().ok_or_else(||io::Error::other("--package-python requires a Python version"))?,
                     "--cpu-parallelism"=>parallelism=args.next().ok_or_else(||io::Error::other("--cpu-parallelism requires a count"))?.parse().map_err(io::Error::other)?,
                     "--host-bytes"=>budget=args.next().ok_or_else(||io::Error::other("--host-bytes requires bytes"))?.parse().map_err(io::Error::other)?,
                     "--cache-ttl-seconds"=>ttl=args.next().ok_or_else(||io::Error::other("--cache-ttl-seconds requires seconds"))?.parse().map_err(io::Error::other)?,
@@ -47,12 +54,92 @@ fn run() -> io::Result<()> {
                 }
             }
             let root=root.ok_or_else(||io::Error::other("--state is required"))?;
+            let generations=generations.unwrap_or_else(||root.join("generations"));
             let owner=Owner::new(&root,budget,Duration::from_secs(ttl))?;
-            let service=cozy_machine::service::Service::open(&root,&generations.unwrap_or_else(||root.join("generations")),parallelism)?;
+            let service=cozy_machine::service::Service::open(&root,&generations,parallelism)?;
+            match (machine_config,listen) {
+                (Some(config),Some(listen))=>start_api(&root,&generations,&config,&listen,&owner,&service,installer_python,client_wheel,package_python)?,
+                (None,None)=>(),
+                _=>return Err(io::Error::other("--machine-config and --listen are required together")),
+            }
             serve(owner,service)
         }
         _=>Err(io::Error::other("usage: cozy-machine version --json | serve --state PATH [--generations PATH] [--cpu-parallelism N] [--host-bytes N]")),
     }
+}
+#[allow(clippy::too_many_arguments)]
+fn start_api(
+    root: &std::path::Path,
+    generations: &std::path::Path,
+    config: &std::path::Path,
+    listen: &str,
+    owner: &Shared,
+    service: &Arc<cozy_machine::service::Service>,
+    helper: Option<PathBuf>,
+    wheel: Option<PathBuf>,
+    python: String,
+) -> io::Result<()> {
+    use cozy_machine::{
+        api::{self, identity::MachineConfig, MachineIdentity},
+        machine_api::NativeBackend,
+    };
+    let identity = MachineIdentity::retained(&MachineConfig::load(config)?)?;
+    let store = owner.lock().unwrap().store();
+    let uploads = api::workspaces::WorkspaceUploads::open(&root.join("uploads"), store.clone())
+        .map_err(io::Error::other)?;
+    let mut backend =
+        NativeBackend::new(service.clone(), identity.authority.clone(), store, uploads);
+    backend.installer = match (helper, wheel) {
+        (Some(helper_python), Some(client_wheel)) => Some(api::install::InstallerConfig {
+            helper_python,
+            client_wheel,
+            python,
+            generations: generations.to_path_buf(),
+            staging_root: root.join("package-staging"),
+        }),
+        (None, None) => None,
+        _ => {
+            return Err(io::Error::other(
+                "--installer-python and --client-wheel are required together",
+            ))
+        }
+    };
+    let listener = std::net::TcpListener::bind(listen)?;
+    listener.set_nonblocking(true)?;
+    #[derive(serde::Serialize)]
+    struct Ready<'a> {
+        address: String,
+        worker_id: &'a str,
+        boot_id: &'a str,
+        cert_pem: &'a str,
+    }
+    let ready = serde_json::to_vec(&Ready {
+        address: listener.local_addr()?.to_string(),
+        worker_id: &identity.authority.worker_id,
+        boot_id: &identity.authority.boot_id,
+        cert_pem: &identity.cert_pem,
+    })?;
+    std::fs::write(root.join("api-ready.json"), ready)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    std::thread::Builder::new()
+        .name("machine-api".into())
+        .spawn(move || {
+            let result = runtime.block_on(async {
+                api::serve(
+                    tokio::net::TcpListener::from_std(listener)?,
+                    identity,
+                    Arc::new(backend),
+                )
+                .await
+            });
+            if let Err(error) = result {
+                eprintln!("machine API stopped: {error}");
+            }
+        })?;
+    Ok(())
 }
 fn serve(owner: Shared, service: Arc<cozy_machine::service::Service>) -> io::Result<()> {
     let path = owner.lock().unwrap().socket.clone();
@@ -221,19 +308,39 @@ fn client(
                 input,
             } => service
                 .submit(&key, &generation, &entrypoint, input)
-                .map(|record| (Body::Execution { record }, None)),
-            Command::Execution { id } => service
-                .engine
-                .get(&id)
-                .map(|record| (Body::Execution { record }, None)),
+                .map(|record| {
+                    (
+                        Body::Execution {
+                            record: Box::new(record),
+                        },
+                        None,
+                    )
+                }),
+            Command::Execution { id } => service.engine.get(&id).map(|record| {
+                (
+                    Body::Execution {
+                        record: Box::new(record),
+                    },
+                    None,
+                )
+            }),
             Command::Executions => service
                 .engine
                 .list()
                 .map(|records| (Body::Executions { records }, None)),
-            Command::Cancel { id } => service
-                .engine
-                .cancel(&id, "local-machine-owner")
-                .map(|record| (Body::Execution { record }, None)),
+            Command::Cancel { id } => {
+                service
+                    .engine
+                    .cancel(&id, "local-machine-owner")
+                    .map(|record| {
+                        (
+                            Body::Execution {
+                                record: Box::new(record),
+                            },
+                            None,
+                        )
+                    })
+            }
             Command::ReadResult { id, index } => (|| {
                 let record = service.engine.get(&id)?;
                 let artifact = record

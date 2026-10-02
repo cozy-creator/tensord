@@ -18,7 +18,7 @@ use std::{
     time::Duration,
 };
 use tensorfs_core::{
-    ids::ObjectRef,
+    ids::{ObjectRef, StoredDoc},
     manifest::{Draft, Entry},
     sha256, source_artifact,
     store::{Fault, Store},
@@ -30,9 +30,11 @@ pub struct NativeBackend {
     pub authority: Authority,
     pub store: Arc<Store>,
     pub uploads: Arc<WorkspaceUploads>,
+    pub installer: Option<crate::api::install::InstallerConfig>,
     // Serialize native projection, not inference or observation. Only one result
     // projection may establish a given immutable output's native custody at once.
     projection: Mutex<()>,
+    installation: Mutex<()>,
 }
 impl NativeBackend {
     pub fn new(
@@ -46,7 +48,9 @@ impl NativeBackend {
             authority,
             store,
             uploads,
+            installer: None,
             projection: Mutex::new(()),
+            installation: Mutex::new(()),
         }
     }
     fn workspace_id(&self) -> String {
@@ -150,10 +154,13 @@ impl NativeBackend {
         if let Some(result) = &record.result {
             let held = self
                 .service
-                .catalog
-                .resolve(&record.invocation.generation)
-                .map_err(problem)?;
-            let declaration = entrypoint(&held.record.interface, &record.invocation.entrypoint)?;
+                .engine
+                .installation_for_generation(&context.actor, &record.invocation.generation)
+                .map_err(problem)?
+                .ok_or_else(|| Status::data_loss("held installation interface absent"))?;
+            let interface: Value = serde_json::from_slice(&held.interface)
+                .map_err(|_| Status::data_loss("held installation interface corrupt"))?;
+            let declaration = entrypoint(&interface, &record.invocation.entrypoint)?;
             schema_digest =
                 Some(identity(declaration.get("result").ok_or_else(|| {
                     Status::failed_precondition("result schema absent")
@@ -179,15 +186,27 @@ impl NativeBackend {
                     .open_result(&record.id, index)
                     .map_err(problem)?;
                 verify_checksum(&mut source, binding)?;
-                self.store
-                    .put_stream_held(&mut source, Some(&object), &Fault::default(), Some(&owner))
-                    .map_err(storage)?;
                 let tree = Draft {
-                    entries: vec![("payload".into(), Entry::File(object))],
+                    entries: vec![("payload".into(), Entry::File(object.clone()))],
                 }
                 .seal()
                 .map_err(storage)?;
-                let root = source_artifact::create(&self.store, &owner, &tree).map_err(storage)?;
+                // Source writer's shared guard excludes GC until its standing root
+                // records the verified member. This is a native file-tree owner,
+                // not an unrelated catalog operation id.
+                let mut writer = source_artifact::Writer::open(
+                    &self.store,
+                    &owner,
+                    tree.object_ref().map_err(storage)?,
+                )
+                .map_err(storage)?;
+                if !writer.completed().map_err(storage)? {
+                    self.store
+                        .put_stream(&mut source, Some(&object), &Fault::default())
+                        .map_err(storage)?;
+                    writer.landed(&object).map_err(storage)?;
+                }
+                let root = writer.finish(&tree).map_err(storage)?;
                 let receipt = root.receipt().map_err(storage)?;
                 let native = pb::NativeByteRetentionRequest {
                     source: Some(pb::NativeByteTreeRef {
@@ -325,6 +344,11 @@ impl MachineBackend for NativeBackend {
         let root = request.release_root.as_ref().ok_or_else(|| {
             Status::unimplemented("captured offers are not qualified by this CPU build")
         })?;
+        if !root.hub.is_empty() || !request.hub.is_empty() {
+            return Err(Status::unimplemented(
+                "scoped Hub grant routing is not qualified by this build",
+            ));
+        }
         if !root.models.is_empty()
             || !root.inputs.is_empty()
             || !root.input_access.is_empty()
@@ -373,7 +397,15 @@ impl MachineBackend for NativeBackend {
         let entry = entrypoint(&interface, &root.entrypoint)?;
         let input: Value = serde_json::from_slice(&request.payload_canonical_bytes)
             .map_err(|_| Status::invalid_argument("payload is invalid JSON"))?;
-        let payload_digest = identity(&input)?;
+        if canonical(&input)? != request.payload_canonical_bytes {
+            return Err(Status::invalid_argument(
+                "payload must carry unambiguous canonical JSON bytes",
+            ));
+        }
+        let payload_digest = format!(
+            "sha256:{}",
+            sha256::hex(&sha256::digest(&request.payload_canonical_bytes))
+        );
         let binding = identity(entry)?;
         let spec = json!({"format":"cozy.worker.v1.InvocationSpec/1","installation_id":installed.alias,"payload_digest":payload_digest,"serving":{"entrypoint_binding_digest":binding,"attempt_binding_id":binding,"bindings_digest":binding}});
         let context = SubmissionContext {
@@ -495,33 +527,36 @@ impl MachineBackend for NativeBackend {
         actor: VerifiedActor,
         request: pb::MachineExecutionListQuery,
     ) -> Result<pb::MachineExecutionList, Status> {
+        let actor = actor_id(actor);
+        let head_number = self.service.engine.actor_head(&actor).map_err(problem)?;
         let records = self
             .service
             .engine
-            .list_actor(&actor_id(actor), usize::MAX)
+            .actor_page(
+                &actor,
+                if request.newest_first {
+                    0
+                } else {
+                    request.after_number
+                },
+                if request.newest_first {
+                    request.before_number
+                } else {
+                    0
+                },
+                request.newest_first,
+                &request.states,
+                if request.limit == 0 {
+                    64
+                } else {
+                    request.limit.min(256)
+                } as usize,
+            )
             .map_err(problem)?;
-        let head_number = records.last().and_then(|r| r.id.parse().ok()).unwrap_or(0);
-        let mut executions = records
+        let executions = records
             .iter()
             .map(|r| self.state(r))
             .collect::<Result<Vec<_>, _>>()?;
-        executions.retain(|r| {
-            if request.newest_first {
-                (request.before_number == 0 || r.number < request.before_number)
-                    && (request.states.is_empty() || request.states.contains(&r.state))
-            } else {
-                r.number > request.after_number
-                    && (request.states.is_empty() || request.states.contains(&r.state))
-            }
-        });
-        if request.newest_first {
-            executions.reverse();
-        }
-        executions.truncate(if request.limit == 0 {
-            64
-        } else {
-            request.limit.min(256)
-        } as usize);
         if request.wait {
             return Err(Status::unimplemented(
                 "list wait is not qualified by this build",
@@ -558,11 +593,80 @@ impl MachineBackend for NativeBackend {
     fn uploads(&self) -> Option<Arc<WorkspaceUploads>> {
         Some(self.uploads.clone())
     }
-    fn read_bytes(
+    fn prepare_local(
+        &self,
+        actor: VerifiedActor,
+        request: pb::PrepareLocalPackageCall,
+        uploaded: Option<crate::api::workspaces::UploadedPackage>,
+    ) -> Result<Vec<pb::PrepareEvent>, Status> {
+        let verified_actor = actor;
+        if !request.hub.is_empty() {
+            return Err(Status::unimplemented(
+                "scoped Hub grant routing is not qualified by this CPU installer",
+            ));
+        }
+        let selection = request
+            .local_package_set
+            .as_ref()
+            .and_then(|s| s.package.as_ref())
+            .ok_or_else(|| Status::invalid_argument("local package metadata absent"))?;
+        let alias = selection.installation_id.clone();
+        let actor = actor_id(verified_actor);
+        let _guard = self.installation.lock().unwrap();
+        let installed = if let Some(prior) = self
+            .service
+            .engine
+            .installation(&actor, &alias)
+            .map_err(problem)?
+        {
+            if prior.package != selection.package || prior.release != selection.release {
+                return Err(Status::already_exists(
+                    "installation alias names different package semantics",
+                ));
+            }
+            prior
+        } else {
+            let uploaded = uploaded.ok_or_else(|| {
+                Status::failed_precondition("captured package uploads are incomplete")
+            })?;
+            let config = self
+                .installer
+                .as_ref()
+                .ok_or_else(|| Status::unimplemented("package installer is not configured"))?;
+            let prepared = crate::api::install::prepare_uploaded(config, &uploaded)?;
+            let record = self
+                .service
+                .engine
+                .bind_installation(crate::journal::Installation {
+                    actor,
+                    alias,
+                    generation: prepared.record.identity,
+                    package: uploaded.root.package.clone(),
+                    release: uploaded.root.release.clone(),
+                    interface: prepared.interface_bytes,
+                })
+                .map_err(problem)?;
+            self.service.changed_environment().map_err(problem)?;
+            self.uploads
+                .release_after_install(verified_actor, &uploaded.root.operation_id)?;
+            record
+        };
+        Ok(vec![pb::PrepareEvent {
+            stage: pb::PrepareStage::Prepared as i32,
+            installed_package: Some(pb::InstalledPackage {
+                installation_id: installed.alias,
+                package: installed.package,
+                release: installed.release,
+                package_interface: installed.interface,
+            }),
+            ..Default::default()
+        }])
+    }
+    fn read_stream(
         &self,
         actor: VerifiedActor,
         request: pb::NativeByteReadCall,
-    ) -> Result<Vec<pb::NativeByteReadChunk>, Status> {
+    ) -> Result<crate::api::backend::NativeByteStream, Status> {
         let source = request
             .source
             .ok_or_else(|| Status::invalid_argument("native source absent"))?;
@@ -572,7 +676,9 @@ impl MachineBackend for NativeBackend {
             .native_output(&actor_id(actor), &source.retention_id)
             .map_err(problem)?
             .ok_or_else(|| Status::not_found("native output is not retained for this actor"))?;
-        if expected != source.encode_to_vec() {
+        let expected = pb::NativeByteRetentionRequest::decode(expected.as_slice())
+            .map_err(|_| Status::data_loss("native output record corrupt"))?;
+        if expected != source {
             return Err(Status::invalid_argument(
                 "native source differs from its retained record",
             ));
@@ -587,10 +693,23 @@ impl MachineBackend for NativeBackend {
             sha256: sha256::hex(&object.digest),
             length: object.length,
         };
-        if !root.objects.contains(&object_ref) || request.offset > object.length {
+        if (!root.objects.contains(&object_ref) && root.manifest != object_ref)
+            || request.offset > object.length
+        {
             return Err(Status::invalid_argument(
                 "byte range is outside retained source",
             ));
+        }
+        if root.manifest == object_ref {
+            let manifest = self.store.read_manifest(&object_ref).map_err(storage)?;
+            let mut file = std::io::Cursor::new(manifest.canonical_bytes().map_err(storage)?);
+            file.seek(SeekFrom::Start(request.offset))
+                .map_err(problem)?;
+            return Ok(Box::new(ByteReader {
+                file: Box::new(file),
+                offset: request.offset,
+                remaining: object.length - request.offset,
+            }));
         }
         let mut file = self
             .store
@@ -599,47 +718,85 @@ impl MachineBackend for NativeBackend {
             .into_file();
         file.seek(SeekFrom::Start(request.offset))
             .map_err(problem)?;
-        let mut chunks = vec![];
-        let mut offset = request.offset;
-        loop {
-            let mut data = vec![0; 1 << 20];
-            let count = file.read(&mut data).map_err(problem)?;
-            if count == 0 {
-                break;
-            }
-            data.truncate(count);
-            chunks.push(pb::NativeByteReadChunk { offset, data });
-            offset += count as u64;
+        Ok(Box::new(ByteReader {
+            file: Box::new(file),
+            offset: request.offset,
+            remaining: object.length - request.offset,
+        }))
+    }
+}
+struct ByteReader {
+    file: Box<dyn Read + Send>,
+    offset: u64,
+    remaining: u64,
+}
+impl Iterator for ByteReader {
+    type Item = Result<pb::NativeByteReadChunk, Status>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
         }
-        Ok(chunks)
+        let mut data = vec![0; self.remaining.min(1 << 20) as usize];
+        if let Err(error) = self.file.read_exact(&mut data) {
+            self.remaining = 0;
+            return Some(Err(problem(error)));
+        }
+        let offset = self.offset;
+        self.offset += data.len() as u64;
+        self.remaining -= data.len() as u64;
+        Some(Ok(pb::NativeByteReadChunk { offset, data }))
     }
 }
 fn actor_id(actor: VerifiedActor) -> String {
     sha256::hex(&actor.public_key)
 }
-fn verify_checksum(source: &mut std::fs::File, binding: &crate::journal::AssetBinding) -> Result<(), Status> {
+fn verify_checksum(
+    source: &mut std::fs::File,
+    binding: &crate::journal::AssetBinding,
+) -> Result<(), Status> {
     use blake2::digest::{Update, VariableOutput};
-    let mut blake = blake2::Blake2bVar::new(16).map_err(|_| Status::internal("checksum configuration invalid"))?;
+    let mut blake = blake2::Blake2bVar::new(16)
+        .map_err(|_| Status::internal("checksum configuration invalid"))?;
     let mut sha = sha256::Sha256::new();
     let mut length = 0;
     let mut buffer = [0; 64 * 1024];
     loop {
         let count = source.read(&mut buffer).map_err(problem)?;
-        if count == 0 { break; }
+        if count == 0 {
+            break;
+        }
         match binding.checksum.algorithm.as_str() {
             "blake2b-128" => Update::update(&mut blake, &buffer[..count]),
             "sha256" => sha.update(&buffer[..count]),
-            _ => return Err(Status::unimplemented("producer output checksum algorithm is unavailable")),
+            _ => {
+                return Err(Status::unimplemented(
+                    "producer output checksum algorithm is unavailable",
+                ))
+            }
         }
         length += count as u64;
     }
     let digest = match binding.checksum.algorithm.as_str() {
-        "blake2b-128" => { let mut bytes = [0;16]; blake.finalize_variable(&mut bytes).map_err(|_|Status::internal("checksum finalization invalid"))?; sha256::hex(&bytes) },
+        "blake2b-128" => {
+            let mut bytes = [0; 16];
+            blake
+                .finalize_variable(&mut bytes)
+                .map_err(|_| Status::internal("checksum finalization invalid"))?;
+            sha256::hex(&bytes)
+        }
         "sha256" => sha256::hex(&sha.finish()),
-        _ => return Err(Status::unimplemented("producer output checksum algorithm is unavailable")),
+        _ => {
+            return Err(Status::unimplemented(
+                "producer output checksum algorithm is unavailable",
+            ))
+        }
     };
     source.seek(SeekFrom::Start(0)).map_err(problem)?;
-    if length != binding.length || digest != binding.checksum.value {return Err(Status::data_loss("SDK output checksum differs from held result bytes"));}
+    if length != binding.length || digest != binding.checksum.value {
+        return Err(Status::data_loss(
+            "SDK output checksum differs from held result bytes",
+        ));
+    }
     Ok(())
 }
 fn canonical(value: &Value) -> Result<Vec<u8>, Status> {
