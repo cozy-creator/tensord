@@ -28,6 +28,12 @@ The adapter contains no scheduler or memory-size admission decisions. Credential
 the seam. Explicit cancellation writes the stock attempt-keyed marker; stale marks cannot cancel
 a later request. Observer teardown must never call cancellation.
 
+StageExit retains its explicit `yielded` acknowledgement separately from the first exit:
+a policy owner cannot release a retained turn until the executor confirms application of the
+returned budget. SDK load/attempt memory and streaming observations are typed optional records;
+absent values remain unknown and signed byte fields preserve the SDK's unreadable `-1` sentinel.
+These observations do not authorize kills or supply a scheduler.
+
 Results remain in `result.canonical`: SHA-256 plus byte length verifies that fixed brokered file.
 Success also requires typed `outcome.terminal=succeeded`, quiescence and an unpoisoned generation;
 `ok=true` alone is not success. Files are opened through the existing O_PATH/NOFOLLOW helper.

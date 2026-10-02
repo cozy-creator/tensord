@@ -36,3 +36,19 @@ and remote `device-pilot validate` passes without launching a device. Native-der
 closure transfer resumes with 4MiB/s after uncapped SSH burst failures; destination was initialized
 independently before copying files, no foreign SQLite. Root owns all model/GPU execution and
 ordinary old-stack baseline. Transfer completion and target admission remain required gates.
+
+Final transfer checkpoint: interrupted SSH partial stores were preserved. The existing local
+Hub CheckpointReads route supplied ephemeral R2 grants; standard curl fetched four objects at
+a time into a separately initialized store-http, checking every length and SHA-256. All 2,604
+objects completed in 444.83 s. Native destination acquire/verification then passed the entire
+6,939,571,699-byte closure, its 320,558-byte header and selected 2,641 tensors/3,746 plan items.
+Final pod configuration selects store-http; CPU validation passes. Evidence is
+`~/cozy_v2/outputs/cm-device-20261002/sdxl-pod-source-verified.json`. No GPU inference by this agent.
+
+Typed load/plane/attempt observations now preserve absent/unreadable counters and StageExit's
+yielded acknowledgement, passes and stalls. Pilot retains these in load-facts/results/event files.
+Actual current/older SDK CPU suite 3 passed in 11.59 s; fmt, clippy and optimized build pass.
+Separate pod binary `stage/device-pilot-observations` SHA-256 is
+`f301a41a8cd0026f9b54524bbc0d644df5e20585d5a334ff8ddf50b963a5d28f`.
+Pod soft FD limit is 1,024; legacy native verification passed, while descriptor-source caching
+still needs its own measured FD-lifecycle gate before activation.

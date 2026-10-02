@@ -298,6 +298,68 @@ pub struct HostFrame {
     pub facts: BTreeMap<String, Value>,
 }
 
+/// SDK observations: absent fields stay unknown; signed byte counters preserve its -1 sentinel.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct PlaneFacts {
+    pub budget_bytes: Option<i64>,
+    pub committed_bytes: Option<i64>,
+    pub leased_bytes: Option<i64>,
+    pub pinned_budget_bytes: Option<i64>,
+    pub pinned_bytes: Option<i64>,
+    pub context_bytes: Option<i64>,
+    pub activation_peak_bytes: Option<i64>,
+    pub resident: BTreeMap<String, i64>,
+    pub streamed: BTreeMap<String, Streamed>,
+    pub h2d_bytes: Option<u64>,
+    pub h2d_gbps: Option<f64>,
+    pub disk_copy_bytes: Option<u64>,
+    pub disk_read_bytes: Option<u64>,
+    pub late: Option<u64>,
+    pub stall_ns: Option<u64>,
+    pub misses: Option<u64>,
+    pub evictions: Option<u64>,
+    pub oom_retries: Option<u64>,
+    pub modes: BTreeMap<String, String>,
+}
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Streamed {
+    pub blocks: u64,
+    pub resident_blocks: u64,
+    pub window: u64,
+}
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Metrics {
+    pub handler_ms: Option<f64>,
+    pub device_lease_ms: Option<f64>,
+    pub d2h_wait_ms: Option<f64>,
+    pub peak_vram_bytes: Option<i64>,
+    pub activation_peak_bytes: Option<i64>,
+    pub activation_peaks: BTreeMap<String, i64>,
+    pub allocated_at_start_bytes: Option<i64>,
+    pub working_peak_vram_bytes: Option<i64>,
+    pub rss_at_end_bytes: Option<i64>,
+    pub started_unix: Option<f64>,
+    pub gpu_count: Option<u32>,
+}
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct LoadFacts {
+    pub cuda_init_ms: Option<f64>,
+    pub prepare_ms: Option<f64>,
+    pub stages: Vec<(String, f64)>,
+    pub warm_ms: Option<f64>,
+    pub filled_bytes: Option<u64>,
+    pub device_free_bytes: Option<i64>,
+    pub device_total_bytes: Option<i64>,
+    pub allocator_bytes: Option<i64>,
+    pub reserved_bytes: Option<i64>,
+    pub rss_bytes: Option<i64>,
+    pub plane: Option<PlaneFacts>,
+}
+
 /// One decode per frame; only consumed business fields are represented.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
@@ -331,7 +393,13 @@ pub struct Frame {
     pub components: Vec<String>,
     pub growth_bytes: u64,
     pub wall_ns: u64,
+    pub stall_ns: u64,
+    pub passes: Option<u64>,
+    pub yielded: bool,
     pub free_bytes: u64,
+    pub facts: Option<LoadFacts>,
+    pub plane: Option<PlaneFacts>,
+    pub metrics: Option<Metrics>,
     pub stage: String,
     pub position: Option<u64>,
     pub total: Option<u64>,

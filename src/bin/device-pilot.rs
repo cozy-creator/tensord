@@ -71,7 +71,7 @@ impl Services for Turns {
             }
             _ => drop(descriptor),
         }
-        let row = serde_json::json!({"phase":self.phase,"exchange":format!("{:?}",frame.kind),"method":frame.method,"ok":answer.ok,"budget":answer.budget_bytes});
+        let row = serde_json::json!({"phase":self.phase,"exchange":format!("{:?}",frame.kind),"method":frame.method,"components":frame.components,"ok":answer.ok,"budget":answer.budget_bytes,"yielded":frame.yielded,"passes":frame.passes,"wall_ns":frame.wall_ns,"growth_bytes":frame.growth_bytes,"stall_ns":frame.stall_ns});
         writeln!(self.events, "{row}")?;
         Ok((answer, None))
     }
@@ -87,6 +87,8 @@ struct RunEvidence {
     post_ms: f64,
     result: Value,
     bindings: Vec<device_executor::AssetBinding>,
+    metrics: Option<device_executor::Metrics>,
+    plane: Option<device_executor::PlaneFacts>,
 }
 
 fn main() {
@@ -206,6 +208,10 @@ fn run() -> io::Result<()> {
             loaded.code, loaded.detail
         )));
     }
+    fs::write(
+        config.root.join("load-facts.json"),
+        serde_json::to_vec_pretty(&loaded.facts)?,
+    )?;
     let budget = executor.command(
         &DeviceCommand::Budget {
             vram_bytes: config.plane_budget_bytes,
@@ -282,6 +288,8 @@ fn run() -> io::Result<()> {
             post_ms,
             result,
             bindings,
+            metrics: reply.metrics,
+            plane: reply.plane,
         });
         fs::write(
             config.root.join("results.json"),

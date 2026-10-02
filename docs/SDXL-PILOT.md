@@ -14,9 +14,11 @@ target/release/device-pilot run CONFIG.json
 ```
 
 `validate` reads configuration/interface paths and never launches Python or touches a
-device. `run` uses the full stock Runtime device Executor and saves `events.jsonl` plus
-`results.json` containing preparation/invoke/post timings, reused executor PID, canonical
-result and exact SDK-bound output checksums. One Start/Load serves all three requests.
+device. `run` uses the full stock Runtime device Executor and saves `events.jsonl`,
+`load-facts.json` and `results.json`: preparation/invoke/post timings, reused executor PID,
+canonical result, exact SDK-bound output checksums and typed memory/streaming observations.
+Stage logs distinguish the first exit from its explicit yielded acknowledgement and retain
+passes, growth, wall and stall counters. One Start/Load serves all three requests.
 The trusted SDK encoder produces the actual WebP; root must independently inspect it.
 
 This is a legacy hardware feasibility pilot. The unchanged SDK still imports TensorFS
@@ -26,7 +28,7 @@ Stage exchanges return the root's fixed allowance; the pilot has no scheduler.
 
 ## Authoritative artifact/package inputs
 
-Current read-only catalog resolution: `cozy model info paul/sdxl --json` selects release
+Current read-only local-Hub catalog resolution: `cozy model info paul/sdxl --json` selects release
 `1.0.0`, lane `bf16`, checkpoint
 `sha256:288440e7dc660d047b23dc72efee3d9ff4d4222a35e45b4bd640848e50bee642`.
 Its complete closure is 6,939,571,699 bytes. The manifest is 164 bytes and names one
@@ -115,12 +117,17 @@ version floors. Package-declared dependency bounds remain authoritative.
 `model-source-check` derives `closure-files.txt` through the linked native core: 2,605
 relative files (one manifest plus 2,604 selected blobs). Use `rsync --files-from=...` from
 the source store into the initialized target; preserve partials on failure. The owned
-pod's sustained SSH upload failed without rate limiting, while `--bwlimit=4096` resumed
-steadily. This transport limit does not rewrite or refuse an inference request.
-After transfer, independently verify and admit the destination closure in one CPU process:
+pod's sustained SSH uploads interrupted even when capped; completed partial stores were
+preserved. The existing local Hub's typed `CheckpointReads` route supplies presigned R2
+HTTPS grants for the exact selected objects. Standard `curl`, in four parallel jobs, fetches
+and checks each size/SHA-256 into a separately initialized `store-http`. Grants travel on
+ephemeral stdin and are never put in durable files/logs or the package
+interpreter. The production Hub's exact checkpoint lookup returned 404; this fixture's
+publication provenance is the local Hub. Independently verify and admit the completed
+destination closure in one CPU process:
 
 ```sh
-model-source-check --verify /workspace/cozy-machine-pilot/store-qualified \
+model-source-check --verify /workspace/cozy-machine-pilot/store-http \
   sha256:288440e7dc660d047b23dc72efee3d9ff4d4222a35e45b4bd640848e50bee642 \
   unet,text_encoder,text_encoder_2,vae \
   /workspace/cozy-machine-pilot/source-qualification
@@ -128,8 +135,13 @@ model-source-check --verify /workspace/cozy-machine-pilot/store-qualified \
 
 The prepared pod configuration is `/workspace/cozy-machine-pilot/stage/sdxl-pilot.json`.
 It points at that store, the separate `sdk99` environment, its `.hold`, and a fresh output
-root. CPU `device-pilot validate` passed there with `gpu_started:false`; validation alone
-does not qualify the unfinished transfer or any CUDA/model execution.
+root. Transfer completed in 444.83 seconds; native destination verification admitted all
+2,604 objects and 6,939,571,699 bytes, with the expected header and four selected components.
+The selected 4 MiB-window plan has 2,641 tensors/3,746 items; changing the window changes
+item count, not weights. CPU `device-pilot validate` passed there with `gpu_started:false`.
+Use the prepared `stage/device-pilot-observations` binary for the hardware run. These CPU
+gates do not qualify CUDA/model execution. Pod soft FD limit is 1,024: the legacy native
+gate passed, while descriptor caching needs a separate measured lifecycle gate.
 
 For a whole old-stack baseline, launch its actual Go machine agent: `cozy-machine run`
 owns the Runtime guardian and host handoff. The fixed `cozy-runtime-worker` takes no argv
