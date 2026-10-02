@@ -604,6 +604,14 @@ impl<B: MachineBackend> pb::pod_host_server::PodHost for Api<B> {
         let (sender, receiver) = tokio::sync::mpsc::channel(2);
         tokio::task::spawn_blocking(move || {
             for chunk in chunks {
+                let chunk = chunk.and_then(|chunk| {
+                    if chunk.data.is_empty() || chunk.data.len() > 1 << 20 {
+                        return Err(Status::data_loss(
+                            "backend byte read did not provide one bounded nonempty chunk",
+                        ));
+                    }
+                    Ok(chunk)
+                });
                 let failed = chunk.is_err();
                 if sender.blocking_send(chunk).is_err() || failed {
                     break;
