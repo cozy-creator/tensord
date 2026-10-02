@@ -80,7 +80,8 @@ exist yet; B2 creates it and moves the budget answers out of `gpu_service::Callb
 | `src/bin/model-source-check.rs`, `scripts/check-model-source-descriptor.py` | Check a selected snapshot's sources | B1 |
 | `src/bin/install-capture.rs` | Run the installer path on a captured archive (used by Python tests) | D1 |
 | `src/bin/front-door.rs`, `tests/*_client`, `tests/creator_*` | Isolated front-door fixture and Go consumer gates | D1 |
-| `scripts/benchmarks/` | Old-stack and switch benchmark drivers, permission probe | F |
+| `scripts/gate/` | Matched old-stack vs Rust-machine gate through ordinary `cozy run` | F |
+| `scripts/benchmarks/permission_probe.py` | CPU executor permission probe | E |
 | `scripts/service_cpu_gate.py` | CPU service end-to-end gate over the control socket | E |
 
 ## Contracts
@@ -92,7 +93,7 @@ exist yet; B2 creates it and moves the budget answers out of `gpu_service::Callb
 - [GPU service](GPU-SERVICE.md): GPU pool, config, launch identity.
 - [Shared host plane](SHARED-HOST-PLANE.md), [model sources](MODEL-SOURCES.md): Degree 1.
 - [Resident custody](RESIDENT-CUSTODY.md): Degree 2 foundation.
-- [Old-stack baseline](old-stack-baseline.md): benchmark driver usage.
+- [Matched gate](../scripts/gate/README.md): old stack vs Rust machine, ordinary CLI.
 
 ## Build and test
 
