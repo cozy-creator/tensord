@@ -522,7 +522,12 @@ impl GpuPool {
                 {
                     engine.finish(
                         &id,
-                        Outcome::Failed(format!("device executor ended: {error}")),
+                        Outcome::Failed(
+                            crate::journal::Failure::abandoned(&format!(
+                                "device executor ended: {error}"
+                            ))
+                            .encode(),
+                        ),
                     )?;
                 }
                 // An unquiesced live/unknown birth remains charged and nonterminal.
@@ -971,7 +976,9 @@ impl GpuPool {
                     // failure cannot cause authored work to be dispatched again.
                     engine.finish(
                         id,
-                        Outcome::Failed(format!("result custody failed: {error}")),
+                        Outcome::Failed(
+                            crate::journal::Failure::custody(&error.to_string()).encode(),
+                        ),
                     )?;
                 }
             }
@@ -981,7 +988,15 @@ impl GpuPool {
             _ => {
                 engine.finish(
                     id,
-                    Outcome::Failed(format!("{}: {}", outcome.code, outcome.message)),
+                    Outcome::Failed(
+                        crate::journal::Failure::executor(
+                            &outcome.terminal,
+                            &outcome.origin,
+                            &outcome.code,
+                            &outcome.message,
+                        )
+                        .encode(),
+                    ),
                 )?;
             }
         }
@@ -1238,13 +1253,32 @@ impl Services for Callbacks<'_> {
         })
     }
     fn progress(&mut self, frame: &Frame) {
-        // Zero-advance frames are telemetry (stage/position), not completed work.
-        if frame.advance > 0 && (frame.request_id.is_empty() || frame.request_id == self.id) {
-            self.completed = self.completed.saturating_add(frame.advance);
-            let _ = self
-                .engine
-                .observe_progress(self.id, self.completed, frame.stage.clone());
+        if !(frame.request_id.is_empty() || frame.request_id == self.id) || frame.stage.is_empty() {
+            return;
         }
+        // Zero-advance frames are telemetry (stage/position), not completed work.
+        self.completed = self.completed.saturating_add(frame.advance);
+        // The Python worker's progress payload: stage and step_ms always, the rest when known.
+        let mut payload = serde_json::json!({"stage": frame.stage.chars().take(120).collect::<String>(), "step_ms": frame.step_ms.unwrap_or(0.0)});
+        for (name, value) in [
+            (
+                "stage_fraction",
+                frame.stage_fraction.map(serde_json::Value::from),
+            ),
+            (
+                "overall_fraction",
+                frame.overall_fraction.map(serde_json::Value::from),
+            ),
+            ("position", frame.position.map(serde_json::Value::from)),
+            ("total", frame.total.map(serde_json::Value::from)),
+        ] {
+            if let Some(value) = value {
+                payload[name] = value;
+            }
+        }
+        let _ = self
+            .engine
+            .observe_progress(self.id, self.completed, payload.to_string());
     }
     fn request(
         &mut self,

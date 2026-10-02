@@ -136,7 +136,9 @@ impl Service {
         let held = self.catalog.resolve(generation)?;
         let mut invocation = held.invocation(entrypoint, input)?;
         invocation.attention_kernel = attention_kernel.into();
-        let record = self.engine.submit_public_on_boot(context, invocation, boot)?;
+        let record = self
+            .engine
+            .submit_public_on_boot(context, invocation, boot)?;
         self.retain(&record, held.retention());
         Ok(record)
     }

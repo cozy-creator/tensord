@@ -28,6 +28,8 @@ base64 = "0.22"
 hmac = "0.12"
 sha2 = "0.10"
 blake2 = "0.10"
+png = "0.17"
+image-webp = "0.2"
 tar = "0.4"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 rustls-pemfile = "2"

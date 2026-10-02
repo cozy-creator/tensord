@@ -300,6 +300,8 @@ pub struct ResultRef {
 pub struct Outcome {
     pub terminal: String,
     #[serde(default)]
+    pub origin: String,
+    #[serde(default)]
     pub code: String,
     #[serde(default)]
     pub message: String,
@@ -462,6 +464,9 @@ pub struct Frame {
     pub stage: String,
     pub position: Option<u64>,
     pub total: Option<u64>,
+    pub stage_fraction: Option<f64>,
+    pub overall_fraction: Option<f64>,
+    pub step_ms: Option<f64>,
     pub advance: u64,
     /// `device_tier`: fds that follow the frame, one per chunk of `regions`.
     pub descriptors: u32,
@@ -616,6 +621,39 @@ pub fn postprocess(
 ) -> io::Result<(Value, Vec<AssetBinding>)> {
     let result = read_result(spool, reply)?;
     let directory = File::open(spool)?;
+    let post = match encode_native(spool, reply)? {
+        Some(bindings) => PostReply { bindings },
+        None => encode_with_sdk(config, spool, reply)?,
+    };
+    for binding in &post.bindings {
+        let mut file = open_artifact(spool, Path::new(&binding.name))?;
+        let mut hash = tensorfs_core::sha256::Sha256::new();
+        let mut length = 0;
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            hash.update(&buffer[..count]);
+            length += count as u64;
+        }
+        if length != binding.length || tensorfs_core::sha256::hex(&hash.finish()) != binding.sha256
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SDK-bound encoded bytes changed before custody",
+            ));
+        }
+        file.sync_all()?;
+    }
+    directory.sync_all()?;
+    Ok((result, post.bindings))
+}
+/// The selected SDK's post helper, one process per request: only for codecs this
+/// machine does not encode itself (audio, video).
+fn encode_with_sdk(config: &CodecConfig, spool: &Path, reply: &Frame) -> io::Result<PostReply> {
+    let directory = File::open(spool)?;
     let fd = directory.as_raw_fd();
     let hold = config.generation_hold.as_ref().map(|hold| hold.as_raw_fd());
     let mut command = Command::new(&config.python);
@@ -668,32 +706,132 @@ pub fn postprocess(
             output.status
         )));
     }
-    let post: PostReply = serde_json::from_slice(&output.stdout)?;
-    for binding in &post.bindings {
-        let mut file = open_artifact(spool, Path::new(&binding.name))?;
-        let mut hash = tensorfs_core::sha256::Sha256::new();
-        let mut length = 0;
-        let mut buffer = [0; 64 * 1024];
-        loop {
-            let count = file.read(&mut buffer)?;
-            if count == 0 {
-                break;
+    serde_json::from_slice(&output.stdout).map_err(io::Error::other)
+}
+
+/// Encodes registered PNG/WebP frames in this process exactly as the SDK's post thread
+/// does (lossless RGB; PNG at zlib's fastest level, WebP lossless) and binds every output
+/// to its spool file. None when a frame needs a codec only the SDK has.
+fn encode_native(spool: &Path, reply: &Frame) -> io::Result<Option<Vec<AssetBinding>>> {
+    if reply
+        .frames
+        .iter()
+        .any(|f| !matches!(f.codec.as_str(), "png" | "webp"))
+    {
+        return Ok(None);
+    }
+    let invalid = |detail: &str| io::Error::new(io::ErrorKind::InvalidData, detail.to_string());
+    let blob = |reference: &str| -> io::Result<String> {
+        let tail: Vec<_> = reference.rsplitn(3, '/').collect();
+        match tail.as_slice() {
+            [name, kind, _]
+                if !name.is_empty()
+                    && !name.contains(['/', '\0'])
+                    && *name != "."
+                    && *name != ".." =>
+            {
+                Ok(format!("{kind}-{name}"))
             }
-            hash.update(&buffer[..count]);
-            length += count as u64;
+            _ => Err(invalid("SDK output has no owned spool binding")),
         }
-        if length != binding.length || tensorfs_core::sha256::hex(&hash.finish()) != binding.sha256
+    };
+    let mut media = BTreeMap::new();
+    for frame in &reply.frames {
+        let mut raw = Vec::new();
+        open_artifact(spool, Path::new(&frame.raw))?.read_to_end(&mut raw)?;
+        let dimension = |name: &str| {
+            frame
+                .facts
+                .get(name)
+                .and_then(Value::as_u64)
+                .filter(|v| *v > 0 && *v <= u32::MAX as u64)
+                .map(|v| v as u32)
+        };
+        let (Some(width), Some(height)) = (dimension("width"), dimension("height")) else {
+            return Err(invalid("registered frame has no dimensions"));
+        };
+        if raw.len() as u64 != frame.raw_bytes
+            || raw.len() as u64 != width as u64 * height as u64 * 3
         {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "SDK-bound encoded bytes changed before custody",
+            return Err(invalid("registered raw frame length changed"));
+        }
+        let mut encoded = Vec::new();
+        if frame.codec == "png" {
+            let mut encoder = png::Encoder::new(&mut encoded, width, height);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_compression(png::Compression::Fast);
+            encoder
+                .write_header()
+                .and_then(|mut w| w.write_image_data(&raw))
+                .map_err(io::Error::other)?;
+        } else {
+            image_webp::WebPEncoder::new(&mut encoded)
+                .encode(&raw, width, height, image_webp::ColorType::Rgb8)
+                .map_err(io::Error::other)?;
+        }
+        let name = blob(&frame.handle)?;
+        let temporary = spool.join(format!(".codec-{}", uuid::Uuid::new_v4().simple()));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&temporary)?;
+        file.write_all(&encoded)?;
+        file.sync_all()?;
+        fs::rename(&temporary, spool.join(&name))?;
+        media.insert(
+            frame.handle.clone(),
+            if frame.codec == "png" {
+                "image/png"
+            } else {
+                "image/webp"
+            },
+        );
+    }
+    let mut total = 0u64;
+    let mut bindings = vec![];
+    for output in &reply.outputs {
+        let name = blob(&output.asset_ref)?;
+        let mut encoded = Vec::new();
+        open_artifact(spool, Path::new(&name))?.read_to_end(&mut encoded)?;
+        use blake2::digest::{Update, VariableOutput};
+        let mut blake = blake2::Blake2bVar::new(16).map_err(io::Error::other)?;
+        blake.update(&encoded);
+        let mut digest = [0; 16];
+        blake
+            .finalize_variable(&mut digest)
+            .map_err(io::Error::other)?;
+        let producer = format!("blake2b:{}", tensorfs_core::sha256::hex(&digest));
+        if !output.digest.is_empty() && output.digest != producer
+            || output.size_bytes.is_some_and(|n| n != encoded.len() as u64)
+        {
+            return Err(invalid("SDK output bytes changed before custody"));
+        }
+        total += encoded.len() as u64;
+        if reply.max_output_bytes.is_some_and(|limit| total > limit) {
+            return Err(invalid(
+                "encoded output exceeds the authored aggregate allowance",
             ));
         }
-        file.sync_all()?;
+        bindings.push(AssetBinding {
+            output_id: output.output_id.clone(),
+            asset_ref: output.asset_ref.clone(),
+            name,
+            kind: output.kind.clone(),
+            media_type: media
+                .get(&output.asset_ref)
+                .map(|m| m.to_string())
+                .unwrap_or_else(|| output.media_type.clone()),
+            length: encoded.len() as u64,
+            producer_digest: producer,
+            sha256: tensorfs_core::sha256::hex_digest(&encoded),
+        });
     }
-    directory.sync_all()?;
-    Ok((result, post.bindings))
+    Ok(Some(bindings))
 }
+
 impl DeviceExecutor {
     pub fn spawn(config: ExecutorConfig) -> io::Result<Self> {
         Self::spawn_observed(config, |_, _| Ok(()))

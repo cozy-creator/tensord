@@ -281,20 +281,28 @@ impl NativeBackend {
             body["execution_started"] = json!(true);
         }
         let (status, code, origin, message) = match record.state {
-            State::Completed => (1, 0, 2, "completed"),
-            State::Canceled => (4, 11, 6, "explicitly canceled"),
-            _ => (
-                3,
-                7,
-                3,
-                "executor failed; inspect the private execution diagnostic",
-            ),
+            State::Completed => (1, 0, 2, "completed".to_string()),
+            State::Canceled => (4, 11, 6, "explicitly canceled".to_string()),
+            _ => {
+                let failure = crate::journal::Failure::decode(
+                    record
+                        .failure
+                        .as_deref()
+                        .unwrap_or("the run failed without a recorded reason"),
+                );
+                (
+                    failure.status,
+                    failure.cause,
+                    failure.origin,
+                    safe(&failure.message, 4096),
+                )
+            }
         };
         body["status"] = json!(status);
         body["cause"] = if code == 0 {
             json!({"origin":origin})
         } else {
-            json!({"code":code,"origin":origin})
+            json!({"code":code,"origin":origin,"detail":safe(&message, 1024)})
         };
         body["safe_message"] = json!(message);
         if !output_entries.is_empty() {
@@ -350,6 +358,19 @@ impl NativeBackend {
             .map_err(|_| Status::data_loss("durable event projection is corrupt"))
     }
 }
+/// Printable ASCII only, bounded: a reason is shown to the client verbatim.
+fn safe(text: &str, limit: usize) -> String {
+    text.chars()
+        .map(|c| if (' '..='~').contains(&c) { c } else { ' ' })
+        .take(limit)
+        .collect()
+}
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -382,7 +403,8 @@ impl MachineBackend for NativeBackend {
         mut access: crate::hub::Access,
     ) -> Result<(String, i64), crate::api::backend::HubAccessRefusal> {
         access.origin = access.origin.trim_end_matches('/').to_string();
-        crate::hub::validate(&access, unix_now()).map_err(|m| (400, "invalid_access", m.to_string()))?;
+        crate::hub::validate(&access, unix_now())
+            .map_err(|m| (400, "invalid_access", m.to_string()))?;
         let key = crate::hub::origin_key(&access.origin).expect("validated origin");
         let (origin, expires_at) = (access.origin.clone(), access.expires_at);
         let grant = crate::hub::Grant {
@@ -396,15 +418,29 @@ impl MachineBackend for NativeBackend {
             Err(_) => Err((503, "hub_access_unavailable", "cannot retain the Hub access grant".into())),
         }
     }
-    fn forget_hub_access(&self, actor: VerifiedActor, origin: &str) -> Result<(), crate::api::backend::HubAccessRefusal> {
+    fn forget_hub_access(
+        &self,
+        actor: VerifiedActor,
+        origin: &str,
+    ) -> Result<(), crate::api::backend::HubAccessRefusal> {
         let key = crate::hub::origin_key(origin)
             .filter(|_| crate::hub::valid_origin(origin))
-            .ok_or((400, "invalid_access", "send one valid Hub origin".to_string()))?;
+            .ok_or((
+                400,
+                "invalid_access",
+                "send one valid Hub origin".to_string(),
+            ))?;
         // Accepted work needs no Hub: removal never waits on it.
         self.service
             .engine
             .with_journal(|j| j.forget_hub_grant(&actor_id(actor), &key))
-            .map_err(|_| (503, "hub_access_unavailable", "cannot remove the Hub access grant".to_string()))
+            .map_err(|_| {
+                (
+                    503,
+                    "hub_access_unavailable",
+                    "cannot remove the Hub access grant".to_string(),
+                )
+            })
     }
     fn begin_input_tree(
         &self,
@@ -639,7 +675,10 @@ impl MachineBackend for NativeBackend {
             .map_err(problem)?
         {
             if request.expected_execution_workspace_id != self.workspace_id() {
-                return Err(refusal("execution_workspace_changed", "the requested execution journal is not this workspace"));
+                return Err(refusal(
+                    "execution_workspace_changed",
+                    "the requested execution journal is not this workspace",
+                ));
             }
             return self.receipt(&prior);
         }
@@ -662,12 +701,19 @@ impl MachineBackend for NativeBackend {
             ));
         }
         let (installed, published_plan) = if !root.hub.is_empty() {
-            if !root.installation_id.is_empty() || root.package.is_empty() || root.release.is_empty() {
-                return Err(Status::invalid_argument("a published root names its package and release"));
+            if !root.installation_id.is_empty()
+                || root.package.is_empty()
+                || root.release.is_empty()
+            {
+                return Err(Status::invalid_argument(
+                    "a published root names its package and release",
+                ));
             }
             let grant = self.hub_grant(&actor, &root.hub)?;
             let publisher = self.publisher.as_ref().ok_or_else(|| {
-                Status::unimplemented("published package preparation is not configured on this machine")
+                Status::unimplemented(
+                    "published package preparation is not configured on this machine",
+                )
             })?;
             let published = crate::published::Request {
                 grant,
@@ -677,11 +723,22 @@ impl MachineBackend for NativeBackend {
                 choices: root.models.clone(),
             };
             match publisher.prepare(&self.service, &actor, &request.submission_id, published) {
-                crate::published::Progress::Ready(prepared) => (prepared.installation.clone(), Some(prepared.plan.clone())),
-                crate::published::Progress::Failed(code, detail) => return Err(refusal(code, &format!("{code}: {detail}"))),
-                crate::published::Progress::Preparing { stage, moved, total } => {
+                crate::published::Progress::Ready(prepared) => {
+                    (prepared.installation.clone(), Some(prepared.plan.clone()))
+                }
+                crate::published::Progress::Failed(code, detail) => {
+                    return Err(refusal(code, &format!("{code}: {detail}")))
+                }
+                crate::published::Progress::Preparing {
+                    stage,
+                    moved,
+                    total,
+                } => {
                     let mut status = Status::unavailable(stage);
-                    status.metadata_mut().insert("cozy-error-code", "release_root_preparing".parse().expect("ASCII"));
+                    status.metadata_mut().insert(
+                        "cozy-error-code",
+                        "release_root_preparing".parse().expect("ASCII"),
+                    );
                     if total > 0 {
                         if let Ok(value) = format!("{moved} {total}").parse() {
                             status.metadata_mut().insert("cozy-progress-bytes", value);
@@ -759,7 +816,10 @@ impl MachineBackend for NativeBackend {
         let input: Value = crate::boundary_json::parse(&request.payload_canonical_bytes)
             .map_err(|_| Status::invalid_argument("payload is invalid JSON"))?;
         if !input.is_object() {
-            return Err(refusal("invalid_request", "the payload must be a JSON object of the function's parameters"));
+            return Err(refusal(
+                "invalid_request",
+                "the payload must be a JSON object of the function's parameters",
+            ));
         }
         let canonical_input = canonical(&input)?;
         let payload_digest = format!("sha256:{}", sha256::hex(&sha256::digest(&canonical_input)));
@@ -843,20 +903,48 @@ impl MachineBackend for NativeBackend {
                 .unwrap_or(request.after);
             return Ok(page);
         }
-        let events = if record.revision > request.after {
-            vec![pb::MachineExecutionEvent {
-                sequence: record.revision,
-                attempt_ordinal: record.attempt.max(1) as u64,
-                at_ms: record.accepted_at_ms,
-                kind: "state".into(),
-                body_canonical_bytes: canonical(
-                    &json!({"state":self.state(&record)?.state,"completed_units":record.completed_units,"waiting_reason":record.waiting_reason}),
-                )?,
+        // The Python worker's live kinds: `running` once, then the latest `progress`.
+        let attempt = record.attempt.max(1) as u64;
+        let event = |sequence: u64,
+                     kind: &str,
+                     body: &Value|
+         -> Result<pb::MachineExecutionEvent, Status> {
+            Ok(pb::MachineExecutionEvent {
+                sequence,
+                attempt_ordinal: attempt,
+                at_ms: now_ms(),
+                kind: kind.into(),
+                body_canonical_bytes: canonical(body)?,
                 ..Default::default()
-            }]
-        } else {
-            vec![]
+            })
         };
+        let mut events = vec![];
+        let running = record.state == State::Running && record.running_revision > 0;
+        if running && record.running_revision > request.after {
+            events.push(event(
+                record.running_revision,
+                "running",
+                &json!({"generation":attempt}),
+            )?);
+        }
+        let floor = request
+            .after
+            .max(if running { record.running_revision } else { 0 });
+        if record.revision > floor {
+            if let Some(progress) = record.progress.as_ref().filter(|_| running) {
+                let payload = serde_json::from_str::<Value>(progress)
+                    .ok()
+                    .filter(Value::is_object)
+                    .unwrap_or_else(|| json!({"stage":progress,"step_ms":0.0}));
+                events.push(event(
+                    record.revision,
+                    "progress",
+                    &json!({"type":"progress","payload":payload}),
+                )?);
+            } else if !running {
+                events.push(event(record.revision, "state", &json!({"state":self.state(&record)?.state,"completed_units":record.completed_units,"waiting_reason":record.waiting_reason}))?);
+            }
+        }
         Ok(pb::MachineExecutionEventPage {
             next_after: events.last().map(|e| e.sequence).unwrap_or(request.after),
             events,

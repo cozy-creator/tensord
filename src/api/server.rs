@@ -246,7 +246,12 @@ impl<B: MachineBackend> Api<B> {
         let refuse = |status: u16, code: &str, message: &str| {
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST);
             let body = serde_json::json!({"error":{"code":code,"message":message}});
-            (status, [("content-type", "application/json")], body.to_string()).into_response()
+            (
+                status,
+                [("content-type", "application/json")],
+                body.to_string(),
+            )
+                .into_response()
         };
         let token = headers
             .get("authorization")
@@ -254,13 +259,25 @@ impl<B: MachineBackend> Api<B> {
             .and_then(|v| v.strip_prefix("Cozy-Cap "))
             .unwrap_or_default();
         let authority = &self.identity.authority;
-        let Some(key) = crate::hub::verify_capability(token, &authority.worker_id, &authority.keys, now_ms() as i64 / 1000, crate::hub::ACTION) else {
-            return refuse(403, "capability_required", "a hub-access capability is required");
+        let Some(key) = crate::hub::verify_capability(
+            token,
+            &authority.worker_id,
+            &authority.keys,
+            now_ms() as i64 / 1000,
+            crate::hub::ACTION,
+        ) else {
+            return refuse(
+                403,
+                "capability_required",
+                "a hub-access capability is required",
+            );
         };
         if body.len() > 64 << 10 {
             return refuse(400, "invalid_access", "Hub access body exceeds 64 KiB");
         }
-        let actor = super::auth::VerifiedActor { public_key: key.to_bytes() };
+        let actor = super::auth::VerifiedActor {
+            public_key: key.to_bytes(),
+        };
         let backend = self.backend.clone();
         let answer = tokio::task::spawn_blocking(move || {
             if forget {
@@ -269,10 +286,24 @@ impl<B: MachineBackend> Api<B> {
                 struct Forget {
                     origin: String,
                 }
-                let request: Forget = serde_json::from_slice(&body).map_err(|_| (400, "invalid_access", "send one valid Hub origin".to_string()))?;
-                backend.forget_hub_access(actor, &request.origin).map(|()| None)
+                let request: Forget = serde_json::from_slice(&body).map_err(|_| {
+                    (
+                        400,
+                        "invalid_access",
+                        "send one valid Hub origin".to_string(),
+                    )
+                })?;
+                backend
+                    .forget_hub_access(actor, &request.origin)
+                    .map(|()| None)
             } else {
-                let access: crate::hub::Access = serde_json::from_slice(&body).map_err(|_| (400, "invalid_access", "invalid Hub access grant".to_string()))?;
+                let access: crate::hub::Access = serde_json::from_slice(&body).map_err(|_| {
+                    (
+                        400,
+                        "invalid_access",
+                        "invalid Hub access grant".to_string(),
+                    )
+                })?;
                 backend.hub_access(actor, access).map(Some)
             }
         })
@@ -285,7 +316,11 @@ impl<B: MachineBackend> Api<B> {
             )
                 .into_response(),
             Ok(Err((status, code, message))) => refuse(status, code, &message),
-            Err(_) => refuse(503, "hub_access_unavailable", "Hub access operation stopped"),
+            Err(_) => refuse(
+                503,
+                "hub_access_unavailable",
+                "Hub access operation stopped",
+            ),
         }
     }
 }

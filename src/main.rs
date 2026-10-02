@@ -141,7 +141,11 @@ fn run_machine(mut grant: cozy_machine::machine::grant::Grant) -> io::Result<()>
         installer.0,
         installer.1,
         "3.12".into(),
-        cozy_machine::published::PackageSdk { uv: "uv".into(), python: "3.12".into(), ..Default::default() },
+        cozy_machine::published::PackageSdk {
+            uv: "uv".into(),
+            python: "3.12".into(),
+            ..Default::default()
+        },
     )?;
     serve(owner, service, control)
 }
@@ -163,9 +167,17 @@ fn start_api(
     let store = owner.lock().unwrap().store();
     let uploads = api::workspaces::WorkspaceUploads::open(&root.join("uploads"), store.clone())
         .map_err(io::Error::other)?;
-    let mut backend =
-        NativeBackend::new(service.clone(), identity.authority.clone(), store.clone(), uploads);
-    backend.publisher = Some(cozy_machine::published::Publisher::new(&root.join("published"), sdk, store)?);
+    let mut backend = NativeBackend::new(
+        service.clone(),
+        identity.authority.clone(),
+        store.clone(),
+        uploads,
+    );
+    backend.publisher = Some(cozy_machine::published::Publisher::new(
+        &root.join("published"),
+        sdk,
+        store,
+    )?);
     backend.installer = match (helper, wheel) {
         (Some(helper_python), Some(client_wheel)) => Some(api::install::InstallerConfig {
             helper_python,

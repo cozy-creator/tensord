@@ -566,7 +566,11 @@ impl Engine {
         if let Some(snapshot) = progress.get(id) {
             snapshot.overlay(&mut record);
         }
-        if completed_units <= record.completed_units {
+        // Units never regress; a stage or position change without new units still shows.
+        if completed_units < record.completed_units
+            || completed_units == record.completed_units
+                && record.progress.as_deref() == Some(detail.as_str())
+        {
             return Ok(());
         }
         if record.revision >= record.revision_ceiling {
@@ -583,6 +587,8 @@ impl Engine {
                     .ok_or_else(|| io::Error::other("execution observation cursor exhausted"))?,
             },
         );
+        drop((progress, journal));
+        self.notify_activity(); // wakes event long-polls; nothing durable is written
         Ok(())
     }
 

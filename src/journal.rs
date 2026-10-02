@@ -183,6 +183,9 @@ pub struct Execution {
     pub cancel_actor: Option<String>,
     pub completed_units: u64,
     pub progress: Option<String>,
+    /// The cursor at which the attempt started running: its `running` event.
+    #[serde(default)]
+    pub running_revision: u64,
     pub result: Option<ResultRecord>,
     pub failure: Option<String>,
 }
@@ -197,7 +200,7 @@ pub struct ProgressSnapshot {
 
 impl ProgressSnapshot {
     pub fn overlay(&self, record: &mut Execution) -> bool {
-        if self.completed_units <= record.completed_units {
+        if self.revision <= record.revision || self.completed_units < record.completed_units {
             return false;
         }
         record.completed_units = self.completed_units;
@@ -493,33 +496,63 @@ impl Journal {
 
     pub fn hub_grant(&self, actor: &str, origin: &str) -> io::Result<Option<crate::hub::Grant>> {
         self.connection
-            .query_row("SELECT record FROM hub_access WHERE actor=?1 AND origin=?2", params![actor, origin], |r| r.get::<_, String>(0))
+            .query_row(
+                "SELECT record FROM hub_access WHERE actor=?1 AND origin=?2",
+                params![actor, origin],
+                |r| r.get::<_, String>(0),
+            )
             .optional()
             .map_err(db_error)?
             .map(|record| serde_json::from_str(&record).map_err(db_error))
             .transpose()
     }
     /// Retains a grant unless this owner already holds another account at the origin.
-    pub fn put_hub_grant(&mut self, actor: &str, origin: &str, grant: &crate::hub::Grant) -> io::Result<bool> {
-        if self.hub_grant(actor, origin)?.is_some_and(|prior| prior.principal != grant.principal) {
+    pub fn put_hub_grant(
+        &mut self,
+        actor: &str,
+        origin: &str,
+        grant: &crate::hub::Grant,
+    ) -> io::Result<bool> {
+        if self
+            .hub_grant(actor, origin)?
+            .is_some_and(|prior| prior.principal != grant.principal)
+        {
             return Ok(false);
         }
         self.connection
-            .execute("INSERT OR REPLACE INTO hub_access(actor,origin,record) VALUES(?1,?2,?3)", params![actor, origin, encoded(grant)?])
+            .execute(
+                "INSERT OR REPLACE INTO hub_access(actor,origin,record) VALUES(?1,?2,?3)",
+                params![actor, origin, encoded(grant)?],
+            )
             .map_err(db_error)?;
         Ok(true)
     }
     pub fn forget_hub_grant(&mut self, actor: &str, origin: &str) -> io::Result<()> {
-        self.connection.execute("DELETE FROM hub_access WHERE actor=?1 AND origin=?2", params![actor, origin]).map_err(db_error)?;
+        self.connection
+            .execute(
+                "DELETE FROM hub_access WHERE actor=?1 AND origin=?2",
+                params![actor, origin],
+            )
+            .map_err(db_error)?;
         Ok(())
     }
     pub fn resolution(&self, actor: &str, key: &str) -> io::Result<Option<String>> {
         self.connection
-            .query_row("SELECT preparation FROM resolutions WHERE actor=?1 AND key=?2", params![actor, key], |r| r.get(0))
+            .query_row(
+                "SELECT preparation FROM resolutions WHERE actor=?1 AND key=?2",
+                params![actor, key],
+                |r| r.get(0),
+            )
             .optional()
             .map_err(db_error)
     }
-    pub fn bind_resolution(&mut self, actor: &str, key: &str, package: &str, preparation: &str) -> io::Result<()> {
+    pub fn bind_resolution(
+        &mut self,
+        actor: &str,
+        key: &str,
+        package: &str,
+        preparation: &str,
+    ) -> io::Result<()> {
         self.connection
             .execute("INSERT OR REPLACE INTO resolutions(actor,key,package,preparation) VALUES(?1,?2,?3,?4)", params![actor, key, package, preparation])
             .map_err(db_error)?;
@@ -527,11 +560,21 @@ impl Journal {
     }
     /// Drops cached model resolutions of a package: the next run reads its bindings again.
     pub fn forget_resolutions(&mut self, actor: &str, package: &str) -> io::Result<()> {
-        self.connection.execute("DELETE FROM resolutions WHERE actor=?1 AND package=?2", params![actor, package]).map_err(db_error)?;
+        self.connection
+            .execute(
+                "DELETE FROM resolutions WHERE actor=?1 AND package=?2",
+                params![actor, package],
+            )
+            .map_err(db_error)?;
         Ok(())
     }
     /// The accepted public execution a submission or request already names, if any.
-    pub fn accepted_public(&self, actor: &str, request_id: &str, submission_id: &str) -> io::Result<Option<Execution>> {
+    pub fn accepted_public(
+        &self,
+        actor: &str,
+        request_id: &str,
+        submission_id: &str,
+    ) -> io::Result<Option<Execution>> {
         let record: Option<String> = self
             .connection
             .query_row(
@@ -541,7 +584,9 @@ impl Journal {
             )
             .optional()
             .map_err(db_error)?;
-        record.map(|r| serde_json::from_str(&r).map_err(db_error)).transpose()
+        record
+            .map(|r| serde_json::from_str(&r).map_err(db_error))
+            .transpose()
     }
     pub fn preparation(&self, actor: &str, id: &str) -> io::Result<Option<Preparation>> {
         self.connection
@@ -813,6 +858,7 @@ impl Journal {
             cancel_actor: None,
             completed_units: 0,
             progress: None,
+            running_revision: 0,
             result: None,
             failure: None,
         };
@@ -1181,6 +1227,7 @@ impl Journal {
                 ));
             }
             record.state = State::Running;
+            record.running_revision = record.revision.max(record.revision_ceiling) + 1;
             Ok(true)
         })
     }
@@ -1267,6 +1314,67 @@ impl Journal {
             }
             record.finished_at_ms = timestamp().max(0) as u64;
             Ok(true)
+        })
+    }
+}
+
+/// Why a run did not complete, in the outcome body's terms (cozy.worker.v1 enums:
+/// status FAILED=3/REFUSED=2/ABANDONED=5; cause codes and origins as numbered there).
+/// Stored as JSON in `Execution::failure`; older plain text reads as an executor fault.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Failure {
+    pub status: u8,
+    pub cause: u8,
+    pub origin: u8,
+    pub message: String,
+}
+impl Failure {
+    /// An executor's own terminal (`refused`/`failed`, origin `request`/`runtime`/`author`).
+    pub fn executor(terminal: &str, origin: &str, code: &str, message: &str) -> Self {
+        let coded = format!("{code}: {message}");
+        let (status, cause, origin, message) = match (terminal, origin, code) {
+            ("refused", ..) | (_, "request", _) => (2, 1, 6, coded),
+            (_, _, "device_out_of_memory") => {
+                (3, 7, 2, format!("accepted_envelope_breach: {coded}"))
+            }
+            (_, "runtime", _) => (3, 7, 2, coded),
+            (_, "author", _) => (3, 6, 1, coded),
+            _ => (3, 7, 3, coded),
+        };
+        Self {
+            status,
+            cause,
+            origin,
+            message,
+        }
+    }
+    /// The executor process ended under the attempt.
+    pub fn abandoned(why: &str) -> Self {
+        Self {
+            status: 5,
+            cause: 16,
+            origin: 3,
+            message: format!("executor invalidated: {why}"),
+        }
+    }
+    /// Results could not be taken into custody (encoding, checksums, storage).
+    pub fn custody(why: &str) -> Self {
+        Self {
+            status: 3,
+            cause: 10,
+            origin: 4,
+            message: format!("result custody failed: {why}"),
+        }
+    }
+    pub fn encode(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+    pub fn decode(text: &str) -> Self {
+        serde_json::from_str(text).unwrap_or_else(|_| Self {
+            status: 3,
+            cause: 7,
+            origin: 3,
+            message: text.into(),
         })
     }
 }
