@@ -60,5 +60,10 @@ class DescribeFailed(msgspec.Struct, tag="describe_failed", tag_field="kind"):
     detail: str
 
 
+class InstallFailed(msgspec.Struct, tag="install_failed", tag_field="kind"):
+    code: str
+    detail: str
+
+
 GENERATION_DECODER = msgspec.json.Decoder(Generation)
 DESCRIPTION_DECODER = msgspec.json.Decoder(Described | DescribeFailed)

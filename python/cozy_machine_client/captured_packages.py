@@ -16,7 +16,7 @@ from packaging.utils import canonicalize_name
 from packaging.version import Version
 
 from .package_records import Dependency, DescribeFailed, DescribeInstalled, DESCRIPTION_DECODER, PackageMetadata
-from .packages import PackageError, describe, publish_generation, read_metadata
+from .packages import PackageError, publish_generation, read_metadata
 
 
 def wheel_metadata(path: Path) -> PackageMetadata:
@@ -38,7 +38,13 @@ def wheel_metadata(path: Path) -> PackageMetadata:
 
 def installed_description(distribution: str, interpreter: Path) -> msgspec.Raw:
     request = DescribeInstalled(distribution, str(interpreter))
-    raw = subprocess.check_output([sys.executable, "-m", "cozy_machine_client.runtime_describe"], input=msgspec.json.encode(request))
+    # -S prevents authored .pth startup code; only the owned venv's regular
+    # site-packages paths are inserted before loading the installed SDK reader.
+    bootstrap = ("import pathlib,runpy,sys;"
+                 "root=pathlib.Path(sys.executable).absolute().parent.parent;"
+                 "sys.path[:0]=[str(p) for p in (root/'lib').glob('python*/site-packages')];"
+                 "runpy.run_module('cozy_machine_client.runtime_describe',run_name='__main__')")
+    raw = subprocess.check_output([str(interpreter), "-I", "-S", "-c", bootstrap], input=msgspec.json.encode(request))
     reply = DESCRIPTION_DECODER.decode(raw)
     if isinstance(reply, DescribeFailed):
         raise PackageError(reply.code, reply.detail)
@@ -65,7 +71,6 @@ def install_captured(*, project: Path | None, wheels: list[Path], requirements: 
         raise PackageError("package_capture_mixed_lock_unsupported", "a frozen source capture cannot overlay an independent wheel/requirements closure")
     if project:
         metadata = read_metadata(project)
-        describe(project)  # existing SDK source-only reader, never project import
     else:
         matches = []
         for wheel in wheels:

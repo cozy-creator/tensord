@@ -21,7 +21,7 @@ import msgspec
 
 from .package_records import (
     DESCRIPTION_DECODER, GENERATION_DECODER, Dependency, Describe, DescribeFailed, Generation,
-    PackageMetadata, Pyproject,
+    InstallFailed, PackageMetadata, Pyproject,
 )
 
 
@@ -165,9 +165,16 @@ def main():
     args = parser.parse_args()
     if args.command == "install-captured":
         from .captured_packages import install_captured
-        result = install_captured(project=args.project, wheels=args.wheel, requirements=args.requirements,
-            distribution=args.distribution, release=args.release, python_requires=args.python_requires,
-            python_version=args.python_version, generations=args.generations, client_wheel=args.client_wheel, python=args.python)
+        try:
+            result = install_captured(project=args.project, wheels=args.wheel, requirements=args.requirements,
+                distribution=args.distribution, release=args.release, python_requires=args.python_requires,
+                python_version=args.python_version, generations=args.generations, client_wheel=args.client_wheel, python=args.python)
+        except PackageError as exc:
+            print(msgspec.json.encode(InstallFailed(exc.code, str(exc))).decode())
+            raise SystemExit(1)
+        except subprocess.CalledProcessError:
+            print(msgspec.json.encode(InstallFailed("package_dependency_operation_failed", "standard uv did not complete the captured dependency operation")).decode())
+            raise SystemExit(1)
         print(msgspec.json.encode(result).decode())
         return
     result = (describe(args.project) if args.command == "describe" else
