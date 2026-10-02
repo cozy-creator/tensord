@@ -185,6 +185,9 @@ impl Engine {
             .unwrap()
             .installation_for_generation(actor, generation)
     }
+    pub fn installations(&self, actor: &str) -> io::Result<Vec<crate::journal::Installation>> {
+        self.journal.lock().unwrap().installations(actor)
+    }
     pub fn bind_installation(
         &self,
         record: crate::journal::Installation,
@@ -199,6 +202,9 @@ impl Engine {
     }
     pub fn native_output(&self, actor: &str, owner: &str) -> io::Result<Option<Vec<u8>>> {
         self.journal.lock().unwrap().native_output(actor, owner)
+    }
+    pub fn native_owner(&self, owner: &str) -> io::Result<Option<String>> {
+        self.journal.lock().unwrap().native_owner(owner)
     }
     pub fn bind_native_output(&self, actor: &str, owner: &str, source: &[u8]) -> io::Result<()> {
         self.journal

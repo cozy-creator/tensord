@@ -98,7 +98,19 @@ impl NativeBackend {
             .submission
             .as_ref()
             .ok_or_else(|| Status::internal("public submission context absent"))?;
-        let sequence=self.service.engine.public_terminal(&record.id).map_err(problem)?.map(|held|pb::MachineExecutionEventPage::decode(held.events.as_slice()).map(|page|page.head_sequence).map_err(|_|Status::data_loss("durable event projection corrupt"))).transpose()?.unwrap_or(record.revision).max(record.revision);
+        let sequence = self
+            .service
+            .engine
+            .public_terminal(&record.id)
+            .map_err(problem)?
+            .map(|held| {
+                pb::MachineExecutionEventPage::decode(held.events.as_slice())
+                    .map(|page| page.head_sequence)
+                    .map_err(|_| Status::data_loss("durable event projection corrupt"))
+            })
+            .transpose()?
+            .unwrap_or(record.revision)
+            .max(record.revision);
         Ok(pb::MachineExecutionState {
             request_id: context.request_id.clone(),
             attempt_ordinal: record.attempt.max(1) as u64,
@@ -328,6 +340,153 @@ impl NativeBackend {
     }
 }
 impl MachineBackend for NativeBackend {
+    fn describe_runtime(&self, _: VerifiedActor) -> Result<pb::MachineRuntime, Status> {
+        Ok(pb::MachineRuntime {
+            wire_minor: crate::api::WIRE_MINOR,
+            minimum_wire_minor: crate::api::WIRE_MINIMUM,
+            tensorfs_version: tensorfs_core::VERSION.into(),
+            accelerator_backend: "none".into(),
+            execution_workspace_id: self.workspace_id(),
+            ..Default::default()
+        })
+    }
+    fn list_packages(
+        &self,
+        actor: VerifiedActor,
+        _: pb::PackageListQuery,
+    ) -> Result<pb::PackageList, Status> {
+        let mut packages = vec![];
+        for installed in self
+            .service
+            .engine
+            .installations(&actor_id(actor))
+            .map_err(problem)?
+        {
+            let held = match self.service.catalog.resolve(&installed.generation) {
+                Ok(held) => held,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(problem(error)),
+            };
+            let sdk = held
+                .record
+                .dependencies
+                .into_iter()
+                .filter(|d| matches!(d.name.as_str(), "cozy-runtime" | "tensorfs"))
+                .map(|d| pb::ImageDistribution {
+                    distribution: d.name,
+                    version: d.version,
+                })
+                .collect();
+            let interface: Value = serde_json::from_slice(&installed.interface)
+                .map_err(|_| Status::data_loss("held interface corrupt"))?;
+            let mut entrypoints = interface
+                .get("entrypoints")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.get("name").and_then(Value::as_str).map(str::to_string))
+                .collect::<Vec<_>>();
+            entrypoints.sort();
+            packages.push(pb::MachinePackage {
+                installation_id: installed.alias,
+                package: installed.package,
+                release: installed.release,
+                origin: "local".into(),
+                sdk,
+                entrypoints,
+                ..Default::default()
+            });
+        }
+        packages.sort_by(|a, b| {
+            (&a.package, &a.release, &a.installation_id).cmp(&(
+                &b.package,
+                &b.release,
+                &b.installation_id,
+            ))
+        });
+        Ok(pb::PackageList { packages })
+    }
+    fn retain_bytes(
+        &self,
+        actor: VerifiedActor,
+        request: pb::NativeByteRetentionCall,
+    ) -> Result<pb::NativeByteRetentionResult, Status> {
+        let _guard = self.projection.lock().unwrap();
+        let request = request
+            .request
+            .ok_or_else(|| Status::invalid_argument("native retention request absent"))?;
+        let source = request
+            .source
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("native source absent"))?;
+        let actor = actor_id(actor);
+        if self
+            .service
+            .engine
+            .native_owner(&request.retention_id)
+            .map_err(problem)?
+            .is_some_and(|held| held != actor)
+        {
+            return Err(Status::permission_denied(
+                "native retention belongs to another actor",
+            ));
+        }
+        let bytes = self
+            .service
+            .engine
+            .native_output(&actor, &source.producer_root_id)
+            .map_err(problem)?
+            .ok_or_else(|| {
+                Status::permission_denied("native producer is not owned by this actor")
+            })?;
+        let donor = pb::NativeByteRetentionRequest::decode(bytes.as_slice())
+            .map_err(|_| Status::data_loss("native source record corrupt"))?;
+        if donor.source != request.source {
+            return Err(Status::invalid_argument(
+                "native source differs from owned producer",
+            ));
+        }
+        source_artifact::retain(&self.store, &donor.retention_id, &request.retention_id)
+            .map_err(storage)?;
+        self.service
+            .engine
+            .bind_native_output(&actor, &request.retention_id, &request.encode_to_vec())
+            .map_err(problem)?;
+        Ok(pb::NativeByteRetentionResult {
+            source: request.source,
+            retention_id: request.retention_id,
+            released: false,
+        })
+    }
+    fn release_bytes(
+        &self,
+        actor: VerifiedActor,
+        request: pb::NativeByteRetentionCall,
+    ) -> Result<pb::NativeByteRetentionResult, Status> {
+        let _guard = self.projection.lock().unwrap();
+        let request = request
+            .request
+            .ok_or_else(|| Status::invalid_argument("native retention request absent"))?;
+        let bytes = self
+            .service
+            .engine
+            .native_output(&actor_id(actor), &request.retention_id)
+            .map_err(problem)?
+            .ok_or_else(|| {
+                Status::permission_denied("native recipient is not held by this actor")
+            })?;
+        let expected = pb::NativeByteRetentionRequest::decode(bytes.as_slice())
+            .map_err(|_| Status::data_loss("native source record corrupt"))?;
+        if expected != request {
+            return Err(Status::invalid_argument("native release subject changed"));
+        }
+        source_artifact::release(&self.store, &request.retention_id).map_err(storage)?;
+        Ok(pb::NativeByteRetentionResult {
+            source: request.source,
+            retention_id: request.retention_id,
+            released: true,
+        })
+    }
     fn workspace(
         &self,
         _: VerifiedActor,
@@ -771,6 +930,11 @@ impl MachineBackend for NativeBackend {
         let root = source_artifact::read(&self.store, &source.retention_id)
             .map_err(storage)?
             .ok_or_else(|| Status::not_found("native output root absent"))?;
+        if root.released || !root.complete {
+            return Err(Status::not_found(
+                "native recipient is released or incomplete",
+            ));
+        }
         let object_ref = ObjectRef {
             sha256: sha256::hex(&object.digest),
             length: object.length,

@@ -319,6 +319,17 @@ impl Journal {
             .map(|record| serde_json::from_str(&record).map_err(db_error))
             .transpose()
     }
+    pub fn installations(&self, actor: &str) -> io::Result<Vec<Installation>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT record FROM installations WHERE actor=?1 ORDER BY alias")
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map([actor], |r| r.get::<_, String>(0))
+            .map_err(db_error)?;
+        rows.map(|r| serde_json::from_str(&r.map_err(db_error)?).map_err(db_error))
+            .collect()
+    }
     pub fn bind_installation(&mut self, record: Installation) -> io::Result<Installation> {
         validate_scope(&record.actor, &record.alias, &record.generation)?;
         if let Some(prior) = self.installation(&record.actor, &record.alias)? {
@@ -378,12 +389,28 @@ impl Journal {
             .optional()
             .map_err(db_error)
     }
+    pub fn native_owner(&self, owner: &str) -> io::Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT actor FROM native_outputs WHERE owner=?1 LIMIT 1",
+                [owner],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_error)
+    }
     pub fn bind_native_output(
         &mut self,
         actor: &str,
         owner: &str,
         source: &[u8],
     ) -> io::Result<()> {
+        if self.native_owner(owner)?.is_some_and(|held| held != actor) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "native retention is already owned by another actor",
+            ));
+        }
         if let Some(prior) = self.native_output(actor, owner)? {
             if prior != source {
                 return Err(admission(AdmissionError::BindingConflict));
