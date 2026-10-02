@@ -952,6 +952,30 @@ impl Journal {
             .collect()
     }
 
+    /// Includes terminal requests: their retained executor may still own a context.
+    /// Read only birth metadata in bounded pages, never materialize old results.
+    pub fn gpu_births_after(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> io::Result<Vec<(u64, ProcessBirth)>> {
+        let mut statement = self.connection.prepare("SELECT id,json_extract(record,'$.process') FROM executions WHERE id>?1 AND json_extract(record,'$.submission.preparation_id') IS NOT NULL AND json_extract(record,'$.submission.preparation_id')!='' AND json_extract(record,'$.process') IS NOT NULL ORDER BY id LIMIT ?2").map_err(db_error)?;
+        let rows = statement
+            .query_map(
+                params![
+                    after.min(i64::MAX as u64) as i64,
+                    limit.min(i64::MAX as usize) as i64
+                ],
+                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(db_error)?;
+        rows.map(|row| {
+            let (id, birth) = row.map_err(db_error)?;
+            Ok((id, serde_json::from_str(&birth).map_err(db_error)?))
+        })
+        .collect()
+    }
+
     fn selected(&self, query: &str, limit: usize) -> io::Result<Vec<Execution>> {
         let mut statement = self.connection.prepare(query).map_err(db_error)?;
         let records = statement

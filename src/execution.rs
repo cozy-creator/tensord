@@ -397,6 +397,13 @@ impl Engine {
     pub fn ready_after(&self, after: u64, limit: usize) -> io::Result<Vec<Execution>> {
         self.journal.lock().unwrap().ready_after(after, limit)
     }
+    pub(crate) fn gpu_births_after(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> io::Result<Vec<(u64, ProcessBirth)>> {
+        self.journal.lock().unwrap().gpu_births_after(after, limit)
+    }
     pub fn nonterminal(&self, limit: usize) -> io::Result<Vec<Execution>> {
         self.select(|journal| journal.nonterminal(limit))
     }
