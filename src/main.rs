@@ -56,12 +56,13 @@ fn run() -> io::Result<()> {
             let generations=generations.unwrap_or_else(||root.join("generations"));
             let owner=Owner::new(&root,budget,Duration::from_secs(ttl))?;
             let service=cozy_machine::service::Service::open(&root,&generations,parallelism)?;
+            let listener=bind_control(&owner)?;
             match (machine_config,listen) {
                 (Some(config),Some(listen))=>start_api(&root,&generations,&config,&listen,&owner,&service,installer_python,client_wheel,package_python)?,
                 (None,None)=>(),
                 _=>return Err(io::Error::other("--machine-config and --listen are required together")),
             }
-            serve(owner,service)
+            serve(owner,service,listener)
         }
         _=>Err(io::Error::other("usage: cozy-machine version --json | serve --state PATH [--generations PATH] [--cpu-parallelism N] [--host-bytes N]")),
     }
@@ -140,7 +141,7 @@ fn start_api(
         })?;
     Ok(())
 }
-fn serve(owner: Shared, service: Arc<cozy_machine::service::Service>) -> io::Result<()> {
+fn bind_control(owner: &Shared) -> io::Result<UnixListener> {
     let path = owner.lock().unwrap().socket.clone();
     // Only the singleton owner can remove a stale socket; no active peer store is touched.
     match std::fs::remove_file(&path) {
@@ -150,6 +151,14 @@ fn serve(owner: Shared, service: Arc<cozy_machine::service::Service>) -> io::Res
     }
     let listener = UnixListener::bind(&path)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
+}
+fn serve(
+    owner: Shared,
+    service: Arc<cozy_machine::service::Service>,
+    listener: UnixListener,
+) -> io::Result<()> {
+    let path = owner.lock().unwrap().socket.clone();
     let stopped = Arc::new(AtomicBool::new(false));
     println!("READY {}", path.display());
     io::stdout().flush()?;
