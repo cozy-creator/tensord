@@ -624,6 +624,20 @@ impl DeviceExecutor {
         config: ExecutorConfig,
         on_birth: impl FnOnce(&ProcessBirth, &Cancellation) -> io::Result<()>,
     ) -> io::Result<Self> {
+        Self::spawn_internal(config, None, on_birth)
+    }
+    pub fn spawn_owned(
+        config: ExecutorConfig,
+        launcher: &crate::child_launcher::ChildLauncher,
+        on_birth: impl FnOnce(&ProcessBirth, &Cancellation) -> io::Result<()>,
+    ) -> io::Result<Self> {
+        Self::spawn_internal(config, Some(launcher), on_birth)
+    }
+    fn spawn_internal(
+        config: ExecutorConfig,
+        launcher: Option<&crate::child_launcher::ChildLauncher>,
+        on_birth: impl FnOnce(&ProcessBirth, &Cancellation) -> io::Result<()>,
+    ) -> io::Result<Self> {
         let codec = CodecConfig {
             python: config.python.clone(),
             environment: config.environment.clone(),
@@ -663,7 +677,10 @@ impl DeviceExecutor {
                 });
             }
         }
-        let mut child = command.spawn()?;
+        let mut child = match launcher {
+            Some(launcher) => launcher.spawn(command)?,
+            None => command.spawn()?,
+        };
         let birth = process_birth(child.id())?;
         on_birth(
             &birth,

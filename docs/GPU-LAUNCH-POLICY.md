@@ -38,3 +38,17 @@ config.runtime_config_from_host; merely adding COZY_HOME to old agent environmen
 change it. Qualification/cache/allocator/NCCL values must come from actual child seal, not guessed
 incoming environment. SDXL2.4 generate's authored invocable.memoize is false in both current
 committed pin and installed safe interface; no CLI memoization toggle is involved.
+
+Linux watches the creating thread's lifetime for parent-death signaling, so spawning from the
+per-request Engine driver thread was unsafe for retained reuse: the live core could lose its
+executor after request1 when that thread returned. The new pool-owned ChildLauncher performs only
+Command.spawn, returns Child immediately, and does no handshake/model load. Its thread stays alive
+with the pool/service. The original negative real CPU reproduction remains; the positive actual
+SDK test proves that a temporary requesting thread can end while the child remains alive/usable,
+then explicit finish exits normally. Three installed-SDK CPU probes pass.
+
+A distinct remaining gate: Linux clears PDEATHSIG when effective credentials change. Runtime's
+current trampoline arms it before setgid/setuid; the same-UID probes above do not prove retention
+after a foreign-UID drop. Root must inspect PR_GET_PDEATHSIG after that transition and fix/re-arm
+with a parent recheck in the shared Runtime if necessary before relying on this guard in either
+stack. [Linux parent-death signal documentation](https://man7.org/linux/man-pages/man2/PR_SET_PDEATHSIG.2const.html)
