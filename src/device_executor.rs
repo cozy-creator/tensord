@@ -462,7 +462,7 @@ pub struct Baseline;
 impl Services for Baseline {}
 
 pub struct DeviceExecutor {
-    child: Child,
+    child: Option<Child>,
     stream: std::os::unix::net::UnixStream,
     pub birth: ProcessBirth,
     pub hello: Hello,
@@ -718,7 +718,7 @@ impl DeviceExecutor {
             ));
         }
         let mut executor = Self {
-            child,
+            child: Some(child),
             stream,
             birth,
             hello: Hello::default(),
@@ -890,7 +890,11 @@ impl DeviceExecutor {
     pub fn shutdown(mut self) -> io::Result<()> {
         self.command(&DeviceCommand::Shutdown, &mut Baseline)?;
         self.stream.shutdown(std::net::Shutdown::Both)?;
-        let status = self.child.wait()?;
+        let status = self
+            .child
+            .as_mut()
+            .ok_or_else(|| io::Error::other("device child handle absent"))?
+            .wait()?;
         fs::remove_file(&self.socket)?;
         if !status.success() {
             return Err(io::Error::other(format!(
@@ -905,22 +909,27 @@ impl Drop for DeviceExecutor {
     fn drop(&mut self) {
         // Close the private owner channel, without writing the explicit cancel marker.
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
-        if self.retained.is_empty() {
-            return;
-        }
         let Some(exit) = self.exit.take() else {
             return;
         };
-        let held = Arc::new(Mutex::new(Some((exit, std::mem::take(&mut self.retained)))));
+        let held = Arc::new(Mutex::new(Some((
+            exit,
+            std::mem::take(&mut self.retained),
+            self.child.take(),
+        ))));
         let task = Arc::clone(&held);
         let monitor = move || {
-            let Some((exit, resources)) = task.lock().unwrap().take() else {
+            let Some((exit, resources, mut child)) = task.lock().unwrap().take() else {
                 return;
             };
             if let Err(error) = wait_exit(&exit) {
                 // An unobservable receiver is not authority to release its sources.
                 eprintln!("receiver-exit observation failed; retaining sources: {error}");
-                std::mem::forget(resources);
+                std::mem::forget((resources, child));
+                return;
+            }
+            if let Some(child) = child.as_mut() {
+                let _ = child.wait();
             }
         };
         if let Err(error) = std::thread::Builder::new()
@@ -929,10 +938,14 @@ impl Drop for DeviceExecutor {
         {
             eprintln!("receiver monitor unavailable; observing exit synchronously: {error}");
             // The original Arc retains resources if thread creation discards its closure.
-            if let Some((exit, resources)) = held.lock().unwrap().take() {
+            if let Some((exit, resources, mut child)) = held.lock().unwrap().take() {
                 if let Err(error) = wait_exit(&exit) {
                     eprintln!("receiver-exit observation failed; retaining sources: {error}");
-                    std::mem::forget(resources);
+                    std::mem::forget((resources, child));
+                    return;
+                }
+                if let Some(child) = child.as_mut() {
+                    let _ = child.wait();
                 }
             }
         }

@@ -393,6 +393,10 @@ impl Engine {
     pub fn ready(&self, limit: usize) -> io::Result<Vec<Execution>> {
         self.select(|journal| journal.ready(limit))
     }
+
+    pub fn ready_after(&self, after: u64, limit: usize) -> io::Result<Vec<Execution>> {
+        self.journal.lock().unwrap().ready_after(after, limit)
+    }
     pub fn nonterminal(&self, limit: usize) -> io::Result<Vec<Execution>> {
         self.select(|journal| journal.nonterminal(limit))
     }

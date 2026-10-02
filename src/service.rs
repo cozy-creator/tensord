@@ -19,6 +19,7 @@ pub struct Service {
     parallelism: usize,
     stopped: Mutex<bool>,
     retained: Mutex<HashMap<String, Arc<File>>>,
+    gpu: Mutex<Option<Arc<crate::gpu_service::GpuPool>>>,
 }
 impl Service {
     pub fn open(root: &Path, generations: &Path, parallelism: usize) -> io::Result<Arc<Self>> {
@@ -34,6 +35,7 @@ impl Service {
             parallelism,
             stopped: Mutex::new(false),
             retained: Mutex::new(HashMap::new()),
+            gpu: Mutex::new(None),
         });
         service.engine.reconcile()?;
         // Keep queued generations alive, including accepted work from a prior boot.
@@ -54,6 +56,21 @@ impl Service {
             .name("machine-dispatch".into())
             .spawn(move || owner.dispatch_loop())?;
         Ok(service)
+    }
+    pub fn gpu(&self) -> Option<Arc<crate::gpu_service::GpuPool>> {
+        self.gpu.lock().unwrap().clone()
+    }
+    pub fn configure_gpu(&self, gpu: Arc<crate::gpu_service::GpuPool>) -> io::Result<()> {
+        let mut current = self.gpu.lock().unwrap();
+        if current.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "GPU service is already configured",
+            ));
+        }
+        *current = Some(gpu);
+        drop(current);
+        self.changed_environment()
     }
     pub fn submit(
         &self,
@@ -123,6 +140,9 @@ impl Service {
             return Ok(false);
         }
         *stopped = true;
+        if let Some(gpu) = self.gpu() {
+            gpu.stop()?;
+        }
         self.engine.notify_activity();
         Ok(true)
     }
@@ -154,35 +174,83 @@ impl Service {
         }
         // Orphan exact process births remain reservations; a new owner does not
         // pretend they are free merely because it has no local supervisor.
-        let active = self.engine.active(self.parallelism)?;
-        let room = self.parallelism.saturating_sub(active.len());
-        if room == 0 {
+        let active = self.engine.active(usize::MAX)?;
+        let is_gpu = |record: &Execution| {
+            record
+                .submission
+                .as_ref()
+                .is_some_and(|s| !s.preparation_id.is_empty())
+        };
+        let mut gpu_active = active.iter().any(is_gpu);
+        let mut room = self
+            .parallelism
+            .saturating_sub(active.iter().filter(|r| !is_gpu(r)).count());
+        if room == 0 && (gpu_active || self.gpu().is_none()) {
             return Ok(());
         }
-        for record in self.engine.ready(room)? {
-            if record.state != State::Queued || record.waiting_reason.is_some() {
-                continue;
+        let mut cursor = 0;
+        loop {
+            let page = self.engine.ready_after(cursor, 256)?;
+            if page.is_empty() {
+                break;
             }
-            let held = match self.catalog.resolve(&record.invocation.generation) {
-                Ok(held) => held,
-                Err(error) => {
+            for record in page {
+                cursor = record.id.parse().map_err(io::Error::other)?;
+                if record.state != State::Queued || record.waiting_reason.is_some() {
+                    continue;
+                }
+                let held = match self.catalog.resolve(&record.invocation.generation) {
+                    Ok(held) => held,
+                    Err(error) => {
+                        self.engine.wait_for_environment(
+                            &record.id,
+                            Some(format!("held generation unavailable: {error}")),
+                        )?;
+                        continue;
+                    }
+                };
+                if record.invocation.package != held.record.package
+                    || record.invocation.module != held.record.application
+                {
                     self.engine.wait_for_environment(
                         &record.id,
-                        Some(format!("held generation unavailable: {error}")),
+                        Some("held package identity differs from accepted invocation".into()),
                     )?;
                     continue;
                 }
-            };
-            if record.invocation.package != held.record.package
-                || record.invocation.module != held.record.application
-            {
-                self.engine.wait_for_environment(
-                    &record.id,
-                    Some("held package identity differs from accepted invocation".into()),
-                )?;
-                continue;
+                if let Some(context) = record
+                    .submission
+                    .as_ref()
+                    .filter(|s| !s.preparation_id.is_empty())
+                {
+                    if gpu_active {
+                        continue;
+                    }
+                    let Some(gpu) = self.gpu() else {
+                        self.engine.wait_for_environment(
+                            &record.id,
+                            Some("GPU execution operation is not configured".into()),
+                        )?;
+                        continue;
+                    };
+                    let preparation = self
+                        .engine
+                        .preparation(&context.actor, &context.preparation_id)?
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "accepted GPU preparation is absent",
+                            )
+                        })?;
+                    gpu_active =
+                        gpu.dispatch(&self.engine, &record, held, gpu.plan(&preparation)?)?;
+                } else if room > 0 && self.engine.dispatch(&record.id, held.runner())? {
+                    room -= 1;
+                }
+                if room == 0 && gpu_active {
+                    return Ok(());
+                }
             }
-            self.engine.dispatch(&record.id, held.runner())?;
         }
         Ok(())
     }

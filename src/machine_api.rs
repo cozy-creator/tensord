@@ -544,8 +544,7 @@ impl MachineBackend for NativeBackend {
                 "scoped Hub grant routing is not qualified by this build",
             ));
         }
-        if !root.models.is_empty()
-            || !root.inputs.is_empty()
+        if !root.inputs.is_empty()
             || !root.input_access.is_empty()
             || root.job
             || root.deadline_unix_ms != 0
@@ -553,21 +552,33 @@ impl MachineBackend for NativeBackend {
             || root.capture.is_some()
             || !request.publication_authorization_id.is_empty()
         {
-            return Err(Status::unimplemented("this CPU vertical slice supports weightless callable roots without asset inputs, deadlines or publication"));
+            return Err(Status::unimplemented("this application slice supports callable roots without asset inputs, deadlines or publication"));
         }
         let actor = actor_id(actor);
-        let installed = self
-            .service
-            .engine
-            .installation(&actor, &root.installation_id)
-            .map_err(problem)?
-            .ok_or_else(|| {
-                refusal(
-                    "release_root_installation_absent",
-                    "this owner has not prepared the named installation",
-                )
-            })?;
-        if !root.release.is_empty()
+        let installed = if root.installation_id.is_empty() {
+            self.service
+                .gpu()
+                .ok_or_else(|| {
+                    Status::unimplemented(
+                        "published cache-only GPU package execution is not configured",
+                    )
+                })?
+                .published_installation(&self.service, &actor, &root.package, &root.release)
+                .map_err(problem)?
+        } else {
+            self.service
+                .engine
+                .installation(&actor, &root.installation_id)
+                .map_err(problem)?
+        }
+        .ok_or_else(|| {
+            refusal(
+                "release_root_installation_absent",
+                "this owner has not prepared the named installation",
+            )
+        })?;
+        if (root.installation_id.is_empty() && root.release != installed.release)
+            || (!root.installation_id.is_empty() && !root.release.is_empty())
             || (!root.package.is_empty() && root.package != installed.package)
         {
             return Err(Status::invalid_argument(
@@ -590,24 +601,60 @@ impl MachineBackend for NativeBackend {
         let interface: Value = serde_json::from_slice(&installed.interface)
             .map_err(|_| Status::data_loss("held installation interface is corrupt"))?;
         let entry = entrypoint(&interface, &root.entrypoint)?;
+        let gpu_plan = if entry
+            .get("models")
+            .and_then(Value::as_array)
+            .is_some_and(|models| !models.is_empty())
+        {
+            let gpu = self.service.gpu().ok_or_else(|| Status::unimplemented("this installed callable needs the GPU execution operation; CPU peers remain usable"))?;
+            let plan = gpu
+                .prepare_root(&actor, &installed, &root.entrypoint, &root.models)
+                .map_err(problem)?;
+            self.service
+                .engine
+                .bind_preparation(crate::journal::Preparation {
+                    actor: actor.clone(),
+                    id: plan.id.clone(),
+                    installation: installed.alias.clone(),
+                    document: serde_json::to_vec(&plan)
+                        .map_err(|_| Status::internal("GPU preparation encoding failed"))?,
+                })
+                .map_err(problem)?;
+            Some(plan)
+        } else {
+            if !root.models.is_empty() {
+                return Err(Status::invalid_argument(
+                    "model choices do not name a declared model slot",
+                ));
+            }
+            None
+        };
         let input: Value = crate::boundary_json::parse(&request.payload_canonical_bytes)
             .map_err(|_| Status::invalid_argument("payload is invalid JSON"))?;
         let canonical_input = canonical(&input)?;
         let payload_digest = format!("sha256:{}", sha256::hex(&sha256::digest(&canonical_input)));
         let binding = identity(entry)?;
-        let spec = json!({"format":"cozy.worker.v1.InvocationSpec/1","installation_id":installed.alias,"payload_digest":payload_digest,"serving":{"entrypoint_binding_digest":binding,"attempt_binding_id":binding,"bindings_digest":binding}});
+        let mut spec = json!({"format":"cozy.worker.v1.InvocationSpec/1","installation_id":installed.alias,"payload_digest":payload_digest,"serving":{"entrypoint_binding_digest":binding,"attempt_binding_id":binding,"bindings_digest":binding}});
+        if let Some(plan) = &gpu_plan {
+            spec["model_preparation"] = json!(plan.id);
+        }
+        let mut capture = json!({"installation":installed.alias,"generation":installed.generation,"entrypoint":root.entrypoint,"owner":root.owner,"hub":root.hub});
+        if let Some(plan) = &gpu_plan {
+            capture["model_preparation"] = json!(plan.id);
+        }
         let context = SubmissionContext {
             actor,
             request_id: offer.request_id.clone(),
             submission_id: request.submission_id,
             expected_workspace_id: request.expected_execution_workspace_id,
-            capture_digest: identity(
-                &json!({"installation":installed.alias,"generation":installed.generation,"entrypoint":root.entrypoint,"owner":root.owner,"hub":root.hub}),
-            )?,
+            capture_digest: identity(&capture)?,
             invocation_digest: identity(&spec)?,
             payload_digest,
             publication_authorization_id: String::new(),
-            preparation_id: String::new(),
+            preparation_id: gpu_plan
+                .as_ref()
+                .map(|plan| plan.id.clone())
+                .unwrap_or_default(),
         };
         let record = self
             .service
