@@ -104,6 +104,7 @@ pub struct GpuPlan {
 
 struct Session {
     plan: String,
+    loaded: bool,
     executor: DeviceExecutor,
     sources: Arc<Mutex<ModelSources>>,
     budget_cells: Vec<File>,
@@ -472,11 +473,13 @@ impl GpuPool {
         plan: GpuPlan,
         slot: &mut Option<Session>,
     ) -> io::Result<()> {
-        if slot.as_ref().is_some_and(|session| {
-            session.plan != plan.id || process_ended(&session.executor.birth).unwrap_or(false)
-        }) {
-            // Closing the old context is observed before creating its replacement.
-            slot.take().unwrap().executor.shutdown()?;
+        if let Some(session) = slot.as_ref() {
+            if process_ended(&session.executor.birth)? {
+                slot.take();
+            } else if session.plan != plan.id {
+                // Closing the old context is observed before creating its replacement.
+                slot.take().unwrap().executor.shutdown()?;
+            }
         }
         let cold = slot.is_none();
         if cold {
@@ -526,6 +529,7 @@ impl GpuPool {
             executor.retain_until_exit(sources.clone());
             *slot = Some(Session {
                 plan: plan.id.clone(),
+                loaded: false,
                 executor,
                 sources,
                 budget_cells: vec![],
@@ -554,7 +558,7 @@ impl GpuPool {
             budget: self.config.plane_budget_bytes,
             completed: 0,
         };
-        if cold {
+        if !session.loaded {
             let interface_path = session.executor.root_path().join("package-interface.json");
             fs::write(&interface_path, serde_json::to_vec(&held.record.interface)?)?;
             command_ok(session.executor.command(
@@ -603,6 +607,7 @@ impl GpuPool {
                 },
                 &mut callbacks,
             )?)?;
+            session.loaded = true;
         }
         let record = engine.get(id)?;
         let prepared = session.executor.command(

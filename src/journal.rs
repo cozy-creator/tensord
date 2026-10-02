@@ -936,6 +936,22 @@ impl Journal {
         self.selected("SELECT record FROM executions WHERE state='queued' AND json_extract(record,'$.waiting_reason') IS NULL ORDER BY id LIMIT ?1", limit)
     }
 
+    pub fn ready_after(&self, after: u64, limit: usize) -> io::Result<Vec<Execution>> {
+        let mut statement = self.connection.prepare("SELECT record FROM executions WHERE id>?1 AND state='queued' AND json_extract(record,'$.waiting_reason') IS NULL ORDER BY id LIMIT ?2").map_err(db_error)?;
+        let records = statement
+            .query_map(
+                params![
+                    after.min(i64::MAX as u64) as i64,
+                    limit.min(i64::MAX as usize) as i64
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(db_error)?;
+        records
+            .map(|record| serde_json::from_str(&record.map_err(db_error)?).map_err(db_error))
+            .collect()
+    }
+
     fn selected(&self, query: &str, limit: usize) -> io::Result<Vec<Execution>> {
         let mut statement = self.connection.prepare(query).map_err(db_error)?;
         let records = statement

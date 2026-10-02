@@ -34,7 +34,7 @@ fn run() -> io::Result<()> {
         }
         Some("serve") => {
             let mut root = None; let mut generations=None; let mut parallelism=1;
-            let mut machine_config=None; let mut listen=None;
+            let mut machine_config=None; let mut listen=None; let mut gpu_config=None;
             let mut installer_python=None; let mut client_wheel=None; let mut package_python="3.12".to_string();
             let mut budget=16*1024*1024; let mut ttl=300;
             while let Some(arg)=args.next() {
@@ -43,6 +43,7 @@ fn run() -> io::Result<()> {
                     "--generations"=>generations=args.next().map(PathBuf::from),
                     "--machine-config"=>machine_config=args.next().map(PathBuf::from),
                     "--listen"=>listen=args.next(),
+                    "--gpu-config"=>gpu_config=args.next().map(PathBuf::from),
                     "--installer-python"=>installer_python=args.next().map(PathBuf::from),
                     "--client-wheel"=>client_wheel=args.next().map(PathBuf::from),
                     "--package-python"=>package_python=args.next().ok_or_else(||io::Error::other("--package-python requires a Python version"))?,
@@ -56,6 +57,10 @@ fn run() -> io::Result<()> {
             let generations=generations.unwrap_or_else(||root.join("generations"));
             let owner=Owner::new(&root,budget,Duration::from_secs(ttl))?;
             let service=cozy_machine::service::Service::open(&root,&generations,parallelism)?;
+            if let Some(config)=gpu_config {
+                let gpu=cozy_machine::gpu_service::GpuPool::new(&root.join("gpu"),cozy_machine::gpu_service::GpuConfig::load(&config)?,owner.lock().unwrap().store())?;
+                service.configure_gpu(gpu)?;
+            }
             let listener=bind_control(&owner)?;
             match (machine_config,listen) {
                 (Some(config),Some(listen))=>start_api(&root,&generations,&config,&listen,&owner,&service,installer_python,client_wheel,package_python)?,
