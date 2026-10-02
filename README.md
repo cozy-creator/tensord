@@ -17,7 +17,7 @@ Cargo needs read access to the private TensorFS repository.
 cargo build --locked
 cargo clippy --all-targets -- -D warnings
 cargo test --locked -- --test-threads=2
-uv run --locked --extra test --with 'cozy-runtime==0.18.102' pytest -q
+uv run --locked --extra test pytest -q
 ```
 
 ## Run

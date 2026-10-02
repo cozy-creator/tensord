@@ -101,8 +101,8 @@ export CARGO_TARGET_DIR=~/cozy/.cargo-target/cozy-machine
 L=~/cozy_v2/outputs/cozy-machine-takeover-20261002/locks
 flock $L/rust-build.lock nice -n 19 cargo clippy --all-targets -j 2 -- -D warnings
 flock $L/rust-build.lock nice -n 19 cargo test -j 2 -- --test-threads=2
-nice -n 19 uv run --locked --extra test --with 'cozy-runtime==0.18.102' pytest -q
+nice -n 19 uv run --locked --extra test pytest -q
 ```
 
-Without `--with cozy-runtime` the Python SDK tests skip. Ignored Rust tests need installed SDK
+The test extra installs cozy-runtime; tests fail without it. Ignored Rust tests need installed SDK
 generations (paths or `COZY_MACHINE_CPU_TEST_PYTHON`); run them with `--ignored` on purpose.

@@ -18,7 +18,6 @@ from test_package_bridge import FIXTURE, ROOT, spawn_runner, send_command, invok
 
 @pytest.fixture(scope="module")
 def capture(tmp_path_factory):
-    pytest.importorskip("cozy_runtime")
     root = tmp_path_factory.mktemp("real-captured-package")
     source = root / "source"
     shutil.copytree(FIXTURE, source)

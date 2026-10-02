@@ -8,8 +8,10 @@ import struct
 import subprocess
 from pathlib import Path
 
+import cozy_runtime  # noqa: F401  (required: absence must fail, not skip)
 import msgspec
 import pytest
+from cozy_runtime.author._services import ProgressFrame
 from packaging.version import Version
 
 from cozy_machine_client.execution_protocol import (
@@ -44,7 +46,6 @@ def send_command(sock, command):
 
 @pytest.fixture(scope="module")
 def generation(tmp_path_factory):
-    pytest.importorskip("cozy_runtime")
     output = tmp_path_factory.mktemp("immutable-package")
     subprocess.run(["uv", "build", "--wheel", "--out-dir", str(output / "client"), str(ROOT)],
                    check=True)
@@ -89,7 +90,6 @@ def terminal(sock, completed=None):
 
 
 def test_static_description_does_not_execute_package_top_level(tmp_path):
-    pytest.importorskip("cozy_runtime")
     source = tmp_path / "package"
     shutil.copytree(FIXTURE, source)
     module = source / "cpu_classifier" / "__init__.py"
@@ -111,8 +111,6 @@ def test_additive_peer_fields_preserve_baseline_invocation():
 
 
 def test_only_new_completed_positions_count_as_productive_progress():
-    ProgressFrame = pytest.importorskip("cozy_runtime.author._services").ProgressFrame
-
     work = CompletedWork()
     assert work.observe(ProgressFrame("stage", None, 1000)) is None
     assert work.observe(ProgressFrame("stage", .5, 1001, position=1, total=2)) == 1
