@@ -16,14 +16,24 @@ PYTHON -I -m cozy_runtime.internal.trampoline --expect-parent <pid> --oom-adj 10
   --socket <path> --root <root>
 ```
 
-- `ExecutorConfig`: `python`, `root` (0700), `socket` (0600), `environment` (env is cleared, then
-  only these vars are set), `generation_hold`, optional `LaunchIdentity`.
-- The SDK trampoline applies parent-death, no_new_privs and OOM ordering before imports. Without
-  a `LaunchIdentity` the child inherits the service's cgroup, UID and process group.
+- `ExecutorConfig`: `python`, `root` (0700), `socket` (0600), `environment` (configured
+  locations), `seal`, `generation_hold`, optional `LaunchIdentity`.
+- Environment (`Seal::environment`, the only place it is composed): the machine's environment
+  without credential-like names or Runtime's erased prefixes (`COZY_`, `CUDA_`, `PYTORCH_`,
+  `NCCL_`, `HF_`, `TMPDIR`, …), then configured locations, then the seal, which always wins:
+  `CUDA_VISIBLE_DEVICES`, `PYTORCH_CUDA_ALLOC_CONF` (default `expandable_segments:True`),
+  `OMP_NUM_THREADS` (4), NCCL group seal for degree > 1, `COZY_HOME` (per-UID home, so the
+  attention qualification is cached), JIT caches and `TMPDIR` (per machine run and generation),
+  and the persistent per-UID kernel store.
+- The SDK trampoline applies parent-death, no_new_privs and OOM ordering before imports. Every
+  child leads its own process group; without a `LaunchIdentity` it keeps the service's UID and
+  cgroup.
 - The generation hold fd is inherited and survives exec and parent death.
 - `on_birth(&ProcessBirth, &Cancellation)` runs right after spawn so the caller can journal it.
-- Startup waits on a pidfd and the listener, with no timeout. The peer's `SO_PEERCRED` must match
-  the child pid, UID and GID. `Hello.pid` must match too.
+- Startup waits on a pidfd and the listener, with no timeout. A child that exits first returns
+  `EndedBeforeStart` (status and stderr tail). Until Hello is verified a launch guard kills and
+  reaps the child on every early return. `SO_PEERCRED` must match the child pid, UID and GID;
+  Hello's pid, and its parent, group and sealed values when reported, must match.
 - Start imports authored code, so journal authorization must come before `Start`.
 
 ## Wire
@@ -82,18 +92,26 @@ The root must then take durable custody before reporting success.
 
 ## Cancellation and lifetime
 
+Nothing is killed because time passed. The wedge rule is Runtime's `liveness`: a meter still for
+longer than eight times the longest pause it has shown, and at least six samples (30 s).
+
+- Every `command` runs under a watch. Non-invoke commands use CPU plus bytes moved
+  (`process::burn`); time the machine spends answering an executor request is excused. A wedged
+  executor and its process group are killed; the call returns the measurement.
 - `cancel(request_id)` atomically writes the stock `executor.cancel` marker, keyed by request, so a
-  stale marker cannot cancel a later request. Observer teardown never calls it.
-- `shutdown()` sends `Shutdown`, waits for exit and removes the socket.
-- Dropping the handle closes the channel but writes no cancel marker. Resources passed to
-  `retain_until_exit` are freed only after the pidfd reports exit. If exit cannot be observed, they
-  are leaked rather than released. The supervisor, never a UI observer, owns the handle.
+  stale marker cannot cancel a later request. The executor stops at its next safe point. From
+  then on the invocation's frames are the meter; if they stop, it is killed. An invocation without
+  a cancel is never judged. Observer teardown never cancels.
+- `terminate()` closes the channel, lets the executor stop at its next exchange, kills only a
+  measured wedge, then reaps it and frees `retain_until_exit` resources. `shutdown()` asks first.
+  `Drop` does the same on a thread. If exit cannot be observed, resources are leaked, not released.
 
 ## Known gaps
 
 - The legacy output-path resolver is imported from the SDK worker module. An executor
   `output_bindings` capability would remove it.
 - Encoders read whole raw buffers. There is no streaming post-processing.
-- No separate containment scope. Same-UID or privileged package code can reopen store paths.
+- Containment is the process group: a descendant that calls `setsid` escapes kills. Same-UID
+  package code can reopen store paths.
 - Descriptor sources still use native TensorFS plane, header and read-plan code inside the executor.
 - Degree > 1 and multi-GPU/NCCL are not covered by descriptor or host-tier owner paths.

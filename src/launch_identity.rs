@@ -1,16 +1,17 @@
 //! Optional root-sealed identity; this is not a public caller-controlled credential.
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::OpenOptions,
+    collections::BTreeMap,
+    fs::{self, OpenOptions},
     io,
     os::{
         fd::AsRawFd,
         unix::{
-            fs::{MetadataExt, OpenOptionsExt},
+            fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
             process::CommandExt,
         },
     },
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
 };
 
@@ -107,7 +108,9 @@ impl LaunchIdentity {
     }
 }
 
-/// Reuse Runtime's pre-CUDA seal. Defaults preserve the inherited identity/group.
+/// Reuse Runtime's pre-CUDA seal: expected parent, parent-death SIGKILL, no_new_privs,
+/// OOM score and the optional identity. Every child gets its own process group, so a kill
+/// reaches the descendants that stayed in it and a terminal signal to the machine does not.
 pub fn trampoline(python: &Path, identity: Option<LaunchIdentity>) -> io::Result<Command> {
     let mut command = Command::new(python);
     command
@@ -127,10 +130,222 @@ pub fn trampoline(python: &Path, identity: Option<LaunchIdentity>) -> io::Result
             "--gid",
             &identity.gid.to_string(),
         ]);
-        command.process_group(0);
     }
-    command.arg("--").arg(python);
+    command.process_group(0).arg("--").arg(python);
     Ok(command)
+}
+
+/// Runtime `child_env.ERASED_PREFIXES`: inherited names no executor sees. The seal imposes
+/// the ones it needs after this erase, so no image or operator export can redirect them.
+const ERASED_PREFIXES: [&str; 17] = [
+    "COZY_",
+    "CUDA_",
+    "PYTORCH_",
+    "PYTHON",
+    "TORCH_",
+    "TORCHINDUCTOR_",
+    "TRITON_",
+    "NCCL_",
+    "HF_",
+    "HUGGINGFACE_",
+    "TENSORHUB_",
+    "CIVITAI_",
+    "COMFY_",
+    "OMP_",
+    "MKL_",
+    "FLASH_ATTENTION_",
+    "TMPDIR",
+];
+
+pub fn credential_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    [
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "CREDENTIAL",
+        "API_KEY",
+        "AUTH",
+    ]
+    .iter()
+    .any(|word| upper.contains(word))
+}
+
+/// The process environment every machine-launched package process starts from: the
+/// machine's own environment without credentials or names the seal owns.
+pub fn inherited() -> BTreeMap<String, String> {
+    std::env::vars()
+        .filter(|(name, _)| {
+            !credential_name(name) && !ERASED_PREFIXES.iter().any(|p| name.starts_with(p))
+        })
+        .collect()
+}
+
+/// What the machine imposes on an executor before CUDA can initialize (Runtime
+/// `Worker.imposed` plus its JIT/kernel scopes). The executor reports what it received in
+/// Hello and the machine compares every name both know.
+#[derive(Clone, Debug)]
+pub struct Seal {
+    /// `CUDA_VISIBLE_DEVICES`; empty means no GPU.
+    pub devices: String,
+    pub alloc_conf: String,
+    pub threads: u32,
+    /// Degree above one: NVLS off and GPU peer memory only over NVLink (Runtime cr-068).
+    pub group: bool,
+    /// `COZY_HOME`: attention/kernel qualification is kept here between executors.
+    pub home: PathBuf,
+    /// Upstream JIT caches and `TMPDIR`, scoped to one machine incarnation and generation.
+    pub jit: PathBuf,
+    /// This identity's persistent kernel-store namespace.
+    pub kernels: PathBuf,
+    pub generation: String,
+}
+
+pub const DEFAULT_ALLOC_CONF: &str = "expandable_segments:True";
+pub const DEFAULT_THREADS: u32 = 4;
+
+impl Seal {
+    /// Create the identity-owned directories under `root` for one generation.
+    pub fn prepare(
+        root: &Path,
+        identity: Option<LaunchIdentity>,
+        incarnation: &str,
+        generation: &str,
+        devices: &str,
+    ) -> io::Result<Self> {
+        let safe = |value: &str| {
+            !value.is_empty()
+                && value.len() <= 128
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        };
+        if !safe(incarnation) || !safe(generation) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seal scope names must be plain identifiers",
+            ));
+        }
+        let uid = identity.map_or_else(|| unsafe { libc::geteuid() }, |i| i.uid);
+        let namespace = format!("u{uid}");
+        let owned = |path: PathBuf| -> io::Result<PathBuf> {
+            match fs::create_dir(&path) {
+                Ok(()) => (),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
+                Err(error) => return Err(error),
+            }
+            match identity {
+                Some(identity) => identity.own(&path)?,
+                None => fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?,
+            }
+            Ok(path)
+        };
+        for boundary in ["home", "kernels", "jit"] {
+            boundary_directory(&root.join(boundary))?;
+        }
+        boundary_directory(&root.join("jit").join(incarnation))?;
+        let kernels = owned(root.join("kernels").join(&namespace))?;
+        owned(kernels.join(format!("torch-kernels.{generation}")))?;
+        let jit = owned(root.join("jit").join(incarnation).join(generation))?;
+        Ok(Self {
+            devices: devices.into(),
+            alloc_conf: DEFAULT_ALLOC_CONF.into(),
+            threads: DEFAULT_THREADS,
+            group: false,
+            home: owned(root.join("home").join(&namespace))?,
+            jit,
+            kernels,
+            generation: generation.into(),
+        })
+    }
+
+    pub fn imposed(&self) -> BTreeMap<String, String> {
+        let path = |path: PathBuf| path.to_string_lossy().into_owned();
+        let mut imposed = BTreeMap::from([
+            ("CUDA_VISIBLE_DEVICES".to_string(), self.devices.clone()),
+            ("PYTORCH_CUDA_ALLOC_CONF".into(), self.alloc_conf.clone()),
+            ("OMP_NUM_THREADS".into(), self.threads.to_string()),
+            ("COZY_HOME".into(), path(self.home.clone())),
+            ("TMPDIR".into(), path(self.jit.clone())),
+            ("CUDA_CACHE_PATH".into(), path(self.jit.join("cuda"))),
+            (
+                "PYTHONPYCACHEPREFIX".into(),
+                path(self.jit.join("bytecode")),
+            ),
+            (
+                "TORCH_EXTENSIONS_DIR".into(),
+                path(self.jit.join("extensions")),
+            ),
+            (
+                "TORCHINDUCTOR_CACHE_DIR".into(),
+                path(self.jit.join("inductor")),
+            ),
+            ("COZY_KERNEL_CACHE".into(), path(self.kernels.clone())),
+            ("TRITON_CACHE_DIR".into(), path(self.kernels.join("triton"))),
+            (
+                "PYTORCH_KERNEL_CACHE_PATH".into(),
+                path(
+                    self.kernels
+                        .join(format!("torch-kernels.{}", self.generation)),
+                ),
+            ),
+            (
+                "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR".into(),
+                path(self.kernels.join("flash-attn4")),
+            ),
+            ("FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED".into(), "1".into()),
+        ]);
+        if self.group {
+            imposed.insert("NCCL_NVLS_ENABLE".into(), "0".into());
+            imposed.insert("NCCL_P2P_LEVEL".into(), "NVL".into());
+        }
+        imposed
+    }
+
+    /// Inherited, then explicitly configured locations, then the seal, which always wins.
+    pub fn environment(&self, configured: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+        let mut environment = inherited();
+        environment.extend(
+            configured
+                .iter()
+                .filter(|(name, _)| !credential_name(name))
+                .map(|(name, value)| (name.clone(), value.clone())),
+        );
+        environment.extend(self.imposed());
+        environment
+    }
+
+    /// Names the executor reports receiving that differ from what was imposed. Names only
+    /// one side knows are skipped: an older or newer Runtime reports its own allowlist.
+    pub fn mismatches(&self, reported: &BTreeMap<String, String>) -> Vec<String> {
+        let imposed = self.imposed();
+        reported
+            .iter()
+            .filter(|(name, value)| {
+                imposed
+                    .get(*name)
+                    .is_some_and(|expected| expected != *value)
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+}
+
+/// Owner-held directory that executors may traverse but not list.
+fn boundary_directory(path: &Path) -> io::Result<()> {
+    match fs::create_dir(path) {
+        Ok(()) => (),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
+        Err(error) => return Err(error),
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "seal boundary is not an owner directory",
+        ));
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o711))
 }
 
 #[cfg(test)]

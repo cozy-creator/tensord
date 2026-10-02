@@ -39,11 +39,9 @@ print(json.dumps({'uid':os.geteuid(),'gid':os.getegid(),'pid':os.getpid(),'paren
             value["cgroup"],
             fs::read_to_string("/proc/self/cgroup").unwrap()
         );
-        if selected.is_some() {
-            assert_eq!(value["pgid"], value["pid"]);
-        } else {
-            assert_eq!(value["pgid"], unsafe { libc::getpgrp() });
-        }
+        // Every launch leads its own group: kills reach its descendants, and a terminal
+        // signal to the machine's group never reaches it directly.
+        assert_eq!(value["pgid"], value["pid"]);
     }
 }
 

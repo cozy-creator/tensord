@@ -210,12 +210,28 @@ fn run() -> io::Result<()> {
             Ok::<_, io::Error>(Arc::new(file))
         })
         .transpose()?;
+    // The pilot's configured device/allocator/thread values become the executor seal.
+    let configured = |name: &str| config.environment.get(name).cloned();
+    let mut seal = cozy_machine::launch_identity::Seal::prepare(
+        &config.root,
+        None,
+        "pilot",
+        "pilot",
+        &configured("CUDA_VISIBLE_DEVICES").unwrap_or_default(),
+    )?;
+    if let Some(alloc_conf) = configured("PYTORCH_CUDA_ALLOC_CONF") {
+        seal.alloc_conf = alloc_conf;
+    }
+    if let Some(threads) = configured("OMP_NUM_THREADS") {
+        seal.threads = threads.parse().map_err(io::Error::other)?;
+    }
     let spawn_started = Instant::now();
     let mut executor = DeviceExecutor::spawn(ExecutorConfig {
         python: config.python,
         root: config.root.clone(),
         socket: config.socket,
         environment: config.environment,
+        seal,
         generation_hold: hold,
         identity: None,
     })?;

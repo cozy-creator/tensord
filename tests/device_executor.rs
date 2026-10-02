@@ -1,5 +1,5 @@
 //! Actual released Runtime executors and installed classifier package, no handler doubles.
-use cozy_machine::device_executor;
+use cozy_machine::{device_executor, launch_identity::Seal};
 
 use device_executor::{
     postprocess, read_result, Baseline, Binding, Budgets, DeviceCommand, DeviceExecutor,
@@ -42,6 +42,8 @@ fn prepared(version: &str, generation_path: &str) -> (DeviceExecutor, PathBuf) {
         serde_json::to_vec(&generation.interface).unwrap(),
     )
     .unwrap();
+    let mut seal = Seal::prepare(&root, None, "test", "test", "").unwrap();
+    seal.threads = 1;
     let config = ExecutorConfig {
         python: generation.python,
         root: root.clone(),
@@ -49,9 +51,8 @@ fn prepared(version: &str, generation_path: &str) -> (DeviceExecutor, PathBuf) {
         environment: BTreeMap::from([
             ("PATH".into(), "/usr/bin:/bin".into()),
             ("LANG".into(), "C.UTF-8".into()),
-            ("OMP_NUM_THREADS".into(), "1".into()),
-            ("TMPDIR".into(), root.join("tmp").display().to_string()),
         ]),
+        seal,
         generation_hold: Some(Arc::new(hold)),
         identity: None,
     };

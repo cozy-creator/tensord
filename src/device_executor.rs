@@ -1,7 +1,9 @@
 //! Existing Runtime device-executor control seam. Models and codecs remain in Python SDK.
 use crate::{
-    execution::{open_artifact, process_birth},
+    execution::open_artifact,
     journal::ProcessBirth,
+    launch_identity::{LaunchIdentity, Seal},
+    process::{burn, process_birth, Exact, Liveness, Pace},
     protocol,
 };
 use serde::{Deserialize, Serialize};
@@ -11,16 +13,17 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     os::{
-        fd::{AsRawFd, FromRawFd},
+        fd::AsRawFd,
         unix::{
             fs::{OpenOptionsExt, PermissionsExt},
-            net::UnixListener,
-            process::CommandExt,
+            net::{UnixListener, UnixStream},
+            process::{CommandExt, ExitStatusExt},
         },
     },
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
+    process::{Child, Command, ExitStatus, Stdio},
+    sync::{Arc, Condvar, Mutex},
+    time::{Duration, Instant},
 };
 
 pub const MAX_DEVICE_FRAME: usize = 64 * 1024;
@@ -33,16 +36,19 @@ pub struct ExecutorConfig {
     pub python: PathBuf,
     pub root: PathBuf,
     pub socket: PathBuf,
-    /// Explicit configuration only. Credentials never enter this child.
+    /// Explicitly configured locations. Credentials never enter this child.
     pub environment: BTreeMap<String, String>,
+    pub seal: Seal,
     pub generation_hold: Option<Arc<File>>,
-    pub identity: Option<crate::launch_identity::LaunchIdentity>,
+    pub identity: Option<LaunchIdentity>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Hello {
     pub pid: u32,
+    pub ppid: u32,
+    pub pgid: u32,
     pub runtime_version: String,
     pub tensorfs_version: String,
     pub executor_protocol_revision: u64,
@@ -550,22 +556,30 @@ impl Services for Baseline {}
 
 pub struct DeviceExecutor {
     child: Option<Child>,
-    stream: std::os::unix::net::UnixStream,
+    exact: Exact,
+    stream: UnixStream,
     pub birth: ProcessBirth,
     pub hello: Hello,
+    /// Sampling resolution of the wedge rule. Tests shorten it; nothing else changes it.
+    pub liveness: Liveness,
     root: PathBuf,
     socket: PathBuf,
     _generation_hold: Option<Arc<File>>,
     codec: CodecConfig,
-    exit: Option<File>,
     retained: Vec<Box<dyn Send>>,
-    identity: Option<crate::launch_identity::LaunchIdentity>,
+    identity: Option<LaunchIdentity>,
+    watched: Watched,
+    /// Longest gap between frames this executor has shown during invocations.
+    worst_gap: Duration,
 }
 
+/// Cooperative first: the executor stops at its next safe point. The running invocation's
+/// frame meter then decides whether it stopped moving and must be killed.
 #[derive(Clone)]
 pub struct Cancellation {
     root: PathBuf,
-    identity: Option<crate::launch_identity::LaunchIdentity>,
+    identity: Option<LaunchIdentity>,
+    watched: Watched,
 }
 impl Cancellation {
     pub fn cancel(&self, request_id: &str) -> io::Result<()> {
@@ -583,8 +597,145 @@ impl Cancellation {
             identity.readable(&temporary)?;
         }
         fs::rename(temporary, self.root.join("executor.cancel"))?;
-        File::open(&self.root)?.sync_all()
+        File::open(&self.root)?.sync_all()?;
+        if let Some(watch) = self.watched.lock().unwrap().as_ref() {
+            watch.canceled();
+        }
+        Ok(())
     }
+}
+
+type Watched = Arc<Mutex<Option<Arc<Watch>>>>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Meter {
+    /// CPU plus bytes moved by the executor (Runtime `ExecutorChild.watched`).
+    Burn,
+    /// Frames of the running invocation, judged only after a cancel (Runtime `cancel_stall`).
+    Frames,
+}
+
+#[derive(Default)]
+struct WatchState {
+    done: bool,
+    serving: bool,
+    frames: u64,
+    canceled_at: Option<Instant>,
+    killed: Option<String>,
+    worst_gap: Duration,
+}
+
+/// One command's progress observer. It kills the exact executor (and its group) only on a
+/// measured wedge; the kill closes the channel, so the blocked exchange returns.
+struct Watch {
+    meter: Meter,
+    state: Mutex<WatchState>,
+    changed: Condvar,
+}
+impl Watch {
+    fn start(
+        exact: Exact,
+        meter: Meter,
+        liveness: Liveness,
+        worst_gap: Duration,
+        what: &'static str,
+    ) -> io::Result<(Arc<Self>, std::thread::JoinHandle<()>)> {
+        let watch = Arc::new(Self {
+            meter,
+            state: Mutex::new(WatchState::default()),
+            changed: Condvar::new(),
+        });
+        let observer = watch.clone();
+        let thread = std::thread::Builder::new()
+            .name(format!("watch-{what}"))
+            .spawn(move || observer.run(exact, liveness, worst_gap, what))?;
+        Ok((watch, thread))
+    }
+    fn run(&self, exact: Exact, liveness: Liveness, worst_gap: Duration, what: &str) {
+        let floor = liveness.floor();
+        // Frame gaps teach only the frame meter; CPU-plus-bytes starts its own pace.
+        let mut pace = match self.meter {
+            Meter::Frames => Pace::seeded(worst_gap),
+            Meter::Burn => Pace::default(),
+        };
+        let mut state = self.state.lock().unwrap();
+        while !state.done {
+            let now = Instant::now();
+            let reading = match self.meter {
+                Meter::Burn => burn(exact.birth.pid),
+                Meter::Frames => Some(state.frames),
+            };
+            pace.observe(reading, now);
+            if state.serving {
+                pace.excuse(now);
+            }
+            state.worst_gap = pace.worst_pause;
+            let since = match self.meter {
+                Meter::Burn => pace.still_since(),
+                Meter::Frames => state
+                    .canceled_at
+                    .map(|at| pace.still_since().map_or(at, |moved| moved.max(at))),
+            };
+            if let Some(since) = since {
+                let still = now - since;
+                if still > pace.patience(floor) {
+                    let verdict = format!(
+                        "the executor wedged during {what}: {}",
+                        pace.verdict(still, floor)
+                    );
+                    match exact.kill() {
+                        Ok(()) => state.killed = Some(verdict),
+                        Err(error) => eprintln!("{verdict}; kill failed: {error}"),
+                    }
+                    return;
+                }
+            }
+            state = self.changed.wait_timeout(state, liveness.sample).unwrap().0;
+        }
+    }
+    fn frame(&self) {
+        self.state.lock().unwrap().frames += 1;
+    }
+    fn serving(&self, serving: bool) {
+        self.state.lock().unwrap().serving = serving;
+    }
+    fn canceled(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.canceled_at.get_or_insert_with(Instant::now);
+        self.changed.notify_all();
+    }
+    fn stop(&self, thread: std::thread::JoinHandle<()>) -> (Option<String>, Duration) {
+        self.state.lock().unwrap().done = true;
+        self.changed.notify_all();
+        let _ = thread.join();
+        let state = self.state.lock().unwrap();
+        (state.killed.clone(), state.worst_gap)
+    }
+}
+
+/// The executor exited before it connected: no authored code ran. Deterministic causes
+/// (an SDK without this module, a broken environment) fail the run with this evidence.
+#[derive(Debug)]
+pub struct EndedBeforeStart {
+    pub status: ExitStatus,
+    pub stderr_tail: String,
+}
+impl std::fmt::Display for EndedBeforeStart {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "executor exited before connecting ({}): {}",
+            self.status, self.stderr_tail
+        )
+    }
+}
+impl std::error::Error for EndedBeforeStart {}
+
+/// How an executor ended: its reaped status and the measurement behind a kill, if any.
+#[derive(Debug)]
+pub struct Ended {
+    pub status: ExitStatus,
+    pub killed: Option<String>,
 }
 
 #[derive(Clone)]
@@ -857,9 +1008,10 @@ impl DeviceExecutor {
         launcher: Option<&crate::child_launcher::ChildLauncher>,
         on_birth: impl FnOnce(&ProcessBirth, &Cancellation) -> io::Result<()>,
     ) -> io::Result<Self> {
+        let environment = config.seal.environment(&config.environment);
         let codec = CodecConfig {
             python: config.python.clone(),
-            environment: config.environment.clone(),
+            environment: environment.clone(),
             generation_hold: config.generation_hold.clone(),
         };
         fs::create_dir_all(&config.root)?;
@@ -879,7 +1031,7 @@ impl DeviceExecutor {
             .arg("--root")
             .arg(&config.root)
             .env_clear()
-            .envs(config.environment)
+            .envs(&environment)
             .stdin(Stdio::null())
             .stdout(File::create(config.root.join("stdout.log"))?)
             .stderr(File::create(config.root.join("stderr.log"))?);
@@ -896,24 +1048,27 @@ impl DeviceExecutor {
                 });
             }
         }
-        let mut child = match launcher {
+        let child = match launcher {
             Some(launcher) => launcher.spawn(command)?,
             None => command.spawn()?,
         };
-        let birth = process_birth(child.id())?;
+        // Until Hello proves the connection, every early return kills and reaps this child.
+        // Nothing authored has run, so no measurement is needed to end it.
+        let mut unready = Unready(Some(child));
+        let pid = unready.child().id();
+        let birth = process_birth(pid)?;
+        let exact = Exact::open(&birth)?
+            .ok_or_else(|| io::Error::other("launched executor has no exact birth"))?;
+        let watched: Watched = Arc::default();
         on_birth(
             &birth,
             &Cancellation {
                 root: config.root.clone(),
                 identity: config.identity,
+                watched: watched.clone(),
             },
         )?;
         // Wait for connection OR observed process death. No elapsed-time startup kill.
-        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) } as i32;
-        if raw < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let pidfd = unsafe { File::from_raw_fd(raw) };
         let mut poll = [
             libc::pollfd {
                 fd: listener.as_raw_fd(),
@@ -921,7 +1076,7 @@ impl DeviceExecutor {
                 revents: 0,
             },
             libc::pollfd {
-                fd: pidfd.as_raw_fd(),
+                fd: exact.as_file().as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             },
@@ -939,10 +1094,11 @@ impl DeviceExecutor {
                 break;
             }
             if poll[1].revents != 0 {
-                return Err(io::Error::other(format!(
-                    "stock executor ended before connection: {}",
-                    child.wait()?
-                )));
+                let status = unready.child().wait()?;
+                return Err(io::Error::other(EndedBeforeStart {
+                    status,
+                    stderr_tail: tail(&config.root.join("stderr.log")),
+                }));
             }
         }
         let (stream, _) = listener.accept()?;
@@ -966,7 +1122,7 @@ impl DeviceExecutor {
         let expected_gid = config
             .identity
             .map_or_else(|| unsafe { libc::getegid() }, |identity| identity.gid);
-        if credential.pid != child.id() as i32
+        if credential.pid != pid as i32
             || credential.uid != expected_uid
             || credential.gid != expected_gid
         {
@@ -976,24 +1132,38 @@ impl DeviceExecutor {
             ));
         }
         let mut executor = Self {
-            child: Some(child),
+            child: None,
+            exact,
             stream,
             birth,
             hello: Hello::default(),
+            liveness: Liveness::default(),
             root: config.root,
             socket: config.socket,
             _generation_hold: config.generation_hold,
             codec,
-            exit: Some(pidfd),
             retained: Vec::new(),
             identity: config.identity,
+            watched,
+            worst_gap: Duration::ZERO,
         };
         let hello = executor.command(&DeviceCommand::Hello, &mut Baseline)?;
-        if !hello.ok || hello.hello.pid != executor.birth.pid {
-            return Err(io::Error::other(
-                "stock executor hello did not identify launched process",
-            ));
+        // Older Runtimes omit ppid/pgid; a reported value must match (Runtime worker hello).
+        let mismatched = config.seal.mismatches(&hello.hello.sealed);
+        if !hello.ok
+            || hello.hello.pid != executor.birth.pid
+            || (hello.hello.ppid != 0 && hello.hello.ppid != std::process::id())
+            || (hello.hello.pgid != 0 && hello.hello.pgid != executor.birth.pid)
+            || !mismatched.is_empty()
+        {
+            return Err(io::Error::other(format!(
+                "stock executor hello did not identify the launched, sealed process \
+                 (pid {}, parent {}, group {}; differing sealed names {mismatched:?})",
+                hello.hello.pid, hello.hello.ppid, hello.hello.pgid
+            )));
         }
+        // Proven: the executor now owns the child; the launch guard no longer kills it.
+        executor.child = unready.0.take();
         executor.hello = hello.hello;
         Ok(executor)
     }
@@ -1007,14 +1177,12 @@ impl DeviceExecutor {
         Cancellation {
             root: self.root.clone(),
             identity: self.identity,
+            watched: self.watched.clone(),
         }
     }
 
     pub fn observer_pidfd(&self) -> io::Result<File> {
-        self.exit
-            .as_ref()
-            .ok_or_else(|| io::Error::other("device exit observer absent"))?
-            .try_clone()
+        self.exact.as_file().try_clone()
     }
 
     /// Retain a source/resource until this exact receiver exits, including owner-handle loss.
@@ -1023,11 +1191,7 @@ impl DeviceExecutor {
         self.retained.push(Box::new(resource));
     }
 
-    pub fn command(
-        &mut self,
-        command: &DeviceCommand,
-        services: &mut impl Services,
-    ) -> io::Result<Frame> {
+    fn offered(&self, command: &DeviceCommand) -> io::Result<()> {
         if let DeviceCommand::Start {
             import_only: true, ..
         } = command
@@ -1098,10 +1262,52 @@ impl DeviceExecutor {
                 ));
             }
         }
+        Ok(())
+    }
+
+    /// One command, observed: a wedged executor is killed on its measured lack of progress,
+    /// which closes the channel and returns this call with the measurement.
+    pub fn command(
+        &mut self,
+        command: &DeviceCommand,
+        services: &mut impl Services,
+    ) -> io::Result<Frame> {
+        self.offered(command)?;
+        let meter = match command {
+            DeviceCommand::Invoke { .. } => Meter::Frames,
+            _ => Meter::Burn,
+        };
+        let (watch, thread) = Watch::start(
+            self.exact.try_clone()?,
+            meter,
+            self.liveness,
+            self.worst_gap,
+            command.name(),
+        )?;
+        *self.watched.lock().unwrap() = Some(watch.clone());
+        let result = self.exchange(command, services, &watch);
+        *self.watched.lock().unwrap() = None;
+        let (killed, worst_gap) = watch.stop(thread);
+        if meter == Meter::Frames {
+            self.worst_gap = self.worst_gap.max(worst_gap);
+        }
+        match killed {
+            Some(verdict) => Err(io::Error::other(verdict)),
+            None => result,
+        }
+    }
+
+    fn exchange(
+        &mut self,
+        command: &DeviceCommand,
+        services: &mut impl Services,
+        watch: &Watch,
+    ) -> io::Result<Frame> {
         write_frame(&mut self.stream, command)?;
         loop {
             let frame = read_frame(&mut self.stream)?
                 .ok_or_else(|| io::Error::other("stock executor EOF before reply"))?;
+            watch.frame();
             match frame.event {
                 Some(Event::Progress) => services.progress(&frame),
                 Some(Event::Request) if frame.kind == Kind::DeviceTier => {
@@ -1123,38 +1329,11 @@ impl DeviceExecutor {
                     }
                 }
                 Some(Event::Request) => {
-                    let descriptor = if frame.descriptor {
-                        Some(File::from(protocol::recv_fd(&self.stream)?))
-                    } else {
-                        None
-                    };
-                    let (mut answer, descriptor) = services.request(&frame, descriptor)?;
-                    if frame.kind == Kind::ModelSourceRead && answer.ok {
-                        let source = descriptor.as_ref().ok_or_else(|| {
-                            io::Error::other("successful model source omitted readonly file")
-                        })?;
-                        let flags = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_GETFL) };
-                        if flags < 0 {
-                            return Err(io::Error::last_os_error());
-                        }
-                        if flags & libc::O_ACCMODE != libc::O_RDONLY
-                            || flags & libc::O_PATH != 0
-                            || !source.metadata()?.is_file()
-                            || source.metadata()?.len() != answer.length
-                        {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "model source is not the declared readonly regular file",
-                            ));
-                        }
-                    }
-                    answer.event = "answer";
-                    answer.seq = frame.seq;
-                    answer.descriptor = descriptor.is_some();
-                    write_frame(&mut self.stream, &answer)?;
-                    if let Some(descriptor) = descriptor {
-                        protocol::send_fd(&self.stream, &descriptor)?;
-                    }
+                    // The machine's own answer time is not the executor's stillness.
+                    watch.serving(true);
+                    let answered = self.answer(&frame, services);
+                    watch.serving(false);
+                    answered?;
                 }
                 Some(Event::Unknown) => (),
                 None if frame.reply == command.name() => return Ok(frame),
@@ -1163,86 +1342,196 @@ impl DeviceExecutor {
         }
     }
 
+    fn answer(&mut self, frame: &Frame, services: &mut impl Services) -> io::Result<()> {
+        let descriptor = if frame.descriptor {
+            Some(File::from(protocol::recv_fd(&self.stream)?))
+        } else {
+            None
+        };
+        let (mut answer, descriptor) = services.request(frame, descriptor)?;
+        if frame.kind == Kind::ModelSourceRead && answer.ok {
+            let source = descriptor
+                .as_ref()
+                .ok_or_else(|| io::Error::other("successful model source omitted readonly file"))?;
+            let flags = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_GETFL) };
+            if flags < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if flags & libc::O_ACCMODE != libc::O_RDONLY
+                || flags & libc::O_PATH != 0
+                || !source.metadata()?.is_file()
+                || source.metadata()?.len() != answer.length
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "model source is not the declared readonly regular file",
+                ));
+            }
+        }
+        answer.event = "answer";
+        answer.seq = frame.seq;
+        answer.descriptor = descriptor.is_some();
+        write_frame(&mut self.stream, &answer)?;
+        if let Some(descriptor) = descriptor {
+            protocol::send_fd(&self.stream, &descriptor)?;
+        }
+        Ok(())
+    }
+
     /// Attempt-keyed cooperative cancellation; observer teardown never calls this.
     pub fn cancel(&self, request_id: &str) -> io::Result<()> {
         self.cancellation().cancel(request_id)
     }
+
+    /// Ask the executor to exit, then observe that exact exit (killing only a wedge).
     pub fn shutdown(mut self) -> io::Result<()> {
-        self.command(&DeviceCommand::Shutdown, &mut Baseline)?;
-        self.stream.shutdown(std::net::Shutdown::Both)?;
-        let status = self
-            .child
-            .as_mut()
-            .ok_or_else(|| io::Error::other("device child handle absent"))?
-            .wait()?;
-        fs::remove_file(&self.socket)?;
-        if !status.success() {
+        let asked = self.command(&DeviceCommand::Shutdown, &mut Baseline);
+        let ended = self.terminate()?;
+        asked?;
+        if !ended.status.success() {
             return Err(io::Error::other(format!(
-                "stock executor shutdown: {status}"
+                "stock executor shutdown: {}",
+                ended.status
             )));
         }
         Ok(())
+    }
+
+    /// Close the channel, let the executor stop at its next exchange, kill it only on a
+    /// measured wedge, then reap it and release what it held. Blocks until it is gone.
+    pub fn terminate(mut self) -> io::Result<Ended> {
+        let parts = self.parts();
+        parts.end()
+    }
+
+    fn parts(&mut self) -> Ending {
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        Ending {
+            exact: self.exact.try_clone(),
+            child: self.child.take(),
+            retained: std::mem::take(&mut self.retained),
+            socket: std::mem::take(&mut self.socket),
+            liveness: self.liveness,
+        }
+    }
+}
+
+struct Unready(Option<Child>);
+impl Unready {
+    fn child(&mut self) -> &mut Child {
+        self.0.as_mut().expect("launch guard holds the child")
+    }
+}
+impl Drop for Unready {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            if let Ok(birth) = process_birth(child.id()) {
+                if let Ok(Some(exact)) = Exact::open(&birth) {
+                    let _ = exact.kill();
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Everything an executor's teardown must hold until its exit is observed.
+struct Ending {
+    exact: io::Result<Exact>,
+    child: Option<Child>,
+    retained: Vec<Box<dyn Send>>,
+    socket: PathBuf,
+    liveness: Liveness,
+}
+impl Ending {
+    fn end(mut self) -> io::Result<Ended> {
+        let exact = match &self.exact {
+            Ok(exact) => exact,
+            Err(error) => {
+                // An unobservable receiver is not authority to release its sources.
+                std::mem::forget(std::mem::take(&mut self.retained));
+                return Err(io::Error::other(format!(
+                    "executor exit unobservable: {error}"
+                )));
+            }
+        };
+        let mut pace = Pace::default();
+        let floor = self.liveness.floor();
+        let mut killed = None;
+        loop {
+            match wait_readable_for(exact.as_file(), self.liveness.sample) {
+                Ok(true) => break,
+                Ok(false) => (),
+                Err(error) => {
+                    std::mem::forget(std::mem::take(&mut self.retained));
+                    return Err(error);
+                }
+            }
+            let now = Instant::now();
+            pace.observe(burn(exact.birth.pid), now);
+            if killed.is_none() {
+                if let Some(since) = pace.still_since() {
+                    let still = now - since;
+                    if still > pace.patience(floor) {
+                        exact.kill()?;
+                        killed = Some(format!(
+                            "the executor wedged while ending: {}",
+                            pace.verdict(still, floor)
+                        ));
+                    }
+                }
+            }
+        }
+        let status = match self.child.as_mut() {
+            Some(child) => child.wait()?,
+            None => ExitStatus::from_raw(0),
+        };
+        if !self.socket.as_os_str().is_empty() {
+            let _ = fs::remove_file(&self.socket);
+        }
+        drop(std::mem::take(&mut self.retained));
+        Ok(Ended { status, killed })
     }
 }
 
 impl Drop for DeviceExecutor {
     fn drop(&mut self) {
-        // Close the private owner channel, without writing the explicit cancel marker.
-        let _ = self.stream.shutdown(std::net::Shutdown::Both);
-        let Some(exit) = self.exit.take() else {
+        if self.child.is_none() && self.retained.is_empty() {
             return;
-        };
-        let held = Arc::new(Mutex::new(Some((
-            exit,
-            std::mem::take(&mut self.retained),
-            self.child.take(),
-        ))));
-        let task = Arc::clone(&held);
+        }
+        let parts = self.parts();
+        let ended = Arc::new(Mutex::new(Some(parts)));
+        let task = ended.clone();
         let monitor = move || {
-            let Some((exit, resources, mut child)) = task.lock().unwrap().take() else {
-                return;
-            };
-            if let Err(error) = wait_exit(&exit) {
-                // An unobservable receiver is not authority to release its sources.
-                eprintln!("receiver-exit observation failed; retaining sources: {error}");
-                std::mem::forget((resources, child));
-                return;
-            }
-            if let Some(child) = child.as_mut() {
-                let _ = child.wait();
+            if let Some(parts) = task.lock().unwrap().take() {
+                if let Err(error) = parts.end() {
+                    eprintln!("executor teardown: {error}");
+                }
             }
         };
         if let Err(error) = std::thread::Builder::new()
-            .name("device-source-custody".into())
+            .name("executor-teardown".into())
             .spawn(monitor)
         {
-            eprintln!("receiver monitor unavailable; observing exit synchronously: {error}");
-            // The original Arc retains resources if thread creation discards its closure.
-            if let Some((exit, resources, mut child)) = held.lock().unwrap().take() {
-                if let Err(error) = wait_exit(&exit) {
-                    eprintln!("receiver-exit observation failed; retaining sources: {error}");
-                    std::mem::forget((resources, child));
-                    return;
-                }
-                if let Some(child) = child.as_mut() {
-                    let _ = child.wait();
-                }
+            eprintln!("executor teardown thread unavailable; ending synchronously: {error}");
+            if let Some(parts) = ended.lock().unwrap().take() {
+                let _ = parts.end();
             }
         }
     }
 }
 
-fn wait_exit(exit: &File) -> io::Result<()> {
+/// Exit observed within one sampling period, or not yet. The period is a meter cadence.
+fn wait_readable_for(file: &File, period: Duration) -> io::Result<bool> {
     let mut poll = libc::pollfd {
-        fd: exit.as_raw_fd(),
+        fd: file.as_raw_fd(),
         events: libc::POLLIN,
         revents: 0,
     };
+    let milliseconds = period.as_millis().clamp(1, i32::MAX as u128) as i32;
     loop {
-        let result = unsafe { libc::poll(&mut poll, 1, -1) };
-        if result > 0 && poll.revents & libc::POLLIN != 0 {
-            return Ok(());
-        }
+        let result = unsafe { libc::poll(&mut poll, 1, milliseconds) };
         if result < 0 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
@@ -1250,10 +1539,28 @@ fn wait_exit(exit: &File) -> io::Result<()> {
             }
             return Err(error);
         }
-        if poll.revents != 0 {
-            return Err(io::Error::other("receiver pidfd is not observable"));
+        if result == 0 {
+            return Ok(false);
         }
+        if poll.revents & libc::POLLIN != 0 {
+            return Ok(true);
+        }
+        return Err(io::Error::other("executor exit is not observable"));
     }
+}
+
+/// The last bytes of a log, for a failure reason.
+pub fn tail(path: &Path) -> String {
+    const TAIL: u64 = 2048;
+    let Ok(mut file) = File::open(path) else {
+        return String::new();
+    };
+    use std::io::Seek;
+    let length = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let _ = file.seek(io::SeekFrom::Start(length.saturating_sub(TAIL)));
+    let mut bytes = Vec::new();
+    let _ = file.read_to_end(&mut bytes);
+    String::from_utf8_lossy(&bytes).trim().to_string()
 }
 
 pub fn read_result(spool: &Path, reply: &Frame) -> io::Result<Value> {
