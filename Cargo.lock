@@ -258,6 +258,7 @@ dependencies = [
  "sha2",
  "tar",
  "tensorfs-core",
+ "tensorfs-plane",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -779,6 +780,16 @@ name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+
+[[package]]
+name = "libloading"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
 
 [[package]]
 name = "libsqlite3-sys"
@@ -1562,8 +1573,8 @@ dependencies = [
 
 [[package]]
 name = "tensorfs-core"
-version = "0.3.87"
-source = "git+https://github.com/cozy-creator/tensorfs.git?tag=v0.3.87#58efd850c98db3968779af73eb4a2eb0ac492d40"
+version = "0.3.91"
+source = "git+https://github.com/cozy-creator/tensorfs.git?tag=v0.3.91#6c61a06dae6e404ce2a073a95c9470761bde86dd"
 dependencies = [
  "fs2",
  "minicbor",
@@ -1572,6 +1583,17 @@ dependencies = [
  "rustix",
  "rustls",
  "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "tensorfs-plane"
+version = "0.3.91"
+source = "git+https://github.com/cozy-creator/tensorfs.git?tag=v0.3.91#6c61a06dae6e404ce2a073a95c9470761bde86dd"
+dependencies = [
+ "libc",
+ "libloading",
+ "tensorfs-core",
+ "thiserror",
 ]
 
 [[package]]
