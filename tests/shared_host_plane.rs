@@ -4,7 +4,8 @@ use cozy_machine::{
     execution::process_birth,
     protocol::send_fd,
     shared_host_plane::{
-        HostConfig, HostKey, HostPeer, HostPreparation, HostScope, SharedHostPlane,
+        HostConfig, HostKey, HostPeer, HostPreparation, HostScope, HostTierPlan,
+        HostTierRegistration, SharedHostPlane,
     },
 };
 use std::{
@@ -38,6 +39,7 @@ struct Fixture {
     plan: ReadPlan,
     regions: Vec<Vec<String>>,
     data: Vec<u8>,
+    header: Header,
 }
 impl Fixture {
     fn new() -> Self {
@@ -102,6 +104,7 @@ impl Fixture {
             plan,
             regions: vec![vec!["linear/weight".into()]],
             data,
+            header,
         }
     }
     fn plane(&self, budget: u64, entries: usize) -> Arc<SharedHostPlane> {
@@ -390,4 +393,200 @@ fn actor_plan_and_recorded_birth_gate_host_grants() {
         })
         .is_err());
     other.end();
+}
+
+fn sealed_payload(bytes: &[u8], sealed: bool) -> File {
+    let name = std::ffi::CString::new("cozy-test-host-partition").unwrap();
+    let raw =
+        unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
+    assert!(raw >= 0);
+    let mut file = unsafe { File::from_raw_fd(raw) };
+    file.write_all(bytes).unwrap();
+    if sealed {
+        assert_eq!(
+            unsafe {
+                libc::fcntl(
+                    raw,
+                    libc::F_ADD_SEALS,
+                    libc::F_SEAL_SEAL
+                        | libc::F_SEAL_SHRINK
+                        | libc::F_SEAL_GROW
+                        | libc::F_SEAL_WRITE,
+                )
+            },
+            0
+        );
+    }
+    file
+}
+fn registration(fx: &Fixture, key: &HostKey, bytes: &[u8]) -> HostTierRegistration {
+    HostTierRegistration {
+        manifest: fx.manifest.clone(),
+        name: key.name.clone(),
+        layout: key.layout.clone(),
+        length: bytes.len() as u64,
+        sha256: tensorfs_core::sha256::hex_digest(bytes),
+    }
+}
+fn partition(fx: &Fixture, key: &HostKey) -> HostTierPlan {
+    HostTierPlan {
+        manifest: fx.manifest.clone(),
+        name: key.name.clone(),
+        layout: key.layout.clone(),
+        traversal: vec![("linear".into(), "weight".into())],
+        components: vec!["linear".into()],
+        regions: fx.regions.clone(),
+        parts: vec![],
+    }
+}
+
+#[test]
+fn typed_sealed_registration_spans_control_limit_and_adopts_authorized_native_plan() {
+    let fx = Fixture::new();
+    let plane = fx.plane(3 << 20, 1);
+    let key = fx.key("generation/linear");
+    plane
+        .authorize(
+            fx.scope(),
+            fx.manifest.clone(),
+            fx.header.clone(),
+            vec!["linear".into()],
+        )
+        .unwrap();
+    let mut child = Recipient::new(&fx.scope(), &plane);
+    #[derive(serde::Serialize)]
+    struct Evolved {
+        #[serde(flatten)]
+        plan: HostTierPlan,
+        future_advisory: String,
+    }
+    let bytes = serde_json::to_vec(&Evolved {
+        plan: partition(&fx, &key),
+        future_advisory: "a".repeat(80 << 10),
+    })
+    .unwrap();
+    assert!(bytes.len() > 64 << 10);
+    let frame = Frame {
+        kind: Kind::HostTierPrepare,
+        manifest: fx.manifest.clone(),
+        name: key.name.clone(),
+        layout: key.layout.clone(),
+        sha256: tensorfs_core::sha256::hex_digest(&bytes),
+        length: bytes.len() as u64,
+        descriptor: true,
+        ..Frame::default()
+    };
+    let (answer, grant) = plane
+        .request(&child.peer, &frame, Some(sealed_payload(&bytes, true)))
+        .unwrap()
+        .unwrap();
+    assert!(answer.ok && grant.is_none());
+    let file = child.grant(&plane, &key);
+    child.infer();
+    assert!(file.metadata().unwrap().blocks() * 512 > 0);
+    child.end();
+}
+
+#[test]
+fn partition_fd_corruption_unsealed_envelope_and_component_authority_fail_closed() {
+    let fx = Fixture::new();
+    let plane = fx.plane(3 << 20, 1);
+    let key = fx.key("generation/linear");
+    plane
+        .authorize(
+            fx.scope(),
+            fx.manifest.clone(),
+            fx.header.clone(),
+            vec!["linear".into()],
+        )
+        .unwrap();
+    let child = Recipient::new(&fx.scope(), &plane);
+    let bytes = serde_json::to_vec(&partition(&fx, &key)).unwrap();
+    let mut wrong = registration(&fx, &key, &bytes);
+    wrong.sha256 = "0".repeat(64);
+    assert_eq!(
+        plane
+            .prepare_peer(&child.peer, wrong, sealed_payload(&bytes, true))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    assert!(plane
+        .prepare_peer(
+            &child.peer,
+            registration(&fx, &key, &bytes),
+            sealed_payload(&bytes, false)
+        )
+        .is_err());
+    let mut changed = partition(&fx, &key);
+    changed.components = vec!["another-model".into()];
+    let foreign = serde_json::to_vec(&changed).unwrap();
+    assert_eq!(
+        plane
+            .prepare_peer(
+                &child.peer,
+                registration(&fx, &key, &foreign),
+                sealed_payload(&foreign, true)
+            )
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    let mut wrong = registration(&fx, &key, &bytes);
+    wrong.name = "envelope-changed".into();
+    assert!(plane
+        .prepare_peer(&child.peer, wrong, sealed_payload(&bytes, true))
+        .is_err());
+    assert_eq!(plane.stats().unwrap().backing_bytes, 0);
+    child.end();
+}
+
+#[test]
+fn failed_native_fill_drains_started_readers_before_allocation_cleanup() {
+    let fx = Fixture::new();
+    let plane = fx.plane(8 << 20, 2);
+    let object = ObjectRef::of(&fx.data);
+    let plan = ReadPlan {
+        items: vec![
+            read::PlanItem {
+                what: "linear/invalid#value".into(),
+                dest_off: 0,
+                len: object.length,
+                source: read::Source::Object(read::ObjectRange {
+                    obj: object.clone(),
+                    off: 1,
+                    len: object.length,
+                }),
+            },
+            read::PlanItem {
+                what: "linear/valid#value".into(),
+                dest_off: object.length,
+                len: object.length,
+                source: read::Source::Object(read::ObjectRange {
+                    obj: object.clone(),
+                    off: 0,
+                    len: object.length,
+                }),
+            },
+        ],
+        bytes: object.length * 2,
+        io_bytes: object.length * 2,
+        inline_parts: 0,
+        order: read::Order::Destination,
+    };
+    let regions = vec![vec!["linear/invalid".into()], vec!["linear/valid".into()]];
+    let key = HostKey::for_regions("failure/linear".into(), &fx.manifest, &regions).unwrap();
+    assert!(plane
+        .prepare(HostPreparation {
+            scope: &fx.scope(),
+            key: &key,
+            manifest: &fx.manifest,
+            plan: &plan,
+            regions: &regions
+        })
+        .is_err());
+    let after = plane.stats().unwrap();
+    assert_eq!(after.entries, 0);
+    assert_eq!(after.native_allocations, 0);
+    assert_eq!(after.backing_bytes, 0);
 }

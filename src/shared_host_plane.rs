@@ -9,17 +9,19 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::File,
-    io,
+    io::{self, Read},
+    os::unix::net::UnixStream,
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
-        unix::fs::MetadataExt,
+        unix::fs::{FileExt, MetadataExt},
     },
     path::Path,
     sync::{Arc, Mutex},
 };
 use tensorfs_core::{
+    header::Header,
     meta::Meta,
     read::{self, ReadPlan, Source as ReadSource},
     store::Store,
@@ -66,7 +68,7 @@ impl HostPeer {
         }
     }
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct HostConfig {
     pub budget_bytes: u64,
     pub readers: usize,
@@ -80,6 +82,7 @@ pub struct HostCharge {
     pub active_backing_bytes: u64,
     pub over_budget_bytes: u64,
     pub entries: usize,
+    pub native_allocations: usize,
     pub recipients: usize,
     pub filled_bytes: u64,
 }
@@ -92,6 +95,42 @@ pub struct HostPreparation<'a> {
     pub manifest: &'a str,
     pub plan: &'a ReadPlan,
     pub regions: &'a [Vec<String>],
+}
+/// Sealed FD payload emitted by the existing SDK model library, not authored code.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct HostTierPlan {
+    pub manifest: String,
+    pub name: String,
+    pub layout: String,
+    pub traversal: Vec<(String, String)>,
+    pub components: Vec<String>,
+    pub regions: Vec<Vec<String>>,
+    #[serde(default)]
+    pub parts: Vec<String>,
+}
+#[derive(Debug)]
+pub struct HostTierRegistration {
+    pub manifest: String,
+    pub name: String,
+    pub layout: String,
+    pub sha256: String,
+    pub length: u64,
+}
+struct AuthorizedModel {
+    header: Header,
+    components: BTreeSet<String>,
+}
+// pread makes verification/decoding independent of a sender's shared OFD seek position.
+struct DescriptorReader<'a> {
+    file: &'a File,
+    offset: u64,
+}
+impl Read for DescriptorReader<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let n = self.file.read_at(bytes, self.offset)?;
+        self.offset += n as u64;
+        Ok(n)
+    }
 }
 type CacheKey = (HostScope, HostKey);
 struct Entry {
@@ -111,6 +150,7 @@ struct State {
     entries: BTreeMap<CacheKey, Entry>,
     recipients: Vec<Recipient>,
     clock: u64,
+    authorized: BTreeMap<(HostScope, String), AuthorizedModel>,
 }
 pub struct SharedHostPlane {
     plane: Plane,
@@ -166,8 +206,28 @@ impl SharedHostPlane {
                 entries: BTreeMap::new(),
                 recipients: Vec::new(),
                 clock: 0,
+                authorized: BTreeMap::new(),
             }),
         }))
+    }
+
+    /// CPU/service fixture adapter: policy scope is supplied by the authenticated owner;
+    /// Linux SO_PEERPIDFD pins the actual connecting peer rather than a reused numeric PID.
+    pub fn register_socket(&self, scope: HostScope, stream: &UnixStream) -> io::Result<HostPeer> {
+        let exit = os::peer_pidfd(stream)?;
+        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", exit.as_raw_fd()))?;
+        let pid = info
+            .lines()
+            .find_map(|line| line.strip_prefix("Pid:\t"))
+            .and_then(|v| v.parse::<u32>().ok())
+            .ok_or_else(|| failure("peer pidfd did not identify a live process"))?;
+        let peer = HostPeer {
+            actor: scope.actor,
+            plan: scope.plan,
+            birth: process_birth(pid)?,
+        };
+        self.register_peer(peer.clone(), exit)?;
+        Ok(peer)
     }
 
     /// Bind to the actual spawned process before sending any host capability. The supplied
@@ -200,6 +260,163 @@ impl SharedHostPlane {
             holds: BTreeMap::new(),
         });
         Ok(())
+    }
+
+    /// Called only by the trusted metadata owner with its selected, verified header and
+    /// allowed components. A socket peer cannot expand this authority by naming a manifest.
+    pub fn authorize(
+        &self,
+        scope: HostScope,
+        manifest: String,
+        header: Header,
+        components: Vec<String>,
+    ) -> io::Result<()> {
+        let components: BTreeSet<String> = components.into_iter().collect();
+        if scope.actor.is_empty()
+            || scope.plan.is_empty()
+            || components.is_empty()
+            || components
+                .iter()
+                .any(|c| !header.components.iter().any(|(name, _)| name == c))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "host authorization requires selected header components and actor/plan",
+            ));
+        }
+        let mut state = self.state.lock().unwrap();
+        let key = (scope, manifest);
+        if let Some(previous) = state.authorized.get(&key) {
+            if previous.components != components
+                || previous.header.canonical_bytes().map_err(failure)?
+                    != header.canonical_bytes().map_err(failure)?
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "immutable host plan authorization changed",
+                ));
+            }
+            return Ok(());
+        }
+        state
+            .authorized
+            .insert(key, AuthorizedModel { header, components });
+        Ok(())
+    }
+
+    /// Fully verified typed FD registration, deliberately outside the 64KiB control cap.
+    /// Success with cached=false is disk fallback, including zero budget or active tenants.
+    pub fn prepare_peer(
+        &self,
+        peer: &HostPeer,
+        request: HostTierRegistration,
+        descriptor: File,
+    ) -> io::Result<bool> {
+        use sha2::{Digest, Sha256};
+        if descriptor.metadata()?.len() != request.length
+            || os::seals(&descriptor)? & os::FULL_SEALS != os::FULL_SEALS
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "host partition descriptor must be sealed at its declared length",
+            ));
+        }
+        let mut hash = Sha256::new();
+        let mut reader = DescriptorReader {
+            file: &descriptor,
+            offset: 0,
+        };
+        let mut buffer = [0u8; 64 << 10];
+        loop {
+            let n = reader.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            hash.update(&buffer[..n]);
+        }
+        if format!("{:x}", hash.finalize()) != request.sha256 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "host partition descriptor checksum differs",
+            ));
+        }
+        let payload: HostTierPlan = serde_json::from_reader(DescriptorReader {
+            file: &descriptor,
+            offset: 0,
+        })
+        .map_err(failure)?;
+        if (
+            payload.manifest.as_str(),
+            payload.name.as_str(),
+            payload.layout.as_str(),
+        ) != (
+            request.manifest.as_str(),
+            request.name.as_str(),
+            request.layout.as_str(),
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "host partition envelope differs from its typed payload",
+            ));
+        }
+        let scope = peer.scope();
+        let plan = {
+            let mut state = self.state.lock().unwrap();
+            self.reap(&mut state)?;
+            if !state.recipients.iter().any(|r| r.peer == *peer) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "host partition sender birth is not registered",
+                ));
+            }
+            let authorized = state
+                .authorized
+                .get(&(scope.clone(), payload.manifest.clone()))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "host manifest was not selected for this actor/plan",
+                    )
+                })?;
+            if payload.components.is_empty()
+                || payload
+                    .components
+                    .iter()
+                    .any(|c| !authorized.components.contains(c))
+                || payload
+                    .traversal
+                    .iter()
+                    .any(|(c, _)| !authorized.components.contains(c))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "host partition leaves authorized model components",
+                ));
+            }
+            let plan = read::plan_for_traversal(
+                &authorized.header,
+                &payload.traversal,
+                &payload.components,
+                4 << 20,
+            )
+            .map_err(failure)?;
+            if payload.parts.is_empty() {
+                plan
+            } else {
+                plan.select(&payload.parts).map_err(failure)?
+            }
+        };
+        let key = HostKey {
+            name: payload.name,
+            layout: payload.layout,
+        };
+        self.prepare(HostPreparation {
+            scope: &scope,
+            key: &key,
+            manifest: &payload.manifest,
+            plan: &plan,
+            regions: &payload.regions,
+        })
     }
 
     /// Populate one exact owner-authorized plan. A false result is an optional cache miss:
@@ -285,11 +502,27 @@ impl SharedHostPlane {
             // per-region future queue or private allocator/read implementation.
             let ids: Vec<u32> = (0..layout.regions.len() as u32).collect();
             for batch in ids.chunks(self.config.readers) {
-                self.plane
-                    .want(ws, Tier::Pinned, Some(batch), 0, true)
-                    .map_err(failure)?
-                    .wait()
-                    .map_err(failure)?;
+                let mut tickets = Vec::new();
+                let mut failed = None;
+                for region in batch {
+                    match self.plane.want(ws, Tier::Pinned, Some(&[*region]), 0, true) {
+                        Ok(ticket) => tickets.push(ticket),
+                        Err(error) => {
+                            failed = Some(failure(error));
+                            break;
+                        }
+                    }
+                }
+                // A failed member does not prove other native readers stopped writing. Drain
+                // every started region before close_ws may unmap/punch partial backing.
+                for ticket in tickets {
+                    if let Err(error) = ticket.wait() {
+                        failed.get_or_insert_with(|| failure(error));
+                    }
+                }
+                if let Some(error) = failed {
+                    return Err(error);
+                }
             }
             if self.backing(&state)?.saturating_add(charge(&file)?) > state.budget {
                 return Ok(None);
@@ -332,11 +565,36 @@ impl SharedHostPlane {
         frame: &Frame,
         descriptor: Option<File>,
     ) -> Option<io::Result<(Answer, Option<File>)>> {
-        if frame.kind != Kind::HostTier {
-            return None;
+        match frame.kind {
+            Kind::HostTier => Some(self.tier(peer, frame, descriptor)),
+            Kind::HostTierPrepare => Some((|| {
+                let descriptor = descriptor.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "host partition registration omitted its sealed fd",
+                    )
+                })?;
+                self.prepare_peer(
+                    peer,
+                    HostTierRegistration {
+                        manifest: frame.manifest.clone(),
+                        name: frame.name.clone(),
+                        layout: frame.layout.clone(),
+                        sha256: frame.sha256.clone(),
+                        length: frame.length,
+                    },
+                    descriptor,
+                )?;
+                let mut answer = Answer::unavailable(frame.seq);
+                answer.ok = true;
+                answer.code.clear();
+                answer.detail.clear();
+                Ok((answer, None))
+            })()),
+            _ => None,
         }
-        Some(self.tier(peer, frame, descriptor))
     }
+
     fn tier(
         &self,
         peer: &HostPeer,
@@ -414,14 +672,16 @@ impl SharedHostPlane {
                 active_backing_bytes += charge(&entry.file)?;
             }
         }
+        let native = self.plane.stats();
         Ok(HostCharge {
             budget_bytes: state.budget,
             backing_bytes,
             active_backing_bytes,
             over_budget_bytes: backing_bytes.saturating_sub(state.budget),
             entries: state.entries.len(),
+            native_allocations: native.sets.len(),
             recipients: state.recipients.len(),
-            filled_bytes: self.plane.stats().host.counters.fill_bytes,
+            filled_bytes: native.host.counters.fill_bytes,
         })
     }
     fn backing(&self, state: &State) -> io::Result<u64> {
