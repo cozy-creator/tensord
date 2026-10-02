@@ -78,10 +78,20 @@ def model_selection(pilot: dict, interface_bytes: bytes) -> dict:
 
 def prepare(pilot_path: Path, output: Path, port: int) -> None:
     pilot = json.loads(pilot_path.read_text())
+    # Released SDK99 session.py creates placement roots under a 24-hex SHA key;
+    # child.py appends executor.sock. Check its real guard before creating a fixture.
+    root = output / "root"
+    placement_socket = root / "run/cozy/worker/placements" / ("0" * 24) / "executor.sock"
+    refusal = subprocess.check_output([pilot["python"], "-I", "-c",
+        "from cozy_runtime.internal.worker.child import socket_path_refusal; "
+        "print(socket_path_refusal(" + repr(str(placement_socket)) + "))"], text=True).strip()
+    if refusal:
+        raise ValueError(refusal)
     output.mkdir(parents=True, exist_ok=False)
     evidence = inspect(pilot)
+    evidence["placement_socket_bytes_including_nul"] = len(os.fsencode(placement_socket)) + 1
+    evidence["socket_formula"] = "<machine-root>/run/cozy/worker/placements/<24hex>/executor.sock"
     write(output / "cpu-inspection.json", evidence)
-    root = output / "root"
     sdk = Path(pilot["python"]).parent.parent
     for directory in ("opt/cozy/bin", "usr/local/bin", "etc/cozy", "var/lib/cozy",
                       "var/lib/cozy/installs/.stage", "run/cozy/bootstrap", "tmp"):
@@ -263,11 +273,11 @@ def full(config_path: Path) -> None:
             if hashlib.sha256(outcome.outcome_canonical_bytes).digest() != outcome.outcome_digest:
                 raise RuntimeError("terminal checksum differs")
             terminal = documents.parse(outcome.outcome_canonical_bytes, pb.AttemptOutcomeBody)
-            if terminal.status != pb.OUTCOME_STATUS_SUCCEEDED:
-                raise RuntimeError(f"run failed: {terminal}")
             run = output / request
             run.mkdir()
             (run / "outcome.json").write_bytes(outcome.outcome_canonical_bytes)
+            if terminal.status != pb.OUTCOME_STATUS_SUCCEEDED:
+                raise RuntimeError(f"run failed: {terminal}")
             saved = []
             for product_index, product in enumerate(products):
                 if product.parts or not product.HasField("source"):
