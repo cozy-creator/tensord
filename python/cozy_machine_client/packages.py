@@ -16,33 +16,37 @@ import tempfile
 import tomllib
 import uuid
 from pathlib import Path
-from typing import Any
 
 import msgspec
 
-
-class Dependency(msgspec.Struct, frozen=True):
-    name: str
-    version: str
-
-
-class Generation(msgspec.Struct, frozen=True):
-    identity: str
-    package: str
-    version: str
-    application: str
-    python: str
-    dependencies: list[Dependency]
-    interface: dict[str, Any]
+from .package_records import (
+    DESCRIPTION_DECODER, GENERATION_DECODER, Dependency, Describe, DescribeFailed, Generation,
+    PackageMetadata, Pyproject,
+)
 
 
-GENERATION_DECODER = msgspec.json.Decoder(Generation)
+class PackageError(Exception):
+    def __init__(self, code: str, detail: str):
+        self.code = code
+        super().__init__(detail)
 
 
-def describe(project: Path, environment_python: Path | None = None) -> dict[str, Any]:
-    from cozy_runtime.internal.static_interface import build
+def describe(project: Path, environment_python: Path | None = None) -> msgspec.Raw:
+    request = Describe(str(project), str(environment_python) if environment_python else None)
+    result = subprocess.check_output([sys.executable, "-m", "cozy_machine_client.runtime_describe"],
+                                     input=msgspec.json.encode(request))
+    reply = DESCRIPTION_DECODER.decode(result)
+    if isinstance(reply, DescribeFailed):
+        raise PackageError(reply.code, reply.detail)
+    return reply.interface
 
-    return build(project, environment_python=environment_python)
+
+def read_metadata(project: Path) -> PackageMetadata:
+    parsed = msgspec.convert(tomllib.loads((project / "pyproject.toml").read_text()),
+                             type=Pyproject)
+    metadata = parsed.project
+    return PackageMetadata(metadata.name, metadata.version,
+                           metadata.entry_points.application.default)
 
 
 class GenerationHold:
@@ -88,9 +92,7 @@ def install(project: Path, generations: Path, client_wheel: Path, *,
     project = project.resolve()
     client_wheel = client_wheel.resolve(strict=True)
     interface = describe(project)
-    metadata = tomllib.loads((project / "pyproject.toml").read_text())["project"]
-    package, version = metadata["name"], metadata["version"]
-    application = metadata["entry-points"]["cozy.application"]["default"]
+    metadata = read_metadata(project)
     generations.mkdir(parents=True, exist_ok=True)
     identity = uuid.uuid4().hex
     # The interpreter embeds its absolute venv path. Create it at its final name;
@@ -115,7 +117,7 @@ def install(project: Path, generations: Path, client_wheel: Path, *,
                 ["uv", "pip", "list", "--python", str(interpreter), "--format", "json"])
             dependencies = msgspec.json.decode(inventory, type=list[Dependency])
             interface = describe(project, interpreter)
-            generation = Generation(identity, package, version, application,
+            generation = Generation(identity, metadata.name, metadata.version, metadata.application,
                                     str(interpreter), dependencies, interface)
             manifest = root / ".generation.json.new"
             with manifest.open("wb") as output:
