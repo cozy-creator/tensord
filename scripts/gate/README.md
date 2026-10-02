@@ -23,6 +23,9 @@ not Rust-machine gains: every row records the Runtime/TensorFS versions the run 
 
 ## One cycle (per arm, order from the manifest, e.g. old, rust, old, rust, ...)
 
+Before the first cycle, each arm in `prime` runs one SDXL and one Anima request, unmeasured, to pay
+its package install and model download.
+
 1. Wait until the GPU is at or below `start_temp_c`.
 2. `cold_first`: restart the arm's machine; once every executor of the previous machine is gone,
    evict `cache_paths` from the page cache (`POSIX_FADV_DONTNEED`); submit SDXL as soon as the new
@@ -37,7 +40,11 @@ checked not flat (per-channel stddev > 2) and hashed.
 
 ## Measurements
 
-- Wall: controller clock; the pod-clock root birth is converted with an ssh round-trip offset (error ≤ rtt/2).
+- Wall (the gate's number): new root's birth, or submit, to the image saved and verified on the
+  controller. The pod-clock birth is converted with an ssh round-trip offset (error ≤ rtt/2).
+- `machine_s`: the same start to the machine's `machine.outcome` event, both on the pod clock.
+- `result_lag_s`: pod outcome to the client noticing it. The controller's daemon is shared with other
+  sessions, so it stalls at times (up to ~47 s seen); this separates that from either arm's machine.
 - Stages: `cozy run show --json --full` per request (executor boot, load, denoise steps, decode).
 - 1 Hz pod sampler: `nvidia-smi` (memory, temperature, SM clock, power, throttle reasons) and the
   container cgroup (`memory.stat`, `io.stat`).
