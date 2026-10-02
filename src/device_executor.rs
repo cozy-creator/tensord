@@ -47,6 +47,11 @@ pub struct Hello {
     pub sealed: BTreeMap<String, String>,
     pub torch_loaded: bool,
 }
+impl Hello {
+    pub fn offers(&self, capability: &str) -> bool {
+        self.memory.iter().any(|offered| offered == capability)
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -702,7 +707,7 @@ impl DeviceExecutor {
             import_only: true, ..
         } = command
         {
-            if !self.hello.memory.iter().any(|cap| cap == "import_only") {
+            if !self.hello.offers("import_only") {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     "import-only startup capability absent",
@@ -713,7 +718,7 @@ impl DeviceExecutor {
             host_tier: true, ..
         } = command
         {
-            if !self.hello.memory.iter().any(|cap| cap == "weight_plane/1") {
+            if !self.hello.offers("weight_plane/1") {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     "host weight tier capability absent",
@@ -723,11 +728,17 @@ impl DeviceExecutor {
         if matches!(
             command,
             DeviceCommand::Load { stages: true, .. } | DeviceCommand::Invoke { stages: true, .. }
-        ) && !self.hello.memory.iter().any(|cap| cap == "stage/1")
+        ) && !self.hello.offers("stage/1")
         {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "stage-turn capability absent",
+            ));
+        }
+        if matches!(command, DeviceCommand::Budget { .. }) && !self.hello.offers("weight_plane/1") {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "plane budget capability absent; legacy residency remains available",
             ));
         }
         if let DeviceCommand::Load {
@@ -736,13 +747,7 @@ impl DeviceExecutor {
             ..
         } = command
         {
-            if *sequence_parallel_degree != 1
-                || !self
-                    .hello
-                    .memory
-                    .iter()
-                    .any(|cap| cap == "model_sources.descriptors/1")
-            {
+            if *sequence_parallel_degree != 1 || !self.hello.offers("model_sources.descriptors/1") {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     "descriptor model sources require qualified world-one capability",

@@ -157,6 +157,20 @@ fn run() -> io::Result<()> {
         .get("CUDA_VISIBLE_DEVICES")
         .cloned()
         .unwrap_or_default();
+    let stages = executor.hello.offers("stage/1");
+    let plane = executor.hello.offers("weight_plane/1");
+    fs::write(
+        config.root.join("negotiation.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "runtime":executor.hello.runtime_version,
+            "tensorfs":executor.hello.tensorfs_version,
+            "offered_memory":executor.hello.memory,
+            "stage_turns":stages,
+            "weight_plane":plane,
+            "legacy_residency":!plane,
+            "descriptor_sources":false
+        }))?,
+    )?;
     let mut turns = Turns {
         budget: config.plane_budget_bytes,
         held: Vec::new(),
@@ -196,7 +210,7 @@ fn run() -> io::Result<()> {
             authorized_device_limit_bytes: Some(config.authorized_device_limit_bytes),
             attention_pin: String::new(),
             host_tier: false,
-            stages: true,
+            stages,
             descriptor_sources: false,
         },
         &mut turns,
@@ -212,18 +226,20 @@ fn run() -> io::Result<()> {
         config.root.join("load-facts.json"),
         serde_json::to_vec_pretty(&loaded.facts)?,
     )?;
-    let budget = executor.command(
-        &DeviceCommand::Budget {
-            vram_bytes: config.plane_budget_bytes,
-            pinned_bytes: config.pinned_budget_bytes,
-        },
-        &mut turns,
-    )?;
-    if !budget.ok {
-        return Err(io::Error::other(format!(
-            "budget: {} {}",
-            budget.code, budget.detail
-        )));
+    if plane {
+        let budget = executor.command(
+            &DeviceCommand::Budget {
+                vram_bytes: config.plane_budget_bytes,
+                pinned_bytes: config.pinned_budget_bytes,
+            },
+            &mut turns,
+        )?;
+        if !budget.ok {
+            return Err(io::Error::other(format!(
+                "budget: {} {}",
+                budget.code, budget.detail
+            )));
+        }
     }
     let active = executor.command(
         &DeviceCommand::Activate {
@@ -271,7 +287,7 @@ fn run() -> io::Result<()> {
                 deadline_s: None,
                 attention_kernel: String::new(),
                 plane_budget_bytes: config.plane_budget_bytes,
-                stages: true,
+                stages,
             },
             &mut turns,
         )?;
@@ -294,7 +310,7 @@ fn run() -> io::Result<()> {
         fs::write(
             config.root.join("results.json"),
             serde_json::to_vec_pretty(
-                &serde_json::json!({"qualification":"legacy pilot; store writer/host ownership/full machine API unqualified","timings":timings,"runs":results}),
+                &serde_json::json!({"qualification":"legacy pilot; store writer/host ownership/full machine API unqualified","stage_turns":stages,"weight_plane":plane,"timings":timings,"runs":results}),
             )?,
         )?;
     }

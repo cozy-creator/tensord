@@ -24,7 +24,11 @@ The trusted SDK encoder produces the actual WebP; root must independently inspec
 This is a legacy hardware feasibility pilot. The unchanged SDK still imports TensorFS
 and opens its store; host-tier retention is disabled. It does not establish sole writer,
 machine-owned host/GPU weights, full API replacement or ordinary CLI compatibility.
-Stage exchanges return the root's fixed allowance; the pilot has no scheduler.
+Offered stage exchanges return the root's fixed allowance; the pilot has no scheduler.
+`negotiation.json` records actual Hello capabilities. Published Runtime 0.18.99 offers only
+`vacate_ranks`; it has no stage/plane flags or Budget command. The pilot keeps its legacy
+residency path, using Load's authorized device limit, and sends stage/budget controls only
+when that peer offers them. No SDK version comparison decides this path.
 
 ## Authoritative artifact/package inputs
 

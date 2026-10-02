@@ -223,6 +223,18 @@ fn credential_refusal_and_result_mutation_are_operation_local() {
         )
         .unwrap_err();
     assert_eq!(secret.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(!executor.hello.offers("stage/1"));
+    assert!(!executor.hello.offers("weight_plane/1"));
+    let unsupported = executor
+        .command(
+            &DeviceCommand::Budget {
+                vram_bytes: 0,
+                pinned_bytes: 0,
+            },
+            &mut Baseline,
+        )
+        .unwrap_err();
+    assert_eq!(unsupported.kind(), std::io::ErrorKind::Unsupported);
     let reply = invoke(&mut executor, &root, "valid", 2, &mut Baseline);
     assert!(read_result(&root.join("valid"), &reply).is_ok());
     fs::write(root.join("valid/result.canonical"), b"mutated").unwrap();
