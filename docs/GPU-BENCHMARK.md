@@ -39,10 +39,12 @@ Detailed records, exact inputs, excluded cohorts, counters and qualification lim
 Other live rentals and GPU processes are independently owned. The display-driving 8 GB
 RTX 4070 is available for ordinary inference; fault and memory pressure tests use RunPod.
 
-First prove an unchanged real SDXL package can load through the Rust owner and complete
-inference on a non-display GPU. Record every process, hardware/driver/CUDA/SDK/TensorFS
-version, model identity, request and output. Report this milestone separately from normal
-Creator CLI, complete single-writer custody, low-memory recovery and release qualification.
+The first unchanged real SDXL loading/inference milestone has passed on a non-display GPU.
+The next integration gate is that same request through the new authenticated public machine
+API and ordinary Creator CLI, with normal preparation, events, output custody and collection.
+Record every process, hardware/driver/CUDA/SDK/TensorFS version, model identity, request and
+output. Keep this separate from complete single-writer custody, low-memory recovery and release
+qualification. The current ordinary CLI CPU proof does not establish GPU API qualification.
 
 After the same request works through both architectures on the same rented GPU:
 

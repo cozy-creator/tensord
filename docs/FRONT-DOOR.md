@@ -184,3 +184,37 @@ production backends provide bounded fd reads instead of collecting output bytes.
 `events_observed` supplies an observation-only cancellation flag so an abandoned
 long poll can leave its wait without controlling the durable execution. A backend
 must actually observe that flag (or bound observation pages) to reclaim its waiter.
+
+## Integrated ordinary CLI CPU gate
+
+The integrated service at `e7750e8` now passes an opt-in ordinary Creator CPU path.
+The Creator endpoint adapter is draft PR #994, head `20c6f22d`; it uses the normal
+default-home controller key, request records, watch/cancel and output export. The
+explicit endpoint file is pinned to the worker, TLS leaf, current boot and workspace.
+It does not replace the default daemon, enroll a rental or implicitly rebind identity.
+An older daemon without the endpoint capability is refused before submission.
+
+Three consecutive fresh SDK99 sklearn application runs completed with predictions
+`[0,2,1]`, matching independently read 244-byte JSON outputs and correct MIME/digest
+metadata. Fresh completion and explicit cancellation also pass on the final service:
+collection is acknowledged, pending cancellation clears, and the final request-release
+event appears exactly once with a stable replay cursor. Native output custody remains
+under its separate explicit source-release authority; a collection acknowledgement
+does not delete it. This accepted CPU path has no asset inputs, so the final event
+does not claim general asset-input or shared-weight reclamation.
+
+The consumer gate found and fixed two real skew bugs: equivalent JSON number/formatting
+forms are now accepted without serialized-byte identity, and the older Creator may omit
+optional acknowledgement boot metadata. Supplied boot metadata, signatures and actual
+outcome/digest identities are still checked. Duplicate JSON keys are refused.
+
+Observer process loss left accepted inference progressing; later explicit cancellation
+recorded its actor and terminal outcome. A separate graceful SIGINT trial reached completion
+before it could prove early detach, and is retained as diagnostic evidence only. Wrong
+TLS pin, worker and workspace selections refused before creating request records.
+
+Evidence: `outputs/cozy-machine-continued-20261002/ordinary-cli-cpu-fixture/ORDINARY-CLI.md`
+and the sibling JSON/event/output artifacts. Issue #3 stays open for complete public-service
+crash/OS-supervisor boundaries, package types and delivery consumers. Automatic receipt
+refresh, Hub packages, jobs, browser media and GPU execution through this API remain
+unqualified. The earlier sections describe component fixtures, not these integrated gates.

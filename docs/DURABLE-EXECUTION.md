@@ -175,6 +175,8 @@ immutable binding conflicts and reopen. Closing a running CPU inference leaves i
 it completes normally; closing absent acceptance blocks a late submit. Sixteen concurrent
 accept/close races each produce exactly one durable known outcome.
 
-These are supervision component checks. Ordinary Creator CLI, installed Runtime author
-bridge, full public-service crash boundaries, systemd/container reaping, browser/Hub consumers,
-child calls and diffusion/GPU/NCCL qualification remain separate required gates.
+These are supervision component checks. The integrated opt-in ordinary Creator CPU
+application now has separate inference/collection evidence in `docs/FRONT-DOOR.md`;
+the installed Runtime author bridge is also tested separately. Full public-service crash
+boundaries, systemd/container reaping, browser/Hub consumers, child calls and
+diffusion/GPU/NCCL qualification remain required gates.
