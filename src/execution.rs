@@ -1,7 +1,7 @@
 //! CPU runner supervision. Scheduling policy remains with the machine owner.
 use crate::journal::{
     Artifact, Execution, Invocation, Journal, Outcome, ProcessBirth, ProgressSnapshot,
-    ResultRecord, State,
+    ResultRecord, State, SubmissionContext,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -163,6 +163,65 @@ impl Engine {
         overlay_observation(&mut record, &owned, &progress);
         Ok(record)
     }
+    pub fn workspace_id(&self) -> String {
+        self.journal.lock().unwrap().workspace_id().into()
+    }
+
+    pub fn submit_public(
+        &self,
+        context: SubmissionContext,
+        invocation: Invocation,
+    ) -> io::Result<Execution> {
+        let owned = self.owned.lock().unwrap();
+        let progress = self.progress.lock().unwrap();
+        let mut record = self
+            .journal
+            .lock()
+            .unwrap()
+            .accept_public(context, invocation)?;
+        overlay_observation(&mut record, &owned, &progress);
+        drop(progress);
+        drop(owned);
+        self.notify_activity();
+        Ok(record)
+    }
+
+    pub fn get_public(&self, actor: &str, request_id: &str) -> io::Result<Execution> {
+        let owned = self.owned.lock().unwrap();
+        let progress = self.progress.lock().unwrap();
+        let mut record = self.journal.lock().unwrap().get_public(actor, request_id)?;
+        overlay_observation(&mut record, &owned, &progress);
+        Ok(record)
+    }
+
+    pub fn list_actor(&self, actor: &str, limit: usize) -> io::Result<Vec<Execution>> {
+        self.select(|journal| journal.list_actor(actor, limit))
+    }
+
+    pub fn close_submission(
+        &self,
+        actor: &str,
+        submission_id: &str,
+        request_id: &str,
+        expected_workspace_id: &str,
+    ) -> io::Result<Option<Execution>> {
+        let owned = self.owned.lock().unwrap();
+        let progress = self.progress.lock().unwrap();
+        let mut record = self.journal.lock().unwrap().close_submission(
+            actor,
+            submission_id,
+            request_id,
+            expected_workspace_id,
+        )?;
+        if let Some(record) = &mut record {
+            overlay_observation(record, &owned, &progress);
+        }
+        drop(progress);
+        drop(owned);
+        self.notify_activity();
+        Ok(record)
+    }
+
     pub fn list(&self) -> io::Result<Vec<Execution>> {
         let owned = self.owned.lock().unwrap();
         let progress = self.progress.lock().unwrap();
