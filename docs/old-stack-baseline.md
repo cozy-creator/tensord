@@ -133,3 +133,13 @@ that source unchanged and prepares the shorter root `/workspace/cm-old4/root`, p
 with a new machine/key identity and the same SDK/store/requests. Its CPU preparation calls
 the actual SDK socket guard before creating files and records the prospective socket length.
 Every terminal, including refusals, is now retained before the driver checks success.
+
+V4's safe root nevertheless replayed the identical V3 refusal: all these fixtures share
+the same TensorFS store, and Runtime99's durable workspace is deliberately
+`<store>/.cozy-workspace/journal.sqlite3` (`workspace.py:205,462–467`). The Go host rewrites
+verified callers to its fixed Runtime owner (`claims.go:23–25`), so the repeated transaction
+name `old-baseline-0` found its old receipt/terminal. There was no inherited global COZY_HOME.
+V5 uses a request/submission prefix derived from each fresh fixture's machine/key identity,
+retained in its typed config; names stay stable within that fixture for observer replay.
+Shared history is preserved. Workspace identity and actual acceptance receipts are recorded,
+and the new short owned root is `/workspace/cm-old5/root`, port 18446.
