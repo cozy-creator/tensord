@@ -257,6 +257,7 @@ impl NativeBackend {
                 )?;
             }
         }
+        let output_entries = output_entries(&products)?;
         let mut events = vec![];
         let first_sequence = record
             .revision
@@ -294,6 +295,9 @@ impl NativeBackend {
             json!({"code":code,"origin":origin})
         };
         body["safe_message"] = json!(message);
+        if !output_entries.is_empty() {
+            body["output_manifest"] = json!({"outputs":output_entries});
+        }
         if let Some(value) = value {
             body["result"] = json!({"result_schema_digest":schema_digest, "inline_result":STANDARD.encode(canonical(&value)?)});
         }
@@ -315,6 +319,11 @@ impl NativeBackend {
             attempt_ordinal: outcome.attempt_ordinal,
             at_ms: record.finished_at_ms,
             kind: "outcome".into(),
+            body_canonical_bytes: canonical(&json!({
+                "state":match record.state { State::Completed => "completed", State::Canceled => "canceled", _ => "failed" },
+                "outcome_id":outcome.outcome_id,
+                "outcome_digest":format!("sha256:{}",sha256::hex(&outcome.outcome_digest))
+            }))?,
             outcome: Some(outcome.clone()),
             ..Default::default()
         });
@@ -581,17 +590,10 @@ impl MachineBackend for NativeBackend {
         let interface: Value = serde_json::from_slice(&installed.interface)
             .map_err(|_| Status::data_loss("held installation interface is corrupt"))?;
         let entry = entrypoint(&interface, &root.entrypoint)?;
-        let input: Value = serde_json::from_slice(&request.payload_canonical_bytes)
+        let input: Value = crate::boundary_json::parse(&request.payload_canonical_bytes)
             .map_err(|_| Status::invalid_argument("payload is invalid JSON"))?;
-        if canonical(&input)? != request.payload_canonical_bytes {
-            return Err(Status::invalid_argument(
-                "payload must carry unambiguous canonical JSON bytes",
-            ));
-        }
-        let payload_digest = format!(
-            "sha256:{}",
-            sha256::hex(&sha256::digest(&request.payload_canonical_bytes))
-        );
+        let canonical_input = canonical(&input)?;
+        let payload_digest = format!("sha256:{}", sha256::hex(&sha256::digest(&canonical_input)));
         let binding = identity(entry)?;
         let spec = json!({"format":"cozy.worker.v1.InvocationSpec/1","installation_id":installed.alias,"payload_digest":payload_digest,"serving":{"entrypoint_binding_digest":binding,"attempt_binding_id":binding,"bindings_digest":binding}});
         let context = SubmissionContext {
@@ -1244,4 +1246,28 @@ fn product_document(product: &pb::RunProduct) -> Result<Vec<u8>, Status> {
         document["index"] = json!(product.index);
     }
     canonical(&document)
+}
+
+fn output_entries(products: &[pb::RunProduct]) -> Result<Vec<Value>, Status> {
+    let mut entries = std::collections::BTreeMap::new();
+    for product in products {
+        let document: Value = serde_json::from_slice(&product_document(product)?)
+            .map_err(|_| Status::internal("product document is invalid"))?;
+        let output_id = if product.op == pb::RunProductOp::Append as i32 {
+            format!("{}[{}]", product.output, product.index)
+        } else {
+            product.output.clone()
+        };
+        let entry = json!({
+            "output_id":output_id,
+            "digest":document["content"]["digest"],
+            "length":document["content"]["length"],
+            "mime_type":product.media_type,
+            "native_tree":document["source"]["source"]
+        });
+        if entries.insert(output_id, entry).is_some() {
+            return Err(Status::data_loss("output binding path is ambiguous"));
+        }
+    }
+    Ok(entries.into_values().collect())
 }

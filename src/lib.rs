@@ -1,4 +1,5 @@
 pub mod api;
+mod boundary_json;
 pub mod catalog;
 pub mod device_executor;
 pub mod execution;
