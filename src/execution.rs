@@ -335,10 +335,7 @@ impl Engine {
         match ready {
             RunnerEvent::Ready { pid, capabilities }
                 if pid == child.id()
-                    && capabilities.iter().any(|cap| cap == "runtime.author-cpu/1") =>
-            {
-                ()
-            }
+                    && capabilities.iter().any(|cap| cap == "runtime.author-cpu/1") => {}
             _ => {
                 return Err(io::Error::other(
                     "runner did not offer CPU author capability for its actual PID",
