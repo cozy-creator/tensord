@@ -11,4 +11,5 @@ pub mod native_inputs;
 pub(crate) mod os;
 pub mod owner;
 pub mod protocol;
+pub mod resident_custody;
 pub mod service;
