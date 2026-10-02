@@ -164,6 +164,8 @@ pub enum DeviceCommand {
         attention_pin: String,
         host_tier: bool,
         stages: bool,
+        #[serde(skip_serializing_if = "is_false")]
+        descriptor_sources: bool,
     },
     Activate {
         construction: String,
@@ -229,6 +231,7 @@ pub enum Event {
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
+    ModelSourceRead,
     HostTier,
     BudgetCell,
     StageEnter,
@@ -239,6 +242,17 @@ pub enum Kind {
     StageMemoStore,
     Progress,
     ExecutionActivity,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceRole {
+    Header,
+    Asset,
+    Object,
     #[default]
     #[serde(other)]
     Unknown,
@@ -309,6 +323,9 @@ pub struct Frame {
     pub descriptor: bool,
     pub name: String,
     pub layout: String,
+    pub manifest: String,
+    pub role: SourceRole,
+    pub length: u64,
     pub offer: bool,
     pub method: String,
     pub components: Vec<String>,
@@ -331,6 +348,8 @@ pub struct Answer {
     pub held: bool,
     pub budget_bytes: i64,
     pub descriptor: bool,
+    pub sha256: String,
+    pub length: u64,
 }
 impl Answer {
     pub fn unavailable(seq: u64) -> Self {
@@ -343,6 +362,8 @@ impl Answer {
             held: false,
             budget_bytes: -1,
             descriptor: false,
+            sha256: String::new(),
+            length: 0,
         }
     }
 }
@@ -641,6 +662,25 @@ impl DeviceExecutor {
                 "stage-turn capability absent",
             ));
         }
+        if let DeviceCommand::Load {
+            descriptor_sources: true,
+            sequence_parallel_degree,
+            ..
+        } = command
+        {
+            if *sequence_parallel_degree != 1
+                || !self
+                    .hello
+                    .memory
+                    .iter()
+                    .any(|cap| cap == "model_sources.descriptors/1")
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "descriptor model sources require qualified world-one capability",
+                ));
+            }
+        }
         write_frame(&mut self.stream, command)?;
         loop {
             let frame = read_frame(&mut self.stream)?
@@ -654,6 +694,25 @@ impl DeviceExecutor {
                         None
                     };
                     let (mut answer, descriptor) = services.request(&frame, descriptor)?;
+                    if frame.kind == Kind::ModelSourceRead && answer.ok {
+                        let source = descriptor.as_ref().ok_or_else(|| {
+                            io::Error::other("successful model source omitted readonly file")
+                        })?;
+                        let flags = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_GETFL) };
+                        if flags < 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        if flags & libc::O_ACCMODE != libc::O_RDONLY
+                            || flags & libc::O_PATH != 0
+                            || !source.metadata()?.is_file()
+                            || source.metadata()?.len() != answer.length
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "model source is not the declared readonly regular file",
+                            ));
+                        }
+                    }
                     answer.event = "answer";
                     answer.seq = frame.seq;
                     answer.descriptor = descriptor.is_some();
