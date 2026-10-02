@@ -32,13 +32,16 @@ PYTHON -I -m cozy_runtime.internal.trampoline --expect-parent <pid> --oom-adj 10
 - Any outgoing object key named `token`, `credential`, `authorization`, `secret` or `jwt` is
   refused. Credentials cannot cross the seam.
 - Commands (`cmd`): `hello`, `start`, `load`, `activate`, `prepare_request`, `invoke`, `budget`,
-  `prefetch`, `unload`, `probe`, `shutdown`. The usual sequence is
+  `prefetch`, `share`, `revoke`, `unload`, `probe`, `shutdown`. The usual sequence is
   Hello -> Start -> Load -> Activate -> PrepareRequest -> Invoke.
 - While waiting for a reply, `event=progress` frames go to `Services::progress`. `event=request`
   frames (optionally with an `SCM_RIGHTS` fd) go to `Services::request`. The reply must name the
   command, otherwise it is an error. Unknown events and fields are ignored.
 - `Baseline` services answer every request `capability_unavailable`.
 - A successful `model_source_read` answer must pass a read-only regular-file fd of the declared length.
+- `device_tier` requests carry `descriptors: N` and are followed by N fds (an offer's exported GPU
+  chunks); the answer names its own `descriptors` and the fds follow it (an ask that is `held`).
+  They go to `Services::device_tier` ([resident custody](RESIDENT-CUSTODY.md)).
 
 ## Capabilities
 
@@ -48,6 +51,8 @@ PYTHON -I -m cozy_runtime.internal.trampoline --expect-parent <pid> --oom-adj 10
 |---|---|
 | `Start.import_only` | `import_only` |
 | `Load.host_tier`, `Budget` | `weight_plane/1` |
+| `Load.device_weights`, `share` | `weights.attach/1` |
+| `revoke` | `weights.revoke/1` |
 | `Load.stages`, `Invoke.stages` | `stage/1` |
 | `Load.descriptor_sources` | `model_sources.descriptors/1` and degree 1 |
 | `Load.host_tier_owner` | `host_tiers.owner/1`, `host_tier`, and degree 1 |

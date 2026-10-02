@@ -24,6 +24,8 @@ use std::{
 };
 
 pub const MAX_DEVICE_FRAME: usize = 64 * 1024;
+/// Chunks of one weight set's shared GPU regions crossing in one exchange.
+const MAX_SHARED_FDS: u32 = 1 << 16;
 pub const RESULT_DOCUMENT: &str = "result.canonical";
 
 #[derive(Clone, Debug)]
@@ -175,6 +177,9 @@ pub enum DeviceCommand {
         descriptor_sources: bool,
         #[serde(skip_serializing_if = "is_false")]
         host_tier_owner: bool,
+        /// Attach GPU weights the machine keeps (`weights.attach/1`).
+        #[serde(skip_serializing_if = "is_false")]
+        device_weights: bool,
     },
     Activate {
         construction: String,
@@ -203,6 +208,13 @@ pub enum DeviceCommand {
     Prefetch {
         construction: String,
     },
+    /// Offer the machine every GPU region filled and not shared yet (`weights.attach/1`).
+    Share,
+    /// Release the machine's GPU regions of one layout (`weights.revoke/1`).
+    Revoke {
+        layout: String,
+        generation: u64,
+    },
     Unload {
         construction: String,
     },
@@ -222,6 +234,8 @@ impl DeviceCommand {
             Self::Invoke { .. } => "invoke",
             Self::Budget { .. } => "budget",
             Self::Prefetch { .. } => "prefetch",
+            Self::Share => "share",
+            Self::Revoke { .. } => "revoke",
             Self::Unload { .. } => "unload",
             Self::Probe { .. } => "probe",
         }
@@ -243,6 +257,7 @@ pub enum Kind {
     ModelSourceRead,
     HostTierPrepare,
     HostTier,
+    DeviceTier,
     BudgetCell,
     StageEnter,
     StageExit,
@@ -415,6 +430,12 @@ pub struct Frame {
     pub position: Option<u64>,
     pub total: Option<u64>,
     pub advance: u64,
+    /// `device_tier`: fds that follow the frame, one per chunk of `regions`.
+    pub descriptors: u32,
+    pub device: String,
+    pub regions: Vec<crate::resident_custody::SharedRegion>,
+    pub shared_bytes: u64,
+    pub released_bytes: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -429,6 +450,14 @@ pub struct Answer {
     pub descriptor: bool,
     pub sha256: String,
     pub length: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub generation: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub regions: Vec<crate::resident_custody::SharedRegion>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub duplicate: bool,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub descriptors: u64,
 }
 impl Answer {
     pub fn unavailable(seq: u64) -> Self {
@@ -443,6 +472,10 @@ impl Answer {
             descriptor: false,
             sha256: String::new(),
             length: 0,
+            generation: 0,
+            regions: Vec::new(),
+            duplicate: false,
+            descriptors: 0,
         }
     }
 }
@@ -456,6 +489,16 @@ pub trait Services {
     ) -> io::Result<(Answer, Option<File>)> {
         drop(descriptor);
         Ok((Answer::unavailable(frame.seq), None))
+    }
+    /// `device_tier` (`weights.attach/1`): `fds` arrived with the request; the returned ones
+    /// follow the answer.
+    fn device_tier(
+        &mut self,
+        frame: &Frame,
+        fds: Vec<std::os::fd::OwnedFd>,
+    ) -> io::Result<(Answer, Vec<std::os::fd::OwnedFd>)> {
+        drop(fds);
+        Ok((Answer::unavailable(frame.seq), Vec::new()))
     }
 }
 
@@ -841,6 +884,20 @@ impl DeviceExecutor {
                 "stage-turn capability absent",
             ));
         }
+        let sharing = match command {
+            DeviceCommand::Load { device_weights, .. } => *device_weights,
+            DeviceCommand::Share => true,
+            _ => false,
+        };
+        if (sharing && !self.hello.offers("weights.attach/1"))
+            || (matches!(command, DeviceCommand::Revoke { .. })
+                && !self.hello.offers("weights.revoke/1"))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "shared GPU weight capability absent",
+            ));
+        }
         if matches!(command, DeviceCommand::Budget { .. }) && !self.hello.offers("weight_plane/1") {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -883,6 +940,24 @@ impl DeviceExecutor {
                 .ok_or_else(|| io::Error::other("stock executor EOF before reply"))?;
             match frame.event {
                 Some(Event::Progress) => services.progress(&frame),
+                Some(Event::Request) if frame.kind == Kind::DeviceTier => {
+                    if frame.descriptors > MAX_SHARED_FDS {
+                        return Err(io::Error::other("device tier names too many descriptors"));
+                    }
+                    let mut fds = Vec::with_capacity(frame.descriptors as usize);
+                    for _ in 0..frame.descriptors {
+                        fds.push(protocol::recv_fd(&self.stream)?);
+                    }
+                    let (mut answer, out) = services.device_tier(&frame, fds)?;
+                    answer.event = "answer";
+                    answer.seq = frame.seq;
+                    answer.descriptor = false;
+                    answer.descriptors = out.len() as u64;
+                    write_frame(&mut self.stream, &answer)?;
+                    for fd in &out {
+                        protocol::send_fd(&self.stream, fd)?;
+                    }
+                }
                 Some(Event::Request) => {
                     let descriptor = if frame.descriptor {
                         Some(File::from(protocol::recv_fd(&self.stream)?))
@@ -1048,6 +1123,9 @@ pub fn read_result(spool: &Path, reply: &Frame) -> io::Result<Value> {
         ));
     }
     serde_json::from_slice(&bytes).map_err(io::Error::other)
+}
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 fn is_false(value: &bool) -> bool {
     !*value

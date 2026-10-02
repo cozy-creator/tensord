@@ -1,397 +1,418 @@
-//! Live resident custody, using the existing Engine's actor/attempt/process authority.
-//! No scheduler, CUDA calls, timer kills, second journal or restart handle adoption.
-use crate::execution::{process_birth, process_ended, Engine};
-use crate::journal::{ProcessBirth, State};
+//! Degree 2 custody: GPU weight regions an executor filled, exported and offered stay alive
+//! here as the driver's own fds. This process never loads CUDA: an exported fd is the
+//! allocation's reference, closing the last reference anywhere frees it. Other executors on
+//! the GPU attach duplicates read-only. Bytes are counted once per GPU, until every reader has
+//! released or ended and the fds here are closed.
+use crate::execution::process_ended;
+use crate::journal::ProcessBirth;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io;
-use std::os::fd::AsRawFd;
-use std::sync::Arc;
+use std::os::fd::{AsFd, OwnedFd};
+use std::time::Instant;
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AllocationId {
-    pub owner_epoch: String,
-    pub id: String,
-    pub generation: u64,
-}
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ResidentKey {
+/// Region spans are multiples of the VMM granularity every supported GPU divides.
+const GRANULE: u64 = 2 << 20;
+
+/// One holding: one weight-set layout on one GPU, shared only within one actor.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct HoldingKey {
     pub actor: String,
-    pub device_uuid: String,
-    pub content_sha256: String,
-    pub layout_sha256: String,
-    pub representation: String,
+    /// GPU UUID.
+    pub device: String,
+    /// TensorFS plane layout digest: the same bytes at the same offsets.
+    pub layout: String,
 }
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+
+/// One plane region: its chunks' bytes in address order (one fd each).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedRegion {
+    pub region: u32,
+    pub chunks: Vec<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
-    Filling,
+    /// Attachable.
     Ready,
+    /// No new attachments; charged until every reader released or ended.
     Revoking,
-    Quarantined,
-    Releasing,
 }
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Role {
-    Writer,
-    Reader,
-}
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Ticket {
-    pub allocation: AllocationId,
-    pub lease: String,
-    pub execution_id: String,
-    pub process: ProcessBirth,
-    pub role: Role,
-}
+
 #[derive(Clone, Debug, Serialize)]
-pub struct Record {
-    pub allocation: AllocationId,
-    pub key: ResidentKey,
-    pub physical_bytes: u64,
+pub struct HoldingFacts {
+    pub key: HoldingKey,
+    pub name: String,
+    pub generation: u64,
+    pub bytes: u64,
     pub phase: Phase,
-    pub recipients: Vec<Ticket>,
-}
-/// Actual native backing and host-source obligations, never serialized/adopted by an ID.
-pub struct Resources {
-    pub backing: Arc<dyn Send + Sync>,
-    pub sources: Arc<dyn Send + Sync>,
-}
-struct Recipient {
-    ticket: Ticket,
-    death: File,
-}
-struct Resident {
-    record: Record,
-    resources: Option<Resources>,
-    recipients: BTreeMap<String, Recipient>,
+    pub readers: Vec<ProcessBirth>,
+    pub idle_ms: u64,
 }
 
-/// Completion cannot be made by deserializing a peer's boolean or progress counter.
-pub struct NativeCompletion {
-    ticket: Ticket,
-}
-impl NativeCompletion {
-    /// # Safety
-    /// Only a qualified native bridge may mint this after it fenced all new uses/views,
-    /// proved every successful DMA/kernel complete, unmapped that generation, released
-    /// tensor owners/imported handles and closed every recipient export-FD duplicate.
-    /// A CPU acknowledgement, socket EOF or one copy-stream event does not suffice.
-    pub unsafe fn after_native_release(ticket: Ticket) -> Self {
-        Self { ticket }
-    }
+pub struct Attachment {
+    pub generation: u64,
+    pub regions: Vec<SharedRegion>,
+    /// Duplicates for the reader, in `regions` order; close-on-exec.
+    pub fds: Vec<OwnedFd>,
 }
 
-/// Single device actor's bounded live inventory. Hardware eligibility belongs to the
-/// existing supervisor. These methods never advertise a capability or launch work.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Offered {
+    Kept {
+        generation: u64,
+    },
+    /// Another executor's offer of the same layout is held; the offered fds were closed.
+    Duplicate,
+}
+
+/// An executor that maps a holding: its exact birth and its pidfd.
+pub struct Reader {
+    pub birth: ProcessBirth,
+    pub exit: File,
+}
+
+struct Holding {
+    name: String,
+    generation: u64,
+    regions: Vec<SharedRegion>,
+    fds: Vec<OwnedFd>,
+    bytes: u64,
+    phase: Phase,
+    readers: Vec<Reader>,
+    used: Instant,
+}
+
+#[derive(Default)]
 pub struct ResidentCustody {
-    engine: Arc<Engine>,
-    epoch: String,
-    maximum_allocations: usize,
-    maximum_recipients: usize,
-    residents: BTreeMap<String, Resident>,
+    generation: u64,
+    holdings: BTreeMap<HoldingKey, Holding>,
 }
-fn invalid(detail: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, detail)
-}
-fn conflict(detail: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::PermissionDenied, detail)
-}
+
 impl ResidentCustody {
-    pub fn new(engine: Arc<Engine>, maximum_allocations: usize, maximum_recipients: usize) -> Self {
-        Self {
-            engine,
-            epoch: uuid::Uuid::new_v4().to_string(),
-            maximum_allocations,
-            maximum_recipients,
-            residents: BTreeMap::new(),
+    /// Keep an executor's exported regions. The offering executor is the first reader (its
+    /// own mapping is a reference too).
+    pub fn offer(
+        &mut self,
+        key: HoldingKey,
+        name: &str,
+        regions: Vec<SharedRegion>,
+        fds: Vec<OwnedFd>,
+        reader: Reader,
+    ) -> io::Result<Offered> {
+        validate(&key, &regions, &fds)?;
+        if let Some(held) = self.holdings.get(&key) {
+            return match held.phase {
+                Phase::Ready => Ok(Offered::Duplicate),
+                Phase::Revoking => Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "this layout is being revoked on this GPU",
+                )),
+            };
+        }
+        self.generation += 1;
+        let bytes = regions.iter().flat_map(|r| &r.chunks).sum();
+        self.holdings.insert(
+            key,
+            Holding {
+                name: name.into(),
+                generation: self.generation,
+                regions,
+                fds,
+                bytes,
+                phase: Phase::Ready,
+                readers: vec![reader],
+                used: Instant::now(),
+            },
+        );
+        Ok(Offered::Kept {
+            generation: self.generation,
+        })
+    }
+
+    /// Duplicates of a Ready holding for `reader`, recorded as its lease. None: not held.
+    pub fn attach(&mut self, key: &HoldingKey, reader: Reader) -> io::Result<Option<Attachment>> {
+        let Some(held) = self.holdings.get_mut(key) else {
+            return Ok(None);
+        };
+        if held.phase != Phase::Ready {
+            return Ok(None);
+        }
+        let fds = held
+            .fds
+            .iter()
+            .map(|fd| fd.try_clone())
+            .collect::<io::Result<Vec<_>>>()?;
+        if !held.readers.iter().any(|r| r.birth == reader.birth) {
+            held.readers.push(reader);
+        }
+        held.used = Instant::now();
+        Ok(Some(Attachment {
+            generation: held.generation,
+            regions: held.regions.clone(),
+            fds,
+        }))
+    }
+
+    /// Fence new attachments of one generation; returns the readers to ask to release it.
+    pub fn begin_revoke(
+        &mut self,
+        key: &HoldingKey,
+        generation: u64,
+    ) -> io::Result<Vec<ProcessBirth>> {
+        let held = self
+            .holdings
+            .get_mut(key)
+            .filter(|h| h.generation == generation)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such holding generation"))?;
+        held.phase = Phase::Revoking;
+        Ok(held.readers.iter().map(|r| r.birth.clone()).collect())
+    }
+
+    /// A reader answered `revoke`: it unmapped and released the generation after its queued
+    /// work. A reader that could not stays charged until its process ends.
+    pub fn released(&mut self, key: &HoldingKey, generation: u64, birth: &ProcessBirth) {
+        if let Some(held) = self
+            .holdings
+            .get_mut(key)
+            .filter(|h| h.generation == generation)
+        {
+            held.readers.retain(|r| r.birth != *birth);
         }
     }
-    pub fn epoch(&self) -> &str {
-        &self.epoch
+
+    /// Forget readers whose processes ended (their driver references ended with them), then
+    /// close every revoked holding no reader maps. Returns what was released.
+    pub fn collect(&mut self) -> Vec<(HoldingKey, u64)> {
+        for held in self.holdings.values_mut() {
+            held.readers.retain(|r| {
+                !(crate::os::ended(&r.exit) && process_ended(&r.birth).unwrap_or(false))
+            });
+        }
+        let done: Vec<HoldingKey> = self
+            .holdings
+            .iter()
+            .filter(|(_, h)| h.phase == Phase::Revoking && h.readers.is_empty())
+            .map(|(k, _)| k.clone())
+            .collect();
+        done.into_iter()
+            .filter_map(|key| self.holdings.remove(&key).map(|h| (key, h.bytes)))
+            .collect()
     }
-    pub fn charged_bytes(&self) -> u64 {
-        self.residents
-            .values()
-            .map(|r| r.record.physical_bytes)
+
+    /// Holdings `birth` maps: (key, generation).
+    pub fn read_by(&self, birth: &ProcessBirth) -> Vec<(HoldingKey, u64)> {
+        self.holdings
+            .iter()
+            .filter(|(_, h)| h.readers.iter().any(|r| r.birth == *birth))
+            .map(|(k, h)| (k.clone(), h.generation))
+            .collect()
+    }
+
+    /// Every holding on `device`, Ready or Revoking: counted once, until released.
+    pub fn charged_bytes(&self, device: &str) -> u64 {
+        self.holdings
+            .iter()
+            .filter(|(k, _)| k.device == device)
+            .map(|(_, h)| h.bytes)
             .sum()
     }
-    pub fn records(&self) -> Vec<Record> {
-        self.residents
-            .values()
-            .map(|resident| {
-                let mut record = resident.record.clone();
-                record.recipients = resident
-                    .recipients
-                    .values()
-                    .map(|r| r.ticket.clone())
-                    .collect();
-                record
+
+    pub fn holdings(&self) -> Vec<HoldingFacts> {
+        self.holdings
+            .iter()
+            .map(|(key, h)| HoldingFacts {
+                key: key.clone(),
+                name: h.name.clone(),
+                generation: h.generation,
+                bytes: h.bytes,
+                phase: h.phase,
+                readers: h.readers.iter().map(|r| r.birth.clone()).collect(),
+                idle_ms: h.used.elapsed().as_millis() as u64,
             })
             .collect()
     }
-    /// Register real backing already created by the native actor. Capacity is a typed
-    /// waiting condition for the supervisor's paging/eviction ladder, not request refusal.
-    pub fn register(
-        &mut self,
-        key: ResidentKey,
-        physical_bytes: u64,
-        resources: Resources,
-    ) -> io::Result<AllocationId> {
-        let digest = |value: &str| {
-            value.len() == 64
-                && value
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        };
-        if key.actor.is_empty()
-            || key.device_uuid.is_empty()
-            || key.representation.is_empty()
-            || !digest(&key.content_sha256)
-            || !digest(&key.layout_sha256)
-            || physical_bytes == 0
-        {
-            return Err(invalid("resident identity/layout/backing is incomplete"));
+}
+
+fn invalid(detail: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, detail.to_string())
+}
+
+fn validate(key: &HoldingKey, regions: &[SharedRegion], fds: &[OwnedFd]) -> io::Result<()> {
+    let hex = key.layout.len() == 64
+        && key
+            .layout
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if key.actor.is_empty() || key.device.is_empty() || !hex || regions.is_empty() {
+        return Err(invalid(
+            "a holding needs an actor, a GPU, a layout digest and regions",
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut chunks = 0;
+    for r in regions {
+        if !seen.insert(r.region) || r.chunks.is_empty() {
+            return Err(invalid("regions repeat or carry no chunks"));
         }
-        if self.residents.len() >= self.maximum_allocations {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "resident inventory full; wait/evict/use a lower rung",
-            ));
+        if r.chunks.iter().any(|&n| n == 0 || n % GRANULE != 0) {
+            return Err(invalid("a chunk is not a whole number of 2 MiB granules"));
         }
-        self.charged_bytes()
-            .checked_add(physical_bytes)
-            .ok_or_else(|| invalid("physical charge overflow"))?;
-        let allocation = AllocationId {
-            owner_epoch: self.epoch.clone(),
-            id: uuid::Uuid::new_v4().to_string(),
-            generation: 1,
-        };
-        self.residents.insert(
-            allocation.id.clone(),
-            Resident {
-                record: Record {
-                    allocation: allocation.clone(),
-                    key,
-                    physical_bytes,
-                    phase: Phase::Filling,
-                    recipients: Vec::new(),
-                },
-                resources: Some(resources),
-                recipients: BTreeMap::new(),
+        chunks += r.chunks.len();
+    }
+    if chunks != fds.len() {
+        return Err(invalid("one fd per chunk"));
+    }
+    for fd in fds {
+        // An exported VMM handle is a descriptor of the driver's control device.
+        let stat = nix::sys::stat::fstat(fd.as_fd()).map_err(io::Error::from)?;
+        if stat.st_mode & libc::S_IFMT != libc::S_IFCHR {
+            return Err(invalid("a GPU allocation must be a driver descriptor"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execution::process_birth;
+    use std::os::fd::FromRawFd;
+
+    fn devnull() -> OwnedFd {
+        // A character device stands in for a driver fd: custody never interprets it.
+        File::open("/dev/null").unwrap().into()
+    }
+    fn pidfd(pid: u32) -> File {
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+        assert!(raw >= 0);
+        unsafe { File::from_raw_fd(raw) }
+    }
+    fn reader(pid: u32) -> Reader {
+        Reader {
+            birth: process_birth(pid).unwrap(),
+            exit: pidfd(pid),
+        }
+    }
+    fn key(actor: &str) -> HoldingKey {
+        HoldingKey {
+            actor: actor.into(),
+            device: "GPU-1".into(),
+            layout: "a".repeat(64),
+        }
+    }
+    fn regions() -> Vec<SharedRegion> {
+        vec![
+            SharedRegion {
+                region: 0,
+                chunks: vec![GRANULE],
             },
-        );
-        self.engine.notify_activity();
-        Ok(allocation)
-    }
-    /// Bind the retained pidfd to an accepted actor and the Engine's exact recorded birth.
-    /// Supply the managed Executor's actual kernel pidfd, not one reconstructed from an ID.
-    pub fn attach(
-        &mut self,
-        allocation: &AllocationId,
-        execution_id: &str,
-        role: Role,
-        death: File,
-    ) -> io::Result<Ticket> {
-        let execution = self.engine.get(execution_id)?;
-        if !matches!(execution.state, State::Starting | State::Running)
-            || execution.cancel_actor.is_some()
-        {
-            return Err(conflict(
-                "execution is not authorized for a new resident attachment",
-            ));
-        }
-        let actor = &execution
-            .submission
-            .as_ref()
-            .ok_or_else(|| conflict("resident attachment needs verified public actor context"))?
-            .actor;
-        let process = execution
-            .process
-            .ok_or_else(|| conflict("accepted execution has no registered process birth"))?;
-        validate_pidfd(&death, &process)?;
-        let maximum_recipients = self.maximum_recipients;
-        let resident = self.resident_mut(allocation)?;
-        if resident.record.key.actor != *actor {
-            return Err(conflict("resident authorization domain differs"));
-        }
-        match role {
-            Role::Writer
-                if resident.record.phase == Phase::Filling && resident.recipients.is_empty() => {}
-            Role::Reader if resident.record.phase == Phase::Ready => (),
-            _ => return Err(conflict("generation is not attachable for this role")),
-        }
-        if resident.recipients.len() >= maximum_recipients {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "resident recipient capacity full; wait for actual release",
-            ));
-        }
-        let ticket = Ticket {
-            allocation: allocation.clone(),
-            lease: uuid::Uuid::new_v4().to_string(),
-            execution_id: execution_id.into(),
-            process,
-            role,
-        };
-        resident.recipients.insert(
-            ticket.lease.clone(),
-            Recipient {
-                ticket: ticket.clone(),
-                death,
+            SharedRegion {
+                region: 2,
+                chunks: vec![64 << 20, 2 * GRANULE],
             },
+        ]
+    }
+
+    #[test]
+    fn a_holding_is_counted_once_and_outlives_its_offerer_until_revoked() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let mut custody = ResidentCustody::default();
+        let fds: Vec<OwnedFd> = (0..3).map(|_| devnull()).collect();
+        let kept = custody
+            .offer(key("x"), "sdxl/unet", regions(), fds, reader(child.id()))
+            .unwrap();
+        assert_eq!(kept, Offered::Kept { generation: 1 });
+        let total = GRANULE + (64 << 20) + 2 * GRANULE;
+        assert_eq!(custody.charged_bytes("GPU-1"), total);
+
+        // A second offer of the same layout is a duplicate; another actor's is its own.
+        let dup = custody.offer(
+            key("x"),
+            "sdxl/unet",
+            regions(),
+            (0..3).map(|_| devnull()).collect(),
+            reader(std::process::id()),
         );
-        self.engine.notify_activity();
-        Ok(ticket)
+        assert_eq!(dup.unwrap(), Offered::Duplicate);
+        assert_eq!(custody.charged_bytes("GPU-1"), total);
+        assert!(custody
+            .attach(&key("y"), reader(std::process::id()))
+            .unwrap()
+            .is_none());
+
+        // The offerer dies; the holding stays and a replacement attaches duplicates.
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(custody.collect().is_empty());
+        let me = process_birth(std::process::id()).unwrap();
+        let a = custody
+            .attach(&key("x"), reader(std::process::id()))
+            .unwrap()
+            .unwrap();
+        assert_eq!((a.generation, a.fds.len(), a.regions), (1, 3, regions()));
+        assert_eq!(custody.holdings()[0].readers, vec![me.clone()]);
+
+        // Revoke fences new attachments; the bytes stay charged until the reader releases.
+        assert_eq!(
+            custody.begin_revoke(&key("x"), 1).unwrap(),
+            vec![me.clone()]
+        );
+        assert!(custody
+            .attach(&key("x"), reader(std::process::id()))
+            .unwrap()
+            .is_none());
+        assert!(custody.collect().is_empty());
+        assert_eq!(custody.charged_bytes("GPU-1"), total);
+        custody.released(&key("x"), 1, &me);
+        assert_eq!(custody.collect(), vec![(key("x"), total)]);
+        assert_eq!(custody.charged_bytes("GPU-1"), 0);
     }
-    /// Publish only after the qualified fill writer released its writable mapping/FDs.
-    /// Failed fills never become readable or reused as a completed generation.
-    pub fn complete_fill(&mut self, completed: NativeCompletion) -> io::Result<()> {
-        if completed.ticket.role != Role::Writer {
-            return Err(invalid("fill completion does not identify its writer"));
-        }
-        let resident = self.resident_mut(&completed.ticket.allocation)?;
-        if resident.record.phase != Phase::Filling {
-            return Err(conflict("fill generation is not live"));
-        }
-        remove_exact(resident, &completed.ticket)?;
-        resident.record.phase = Phase::Ready;
-        self.engine.notify_activity();
-        Ok(())
-    }
-    pub fn quarantine(&mut self, allocation: &AllocationId) -> io::Result<()> {
-        self.resident_mut(allocation)?.record.phase = Phase::Quarantined;
-        self.engine.notify_activity();
-        Ok(())
-    }
-    /// Fence new leases, then ask existing holders to stop uses and release at a safe boundary.
-    /// A progressing holder remains charged; this function has no kill/deadline policy.
-    pub fn begin_revoke(&mut self, allocation: &AllocationId) -> io::Result<Vec<Ticket>> {
-        let resident = self.resident_mut(allocation)?;
-        if resident.record.phase == Phase::Releasing {
-            return Err(conflict("allocation already awaits physical release"));
-        }
-        resident.record.phase = Phase::Revoking;
-        let tickets = resident
-            .recipients
-            .values()
-            .map(|r| r.ticket.clone())
-            .collect();
-        self.engine.notify_activity();
-        Ok(tickets)
-    }
-    pub fn release_recipient(&mut self, completed: NativeCompletion) -> io::Result<()> {
-        let resident = self.resident_mut(&completed.ticket.allocation)?;
-        if resident.record.phase == Phase::Filling {
-            return Err(conflict("writer must complete or quarantine the fill"));
-        }
-        remove_exact(resident, &completed.ticket)?;
-        self.engine.notify_activity();
-        Ok(())
-    }
-    /// Kernel death + the existing Engine's exact birth are authority; terminal status,
-    /// cancellation, observer loss and telemetry silence alone cannot release a lease.
-    pub fn reap_ended(&mut self) -> io::Result<Vec<Ticket>> {
-        let mut ended = Vec::new();
-        for resident in self.residents.values_mut() {
-            let mut remove = Vec::new();
-            for (id, recipient) in &resident.recipients {
-                if crate::os::ended(&recipient.death) && process_ended(&recipient.ticket.process)? {
-                    remove.push(id.clone())
-                }
-            }
-            for id in remove {
-                let recipient = resident.recipients.remove(&id).unwrap();
-                if recipient.ticket.role == Role::Writer && resident.record.phase == Phase::Filling
-                {
-                    resident.record.phase = Phase::Quarantined;
-                }
-                ended.push(recipient.ticket);
-            }
-        }
-        if !ended.is_empty() {
-            self.engine.notify_activity()
-        }
-        Ok(ended)
-    }
-    /// Give the native device actor custody for physical release only after all recipients
-    /// ended/released. Charge remains present until confirm_physical_release succeeds.
-    pub fn take_for_release(&mut self, allocation: &AllocationId) -> io::Result<Resources> {
-        let resident = self.resident_mut(allocation)?;
-        if !matches!(resident.record.phase, Phase::Revoking | Phase::Quarantined)
-            || !resident.recipients.is_empty()
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "resident remains live or has recipient obligations",
-            ));
-        }
-        resident.record.phase = Phase::Releasing;
-        let resources = resident
-            .resources
-            .take()
-            .ok_or_else(|| conflict("native backing already handed to release actor"))?;
-        self.engine.notify_activity();
-        Ok(resources)
-    }
-    /// # Safety
-    /// The qualified actor must have closed every owner/keeper/export reference, released
-    /// native handles, and observed physical release. Logical counters, dropping an Arc
-    /// or receiving an executor's CPU acknowledgement are insufficient evidence.
-    pub unsafe fn confirm_physical_release(&mut self, allocation: &AllocationId) -> io::Result<()> {
-        let resident = self.resident_mut(allocation)?;
-        if resident.record.phase != Phase::Releasing
-            || resident.resources.is_some()
-            || !resident.recipients.is_empty()
-        {
-            return Err(conflict("allocation physical release is not pending"));
-        }
-        self.residents.remove(&allocation.id);
-        self.engine.notify_activity();
-        Ok(())
-    }
-    fn resident_mut(&mut self, id: &AllocationId) -> io::Result<&mut Resident> {
-        let resident = self.residents.get_mut(&id.id).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "resident generation does not exist",
+
+    #[test]
+    fn offers_are_validated_before_custody() {
+        let mut custody = ResidentCustody::default();
+        let me = std::process::id();
+        let mut bad = key("x");
+        bad.layout = "not-a-digest".into();
+        assert!(custody
+            .offer(
+                bad,
+                "n",
+                regions(),
+                (0..3).map(|_| devnull()).collect(),
+                reader(me)
             )
-        })?;
-        if resident.record.allocation != *id {
-            return Err(conflict("resident owner epoch/generation differs"));
-        }
-        Ok(resident)
+            .is_err());
+        assert!(custody
+            .offer(
+                key("x"),
+                "n",
+                regions(),
+                (0..2).map(|_| devnull()).collect(),
+                reader(me)
+            )
+            .is_err());
+        let odd = vec![SharedRegion {
+            region: 0,
+            chunks: vec![GRANULE + 1],
+        }];
+        assert!(custody
+            .offer(key("x"), "n", odd, vec![devnull()], reader(me))
+            .is_err());
+        let file: OwnedFd = File::open("/proc/self/stat").unwrap().into();
+        let one = vec![SharedRegion {
+            region: 0,
+            chunks: vec![GRANULE],
+        }];
+        assert!(custody
+            .offer(key("x"), "n", one, vec![file], reader(me))
+            .is_err());
+        assert_eq!(custody.charged_bytes("GPU-1"), 0);
     }
-}
-fn remove_exact(resident: &mut Resident, ticket: &Ticket) -> io::Result<()> {
-    if resident
-        .recipients
-        .get(&ticket.lease)
-        .is_none_or(|r| r.ticket != *ticket)
-    {
-        return Err(conflict(
-            "native release names another lease/process/generation",
-        ));
-    }
-    resident.recipients.remove(&ticket.lease);
-    Ok(())
-}
-fn validate_pidfd(death: &File, birth: &ProcessBirth) -> io::Result<()> {
-    let fd = death.as_raw_fd();
-    if fs::read_link(format!("/proc/self/fd/{fd}"))?.to_string_lossy() != "anon_inode:[pidfd]" {
-        return Err(invalid("recipient custody requires a kernel pidfd"));
-    }
-    let info = fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))?;
-    let pid = info.lines().find_map(|line| {
-        line.strip_prefix("Pid:")
-            .and_then(|n| n.trim().parse::<u32>().ok())
-    });
-    if pid != Some(birth.pid) || crate::os::ended(death) || process_birth(birth.pid)? != *birth {
-        return Err(conflict(
-            "pidfd does not identify the registered live process birth",
-        ));
-    }
-    Ok(())
 }

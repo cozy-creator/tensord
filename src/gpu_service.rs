@@ -8,6 +8,7 @@ use crate::{
     execution::{process_ended, Engine},
     journal::{AssetBinding, Execution, Outcome, OutputChecksum, Preparation, State},
     model_sources::{ModelSources, SelectedManifest},
+    resident_custody::{HoldingFacts, HoldingKey, Offered, Reader, ResidentCustody},
     shared_host_plane::{HostConfig, HostPeer, HostScope, SharedHostPlane},
 };
 use serde::{Deserialize, Serialize};
@@ -15,7 +16,7 @@ use std::{
     collections::BTreeMap,
     fs::{self, File},
     io,
-    os::fd::AsRawFd,
+    os::fd::{AsRawFd, OwnedFd},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -141,6 +142,8 @@ pub struct GpuPool {
     reserved: AtomicBool,
     session: Mutex<Option<Session>>,
     host: Option<Arc<SharedHostPlane>>,
+    /// Degree 2: GPU weights kept across executors. None on a GPU that drives a display.
+    custody: Option<Mutex<ResidentCustody>>,
     // Drop session/resource custody before ending the actual spawning thread.
     launcher: crate::child_launcher::ChildLauncher,
 }
@@ -189,6 +192,10 @@ impl GpuPool {
                 )
             })
             .transpose()?;
+        let custody = (!display_active(&config.devices)).then(|| {
+            raise_fd_limit();
+            Mutex::new(ResidentCustody::default())
+        });
         Ok(Arc::new(Self {
             launcher: crate::child_launcher::ChildLauncher::new()?,
             root: root.to_path_buf(),
@@ -197,10 +204,38 @@ impl GpuPool {
             reserved: AtomicBool::new(false),
             session: Mutex::new(None),
             host,
+            custody,
         }))
     }
     pub fn config(&self) -> &GpuConfig {
         &self.config
+    }
+    /// GPU weights kept across executors (Degree 2), for the memory policy. Lets go of
+    /// revoked generations whose last reader ended first.
+    pub fn resident(&self) -> Vec<HoldingFacts> {
+        self.custody.as_ref().map_or_else(Vec::new, |c| {
+            let mut custody = c.lock().unwrap();
+            log_released(custody.collect());
+            custody.holdings()
+        })
+    }
+    /// Revoke one held generation: no new attachments now; the bytes stay charged until each
+    /// reader released it at an idle boundary (now, when the pool is idle) or ended.
+    pub fn revoke(&self, key: &HoldingKey, generation: u64) -> io::Result<()> {
+        let custody = self
+            .custody
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "no GPU weight custody"))?;
+        custody.lock().unwrap().begin_revoke(key, generation)?;
+        if let Ok(mut slot) = self.session.try_lock() {
+            if let Some(session) = slot.as_mut() {
+                if let Err(error) = release_revoked(custody, &mut session.executor) {
+                    eprintln!("resident revoke left a lease charged: {error}");
+                }
+            }
+        }
+        log_released(custody.lock().unwrap().collect());
+        Ok(())
     }
     pub fn source_facts(&self, selections: &[SelectedManifest]) -> io::Result<ModelSources> {
         ModelSources::open_shared(self.store.clone(), selections)
@@ -524,6 +559,9 @@ impl GpuPool {
         plan: GpuPlan,
         slot: &mut Option<Session>,
     ) -> io::Result<()> {
+        if let Some(custody) = &self.custody {
+            log_released(custody.lock().unwrap().collect());
+        }
         if let Some(session) = slot.as_ref() {
             if process_ended(&session.executor.birth)? {
                 slot.take();
@@ -641,6 +679,7 @@ impl GpuPool {
         }
         let session = slot.as_mut().unwrap();
         let stages = self.config.stages && session.executor.hello.offers("stage/1");
+        let sharing = self.custody.is_some() && session.executor.hello.offers("weights.attach/1");
         let mut callbacks = Callbacks {
             engine,
             id,
@@ -650,6 +689,8 @@ impl GpuPool {
             completed: 0,
             host: self.host.as_ref(),
             peer: &session.peer,
+            custody: self.custody.as_ref().filter(|_| sharing),
+            exit: session.executor.observer_pidfd()?,
         };
         if !session.loaded {
             let interface_path = session.executor.root_path().join("package-interface.json");
@@ -691,6 +732,7 @@ impl GpuPool {
                     descriptor_sources: session.descriptors,
                     host_tier_owner: self.host.is_some()
                         && session.executor.hello.offers("host_tiers.owner/1"),
+                    device_weights: sharing,
                 },
                 &mut callbacks,
             )?)?;
@@ -779,7 +821,100 @@ impl GpuPool {
                 )?;
             }
         }
+        if let Some(custody) = callbacks.custody {
+            // The call is over: the GPU regions it filled outlive this executor, and
+            // generations revoked meanwhile are let go at this idle boundary.
+            let shared = session
+                .executor
+                .command(&DeviceCommand::Share, &mut callbacks);
+            let released = shared.and_then(|_| release_revoked(custody, &mut session.executor));
+            if let Err(error) = released {
+                eprintln!("device weights share/revoke failed; replacing the executor: {error}");
+                slot.take();
+            }
+        }
         Ok(())
+    }
+}
+
+/// Ask the executor to release every revoked generation it reads (it is idle here).
+fn release_revoked(
+    custody: &Mutex<ResidentCustody>,
+    executor: &mut DeviceExecutor,
+) -> io::Result<()> {
+    let pending: Vec<(HoldingKey, u64)> = {
+        let custody = custody.lock().unwrap();
+        let revoking: std::collections::BTreeSet<_> = custody
+            .holdings()
+            .into_iter()
+            .filter(|h| h.phase == crate::resident_custody::Phase::Revoking)
+            .map(|h| (h.key, h.generation))
+            .collect();
+        custody
+            .read_by(&executor.birth)
+            .into_iter()
+            .filter(|row| revoking.contains(row))
+            .collect()
+    };
+    for (key, generation) in pending {
+        let reply = executor.command(
+            &DeviceCommand::Revoke {
+                layout: key.layout.clone(),
+                generation,
+            },
+            &mut device_executor::Baseline,
+        )?;
+        if reply.ok {
+            custody
+                .lock()
+                .unwrap()
+                .released(&key, generation, &executor.birth);
+        } else {
+            // A reader that cannot release keeps its lease charged until it ends: no kill.
+            eprintln!(
+                "revoke of {} refused: {} {}",
+                key.layout, reply.code, reply.detail
+            );
+        }
+    }
+    Ok(())
+}
+
+fn log_released(released: Vec<(HoldingKey, u64)>) {
+    for (key, bytes) in released {
+        eprintln!(
+            "resident GPU weights released: {} on {}, {bytes} bytes",
+            key.layout, key.device
+        );
+    }
+}
+
+/// Degree 2 stays off on a GPU that drives a display until qualified there. Unknown is "yes".
+fn display_active(devices: &str) -> bool {
+    let output = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=display_active",
+            "--format=csv,noheader",
+            "-i",
+            devices,
+        ])
+        .output();
+    !matches!(output, Ok(o) if o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "Disabled")
+}
+
+/// Each held chunk is one fd: let the soft descriptor limit reach the hard one.
+fn raise_fd_limit() {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: writable rlimit structure; a failure leaves the current limit.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 && limit.rlim_cur < limit.rlim_max
+        {
+            limit.rlim_cur = limit.rlim_max;
+            libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+        }
     }
 }
 
@@ -831,8 +966,56 @@ struct Callbacks<'a> {
     completed: u64,
     host: Option<&'a Arc<SharedHostPlane>>,
     peer: &'a HostPeer,
+    custody: Option<&'a Mutex<ResidentCustody>>,
+    /// The executor's pidfd: a reader lease ends when it does.
+    exit: File,
 }
 impl Services for Callbacks<'_> {
+    fn device_tier(
+        &mut self,
+        frame: &Frame,
+        fds: Vec<OwnedFd>,
+    ) -> io::Result<(Answer, Vec<OwnedFd>)> {
+        let mut answer = Answer::unavailable(frame.seq);
+        let Some(custody) = self.custody else {
+            return Ok((answer, Vec::new()));
+        };
+        let key = HoldingKey {
+            actor: self.peer.actor.clone(),
+            device: frame.device.clone(),
+            layout: frame.layout.clone(),
+        };
+        let reader = Reader {
+            birth: self.peer.birth.clone(),
+            exit: self.exit.try_clone()?,
+        };
+        answer.ok = true;
+        answer.code.clear();
+        answer.detail.clear();
+        let mut custody = custody.lock().unwrap();
+        if frame.offer {
+            match custody.offer(key, &frame.name, frame.regions.clone(), fds, reader) {
+                Ok(Offered::Kept { generation }) => answer.generation = generation,
+                Ok(Offered::Duplicate) => answer.duplicate = true,
+                Err(error) => {
+                    answer.ok = false;
+                    answer.code = "device_tier_refused".into();
+                    answer.detail = error.to_string();
+                }
+            }
+            return Ok((answer, Vec::new()));
+        }
+        drop(fds);
+        Ok(match custody.attach(&key, reader)? {
+            Some(attached) => {
+                answer.held = true;
+                answer.generation = attached.generation;
+                answer.regions = attached.regions;
+                (answer, attached.fds)
+            }
+            None => (answer, Vec::new()),
+        })
+    }
     fn progress(&mut self, frame: &Frame) {
         // Zero-advance frames are telemetry (stage/position), not completed work.
         if frame.advance > 0 && (frame.request_id.is_empty() || frame.request_id == self.id) {

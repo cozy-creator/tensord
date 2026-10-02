@@ -56,7 +56,7 @@ by `Engine`; outputs are kept in native custody until the client acknowledges co
 | `shared_host_plane.rs` | Degree 1 host tier: machine-filled sealed host layouts shared across executors | `SharedHostPlane`, `HostScope`, `HostKey`, `HostTierPlan` | B1 |
 | `model_sources.rs` | Selected model byte grants (read-only descriptors) | `ModelSources`, `SelectedManifest`, `SourceGrant` | B1 |
 | `model_source_driver.rs` | Answer one executor model-source request | `answer` | B1 |
-| `resident_custody.rs` | Degree 2 resident allocation inventory (no CUDA) | `ResidentCustody`, `ResidentKey`, `Ticket` | C |
+| `resident_custody.rs` | Degree 2: executor-exported GPU regions kept as driver fds (no CUDA), leases, revocation | `ResidentCustody`, `HoldingKey`, `SharedRegion` | C |
 | `boundary_json.rs` | Strict JSON parse (no duplicate keys) for boundary records | — | D1 |
 
 The memory policy module (per-GPU and per-host ledgers, admission, grants, eviction) does not

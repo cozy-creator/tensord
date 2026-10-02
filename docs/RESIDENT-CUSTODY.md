@@ -1,32 +1,34 @@
-# Resident custody
+# Resident custody (Degree 2)
 
-`resident_custody.rs` (`ResidentCustody`) is one device actor's bounded in-memory inventory of
-device-resident weight allocations. It binds leases to Engine executions and process births. It
-does not schedule, call CUDA, journal or kill.
+`resident_custody.rs` keeps GPU weight regions alive across executors without CUDA in the
+machine. An executor fills plane regions in its own context, exports their VMM handles
+(TensorFS `Plane.export_device`) and offers the fds; the fds here are the allocation's
+references. Later executors on the GPU get duplicates and map them read-only
+(`Plane.attach_device`). Rental proof that a CUDA-free holder keeps and frees the bytes:
+`outputs/cozy-machine-takeover-20261002/C/FEASIBILITY.md`.
 
 ## Model
 
-- `ResidentKey`: `actor`, `device_uuid`, `content_sha256`, `layout_sha256`, `representation`.
-- `AllocationId`: `owner_epoch` (fresh per instance), `id`, `generation`.
-- Phases: `filling` -> `ready` -> `revoking`/`quarantined` -> `releasing` -> removed.
+- A holding is one weight-set layout on one GPU for one actor: `HoldingKey {actor, device
+  (GPU UUID), layout (plane digest)}`, a generation, regions (chunk sizes), one fd per chunk,
+  readers (exact process birth + pidfd), phase `Ready` or `Revoking`.
+- Bytes (Σ chunk sizes) are charged once per GPU from the offer until the holding is let go.
 
 ## Rules
 
-- `register` starts in `filling`. When full it returns `WouldBlock`, a wait condition, not a refusal.
-- `attach(allocation, execution_id, role, pidfd)` requires:
-  - the execution is `starting`/`running` with no cancel actor;
-  - its public actor equals `key.actor`;
-  - the fd is a kernel pidfd for Engine's recorded birth.
-  One writer may attach while `filling`. Readers attach only when `ready`.
-- `complete_fill` and `release_recipient` need a `NativeCompletion` for the exact lease. It is minted
-  only by `unsafe after_native_release`, after uses are fenced, DMA is done and handles are closed.
-- `reap_ended` needs both pidfd exit and Engine's birth check. A dead writer makes the allocation
-  `quarantined`.
-- `begin_revoke` fences new leases. `take_for_release` needs no recipients. The charge stays until
-  `unsafe confirm_physical_release`.
-- No adoption across restarts: a new epoch rejects old ids.
+- `offer`: validated (64-hex layout, 2 MiB chunks, one character-device fd per chunk). A second
+  offer of a Ready layout is `Duplicate` (its fds close; the executor attaches the held one).
+- `attach`: Ready only; records the reader.
+- `begin_revoke(key, generation)`: no new attachments. Each reader gets `revoke` at its next idle
+  boundary (`GpuPool::revoke`, or the end of the running call). A refusal keeps its lease charged
+  until the process ends: no kill.
+- `collect`: readers whose pidfd ended and whose birth is gone are dropped (the driver tore their
+  references down); a Revoking holding with no readers is removed and its fds closed.
+- No adoption across machine restarts: custody is in memory; a restart drops the fds and the
+  executors' own references keep whatever they map.
 
-## Known gaps
+## Wiring
 
-- Not wired into `GpuPool`. Nothing in production mints `NativeCompletion`.
-- `quarantine` accepts any phase, including `releasing`.
+`GpuPool` holds custody unless its GPU drives a display (`nvidia-smi display_active`; unknown =
+off). `Load.device_weights` when the executor offers `weights.attach/1`; `share` after every
+call; `GpuPool::resident()` and `GpuPool::revoke()` for the memory policy (B2).

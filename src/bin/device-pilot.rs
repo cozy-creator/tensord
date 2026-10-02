@@ -321,6 +321,7 @@ fn run() -> io::Result<()> {
             stages,
             descriptor_sources: descriptors,
             host_tier_owner: false,
+            device_weights: false,
         },
         &mut turns,
     )?;
