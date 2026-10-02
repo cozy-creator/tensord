@@ -18,6 +18,7 @@ pub mod model_sources;
 pub mod native_inputs;
 pub(crate) mod os;
 pub mod owner;
+pub mod process;
 pub mod protocol;
 pub mod published;
 pub mod resident_custody;

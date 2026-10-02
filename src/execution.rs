@@ -655,6 +655,15 @@ impl Engine {
         Ok(())
     }
 
+    /// A previous machine's process has no owner channel and is never adopted: kill that
+    /// exact birth (and its group) and wake dispatch when its exit is observed.
+    pub(crate) fn end_orphan(self: &Arc<Self>, birth: ProcessBirth) -> io::Result<()> {
+        if let Some(exact) = crate::process::Exact::open(&birth)? {
+            exact.kill()?;
+        }
+        self.watch_process(birth)
+    }
+
     pub(crate) fn register_managed(
         self: &Arc<Self>,
         id: &str,
@@ -1098,45 +1107,7 @@ fn spawn_runner(
     command.spawn()
 }
 
-pub fn process_birth(pid: u32) -> io::Result<ProcessBirth> {
-    let (start_ticks, _) = process_stat(pid)?;
-    Ok(ProcessBirth {
-        pid,
-        boot_id: fs::read_to_string("/proc/sys/kernel/random/boot_id")?
-            .trim()
-            .into(),
-        start_ticks,
-    })
-}
-
-pub fn process_ended(birth: &ProcessBirth) -> io::Result<bool> {
-    if fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim() != birth.boot_id {
-        return Ok(true);
-    }
-    match process_stat(birth.pid) {
-        Ok((start, state)) => Ok(start != birth.start_ticks || state == 'Z' || state == 'X'),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
-        Err(error) => Err(error),
-    }
-}
-
-fn process_stat(pid: u32) -> io::Result<(u64, char)> {
-    let record = fs::read_to_string(format!("/proc/{pid}/stat"))?;
-    let (_, suffix) = record
-        .rsplit_once(") ")
-        .ok_or_else(|| io::Error::other("invalid process stat"))?;
-    let fields: Vec<_> = suffix.split_whitespace().collect();
-    let start = fields
-        .get(19)
-        .ok_or_else(|| io::Error::other("process stat lacks birth"))?
-        .parse()
-        .map_err(io::Error::other)?;
-    let state = fields
-        .first()
-        .and_then(|value| value.chars().next())
-        .ok_or_else(|| io::Error::other("process stat lacks state"))?;
-    Ok((start, state))
-}
+pub use crate::process::{process_birth, process_ended};
 
 /// Walk relative components using openat+NOFOLLOW: no symlink or parent escape races.
 pub(crate) fn open_artifact(root: &Path, path: &Path) -> io::Result<File> {
