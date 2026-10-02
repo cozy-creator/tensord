@@ -683,17 +683,17 @@ impl Engine {
         fs::create_dir_all(&root)?;
         Ok(root)
     }
-
     pub(crate) fn managed_result(
         &self,
         id: &str,
+        source: &Path,
         value: Value,
         bindings: Vec<crate::journal::AssetBinding>,
     ) -> io::Result<Execution> {
         let mut paths: Vec<_> = bindings.iter().map(|b| b.relative_path.clone()).collect();
         paths.sort();
         paths.dedup();
-        let result = self.bound_custody(id, &self.staging(id)?, value, paths, bindings)?;
+        let result = self.bound_custody(id, source, value, paths, bindings)?;
         self.finish(id, Outcome::Completed(result))
     }
 

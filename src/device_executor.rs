@@ -34,6 +34,7 @@ pub struct ExecutorConfig {
     /// Explicit configuration only. Credentials never enter this child.
     pub environment: BTreeMap<String, String>,
     pub generation_hold: Option<Arc<File>>,
+    pub identity: Option<crate::launch_identity::LaunchIdentity>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -472,11 +473,13 @@ pub struct DeviceExecutor {
     codec: CodecConfig,
     exit: Option<File>,
     retained: Vec<Box<dyn Send>>,
+    identity: Option<crate::launch_identity::LaunchIdentity>,
 }
 
 #[derive(Clone)]
 pub struct Cancellation {
     root: PathBuf,
+    identity: Option<crate::launch_identity::LaunchIdentity>,
 }
 impl Cancellation {
     pub fn cancel(&self, request_id: &str) -> io::Result<()> {
@@ -490,6 +493,9 @@ impl Cancellation {
             .open(&temporary)?;
         file.write_all(request_id.as_bytes())?;
         file.sync_all()?;
+        if let Some(identity) = self.identity {
+            identity.readable(&temporary)?;
+        }
         fs::rename(temporary, self.root.join("executor.cancel"))?;
         File::open(&self.root)?.sync_all()
     }
@@ -625,19 +631,16 @@ impl DeviceExecutor {
         };
         fs::create_dir_all(&config.root)?;
         fs::set_permissions(&config.root, fs::Permissions::from_mode(0o700))?;
+        if let Some(identity) = config.identity {
+            identity.own(&config.root)?;
+        }
         let listener = UnixListener::bind(&config.socket)?;
         fs::set_permissions(&config.socket, fs::Permissions::from_mode(0o600))?;
-        let mut command = Command::new(config.python);
+        if let Some(identity) = config.identity {
+            identity.socket(&config.socket)?;
+        }
+        let mut command = crate::launch_identity::trampoline(&config.python, config.identity)?;
         command
-            .args([
-                "-I",
-                "-m",
-                "cozy_runtime.internal.trampoline",
-                "--expect-parent",
-            ])
-            .arg(std::process::id().to_string())
-            .args(["--oom-adj", "1000", "--scope-backend", "inherit", "--"])
-            .arg(&codec.python)
             .args(["-I", "-m", "cozy_runtime.internal.executor", "--socket"])
             .arg(&config.socket)
             .arg("--root")
@@ -666,6 +669,7 @@ impl DeviceExecutor {
             &birth,
             &Cancellation {
                 root: config.root.clone(),
+                identity: config.identity,
             },
         )?;
         // Wait for connection OR observed process death. No elapsed-time startup kill.
@@ -720,7 +724,16 @@ impl DeviceExecutor {
         {
             return Err(io::Error::last_os_error());
         }
-        if credential.pid != child.id() as i32 || credential.uid != unsafe { libc::geteuid() } {
+        let expected_uid = config
+            .identity
+            .map_or_else(|| unsafe { libc::geteuid() }, |identity| identity.uid);
+        let expected_gid = config
+            .identity
+            .map_or_else(|| unsafe { libc::getegid() }, |identity| identity.gid);
+        if credential.pid != child.id() as i32
+            || credential.uid != expected_uid
+            || credential.gid != expected_gid
+        {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "device executor connection differs from launched process",
@@ -737,6 +750,7 @@ impl DeviceExecutor {
             codec,
             exit: Some(pidfd),
             retained: Vec::new(),
+            identity: config.identity,
         };
         let hello = executor.command(&DeviceCommand::Hello, &mut Baseline)?;
         if !hello.ok || hello.hello.pid != executor.birth.pid {
@@ -756,6 +770,7 @@ impl DeviceExecutor {
     pub fn cancellation(&self) -> Cancellation {
         Cancellation {
             root: self.root.clone(),
+            identity: self.identity,
         }
     }
 
