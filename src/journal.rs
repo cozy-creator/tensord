@@ -110,11 +110,12 @@ impl Journal {
             .execute_batch(
                 "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
             CREATE TABLE IF NOT EXISTS executions (
-              id INTEGER PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE,
+              id INTEGER PRIMARY KEY AUTOINCREMENT, idempotency_key TEXT NOT NULL UNIQUE,
               invocation TEXT NOT NULL, record TEXT NOT NULL, state TEXT NOT NULL,
               updated_ms INTEGER NOT NULL);",
             )
             .map_err(db_error)?;
+        fs::File::open(root)?.sync_all()?;
         Ok(Self { connection })
     }
 

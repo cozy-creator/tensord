@@ -147,6 +147,9 @@ impl Engine {
     pub fn list(&self) -> io::Result<Vec<Execution>> {
         self.journal.lock().unwrap().list()
     }
+    pub fn supervising(&self) -> usize {
+        self.owned.lock().unwrap().len()
+    }
 
     /// Dispatch only after the owner's admission and trusted generation resolution.
     pub fn dispatch(self: &Arc<Self>, id: &str, config: RunnerConfig) -> io::Result<bool> {
@@ -203,7 +206,16 @@ impl Engine {
                 continue;
             }
             let ended = match &record.process {
-                Some(birth) => process_ended(birth)?,
+                Some(birth) => match process_ended(birth) {
+                    Ok(ended) => ended,
+                    Err(error) => {
+                        eprintln!(
+                            "execution {}: cannot prove executor termination: {error}",
+                            record.id
+                        );
+                        continue;
+                    }
+                },
                 None => true,
             };
             if !ended {
@@ -574,13 +586,13 @@ fn open_artifact(root: &Path, path: &Path) -> io::Result<File> {
     for (index, name) in parts.iter().enumerate() {
         let name = CString::new(name.as_bytes()).map_err(io::Error::other)?;
         let final_component = index + 1 == parts.len();
-        let flags = libc::O_RDONLY
-            | libc::O_CLOEXEC
+        // O_PATH inspects the final inode without opening devices or blocking on FIFOs.
+        let flags = libc::O_CLOEXEC
             | libc::O_NOFOLLOW
             | if final_component {
-                0
+                libc::O_PATH
             } else {
-                libc::O_DIRECTORY
+                libc::O_RDONLY | libc::O_DIRECTORY
             };
         // SAFETY: live directory descriptor and NUL-terminated component, no pointer outputs.
         let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
@@ -596,7 +608,8 @@ fn open_artifact(root: &Path, path: &Path) -> io::Result<File> {
                     "artifact is not a regular file",
                 ));
             }
-            return Ok(file);
+            // Reopen this exact, retained regular inode through our descriptor, not its name.
+            return File::open(format!("/proc/self/fd/{}", file.as_raw_fd()));
         }
         directory = file;
     }
