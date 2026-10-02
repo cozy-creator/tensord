@@ -96,7 +96,8 @@ mutation, but this CPU foundation does not claim to contain untrusted packages.
 
 ## Evidence
 
-`cargo test --test durable_execution` checks actual-process/socket/filesystem cases:
+`cargo test --test durable_execution` passed nine actual-process/socket/filesystem cases
+(2.68 s; one explicitly invoked child helper is ignored by the parent harness):
 CPU matrix inference and persisted output; observer-safe duplicate acceptance; explicit
 executor SIGKILL without repeated effects; actor-attributed cooperative cancel; visible
 launch failure followed by changed-interpreter retry; symlink escape and mutation detection;
