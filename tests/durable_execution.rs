@@ -9,7 +9,7 @@ use journal::{Invocation, Journal, State};
 use serde_json::json;
 use std::{
     fs,
-    io::Read,
+    io::{Read, Write},
     path::PathBuf,
     process::{Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
@@ -79,7 +79,46 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
+        let _ = fs::write(self.root.join("release"), b"fixture cleanup");
+        if let Ok(records) = self.engine.list() {
+            for record in records {
+                if !record.state.terminal() {
+                    let _ = self.engine.cancel(&record.id, "test-fixture-teardown");
+                }
+            }
+        }
+        // An observation deadline does not authorize a kill or deleting a live generation.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let _ = self.engine.reconcile();
+            let settled = self
+                .engine
+                .list()
+                .map(|records| {
+                    records
+                        .iter()
+                        .all(|record| record.state.terminal() || record.process.is_none())
+                })
+                .unwrap_or(false);
+            if settled && self.engine.supervising() == 0 {
+                let _ = fs::remove_dir_all(&self.root);
+                break;
+            }
+            if Instant::now() > deadline {
+                eprintln!("preserving live fixture {}", self.root.display());
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+struct OwnedFaultProcess(std::process::Child);
+impl Drop for OwnedFaultProcess {
+    fn drop(&mut self) {
+        // Explicit teardown of the test-owned fault driver, never a product kill policy.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 
@@ -204,6 +243,13 @@ fn durable_custody_rejects_symlink_escape_and_detects_mutation() {
             .state,
         State::Failed
     );
+    let fifo_id = fixture.submit("fifo");
+    assert_eq!(
+        fixture
+            .wait(&fifo_id, |record| record.state.terminal())
+            .state,
+        State::Failed
+    );
     let id = fixture.submit("infer");
     let record = fixture.wait(&id, |record| record.state.terminal());
     let path = fixture
@@ -312,6 +358,95 @@ fn idempotency_compares_semantics_and_additive_runner_fields_are_tolerated() {
     );
 }
 
+#[test]
+fn actual_owner_death_waits_for_orphan_then_fails_without_repeating_effects() {
+    let fixture = Fixture::new();
+    let mut owner = OwnedFaultProcess(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "owner_process_fixture",
+                "--nocapture",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let config = json!({"state":fixture.root.join("state"),"imports":fixture.root,"invocation":fixture.invocation("wait")});
+    writeln!(owner.0.stdin.as_mut().unwrap(), "{config}").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let record = loop {
+        if let Ok(record) = fixture.engine.get("1") {
+            if record.completed_units == 1 {
+                break record;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "child owner failed to start its package"
+        );
+        thread::sleep(Duration::from_millis(5));
+    };
+    let birth = record.process.unwrap();
+    owner.0.kill().unwrap();
+    owner.0.wait().unwrap();
+    fixture.engine.reconcile().unwrap();
+    assert_eq!(
+        fixture.engine.get(&record.id).unwrap().state,
+        State::Running
+    );
+    assert!(!execution::process_ended(&birth).unwrap());
+    fs::write(fixture.root.join("release"), b"continue").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !execution::process_ended(&birth).unwrap() {
+        assert!(
+            Instant::now() < deadline,
+            "orphan has not completed the authored package"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    fixture.engine.reconcile().unwrap();
+    assert_eq!(fixture.engine.get(&record.id).unwrap().state, State::Failed);
+    assert!(!fixture
+        .engine
+        .dispatch(&record.id, fixture.config())
+        .unwrap());
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("effect")).unwrap(),
+        "once\n"
+    );
+}
+
+/// Explicitly selected child-process fixture; its input is typed stdin configuration.
+#[test]
+#[ignore = "launched only by actual_owner_death component test"]
+fn owner_process_fixture() {
+    use std::io::BufRead;
+    let mut input = String::new();
+    std::io::stdin().lock().read_line(&mut input).unwrap();
+    let config: serde_json::Value = serde_json::from_str(&input).unwrap();
+    let engine = Engine::open(std::path::Path::new(config["state"].as_str().unwrap())).unwrap();
+    let invocation: Invocation = serde_json::from_value(config["invocation"].clone()).unwrap();
+    let record = engine.submit("owner-death", invocation).unwrap();
+    engine
+        .dispatch(
+            &record.id,
+            RunnerConfig {
+                python: "/usr/bin/python3".into(),
+                module: "runner_fixture".into(),
+                import_paths: vec![PathBuf::from(config["imports"].as_str().unwrap())],
+                generation_hold: None,
+            },
+        )
+        .unwrap();
+    // Remain the actual owner until explicitly killed by the parent fault experiment.
+    let mut control = String::new();
+    std::io::stdin().read_to_string(&mut control).unwrap();
+}
+
 const RUNNER: &str = r#"
 import argparse, importlib, json, os, socket, struct, threading
 p=argparse.ArgumentParser();p.add_argument('--execution-fd',type=int,required=True);a=p.parse_args()
@@ -361,6 +496,9 @@ def infer(inputs, output_root, canceled, progress):
     root=Path(output_root)
     if inputs['mode']=='symlink':
         (root/'prediction').symlink_to('/etc/passwd')
+    elif inputs['mode']=='fifo':
+        import os
+        os.mkfifo(root/'prediction')
     else:(root/'prediction').write_text(','.join(map(str,prediction))+'\n')
     return {'prediction':prediction},['prediction']
 "#;
