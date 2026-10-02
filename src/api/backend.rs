@@ -4,7 +4,10 @@ use super::{
     pb,
     workspaces::{UploadedPackage, WorkspaceUploads},
 };
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tonic::Status;
 
 pub trait MachineBackend: Send + Sync + 'static {
@@ -33,6 +36,14 @@ pub trait MachineBackend: Send + Sync + 'static {
         _: pb::MachineExecutionEventsQuery,
     ) -> Result<pb::MachineExecutionEventPage, Status> {
         unsupported()
+    }
+    fn events_observed(
+        &self,
+        actor: VerifiedActor,
+        request: pb::MachineExecutionEventsQuery,
+        _: Observation,
+    ) -> Result<pb::MachineExecutionEventPage, Status> {
+        self.events(actor, request)
     }
     fn control(
         &self,
@@ -76,6 +87,15 @@ pub trait MachineBackend: Send + Sync + 'static {
     ) -> Result<Vec<pb::NativeByteReadChunk>, Status> {
         unsupported()
     }
+    fn read_stream(
+        &self,
+        actor: VerifiedActor,
+        request: pb::NativeByteReadCall,
+    ) -> Result<NativeByteStream, Status> {
+        Ok(Box::new(
+            self.read_bytes(actor, request)?.into_iter().map(Ok),
+        ))
+    }
     fn uploads(&self) -> Option<Arc<WorkspaceUploads>> {
         None
     }
@@ -86,6 +106,22 @@ pub trait MachineBackend: Send + Sync + 'static {
         _: Option<UploadedPackage>,
     ) -> Result<Vec<pb::PrepareEvent>, Status> {
         unsupported()
+    }
+}
+pub type NativeByteStream =
+    Box<dyn Iterator<Item = Result<pb::NativeByteReadChunk, Status>> + Send>;
+
+/// Observation cancellation only: it carries no durable run-control authority.
+#[derive(Clone, Default)]
+pub struct Observation {
+    canceled: Arc<AtomicBool>,
+}
+impl Observation {
+    pub fn canceled(&self) -> bool {
+        self.canceled.load(Ordering::Acquire)
+    }
+    pub(crate) fn cancel(&self) {
+        self.canceled.store(true, Ordering::Release);
     }
 }
 
