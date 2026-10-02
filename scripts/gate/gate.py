@@ -9,9 +9,12 @@ See README.md for the method, the manifest and what the numbers do and do not sh
 """
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
+import os
 import random
+import re
 import shlex
 import statistics
 import subprocess
@@ -131,6 +134,17 @@ class Pod:
         return json.loads(self.sh(" ".join([self.py, f"{POD_DIR}/pod.py", *map(shlex.quote, args)])))
 
 
+def marks(events: str) -> dict:
+    """First time of each event type. Machine events carry the pod's clock, client events the controller's."""
+    out = {}
+    for line in events.splitlines():
+        if line.startswith("{"):
+            event = json.loads(line)
+            at = re.sub(r"(\.\d{6})\d*", r"\1", event["at"].rstrip("Z"))
+            out.setdefault(event["type"], datetime.datetime.fromisoformat(at).replace(tzinfo=datetime.timezone.utc).timestamp())
+    return out
+
+
 def verify(directory: Path, shape: list[int]) -> list[dict]:
     """Decode every saved image: declared size, not flat, hashed."""
     images = []
@@ -218,10 +232,15 @@ class Gate:
             (root / "show.json").write_text(shown.stdout or shown.stderr)
             show = json.loads(shown.stdout) if shown.returncode == 0 else {}
         start = submit if t0 is None else t0 - self.offset   # t0 is a pod-clock process start time
+        seen = marks(done.stderr)
+        accepted, outcome = seen.get("request.machine_accepted"), seen.get("machine.outcome")
         row = {"arm": arm, "cycle": cycle, "scenario": scenario, "model": model, "prompt": prompt, "seed": seed,
                "run": run, "exit": done.returncode, "dir": str(root), "runtime": show.get("runtime"),
                "t_start": start, "t_submit": submit, "t_cli_done": finished, "t_verified": verified,
                "wall_s": verified - start, "cli_s": finished - submit, "offset": self.offset,
+               # Pod clock only, free of controller noise: machine birth (or acceptance) to outcome.
+               "machine_s": (outcome - (t0 if t0 is not None else accepted)) if outcome and accepted else None,
+               "controller_load": os.getloadavg()[0],
                "execution_ms": show.get("execution_ms"), "stages": show.get("stages"), "steps": show.get("steps"),
                "disk_read_bytes": after["cg"]["read_bytes"] - before["cg"]["read_bytes"],
                "executors_after": after["executors"], "images": images,
@@ -316,6 +335,7 @@ def report(out: Path) -> dict:
         for s in SCENARIOS:
             cell[s] = spread([r["wall_s"] for r in mine if r["scenario"] == s])
             cell[s + "_from_submit"] = spread([r["cli_s"] for r in mine if r["scenario"] == s])
+            cell[s + "_machine"] = spread([r["machine_s"] for r in mine if r["scenario"] == s and r.get("machine_s")])
             cell[s + "_disk_gib"] = spread([r["disk_read_bytes"] / 2**30 for r in mine if r["scenario"] == s])
         cell["switch_pair"] = spread([sum(r["wall_s"] for r in mine if r["cycle"] == c and r["scenario"] in
                                           ("to_anima", "to_sdxl")) for c in cycles])
