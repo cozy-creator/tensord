@@ -1,5 +1,5 @@
 """CPU executor records. Unknown advisory fields are accepted across peer versions."""
-from typing import Any
+from typing import Any, Literal
 
 import msgspec
 
@@ -35,6 +35,22 @@ class Result(msgspec.Struct, tag="result", tag_field="kind"):
     execution_id: str
     value: Any
     artifacts: list[str]
+
+
+class OutputChecksum(msgspec.Struct, frozen=True):
+    algorithm: Literal["sha256", "blake2b-128"]
+    value: str
+
+    def __post_init__(self):
+        length = 64 if self.algorithm == "sha256" else 32
+        if len(self.value) != length or any(c not in "0123456789abcdef" for c in self.value):
+            raise ValueError("output checksum has an invalid hexadecimal digest")
+
+
+class OutputFacts(msgspec.Struct, frozen=True):
+    relative_path: str
+    checksum: OutputChecksum
+    length: int
 
 
 class Failed(msgspec.Struct, tag="failed", tag_field="kind"):

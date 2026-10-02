@@ -9,7 +9,7 @@ import msgspec
 from cozy_runtime.author import App, Asset, Device, Invocation, classify, invoke, prepare
 from cozy_runtime.author._services import Attempt, ProgressFrame
 
-from .execution_protocol import Invoke, Progress, Result
+from .execution_protocol import Invoke, OutputChecksum, OutputFacts, Progress, Result
 from .progress import CompletedWork
 
 
@@ -24,8 +24,16 @@ def asset_wire(value: object) -> object:
     raise TypeError(f"{type(value).__name__} has no result wire representation")
 
 
+def output_checksum(value: str) -> OutputChecksum:
+    prefix, separator, digest = value.partition(":")
+    if not separator or prefix not in ("sha256", "blake2b"):
+        raise ValueError("SDK output checksum algorithm is not supported by this operation")
+    return OutputChecksum("blake2b-128" if prefix == "blake2b" else "sha256", digest)
+
+
 def execute(command: Invoke, canceled: threading.Event,
-            progress_sink: Callable[[Progress], None]) -> Result:
+            progress_sink: Callable[[Progress], None], *,
+            artifact_sink: Callable[[OutputFacts], None] | None = None) -> Result:
     distribution = importlib.metadata.distribution(command.package)
     applications = [entry.value for entry in distribution.entry_points
                     if entry.group == "cozy.application"]
@@ -68,5 +76,7 @@ def execute(command: Invoke, canceled: threading.Event,
         if local is None or local.parent != spool or local.is_symlink() or not local.is_file():
             raise ValueError("output is not a single relative spool file")
         artifacts.append(local.name)
+        if artifact_sink is not None:
+            artifact_sink(OutputFacts(local.name, output_checksum(asset.digest), asset.size_bytes))
     return Result(command.execution_id,
                   msgspec.to_builtins(result.result, enc_hook=asset_wire), artifacts)
