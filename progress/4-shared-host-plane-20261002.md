@@ -12,3 +12,9 @@
 - Existing HostTier asks name/layout only: trusted native layout priming is required;
   raw cache names are never actor/model authority. Older peers retain optional-tier fallback.
 - Root owns GPU/rentals/fault pressure; this task is CPU-only.
+- Draft PR: https://github.com/cozy-creator/cozy-machine/pull/18
+- First CPU checkpoint: 5 actual native host/process/fd gates and 5 existing model-source
+  gates pass. Native host-only maps/fds contain no CUDA/NVML/NVIDIA opens.
+- Exact exited-recipient whole-file OFD unlock fixes retained-grant duplication before
+  native release; backing reclaim is tested while copied descriptors remain open.
+- SDK typed partition registration and actual model consumer/GPU gates remain open.
