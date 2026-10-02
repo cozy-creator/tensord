@@ -46,3 +46,85 @@ print(json.dumps({'uid':os.geteuid(),'gid':os.getegid(),'pid':os.getpid(),'paren
         }
     }
 }
+
+#[test]
+#[ignore = "installed SDK CPU fault probe; proves Linux creator-thread lifetime"]
+fn retained_child_is_killed_when_the_temporary_creator_thread_exits() {
+    use std::{
+        io::{BufRead, BufReader},
+        os::{fd::FromRawFd, unix::process::ExitStatusExt},
+    };
+    let python = PathBuf::from(std::env::var("COZY_MACHINE_CPU_TEST_PYTHON").unwrap());
+    let mut child = std::thread::spawn(move || {
+        let mut child = trampoline(&python, None)
+            .unwrap()
+            .args([
+                "-I",
+                "-c",
+                "import signal; print('armed',flush=True); signal.pause()",
+            ])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "armed\n");
+        child // moved to live parent process; only creating THREAD exits
+    })
+    .join()
+    .unwrap();
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) } as i32;
+    assert!(raw >= 0);
+    let _fd = unsafe { std::fs::File::from_raw_fd(raw) };
+    let mut p = libc::pollfd {
+        fd: raw,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let observed = unsafe { libc::poll(&mut p, 1, 5000) };
+    if observed <= 0 {
+        // Explicit teardown of this owned CPU fault probe; never a product timeout policy.
+        child.kill().unwrap();
+        child.wait().unwrap();
+        panic!("creator-thread exit did not signal observed fixture child");
+    }
+    assert_eq!(child.wait().unwrap().signal(), Some(9));
+}
+
+#[test]
+#[ignore = "installed SDK CPU positive proof for retained-child spawn ownership"]
+fn pool_launcher_keeps_retained_child_usable_after_requesting_thread_exits() {
+    use std::{
+        io::{BufRead, BufReader, Write},
+        sync::Arc,
+    };
+    let python = PathBuf::from(std::env::var("COZY_MACHINE_CPU_TEST_PYTHON").unwrap());
+    let launcher = Arc::new(cozy_machine::child_launcher::ChildLauncher::new().unwrap());
+    let owner = launcher.clone();
+    let (mut child,mut stdout)=std::thread::spawn(move || {
+        let mut command=trampoline(&python,None).unwrap();
+        command.args(["-I","-c","import sys;print('armed',flush=True)\nfor line in sys.stdin: print(line.strip(),flush=True)"])
+            .env_clear().env("PATH","/usr/bin:/bin").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped());
+        let mut child=owner.spawn(command).unwrap();
+        let mut stdout=BufReader::new(child.stdout.take().unwrap());
+        let mut line=String::new();stdout.read_line(&mut line).unwrap();assert_eq!(line,"armed\n");
+        (child,stdout)
+    }).join().unwrap();
+    assert!(child.try_wait().unwrap().is_none());
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"usable\n")
+        .unwrap();
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    assert_eq!(line, "usable\n");
+    drop(child.stdin.take());
+    assert!(child.wait().unwrap().success());
+    drop(launcher); // explicit finish preceded launcher-owner lifetime end
+}

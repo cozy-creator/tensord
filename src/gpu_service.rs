@@ -141,6 +141,8 @@ pub struct GpuPool {
     reserved: AtomicBool,
     session: Mutex<Option<Session>>,
     host: Option<Arc<SharedHostPlane>>,
+    // Drop session/resource custody before ending the actual spawning thread.
+    launcher: crate::child_launcher::ChildLauncher,
 }
 struct Permit {
     pool: Arc<GpuPool>,
@@ -188,6 +190,7 @@ impl GpuPool {
             })
             .transpose()?;
         Ok(Arc::new(Self {
+            launcher: crate::child_launcher::ChildLauncher::new()?,
             root: root.to_path_buf(),
             config,
             store,
@@ -553,7 +556,7 @@ impl GpuPool {
             };
             let mut environment = self.config.environment.clone();
             environment.insert("CUDA_VISIBLE_DEVICES".into(), self.config.devices.clone());
-            let mut executor = DeviceExecutor::spawn_observed(
+            let mut executor = DeviceExecutor::spawn_owned(
                 ExecutorConfig {
                     python: held.record.python.clone(),
                     root: root.clone(),
@@ -562,6 +565,7 @@ impl GpuPool {
                     generation_hold: Some(held.retention()),
                     identity: self.config.identity,
                 },
+                &self.launcher,
                 |birth, cancel| {
                     let cancel = cancel.clone();
                     let request = id.to_string();

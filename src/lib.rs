@@ -1,6 +1,7 @@
 pub mod api;
 mod boundary_json;
 pub mod catalog;
+pub mod child_launcher;
 pub mod device_executor;
 pub mod execution;
 pub mod gpu_service;
