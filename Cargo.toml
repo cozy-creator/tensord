@@ -10,4 +10,5 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 fs2 = "0.4"
 libc = "0.2"
+rusqlite = { version = "0.32", features = ["bundled"] }
 nix = { version = "0.31.3", default-features = false, features = ["fs", "socket", "uio", "user"] }
