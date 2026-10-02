@@ -20,3 +20,10 @@ Build/test commands used nice 19 and the program's heavy-job lock after load dro
 Root integrates modules with the package bridge and public front door. This is not
 ordinary CLI, installed SDK, Hub/browser, systemd/container, GPU or old-stack
 benchmark qualification. No task GPU/rental processes were created.
+
+Follow-up: bounded coalesced progress replaces per-event FULL-WAL updates. A 257-unit
+actual socket gate advances get/list/duplicate receipts while independent persisted
+state and WAL size stay unchanged; cancel/terminal commits retain the latest count.
+Reserved status revision windows preserve monotonic cursors across actual owner death,
+and renew without cursor reuse. The optional stored ceiling defaults for older records.
+Twelve focused tests pass (0.36 s), including the allocator boundary and queued cancel.

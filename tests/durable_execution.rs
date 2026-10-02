@@ -50,7 +50,7 @@ impl Fixture {
             generation: "installed-cpu-v1".into(),
             module: "cpu_package".into(),
             entrypoint: "infer".into(),
-            input: json!({"mode":mode,"side_effect":self.root.join("effect"),"release":self.root.join("release")}),
+            input: json!({"mode":mode,"side_effect":self.root.join("effect"),"release":self.root.join("release"),"advance":self.root.join("advance")}),
         }
     }
     fn submit(&self, mode: &str) -> String {
@@ -203,6 +203,123 @@ fn cooperative_cancel_is_actor_attributed_and_not_a_timer_kill() {
     assert_eq!(result.state, State::Canceled);
     assert_eq!(result.cancel_actor.as_deref(), Some("test-controller"));
     assert!(result.result.is_none());
+    assert_eq!(result.completed_units, 1);
+    assert_eq!(
+        Journal::open(&fixture.root.join("state"))
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .completed_units,
+        1
+    );
+}
+
+#[test]
+fn progress_is_coalesced_without_wal_writes_and_terminal_preserves_latest() {
+    let fixture = Fixture::new();
+    let id = fixture.submit("progress");
+    let first = fixture.wait(&id, |record| record.completed_units == 1);
+    let independent = Journal::open(&fixture.root.join("state")).unwrap();
+    let start = independent.get(&id).unwrap();
+    assert_eq!(start.completed_units, 0);
+    assert!(first.revision > start.revision);
+    let wal = fixture.root.join("state/executions.sqlite3-wal");
+    let durable_bytes = fs::metadata(&wal).unwrap().len();
+    fs::write(fixture.root.join("advance"), b"produce actual progress").unwrap();
+    let latest = fixture.wait(&id, |record| record.completed_units == 257);
+    assert!(latest.revision > first.revision);
+    assert_eq!(fixture.engine.list().unwrap()[0].completed_units, 257);
+    assert_eq!(
+        fixture
+            .engine
+            .submit("progress", fixture.invocation("progress"))
+            .unwrap()
+            .completed_units,
+        257
+    );
+    assert_eq!(independent.get(&id).unwrap().revision, start.revision);
+    assert_eq!(independent.get(&id).unwrap().completed_units, 0);
+    assert_eq!(fs::metadata(&wal).unwrap().len(), durable_bytes);
+    fs::write(fixture.root.join("release"), b"complete").unwrap();
+    let completed = fixture.wait(&id, |record| record.state.terminal());
+    assert_eq!(completed.state, State::Completed);
+    assert_eq!(completed.completed_units, 257);
+    assert!(completed.revision > latest.revision);
+    let persisted = independent.get(&id).unwrap();
+    assert_eq!(persisted.completed_units, 257);
+    assert_eq!(persisted.revision, completed.revision);
+}
+
+#[test]
+fn cancel_before_dispatch_is_durable_and_never_executes_package() {
+    let fixture = Fixture::new();
+    let mut journal = Journal::open(&fixture.root.join("queued-state")).unwrap();
+    let record = journal
+        .accept("cancel-queued", fixture.invocation("infer"))
+        .unwrap();
+    assert_eq!(
+        journal
+            .cancel(&record.id, "explicit-test-controller")
+            .unwrap()
+            .state,
+        State::Canceled
+    );
+    drop(journal);
+    let reopened = Engine::open(&fixture.root.join("queued-state")).unwrap();
+    assert_eq!(reopened.get(&record.id).unwrap().state, State::Canceled);
+    assert!(!reopened.dispatch(&record.id, fixture.config()).unwrap());
+    assert!(!fixture.root.join("effect").exists());
+}
+
+#[test]
+fn cursor_reservation_renewal_never_reuses_old_cursors_and_accepts_older_records() {
+    let fixture = Fixture::new();
+    let root = fixture.root.join("cursor-state");
+    let mut journal = Journal::open(&root).unwrap();
+    let id = journal
+        .accept("cursor-allocation", fixture.invocation("infer"))
+        .unwrap()
+        .id;
+    assert!(journal.claim(&id).unwrap());
+    let mut child = Command::new("/usr/bin/python3")
+        .arg("-c")
+        .arg("import sys;sys.stdin.read()")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    journal
+        .register_process(&id, process_birth(child.id()).unwrap())
+        .unwrap();
+    let first = journal.running(&id).unwrap();
+    let old_edge = first.revision_ceiling;
+    // Exercise the allocator's boundary directly, without publishing billions of frames.
+    let snapshot = journal::ProgressSnapshot {
+        completed_units: 7,
+        detail: "seven completed units".into(),
+        revision: old_edge,
+    };
+    let renewed = journal.reserve_observations(&id, Some(&snapshot)).unwrap();
+    assert!(renewed.revision > old_edge);
+    assert!(renewed.revision_ceiling > renewed.revision);
+    assert_eq!(renewed.completed_units, 7);
+    let mut older = serde_json::to_value(&renewed).unwrap();
+    older.as_object_mut().unwrap().remove("revision_ceiling");
+    let decoded: journal::Execution = serde_json::from_value(older).unwrap();
+    assert_eq!(decoded.revision_ceiling, 0);
+    drop(child.stdin.take());
+    child.wait().unwrap();
+    let finished = journal
+        .finish(
+            &id,
+            journal::Outcome::Failed("owned cursor driver ended".into()),
+        )
+        .unwrap();
+    assert!(finished.revision > renewed.revision_ceiling);
+    drop(journal);
+    assert_eq!(
+        Journal::open(&root).unwrap().get(&id).unwrap().revision,
+        finished.revision
+    );
 }
 
 #[test]
@@ -380,7 +497,9 @@ fn actual_owner_death_waits_for_orphan_then_fails_without_repeating_effects() {
     let deadline = Instant::now() + Duration::from_secs(15);
     let record = loop {
         if let Ok(record) = fixture.engine.get("1") {
-            if record.completed_units == 1 {
+            if record.state == State::Running
+                && fixture.root.join("owner-observation.json").exists()
+            {
                 break record;
             }
         }
@@ -390,6 +509,10 @@ fn actual_owner_death_waits_for_orphan_then_fails_without_repeating_effects() {
         );
         thread::sleep(Duration::from_millis(5));
     };
+    let observed: journal::Execution =
+        serde_json::from_slice(&fs::read(fixture.root.join("owner-observation.json")).unwrap())
+            .unwrap();
+    assert_eq!(observed.completed_units, 1);
     let birth = record.process.unwrap();
     owner.0.kill().unwrap();
     owner.0.wait().unwrap();
@@ -398,6 +521,8 @@ fn actual_owner_death_waits_for_orphan_then_fails_without_repeating_effects() {
         fixture.engine.get(&record.id).unwrap().state,
         State::Running
     );
+    assert_eq!(fixture.engine.get(&record.id).unwrap().completed_units, 0);
+    assert!(fixture.engine.get(&record.id).unwrap().revision > observed.revision);
     assert!(!execution::process_ended(&birth).unwrap());
     fs::write(fixture.root.join("release"), b"continue").unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -410,6 +535,12 @@ fn actual_owner_death_waits_for_orphan_then_fails_without_repeating_effects() {
     }
     fixture.engine.reconcile().unwrap();
     assert_eq!(fixture.engine.get(&record.id).unwrap().state, State::Failed);
+    let persisted = Journal::open(&fixture.root.join("state"))
+        .unwrap()
+        .get(&record.id)
+        .unwrap();
+    assert!(persisted.revision > observed.revision);
+    assert!(persisted.revision > observed.revision_ceiling);
     assert!(!fixture
         .engine
         .dispatch(&record.id, fixture.config())
@@ -442,6 +573,18 @@ fn owner_process_fixture() {
             },
         )
         .unwrap();
+    loop {
+        let snapshot = engine.get(&record.id).unwrap();
+        if snapshot.completed_units == 1 {
+            let path =
+                PathBuf::from(config["imports"].as_str().unwrap()).join("owner-observation.json");
+            let temporary = path.with_extension("pending");
+            fs::write(&temporary, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+            fs::rename(temporary, path).unwrap();
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
     // Remain the actual owner until explicitly killed by the parent fault experiment.
     let mut control = String::new();
     std::io::stdin().read_to_string(&mut control).unwrap();
@@ -487,7 +630,11 @@ from pathlib import Path
 def infer(inputs, output_root, canceled, progress):
     with open(inputs['side_effect'],'a') as stream:stream.write('once\n')
     progress(1)
-    if inputs['mode']=='wait':
+    if inputs['mode']=='progress':
+        while not Path(inputs['advance']).exists() and not canceled.wait(0.01):pass
+        for units in range(2,258):progress(units)
+        progress(257);progress(7)
+    if inputs['mode'] in ('wait','progress'):
         while not Path(inputs['release']).exists() and not canceled.wait(0.01):pass
     if canceled.is_set():return None,[]
     # Actual CPU inference against fixed linear weights, with an independently checked result.
