@@ -8,11 +8,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd},
-        unix::{fs::PermissionsExt, net::UnixListener, process::CommandExt},
+        unix::{
+            fs::{OpenOptionsExt, PermissionsExt},
+            net::UnixListener,
+            process::CommandExt,
+        },
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -255,7 +259,7 @@ pub struct Outcome {
     pub message: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Output {
     pub output_id: String,
     pub asset_ref: String,
@@ -268,7 +272,7 @@ pub struct Output {
     pub digest: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HostFrame {
     pub handle: String,
     pub codec: String,
@@ -298,6 +302,7 @@ pub struct Frame {
     pub result_ref: Option<ResultRef>,
     pub outputs: Vec<Output>,
     pub frames: Vec<HostFrame>,
+    pub max_output_bytes: Option<u64>,
     pub request_id: String,
     pub seq: u64,
     pub kind: Kind,
@@ -364,9 +369,130 @@ pub struct DeviceExecutor {
     root: PathBuf,
     socket: PathBuf,
     _generation_hold: Option<Arc<File>>,
+    codec: CodecConfig,
+}
+
+#[derive(Clone)]
+pub struct CodecConfig {
+    pub python: PathBuf,
+    pub environment: BTreeMap<String, String>,
+    pub generation_hold: Option<Arc<File>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AssetBinding {
+    pub output_id: String,
+    pub asset_ref: String,
+    pub name: String,
+    pub kind: String,
+    pub media_type: String,
+    pub length: u64,
+    pub producer_digest: String,
+    pub sha256: String,
+}
+#[derive(Debug, Deserialize)]
+struct PostReply {
+    bindings: Vec<AssetBinding>,
+}
+#[derive(Serialize)]
+struct PostRequest<'a> {
+    frames: &'a [HostFrame],
+    outputs: &'a [Output],
+    max_output_bytes: Option<u64>,
+}
+
+pub fn postprocess(
+    config: &CodecConfig,
+    spool: &Path,
+    reply: &Frame,
+) -> io::Result<(Value, Vec<AssetBinding>)> {
+    let result = read_result(spool, reply)?;
+    let directory = File::open(spool)?;
+    let fd = directory.as_raw_fd();
+    let hold = config.generation_hold.as_ref().map(|hold| hold.as_raw_fd());
+    let mut command = Command::new(&config.python);
+    let log_name = format!("codec-{}.stderr.log", uuid::Uuid::new_v4());
+    command
+        .args([
+            "-I",
+            "-c",
+            include_str!("../python/cozy_machine_client/device_codec.py"),
+            "--spool-fd",
+        ])
+        .arg(fd.to_string())
+        .env_clear()
+        .envs(&config.environment)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(spool.join(&log_name))?,
+        );
+    // SAFETY: only async-signal-safe fcntl on retained directory/generation fds.
+    unsafe {
+        command.pre_exec(move || {
+            for descriptor in std::iter::once(fd).chain(hold) {
+                if libc::fcntl(descriptor, libc::F_SETFD, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn()?;
+    let request = PostRequest {
+        frames: &reply.frames,
+        outputs: &reply.outputs,
+        max_output_bytes: reply.max_output_bytes,
+    };
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("codec stdin missing"))?
+        .write_all(&serde_json::to_vec(&request)?)?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "selected SDK post helper failed: {}; see {log_name}",
+            output.status
+        )));
+    }
+    let post: PostReply = serde_json::from_slice(&output.stdout)?;
+    for binding in &post.bindings {
+        let mut file = open_artifact(spool, Path::new(&binding.name))?;
+        let mut hash = tensorfs_core::sha256::Sha256::new();
+        let mut length = 0;
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            hash.update(&buffer[..count]);
+            length += count as u64;
+        }
+        if length != binding.length || tensorfs_core::sha256::hex(&hash.finish()) != binding.sha256
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SDK-bound encoded bytes changed before custody",
+            ));
+        }
+        file.sync_all()?;
+    }
+    directory.sync_all()?;
+    Ok((result, post.bindings))
 }
 impl DeviceExecutor {
     pub fn spawn(config: ExecutorConfig) -> io::Result<Self> {
+        let codec = CodecConfig {
+            python: config.python.clone(),
+            environment: config.environment.clone(),
+            generation_hold: config.generation_hold.clone(),
+        };
         fs::create_dir_all(&config.root)?;
         fs::set_permissions(&config.root, fs::Permissions::from_mode(0o700))?;
         let listener = UnixListener::bind(&config.socket)?;
@@ -463,6 +589,7 @@ impl DeviceExecutor {
             root: config.root,
             socket: config.socket,
             _generation_hold: config.generation_hold,
+            codec,
         };
         let hello = executor.command(&DeviceCommand::Hello, &mut Baseline)?;
         if !hello.ok || hello.hello.pid != executor.birth.pid {
@@ -472,6 +599,9 @@ impl DeviceExecutor {
         }
         executor.hello = hello.hello;
         Ok(executor)
+    }
+    pub fn codec(&self) -> CodecConfig {
+        self.codec.clone()
     }
 
     pub fn command(
