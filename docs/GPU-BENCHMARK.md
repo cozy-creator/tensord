@@ -1,0 +1,41 @@
+# GPU qualification and comparison
+
+GPU work and RunPod rentals are authorized, with a $20 total cap for this task. The root
+agent owns acquisition, accounting and teardown. No rental has been started by this task.
+Other live rentals and GPU processes are independently owned. The display-driving 8 GB
+RTX 4070 is available for ordinary inference; fault and memory pressure tests use RunPod.
+
+First prove an unchanged real SDXL package can load through the Rust owner and complete
+inference on a non-display GPU. Record every process, hardware/driver/CUDA/SDK/TensorFS
+version, model identity, request and output. Report this milestone separately from normal
+Creator CLI, complete single-writer custody, low-memory recovery and release qualification.
+
+After the same request works through both architectures on the same rented GPU:
+
+1. Alternate old/new runs. Compare stopped-machine start, warm verified disk, fresh
+   executor/model load, reused executor, and repeated inference separately. Record first
+   submit to verified output and preparation/executor counts. Downloads get their own timing.
+2. Submit several consecutive fresh prompts and seeds with identical dimensions, steps,
+   model/precision/attention settings. Preserve each request and output. Measure distributions,
+   steady throughput, gaps between device work and utilisation; a single smoke run is insufficient.
+3. Switch A→B→A models. Measure shared-weight retention, physical host allocation, RSS/PSS,
+   pinned memory and total per-device memory including every CUDA context and compute workspace.
+4. Kill an owned executor during real work, then retry as a new attempt of that transaction.
+   Verify surviving weights, other readers and final output. Kill/restart the Rust owner
+   separately: observe exact executor death and conservative settlement; never manufacture
+   completion or replay started effects. Distinguish safety from transparent recovery.
+5. On non-display hardware, test natural memory pressure, failed copy and context admission.
+   A constrained larger GPU is diagnostic evidence, not qualification of a real 8 GB GPU.
+   Never downsize a request to turn a memory failure into a passing result.
+
+SDXL and Anima on 8 GB, H3 streaming on 48–80 GB, and multi-GPU/NCCL are separate gates.
+Host-only ownership (Degree 1) precedes shared GPU backing. Shared GPU allocation must then
+prove both crash directions, revocation after all work drains and normal executor-issued copies.
+Machine-issued streamed copies stay an optional research arm. Synthetic ring-copy measurements
+do not establish real-model per-step overhead or end-to-end cold start.
+
+Use the existing published baseline and the new isolated build. Do not patch the old checkout,
+change default controller state, or reuse someone else's rental. Retain logs, exact requests,
+outputs and spend records under `outputs/cozy-machine-continued-20261002/`. Stop an owned rental
+as soon as its measurements finish and verify provider teardown. Budget exhaustion is an external
+safety limit; test observation deadlines never authorize production cancellation.

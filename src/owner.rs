@@ -39,7 +39,7 @@ struct Lease {
     host: bool,
 }
 pub struct Owner {
-    store: Store,
+    store: Arc<Store>,
     _lock: File,
     cache: HashMap<String, Cached>,
     peers: HashMap<u64, Peer>,
@@ -75,7 +75,7 @@ impl Owner {
             )
         })?;
         std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
-        let store = Store::ensure(&root.join("tensorfs")).map_err(io::Error::other)?;
+        let store = Arc::new(Store::ensure(&root.join("tensorfs")).map_err(io::Error::other)?);
         let incarnation = format!(
             "{}-{}",
             std::process::id(),
@@ -120,6 +120,9 @@ impl Owner {
             },
         );
         Ok(id)
+    }
+    pub fn store(&self) -> Arc<Store> {
+        self.store.clone()
     }
     pub fn disconnect(&mut self, peer: u64) {
         if self.leases.values().any(|lease| lease.peer == peer) {
@@ -311,9 +314,12 @@ impl Owner {
             Ok(())
         }
     }
-    pub fn stop(&mut self) -> bool {
+    pub fn idle(&mut self) -> bool {
         self.reap();
-        if !self.leases.is_empty() {
+        self.leases.is_empty()
+    }
+    pub fn stop(&mut self) -> bool {
+        if !self.idle() {
             return false;
         }
         self.stopping = true;

@@ -246,9 +246,16 @@ fn client(
                 Ok((Body::ResultArtifact { id, artifact }, Some(file)))
             })(),
             Command::Shutdown => {
-                if !owner.lock().unwrap().stop() {
-                    Err(io::Error::other("active leases prevent shutdown"))
+                // Hold the weight gate while quiescing dispatch: neither half may
+                // stop after discovering the other still has live obligations.
+                let mut weight_owner = owner.lock().unwrap();
+                if !weight_owner.idle() || !service.stop()? {
+                    Err(io::Error::other(
+                        "accepted work or active leases prevent shutdown",
+                    ))
                 } else {
+                    assert!(weight_owner.stop());
+                    drop(weight_owner);
                     let acknowledgement = protocol::write(
                         &mut stream,
                         &Reply {

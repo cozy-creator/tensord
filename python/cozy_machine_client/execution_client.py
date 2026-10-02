@@ -24,6 +24,11 @@ class ExecutionResult(msgspec.Struct):
     value: object
     artifacts: list[Artifact]
 
+class ProcessBirth(msgspec.Struct):
+    pid: int
+    boot_id: str
+    start_ticks: int
+
 class ExecutionRecord(msgspec.Struct):
     id: str
     idempotency_key: str
@@ -31,6 +36,7 @@ class ExecutionRecord(msgspec.Struct):
     state: str
     revision: int
     attempt: int = 0
+    process: ProcessBirth | None = None
     waiting_reason: str | None = None
     completed_units: int = 0
     progress: str | None = None

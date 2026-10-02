@@ -93,6 +93,9 @@ impl Catalog {
     }
 }
 impl HeldGeneration {
+    pub fn retention(&self) -> Arc<File> {
+        self.hold.clone()
+    }
     pub fn invocation(&self, entrypoint: &str, input: serde_json::Value) -> io::Result<Invocation> {
         if entrypoint.is_empty() || entrypoint.starts_with('_') || entrypoint.contains('/') {
             return Err(invalid(

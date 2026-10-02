@@ -1,8 +1,5 @@
 //! Real process/socket/filesystem checks, not full Runtime/CLI qualification.
-#[path = "../src/execution.rs"]
-mod execution;
-#[path = "../src/journal.rs"]
-mod journal;
+use cozy_machine::{execution, journal};
 
 use execution::{process_birth, Engine, RunnerConfig};
 use journal::{Invocation, Journal, State};

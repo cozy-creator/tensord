@@ -9,7 +9,7 @@ import msgspec
 from cozy_runtime.author import App, Asset, Device, Invocation, classify, invoke, prepare
 from cozy_runtime.author._services import Attempt, ProgressFrame
 
-from .execution_protocol import Invoke, OutputChecksum, OutputFacts, Progress, Result
+from .execution_protocol import AssetBinding, Invoke, OutputChecksum, OutputFacts, Progress, Result
 from .progress import CompletedWork
 
 
@@ -71,12 +71,16 @@ def execute(command: Invoke, canceled: threading.Event,
     if record.frames or record.pending_trees or record.committed_files:
         raise ValueError("this CPU executor does not support deferred media or tree outputs")
     artifacts = []
+    bindings = []
     for asset in record.pending.values():
         local = asset._local
         if local is None or local.parent != spool or local.is_symlink() or not local.is_file():
             raise ValueError("output is not a single relative spool file")
         artifacts.append(local.name)
+        row = asset.row()
+        bindings.append(AssetBinding(local.name, row["ref"], row["media_type"],
+                                     output_checksum(asset.digest), asset.size_bytes))
         if artifact_sink is not None:
             artifact_sink(OutputFacts(local.name, output_checksum(asset.digest), asset.size_bytes))
     return Result(command.execution_id,
-                  msgspec.to_builtins(result.result, enc_hook=asset_wire), artifacts)
+                  msgspec.to_builtins(result.result, enc_hook=asset_wire), artifacts, bindings)

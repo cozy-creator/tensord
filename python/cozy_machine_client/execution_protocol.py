@@ -35,6 +35,7 @@ class Result(msgspec.Struct, tag="result", tag_field="kind"):
     execution_id: str
     value: Any
     artifacts: list[str]
+    asset_bindings: list["AssetBinding"] = msgspec.field(default_factory=list)
 
 
 class OutputChecksum(msgspec.Struct, frozen=True):
@@ -49,6 +50,14 @@ class OutputChecksum(msgspec.Struct, frozen=True):
 
 class OutputFacts(msgspec.Struct, frozen=True):
     relative_path: str
+    checksum: OutputChecksum
+    length: int
+
+
+class AssetBinding(msgspec.Struct, frozen=True):
+    relative_path: str
+    asset_ref: str
+    media_type: str
     checksum: OutputChecksum
     length: int
 
