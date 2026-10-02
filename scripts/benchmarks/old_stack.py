@@ -209,7 +209,8 @@ def full(config_path: Path) -> None:
                     receipt = host.SubmitMachineExecution(submission)
                     break
                 except grpc.RpcError as error:
-                    if error.code() != grpc.StatusCode.UNAVAILABLE:
+                    metadata = dict(error.trailing_metadata() or ())
+                    if error.code() != grpc.StatusCode.UNAVAILABLE or metadata.get("cozy-error-code") != "release_root_preparing":
                         raise
                     with (output / "submission-progress.jsonl").open("a") as sink:
                         sink.write(json.dumps({"request": request, "details": error.details()}) + "\n")
@@ -248,16 +249,18 @@ def full(config_path: Path) -> None:
                         sink.write(chunk.data); digest.update(chunk.data); length += len(chunk.data)
                 if length != product.content.length or digest.digest() != product.content.digest:
                     raise RuntimeError("native output checksum differs")
-                with Image.open(path) as image:
-                    image.load()
-                    if image.size != (1024, 1024):
-                        raise RuntimeError("request image dimensions changed")
                 saved.append({"path": str(path), "length": length, "sha256": digest.hexdigest()})
             if not saved:
                 raise RuntimeError("successful run carried no verified image")
             rows.append({"request": request, "wall_ms": (time.perf_counter() - began) * 1000,
                          "outcome": documents.body(terminal), "outputs": saved})
             write(output / "results.json", evidence)
+        for row in rows:
+            for saved in row["outputs"]:
+                with Image.open(saved["path"]) as image:
+                    image.load()
+                    if image.size != (1024, 1024):
+                        raise RuntimeError("request image dimensions changed")
         evidence["qualification"] = "full released Go agent + Python worker + stock Executor; RPC only"
         write(output / "results.json", evidence)
         agent.terminate()  # Explicit completed benchmark cleanup; no request is left running.
