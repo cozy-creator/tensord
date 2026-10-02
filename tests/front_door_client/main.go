@@ -42,8 +42,13 @@ type evidence struct {
 func main() {
 	machine := flag.String("machine", "", "path to front-door fixture binary")
 	output := flag.String("output", "", "owned evidence directory")
+	retained := flag.Bool("retained-restart", false, "qualify retained pin and key refresh across owned fixture restarts")
 	flag.Parse()
-	if err := run(*machine, *output); err != nil {
+	gate := run
+	if *retained {
+		gate = runRetained
+	}
+	if err := gate(*machine, *output); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}

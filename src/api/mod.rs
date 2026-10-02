@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod backend;
 pub mod identity;
+pub mod install;
 mod server;
 pub mod workspaces;
 
