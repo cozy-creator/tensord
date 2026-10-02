@@ -53,6 +53,7 @@ fn prepared(version: &str, generation_path: &str) -> (DeviceExecutor, PathBuf) {
             ("TMPDIR".into(), root.join("tmp").display().to_string()),
         ]),
         generation_hold: Some(Arc::new(hold)),
+        identity: None,
     };
     let mut executor = DeviceExecutor::spawn(config).unwrap();
     assert_eq!(executor.hello.runtime_version, version); // fixture provenance, not admission

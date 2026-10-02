@@ -70,6 +70,8 @@ pub struct HostOptions {
 #[derive(Clone, Debug, Deserialize)]
 pub struct GpuConfig {
     #[serde(default)]
+    pub identity: Option<crate::launch_identity::LaunchIdentity>,
+    #[serde(default)]
     pub source_mode: SourceMode,
     pub devices: String,
     pub authorized_device_limit_bytes: Option<u64>,
@@ -164,6 +166,13 @@ impl Drop for WakeOnExit {
 impl GpuPool {
     pub fn new(root: &Path, config: GpuConfig, store: Arc<Store>) -> io::Result<Arc<Self>> {
         fs::create_dir_all(root)?;
+        if let Some(identity) = config.identity {
+            identity.traverse(root)?;
+            identity.traverse(
+                root.parent()
+                    .ok_or_else(|| io::Error::other("GPU root has no owned state parent"))?,
+            )?;
+        }
         let host = config
             .host
             .as_ref()
@@ -526,11 +535,22 @@ impl GpuPool {
             fs::create_dir(&root)?;
             let directory = File::open(&root)?;
             // Linux pathname limit is independent of the owned state directory length.
-            let socket = PathBuf::from(format!(
-                "/proc/{}/fd/{}/executor",
-                std::process::id(),
-                directory.as_raw_fd()
-            ));
+            let socket = if self.config.identity.is_some() {
+                // Another UID cannot traverse this owner's /proc/fd magic link.
+                // A deliberately short owned state root is required for this operation.
+                let socket = root.join("executor");
+                use std::os::unix::ffi::OsStrExt;
+                if socket.as_os_str().as_bytes().len() > 107 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput,"configured identity needs a short owned executor socket path (Linux sun_path)"));
+                }
+                socket
+            } else {
+                PathBuf::from(format!(
+                    "/proc/{}/fd/{}/executor",
+                    std::process::id(),
+                    directory.as_raw_fd()
+                ))
+            };
             let mut environment = self.config.environment.clone();
             environment.insert("CUDA_VISIBLE_DEVICES".into(), self.config.devices.clone());
             let mut executor = DeviceExecutor::spawn_observed(
@@ -540,6 +560,7 @@ impl GpuPool {
                     socket,
                     environment,
                     generation_hold: Some(held.retention()),
+                    identity: self.config.identity,
                 },
                 |birth, cancel| {
                     let cancel = cancel.clone();
@@ -629,6 +650,9 @@ impl GpuPool {
         if !session.loaded {
             let interface_path = session.executor.root_path().join("package-interface.json");
             fs::write(&interface_path, serde_json::to_vec(&held.record.interface)?)?;
+            if let Some(identity) = self.config.identity {
+                identity.readable(&interface_path)?;
+            }
             command_ok(session.executor.command(
                 &DeviceCommand::Start {
                     devices: self.config.devices.clone(),
@@ -694,7 +718,16 @@ impl GpuPool {
             &mut callbacks,
         )?;
         command_ok(prepared)?;
-        let spool = engine.staging(id)?;
+        let spool = if let Some(identity) = self.config.identity {
+            // Keep Journal/results/admin paths private to the core. A separate peer-owned
+            // spool lives only inside this executor's already authorized output directory.
+            let spool = session.executor.root_path().join(format!("output-{id}"));
+            fs::create_dir(&spool)?;
+            identity.own(&spool)?;
+            spool
+        } else {
+            engine.staging(id)?
+        };
         let reply = session.executor.command(
             &DeviceCommand::Invoke {
                 request_id: id.into(),
@@ -721,7 +754,7 @@ impl GpuPool {
                 let result = (|| {
                     let (value, bindings) =
                         device_executor::postprocess(&session.executor.codec(), &spool, &reply)?;
-                    engine.managed_result(id, value, output_bindings(bindings)?)
+                    engine.managed_result(id, &spool, value, output_bindings(bindings)?)
                 })();
                 if let Err(error) = result {
                     // The invocation is already quiescent; a codec/custody

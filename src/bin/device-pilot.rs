@@ -217,6 +217,7 @@ fn run() -> io::Result<()> {
         socket: config.socket,
         environment: config.environment,
         generation_hold: hold,
+        identity: None,
     })?;
     let spawn_ms = spawn_started.elapsed().as_secs_f64() * 1000.;
     let devices = executor
