@@ -172,6 +172,8 @@ pub enum DeviceCommand {
         stages: bool,
         #[serde(skip_serializing_if = "is_false")]
         descriptor_sources: bool,
+        #[serde(skip_serializing_if = "is_false")]
+        host_tier_owner: bool,
     },
     Activate {
         construction: String,
@@ -238,6 +240,7 @@ pub enum Event {
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     ModelSourceRead,
+    HostTierPrepare,
     HostTier,
     BudgetCell,
     StageEnter,
@@ -392,6 +395,7 @@ pub struct Frame {
     pub name: String,
     pub layout: String,
     pub manifest: String,
+    pub sha256: String,
     pub role: SourceRole,
     pub length: u64,
     pub offer: bool,
@@ -468,6 +472,27 @@ pub struct DeviceExecutor {
     codec: CodecConfig,
     exit: Option<File>,
     retained: Vec<Box<dyn Send>>,
+}
+
+#[derive(Clone)]
+pub struct Cancellation {
+    root: PathBuf,
+}
+impl Cancellation {
+    pub fn cancel(&self, request_id: &str) -> io::Result<()> {
+        let temporary = self
+            .root
+            .join(format!("executor.cancel.{}.pending", uuid::Uuid::new_v4()));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(request_id.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(temporary, self.root.join("executor.cancel"))?;
+        File::open(&self.root)?.sync_all()
+    }
 }
 
 #[derive(Clone)]
@@ -586,6 +611,13 @@ pub fn postprocess(
 }
 impl DeviceExecutor {
     pub fn spawn(config: ExecutorConfig) -> io::Result<Self> {
+        Self::spawn_observed(config, |_, _| Ok(()))
+    }
+
+    pub fn spawn_observed(
+        config: ExecutorConfig,
+        on_birth: impl FnOnce(&ProcessBirth, &Cancellation) -> io::Result<()>,
+    ) -> io::Result<Self> {
         let codec = CodecConfig {
             python: config.python.clone(),
             environment: config.environment.clone(),
@@ -621,6 +653,12 @@ impl DeviceExecutor {
         }
         let mut child = command.spawn()?;
         let birth = process_birth(child.id())?;
+        on_birth(
+            &birth,
+            &Cancellation {
+                root: config.root.clone(),
+            },
+        )?;
         // Wait for connection OR observed process death. No elapsed-time startup kill.
         let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) } as i32;
         if raw < 0 {
@@ -703,6 +741,21 @@ impl DeviceExecutor {
     pub fn codec(&self) -> CodecConfig {
         self.codec.clone()
     }
+    pub fn root_path(&self) -> &Path {
+        &self.root
+    }
+    pub fn cancellation(&self) -> Cancellation {
+        Cancellation {
+            root: self.root.clone(),
+        }
+    }
+
+    pub fn observer_pidfd(&self) -> io::Result<File> {
+        self.exit
+            .as_ref()
+            .ok_or_else(|| io::Error::other("device exit observer absent"))?
+            .try_clone()
+    }
 
     /// Retain a source/resource until this exact receiver exits, including owner-handle loss.
     /// Observer lifetimes must never own the DeviceExecutor handle.
@@ -766,6 +819,23 @@ impl DeviceExecutor {
                 ));
             }
         }
+        if let DeviceCommand::Load {
+            host_tier_owner: true,
+            host_tier,
+            sequence_parallel_degree,
+            ..
+        } = command
+        {
+            if !*host_tier
+                || *sequence_parallel_degree != 1
+                || !self.hello.offers("host_tiers.owner/1")
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "machine host-tier registration requires qualified world-one capability",
+                ));
+            }
+        }
         write_frame(&mut self.stream, command)?;
         loop {
             let frame = read_frame(&mut self.stream)?
@@ -815,12 +885,7 @@ impl DeviceExecutor {
 
     /// Attempt-keyed cooperative cancellation; observer teardown never calls this.
     pub fn cancel(&self, request_id: &str) -> io::Result<()> {
-        let temporary = self.root.join("executor.cancel.pending");
-        let mut file = File::create(&temporary)?;
-        file.write_all(request_id.as_bytes())?;
-        file.sync_all()?;
-        fs::rename(temporary, self.root.join("executor.cancel"))?;
-        File::open(&self.root)?.sync_all()
+        self.cancellation().cancel(request_id)
     }
     pub fn shutdown(mut self) -> io::Result<()> {
         self.command(&DeviceCommand::Shutdown, &mut Baseline)?;
