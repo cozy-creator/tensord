@@ -12,6 +12,30 @@ allocator-derived peak was about 8.96 GiB. Admission must include allocator rese
 contexts and external allocations. The exact split is unmeasured, and sampled peaks may
 miss brief higher allocations. These resident A40 runs do not qualify 8 GB operation or
 the optional machine-copy/streamed-weight latency claim.
+
+The negotiated descriptor source subsequently completed unchanged real SDXL inference with
+an empty executor store path. Its first 21.933 s Load was observer-confounded: per-export FD
+table scans and external sampling materially changed measurements. Removing those observers
+gave 11.629 s; bounded parallel full verification then gave 7.507 s in a three-request trial.
+All three parallel outputs match the same-version sequential outputs. Integrity checks remain;
+three verification workers, six pending FDs and a 128 MiB queue were derived on this container.
+Cold first import/cache state varied, so no aggregate startup speedup is established.
+
+A single fixed-budget stage-policy pair produced 12 matching image pairs. Warm encoded-output
+medians were 4.928/4.917 s with/without 69 stage round trips per image, an observed 0.22% difference.
+This is a diagnostic comparison, with no memory pressure, fairness or revocation qualification.
+Zero model-source exports during inference does not mean zero per-step stage exchanges.
+
+The full old Go-agent/worker/Executor RPC reference completed three matching images with one
+executor/load: sequential launch/preparation/first output 31.420 s; warm outputs 4.797/4.831 s.
+Its allocator configuration uses expandable segments; matching that setting in the private
+SDK99 pilot lowered sampled peak to the same 9,849 MiB. The private GPU pilot still lacks the
+new public API/custody path, so this old full-stack reference cannot yield a full old/new ratio.
+
+All 132 generated images were preserved and independently decoded before provider-confirmed
+termination of the owned A40. Estimated compute/storage spend was $1.97 against the $20 cap.
+Detailed records, exact inputs, excluded cohorts, counters and qualification limits are in
+`~/cozy_v2/outputs/cozy-machine-continued-20261002/gpu-runpod/REPORT.md`.
 Other live rentals and GPU processes are independently owned. The display-driving 8 GB
 RTX 4070 is available for ordinary inference; fault and memory pressure tests use RunPod.
 
