@@ -95,4 +95,3 @@ pub fn ended(pidfd: &File) -> bool {
     // SAFETY: one live poll descriptor, instantaneous readiness observation, no elapsed-time policy.
     unsafe { libc::poll(&mut poll, 1, 0) > 0 && poll.revents != 0 }
 }
-

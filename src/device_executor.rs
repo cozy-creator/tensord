@@ -346,6 +346,8 @@ pub struct HostFrame {
 pub struct PlaneFacts {
     pub budget_bytes: Option<i64>,
     pub committed_bytes: Option<i64>,
+    /// GPU regions mapped from custody (`weights.attach/1`): outside `committed_bytes`.
+    pub shared_bytes: Option<i64>,
     pub leased_bytes: Option<i64>,
     pub pinned_budget_bytes: Option<i64>,
     pub pinned_bytes: Option<i64>,

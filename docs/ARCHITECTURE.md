@@ -78,6 +78,7 @@ The host ledger (pinned tier, RSS/PSS, cgroup headroom) is not in `memory/` yet 
 | Path | Use | Owner |
 |---|---|---|
 | `src/bin/device-pilot.rs` | Drive one stock executor from a JSON config on a rental | F |
+| `src/bin/degree2-pilot.rs` | Degree 2 on a rental: stock executors share GPU weights through `ResidentCustody` (replacement, count-once, revoke, output equality) | C |
 | `src/bin/model-source-check.rs`, `scripts/check-model-source-descriptor.py` | Check a selected snapshot's sources | B1 |
 | `src/bin/install-capture.rs` | Run the installer path on a captured archive (used by Python tests) | D1 |
 | `src/bin/front-door.rs`, `tests/*_client`, `tests/creator_*` | Isolated front-door fixture and Go consumer gates | D1 |
