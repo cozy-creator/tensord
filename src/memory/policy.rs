@@ -317,7 +317,7 @@ impl Gpu {
             .shapes
             .get(plan)
             .and_then(|shape| self.learned.shape(plan, shape))
-            .map(|measured| measured.peak)
+            .map(super::learned::Shape::bytes)
             .filter(|peak| *peak > 0);
         shaped.or_else(|| {
             [self.facts(plan).activation, self.learned.peak(plan)]
@@ -751,21 +751,22 @@ mod tests {
         };
         assert_eq!(gpu.want("sdxl"), None);
         // An earlier run loaded SDXL (7 GiB) and ran two shapes; no shape is known at a load.
+        // At 1024 its call peaked at 0.5 GiB, but its decode reserved 3 GiB.
         gpu.learned.load("sdxl", 7 * GIB, 2 * GIB);
-        let methods = BTreeMap::new();
+        let decode = BTreeMap::from([("decode".to_string(), 3 * GIB)]);
         gpu.learned
-            .call("sdxl", "height=1024,width=1024", GIB / 2, &methods);
+            .call("sdxl", "height=1024,width=1024", GIB / 2, &decode);
         gpu.learned
-            .call("sdxl", "height=512,width=512", GIB / 4, &methods);
+            .call("sdxl", "height=512,width=512", GIB / 4, &BTreeMap::new());
         gpu.learned.context("GPU-1/580", 300 * MIB);
-        assert_eq!(gpu.activation("sdxl"), Some(GIB / 2));
+        assert_eq!(gpu.activation("sdxl"), Some(3 * GIB));
         assert_eq!(
             gpu.want("sdxl"),
-            Some(300 * MIB + MARGIN + 7 * GIB + GIB / 2 + MARGIN)
+            Some(300 * MIB + MARGIN + 7 * GIB + 3 * GIB + MARGIN)
         );
         assert_eq!(
             gpu.need("sdxl"),
-            300 * MIB + MARGIN + 2 * GIB + GIB / 2 + MARGIN
+            300 * MIB + MARGIN + 2 * GIB + 3 * GIB + MARGIN
         );
         // The next shape, once known, takes its own measurement.
         gpu.set_shape("sdxl", "height=512,width=512");

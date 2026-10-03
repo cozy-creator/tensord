@@ -20,6 +20,13 @@ pub struct Shape {
     /// Each stage method's.
     pub methods: BTreeMap<String, u64>,
 }
+impl Shape {
+    /// What the call grows by at its worst: its own peak or a stage's (a stage counts the
+    /// segments torch reserved for it), whichever is more.
+    pub fn bytes(&self) -> u64 {
+        self.methods.values().copied().fold(self.peak, u64::max)
+    }
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -124,7 +131,7 @@ impl Learned {
         let plan = self.plans.get(plan)?;
         plan.shapes
             .values()
-            .map(|shape| shape.peak)
+            .map(Shape::bytes)
             .max()
             .filter(|peak| *peak > 0)
     }
@@ -153,7 +160,7 @@ impl Learned {
                 })
             })
             .map(|(_, measured)| measured)
-            .min_by_key(|measured| measured.peak)
+            .min_by_key(|measured| measured.bytes())
     }
 }
 
