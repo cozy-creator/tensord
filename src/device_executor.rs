@@ -3,7 +3,7 @@ use crate::{
     execution::open_artifact,
     journal::ProcessBirth,
     launch_identity::{LaunchIdentity, Seal},
-    process::{burn, process_birth, Exact, Liveness, Pace},
+    process::{process_birth, reap, tail, Exact, Liveness, Meter, Watch, Watching},
     protocol,
 };
 use serde::{Deserialize, Serialize};
@@ -17,13 +17,13 @@ use std::{
         unix::{
             fs::{OpenOptionsExt, PermissionsExt},
             net::{UnixListener, UnixStream},
-            process::{CommandExt, ExitStatusExt},
+            process::CommandExt,
         },
     },
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
-    sync::{Arc, Condvar, Mutex},
-    time::{Duration, Instant},
+    sync::{Arc, Mutex},
+    time::Duration,
 };
 
 pub const MAX_DEVICE_FRAME: usize = 64 * 1024;
@@ -632,112 +632,6 @@ impl Cancellation {
 
 type Watched = Arc<Mutex<Option<Arc<Watch>>>>;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Meter {
-    /// CPU plus bytes moved by the executor (Runtime `ExecutorChild.watched`).
-    Burn,
-    /// Frames of the running invocation, judged only after a cancel (Runtime `cancel_stall`).
-    Frames,
-}
-
-#[derive(Default)]
-struct WatchState {
-    done: bool,
-    serving: bool,
-    frames: u64,
-    canceled_at: Option<Instant>,
-    killed: Option<String>,
-    worst_gap: Duration,
-}
-
-/// One command's progress observer. It kills the exact executor (and its group) only on a
-/// measured wedge; the kill closes the channel, so the blocked exchange returns.
-struct Watch {
-    meter: Meter,
-    state: Mutex<WatchState>,
-    changed: Condvar,
-}
-impl Watch {
-    fn start(
-        exact: Exact,
-        meter: Meter,
-        liveness: Liveness,
-        worst_gap: Duration,
-        what: &'static str,
-    ) -> io::Result<(Arc<Self>, std::thread::JoinHandle<()>)> {
-        let watch = Arc::new(Self {
-            meter,
-            state: Mutex::new(WatchState::default()),
-            changed: Condvar::new(),
-        });
-        let observer = watch.clone();
-        let thread = std::thread::Builder::new()
-            .name(format!("watch-{what}"))
-            .spawn(move || observer.run(exact, liveness, worst_gap, what))?;
-        Ok((watch, thread))
-    }
-    fn run(&self, exact: Exact, liveness: Liveness, worst_gap: Duration, what: &str) {
-        let floor = liveness.floor();
-        // Frame gaps teach only the frame meter; CPU-plus-bytes starts its own pace.
-        let mut pace = match self.meter {
-            Meter::Frames => Pace::seeded(worst_gap),
-            Meter::Burn => Pace::default(),
-        };
-        let mut state = self.state.lock().unwrap();
-        while !state.done {
-            let now = Instant::now();
-            let reading = match self.meter {
-                Meter::Burn => burn(exact.birth.pid),
-                Meter::Frames => Some(state.frames),
-            };
-            pace.observe(reading, now);
-            if state.serving {
-                pace.excuse(now);
-            }
-            state.worst_gap = pace.worst_pause;
-            let since = match self.meter {
-                Meter::Burn => pace.still_since(),
-                Meter::Frames => state
-                    .canceled_at
-                    .map(|at| pace.still_since().map_or(at, |moved| moved.max(at))),
-            };
-            if let Some(since) = since {
-                let still = now - since;
-                if still > pace.patience(floor) {
-                    let verdict = format!(
-                        "the executor wedged during {what}: {}",
-                        pace.verdict(still, floor)
-                    );
-                    match exact.kill() {
-                        Ok(()) => state.killed = Some(verdict),
-                        Err(error) => eprintln!("{verdict}; kill failed: {error}"),
-                    }
-                    return;
-                }
-            }
-            state = self.changed.wait_timeout(state, liveness.sample).unwrap().0;
-        }
-    }
-    fn frame(&self) {
-        self.state.lock().unwrap().frames += 1;
-    }
-    fn serving(&self, serving: bool) {
-        self.state.lock().unwrap().serving = serving;
-    }
-    fn canceled(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.canceled_at.get_or_insert_with(Instant::now);
-        self.changed.notify_all();
-    }
-    fn stop(&self, thread: std::thread::JoinHandle<()>) -> (Option<String>, Duration) {
-        self.state.lock().unwrap().done = true;
-        self.changed.notify_all();
-        let _ = thread.join();
-        let state = self.state.lock().unwrap();
-        (state.killed.clone(), state.worst_gap)
-    }
-}
-
 /// The executor exited before it connected: no authored code ran. Deterministic causes
 /// (an SDK without this module, a broken environment) fail the run with this evidence.
 #[derive(Debug)]
@@ -1302,17 +1196,17 @@ impl DeviceExecutor {
             DeviceCommand::Invoke { .. } => Meter::Frames,
             _ => Meter::Burn,
         };
-        let (watch, thread) = Watch::start(
+        let watching = Watching::start(
             self.exact.try_clone()?,
             meter,
             self.liveness,
             self.worst_gap,
             command.name(),
         )?;
-        *self.watched.lock().unwrap() = Some(watch.clone());
-        let result = self.exchange(command, services, &watch);
+        *self.watched.lock().unwrap() = Some(watching.watch());
+        let result = self.exchange(command, services, &watching.watch());
         *self.watched.lock().unwrap() = None;
-        let (killed, worst_gap) = watch.stop(thread);
+        let (killed, worst_gap) = watching.finish();
         if meter == Meter::Frames {
             self.worst_gap = self.worst_gap.max(worst_gap);
         }
@@ -1481,36 +1375,12 @@ impl Ending {
                 )));
             }
         };
-        let mut pace = Pace::default();
-        let floor = self.liveness.floor();
-        let mut killed = None;
-        loop {
-            match wait_readable_for(exact.as_file(), self.liveness.sample) {
-                Ok(true) => break,
-                Ok(false) => (),
-                Err(error) => {
-                    std::mem::forget(std::mem::take(&mut self.retained));
-                    return Err(error);
-                }
+        let (status, killed) = match reap(exact, self.child.as_mut(), self.liveness) {
+            Ok(ended) => ended,
+            Err(error) => {
+                std::mem::forget(std::mem::take(&mut self.retained));
+                return Err(error);
             }
-            let now = Instant::now();
-            pace.observe(burn(exact.birth.pid), now);
-            if killed.is_none() {
-                if let Some(since) = pace.still_since() {
-                    let still = now - since;
-                    if still > pace.patience(floor) {
-                        exact.kill()?;
-                        killed = Some(format!(
-                            "the executor wedged while ending: {}",
-                            pace.verdict(still, floor)
-                        ));
-                    }
-                }
-            }
-        }
-        let status = match self.child.as_mut() {
-            Some(child) => child.wait()?,
-            None => ExitStatus::from_raw(0),
         };
         if !self.socket.as_os_str().is_empty() {
             let _ = fs::remove_file(&self.socket);
@@ -1531,47 +1401,6 @@ impl Drop for DeviceExecutor {
             eprintln!("executor teardown: {error}");
         }
     }
-}
-
-/// Exit observed within one sampling period, or not yet. The period is a meter cadence.
-fn wait_readable_for(file: &File, period: Duration) -> io::Result<bool> {
-    let mut poll = libc::pollfd {
-        fd: file.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let milliseconds = period.as_millis().clamp(1, i32::MAX as u128) as i32;
-    loop {
-        let result = unsafe { libc::poll(&mut poll, 1, milliseconds) };
-        if result < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
-        if result == 0 {
-            return Ok(false);
-        }
-        if poll.revents & libc::POLLIN != 0 {
-            return Ok(true);
-        }
-        return Err(io::Error::other("executor exit is not observable"));
-    }
-}
-
-/// The last bytes of a log, for a failure reason.
-pub fn tail(path: &Path) -> String {
-    const TAIL: u64 = 2048;
-    let Ok(mut file) = File::open(path) else {
-        return String::new();
-    };
-    use std::io::Seek;
-    let length = file.metadata().map(|m| m.len()).unwrap_or(0);
-    let _ = file.seek(io::SeekFrom::Start(length.saturating_sub(TAIL)));
-    let mut bytes = Vec::new();
-    let _ = file.read_to_end(&mut bytes);
-    String::from_utf8_lossy(&bytes).trim().to_string()
 }
 
 pub fn read_result(spool: &Path, reply: &Frame) -> io::Result<Value> {

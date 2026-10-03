@@ -219,7 +219,7 @@ impl GpuPool {
         let custody =
             (!display_active(&config.devices)).then(|| Mutex::new(ResidentCustody::default()));
         let incarnation = uuid::Uuid::new_v4().simple().to_string();
-        remove_stale_jit(root, &incarnation);
+        crate::launch_identity::remove_stale_jit(root, &incarnation);
         Ok(Arc::new(Self {
             launcher: crate::child_launcher::ChildLauncher::new()?,
             root: root.to_path_buf(),
@@ -1254,11 +1254,7 @@ fn settle(engine: &Arc<Engine>, id: &str, error: &io::Error) -> io::Result<()> {
     if !ended {
         return Ok(()); // exit unproven: the reservation stays charged and nonterminal
     }
-    let transient = matches!(
-        error.raw_os_error(),
-        Some(libc::EAGAIN | libc::ENOMEM | libc::EMFILE | libc::ENFILE | libc::EINTR)
-    );
-    if record.state == State::Starting && transient {
+    if record.state == State::Starting && crate::process::transient(error) {
         return engine.defer_managed(id, format!("device startup unavailable: {error}"));
     }
     let outcome = if record.cancel_actor.is_some() {
@@ -1271,21 +1267,6 @@ fn settle(engine: &Arc<Engine>, id: &str, error: &io::Error) -> io::Result<()> {
         Outcome::Failed(Failure::abandoned(&format!("device executor ended: {error}")).encode())
     };
     engine.finish(id, outcome).map(drop)
-}
-
-/// JIT scopes belong to one machine run (Runtime: one worker boot); executors of earlier
-/// runs are gone before this pool exists, so their scopes are unowned.
-fn remove_stale_jit(root: &Path, incarnation: &str) {
-    let Ok(entries) = fs::read_dir(root.join("jit")) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if entry.file_name() != incarnation {
-            if let Err(error) = fs::remove_dir_all(entry.path()) {
-                eprintln!("stale JIT scope {}: {error}", entry.path().display());
-            }
-        }
-    }
 }
 
 pub(crate) fn output_bindings(bindings: Vec<device_executor::AssetBinding>) -> io::Result<Vec<AssetBinding>> {

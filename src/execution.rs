@@ -1,7 +1,11 @@
 //! CPU runner supervision. Scheduling policy remains with the machine owner.
-use crate::journal::{
-    Artifact, Execution, Invocation, Journal, Outcome, ProcessBirth, ProgressSnapshot,
-    ResultRecord, State, SubmissionContext,
+use crate::{
+    journal::{
+        Artifact, Execution, Invocation, Journal, Outcome, ProcessBirth, ProgressSnapshot,
+        ResultRecord, State, SubmissionContext,
+    },
+    launch_identity::Seal,
+    process::Liveness,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -20,7 +24,7 @@ use std::{
         },
     },
     path::{Component, Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Stdio},
     sync::{Arc, Condvar, Mutex},
     time::Duration,
 };
@@ -151,6 +155,8 @@ type Writer = Arc<Mutex<UnixStream>>;
 
 pub struct Engine {
     pub root: PathBuf,
+    /// Scopes runner JIT caches to this machine run.
+    incarnation: String,
     journal: Mutex<Journal>,
     active: Mutex<HashMap<String, ActiveRun>>,
     owned: Mutex<HashSet<String>>,
@@ -161,7 +167,7 @@ pub struct Engine {
 
 #[derive(Clone)]
 enum ActiveRun {
-    Protocol(Writer),
+    Protocol(Writer, Arc<crate::process::Watch>),
     Managed(Arc<dyn Fn() -> io::Result<()> + Send + Sync>),
 }
 
@@ -173,8 +179,11 @@ impl Engine {
             fs::create_dir_all(root.join(name))?;
         }
         File::open(root)?.sync_all()?;
+        let incarnation = uuid::Uuid::new_v4().simple().to_string();
+        crate::launch_identity::remove_stale_jit(&root.join("seal"), &incarnation);
         Ok(Arc::new(Self {
             root: root.to_path_buf(),
+            incarnation,
             journal: Mutex::new(Journal::open(root)?),
             active: Mutex::new(HashMap::new()),
             owned: Mutex::new(HashSet::new()),
@@ -550,10 +559,14 @@ impl Engine {
         if let Some(active) = active {
             // Delivery failure does not revoke the already committed cancellation authority.
             let _ = match active {
-                ActiveRun::Protocol(writer) => write_command(
-                    &mut writer.lock().unwrap(),
-                    &RunnerCommand::Cancel { execution_id: id },
-                ),
+                ActiveRun::Protocol(writer, watch) => {
+                    // From now on the runner's frames are the meter: if they stop, it is killed.
+                    watch.canceled();
+                    write_command(
+                        &mut writer.lock().unwrap(),
+                        &RunnerCommand::Cancel { execution_id: id },
+                    )
+                }
                 ActiveRun::Managed(cancel) => cancel(),
             };
         }
@@ -798,16 +811,25 @@ impl Engine {
         let output_root = self.root.join("staging").join(id);
         let launch = (|| {
             fs::create_dir_all(&output_root)?;
+            let seal = Seal::prepare(
+                &self.root.join("seal"),
+                None,
+                &self.incarnation,
+                &record.invocation.generation,
+                "",
+            )?;
             let (parent, runner) = UnixStream::pair()?;
             let stdout = File::create(output_root.join("stdout.log"))?;
             let stderr = File::create(output_root.join("stderr.log"))?;
-            let child = spawn_runner(config, &runner, stdout, stderr)?;
+            let child = spawn_runner(config, &seal, &runner, stdout, stderr)?;
             drop(runner);
-            Ok::<_, io::Error>((child, parent))
+            let exact = crate::process::Exact::open(&process_birth(child.id())?)?
+                .ok_or_else(|| io::Error::other("launched runner has no exact birth"))?;
+            Ok::<_, io::Error>((child, parent, exact))
         })();
-        let (mut child, mut reader) = match launch {
+        let (mut child, mut reader, exact) = match launch {
             Ok(value) => value,
-            Err(error) => {
+            Err(error) if crate::process::transient(&error) => {
                 self.journal
                     .lock()
                     .unwrap()
@@ -815,19 +837,22 @@ impl Engine {
                 self.notify_activity();
                 return Ok(());
             }
+            Err(error) => {
+                // Nothing authored ran; a deterministic launch failure is not retried.
+                self.finish(
+                    id,
+                    Outcome::Failed(format!("runner did not start: {error}")),
+                )?;
+                return Ok(());
+            }
         };
-        let supervised = self.supervise(
-            id,
-            &record.invocation,
-            &output_root,
-            &mut child,
-            &mut reader,
-        );
-        // Closing both socket directions is a cooperative EOF signal, not a process kill.
+        let supervised = self.supervise(id, &record.invocation, &output_root, &exact, &mut reader);
+        // Closing both socket directions is a cooperative EOF signal; the runner is killed
+        // only if it then stops making measurable progress without exiting.
         self.active.lock().unwrap().remove(id);
         let _ = reader.shutdown(std::net::Shutdown::Both);
         drop(reader);
-        let status = child.wait()?;
+        let (status, _) = crate::process::reap(&exact, Some(&mut child), Liveness::default())?;
         match supervised {
             Ok(terminal) => {
                 let outcome = match terminal {
@@ -862,18 +887,19 @@ impl Engine {
                 self.finish(id, outcome)?;
             }
             Err(error) => {
-                if self.get(id)?.state == State::Starting {
-                    self.journal.lock().unwrap().defer_unstarted(
-                        id,
-                        format!("runner ended before start authorization: {error}"),
-                    )?;
-                    self.notify_activity();
+                let record = self.get(id)?;
+                let outcome = if record.cancel_actor.is_some() {
+                    Outcome::Canceled
+                } else if record.state == State::Starting {
+                    // Ended before authorization: no authored code ran; its exit is the reason.
+                    Outcome::Failed(format!(
+                        "runner ended before start ({status}): {error}; {}",
+                        crate::process::tail(&output_root.join("stderr.log"))
+                    ))
                 } else {
-                    self.finish(
-                        id,
-                        Outcome::Failed(format!("executor ended {status}: {error}")),
-                    )?;
-                }
+                    Outcome::Failed(format!("executor ended {status}: {error}"))
+                };
+                self.finish(id, outcome)?;
             }
         }
         Ok(())
@@ -884,19 +910,23 @@ impl Engine {
         id: &str,
         invocation: &Invocation,
         output_root: &Path,
-        child: &mut Child,
+        exact: &crate::process::Exact,
         reader: &mut UnixStream,
     ) -> io::Result<RunnerEvent> {
         // Register identity immediately after spawn, before any package authorization.
-        let birth = process_birth(child.id())?;
-        self.journal.lock().unwrap().register_process(id, birth)?;
+        let pid = exact.birth.pid;
+        self.journal
+            .lock()
+            .unwrap()
+            .register_process(id, exact.birth.clone())?;
         self.notify_activity();
         let ready =
             read_event(reader)?.ok_or_else(|| io::Error::other("runner EOF before Ready"))?;
         match ready {
-            RunnerEvent::Ready { pid, capabilities }
-                if pid == child.id()
-                    && capabilities.iter().any(|cap| cap == "runtime.author-cpu/1") => {}
+            RunnerEvent::Ready {
+                pid: ready,
+                capabilities,
+            } if ready == pid && capabilities.iter().any(|cap| cap == "runtime.author-cpu/1") => {}
             _ => {
                 return Err(io::Error::other(
                     "runner did not offer CPU author capability for its actual PID",
@@ -904,6 +934,14 @@ impl Engine {
             }
         }
         let writer = Arc::new(Mutex::new(reader.try_clone()?));
+        let watching = crate::process::Watching::start(
+            exact.try_clone()?,
+            crate::process::Meter::Frames,
+            Liveness::default(),
+            Duration::ZERO,
+            "invocation",
+        )?;
+        let watch = watching.watch();
         {
             let mut stream = writer.lock().unwrap();
             // Running means authorization may have arrived, including a lost write ack.
@@ -917,12 +955,27 @@ impl Engine {
                     output_root,
                 },
             )?;
-            self.active
-                .lock()
-                .unwrap()
-                .insert(id.into(), ActiveRun::Protocol(writer.clone()));
+            self.active.lock().unwrap().insert(
+                id.into(),
+                ActiveRun::Protocol(writer.clone(), watch.clone()),
+            );
         }
+        let terminal = self.events(id, reader, &writer, &watch);
+        match watching.finish().0 {
+            Some(verdict) => Err(io::Error::other(verdict)),
+            None => terminal,
+        }
+    }
+
+    fn events(
+        &self,
+        id: &str,
+        reader: &mut UnixStream,
+        writer: &Writer,
+        watch: &crate::process::Watch,
+    ) -> io::Result<RunnerEvent> {
         if self.get(id)?.cancel_actor.is_some() {
+            watch.canceled();
             write_command(
                 &mut writer.lock().unwrap(),
                 &RunnerCommand::Cancel { execution_id: id },
@@ -931,6 +984,7 @@ impl Engine {
         loop {
             let event = read_event(reader)?
                 .ok_or_else(|| io::Error::other("runner EOF before terminal result"))?;
+            watch.frame();
             let event_id = match &event {
                 RunnerEvent::Progress { execution_id, .. }
                 | RunnerEvent::Result { execution_id, .. }
@@ -1092,27 +1146,35 @@ fn overlay_observation(
     }
 }
 
+/// The CPU runner launches like an executor: through the Runtime trampoline (parent-death,
+/// no_new_privs, OOM order, own process group) with the sealed environment and no GPU.
 fn spawn_runner(
     config: RunnerConfig,
+    seal: &Seal,
     socket: &UnixStream,
     stdout: File,
     stderr: File,
 ) -> io::Result<Child> {
     let fd = socket.as_raw_fd();
-    let mut command = Command::new(config.python);
+    let mut configured = std::collections::BTreeMap::new();
+    if !config.import_paths.is_empty() {
+        // PYTHONPATH is import-path configuration, never an execution-mode switch.
+        configured.insert(
+            "PYTHONPATH".to_string(),
+            std::env::join_paths(config.import_paths)
+                .map_err(io::Error::other)?
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    let mut command = crate::launch_identity::trampoline(&config.python, None)?;
     command
         .arg("-m")
         .arg(config.module)
         .arg("--execution-fd")
-        .arg(fd.to_string());
-    if !config.import_paths.is_empty() {
-        // PYTHONPATH is import-path configuration, never an execution-mode switch.
-        command.env(
-            "PYTHONPATH",
-            std::env::join_paths(config.import_paths).map_err(io::Error::other)?,
-        );
-    }
-    command
+        .arg(fd.to_string())
+        .env_clear()
+        .envs(seal.environment(&configured))
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));

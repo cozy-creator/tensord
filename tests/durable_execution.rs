@@ -15,6 +15,9 @@ use std::{
 };
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
+/// The runner launches through the Runtime trampoline, so its interpreter needs cozy-runtime:
+/// the repository's test environment (`uv sync --locked --extra test`).
+const RUNNER_PYTHON: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/.venv/bin/python");
 
 struct Fixture {
     root: PathBuf,
@@ -35,7 +38,7 @@ impl Fixture {
     }
     fn config(&self) -> RunnerConfig {
         RunnerConfig {
-            python: "/usr/bin/python3".into(),
+            python: RUNNER_PYTHON.into(),
             module: "runner_fixture".into(),
             import_paths: vec![self.root.clone()],
             generation_hold: None,
@@ -626,7 +629,7 @@ fn cursor_reservation_renewal_never_reuses_old_cursors_and_accepts_older_records
 }
 
 #[test]
-fn launch_failure_is_a_visible_wait_without_retry_churn() {
+fn deterministic_launch_failure_fails_once_with_its_reason() {
     let fixture = Fixture::new();
     let record = fixture
         .engine
@@ -635,22 +638,22 @@ fn launch_failure_is_a_visible_wait_without_retry_churn() {
     let mut config = fixture.config();
     config.python = fixture.root.join("absent-python");
     fixture.engine.dispatch(&record.id, config).unwrap();
-    let result = fixture.wait(&record.id, |record| record.waiting_reason.is_some());
-    assert_eq!(result.state, State::Queued);
+    // Nothing authored ran; the missing interpreter is the reason, not a queue that waits
+    // for someone's next install.
+    let result = fixture.wait(&record.id, |record| record.state.terminal());
+    assert_eq!(result.state, State::Failed);
     assert_eq!(result.attempt, 1);
+    assert!(result.failure.unwrap().contains("did not start"));
     let duplicate = fixture
         .engine
         .submit("unlaunchable", fixture.invocation("infer"))
         .unwrap();
-    assert_eq!(duplicate.attempt, 1);
-    // Correct interpreter is the observed changed condition permitting an explicit retry.
-    fixture
+    assert_eq!((duplicate.state, duplicate.attempt), (State::Failed, 1));
+    assert!(!fixture
         .engine
         .dispatch(&record.id, fixture.config())
-        .unwrap();
-    let result = fixture.wait(&record.id, |record| record.state.terminal());
-    assert_eq!(result.state, State::Completed);
-    assert_eq!(result.attempt, 2);
+        .unwrap());
+    assert!(!fixture.root.join("effect").exists());
 }
 
 #[test]
@@ -779,7 +782,7 @@ fn idempotency_compares_semantics_and_additive_runner_fields_are_tolerated() {
 }
 
 #[test]
-fn actual_owner_death_waits_for_orphan_then_fails_without_repeating_effects() {
+fn actual_owner_death_kills_its_runner_then_fails_without_repeating_effects() {
     let fixture = Fixture::new();
     let mut owner = OwnedFaultProcess(
         Command::new(std::env::current_exe().unwrap())
@@ -817,37 +820,57 @@ fn actual_owner_death_waits_for_orphan_then_fails_without_repeating_effects() {
             .unwrap();
     assert_eq!(observed.completed_units, 1);
     let birth = record.process.unwrap();
+    let runner = cozy_machine::process::Exact::open(&birth).unwrap();
     owner.0.kill().unwrap();
     owner.0.wait().unwrap();
-    fixture.engine.reconcile().unwrap();
-    assert_eq!(
-        fixture.engine.get(&record.id).unwrap().state,
-        State::Running
-    );
-    assert_eq!(fixture.engine.get(&record.id).unwrap().completed_units, 0);
-    assert!(fixture.engine.get(&record.id).unwrap().revision > observed.revision);
-    assert!(!execution::process_ended(&birth).unwrap());
-    fs::write(fixture.root.join("release"), b"continue").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while !execution::process_ended(&birth).unwrap() {
-        assert!(
-            Instant::now() < deadline,
-            "orphan has not completed the authored package"
-        );
-        thread::sleep(Duration::from_millis(5));
+    // Parent-death SIGKILL: authored code does not outlive the machine that owns it.
+    if let Some(runner) = runner {
+        runner.wait().unwrap();
     }
+    assert!(execution::process_ended(&birth).unwrap());
     fixture.engine.reconcile().unwrap();
-    assert_eq!(fixture.engine.get(&record.id).unwrap().state, State::Failed);
+    let failed = fixture.engine.get(&record.id).unwrap();
+    assert_eq!(failed.state, State::Failed);
+    assert!(failed.revision > observed.revision);
     let persisted = Journal::open(&fixture.root.join("state"))
         .unwrap()
         .get(&record.id)
         .unwrap();
-    assert!(persisted.revision > observed.revision);
     assert!(persisted.revision > observed.revision_ceiling);
     assert!(!fixture
         .engine
         .dispatch(&record.id, fixture.config())
         .unwrap());
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("effect")).unwrap(),
+        "once\n"
+    );
+}
+
+#[test]
+fn canceled_runner_that_ignores_cancel_is_killed_on_measured_stillness() {
+    let fixture = Fixture::new();
+    let id = fixture.submit("wedge");
+    let running = fixture.wait(&id, |record| record.completed_units == 1);
+    let birth = running.process.unwrap();
+    let canceled_at = Instant::now();
+    fixture.engine.cancel(&id, "actor-a").unwrap();
+    // Production constants: no frames after the cancel for longer than the 30 s floor.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let ended = loop {
+        let record = fixture.engine.get(&id).unwrap();
+        if record.state.terminal() {
+            break record;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "canceled wedge was never ended: {record:?}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(ended.state, State::Canceled);
+    assert!(canceled_at.elapsed() >= Duration::from_secs(30));
+    assert!(execution::process_ended(&birth).unwrap());
     assert_eq!(
         fs::read_to_string(fixture.root.join("effect")).unwrap(),
         "once\n"
@@ -869,7 +892,7 @@ fn owner_process_fixture() {
         .dispatch(
             &record.id,
             RunnerConfig {
-                python: "/usr/bin/python3".into(),
+                python: RUNNER_PYTHON.into(),
                 module: "runner_fixture".into(),
                 import_paths: vec![PathBuf::from(config["imports"].as_str().unwrap())],
                 generation_hold: None,
@@ -933,6 +956,8 @@ from pathlib import Path
 def infer(inputs, output_root, canceled, progress):
     with open(inputs['side_effect'],'a') as stream:stream.write('once\n')
     progress(1)
+    if inputs['mode']=='wedge':
+        import threading;threading.Event().wait()
     if inputs['mode']=='progress':
         while not Path(inputs['advance']).exists() and not canceled.wait(0.01):pass
         for units in range(2,258):progress(units)

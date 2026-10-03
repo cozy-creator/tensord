@@ -42,8 +42,10 @@ let file = engine.open_result(&record.id, 0)?;  // re-verifies digest and length
 
 - `RunnerConfig`: trusted `python`, `module`, `import_paths` (`PYTHONPATH`), `generation_hold`.
   The runner holds its generation independently too.
-- `dispatch` spawns directly (no shell) with one inherited socket (`--execution-fd`), null stdin,
-  and stdout/stderr files in staging.
+- `dispatch` launches through the Runtime trampoline like an executor (parent-death SIGKILL,
+  no_new_privs, OOM order, own process group) with the sealed environment and no GPU, one
+  inherited socket (`--execution-fd`), null stdin, and stdout/stderr files in staging. A machine
+  that dies takes its runners with it.
 - Scheduler hooks: `ready`, `active`, `nonterminal` (partial indexes). `activity_epoch()` +
   `wait_activity(epoch, wait)` is a process-local wake. The wait bounds observation only.
 - `waiting_reason` excludes a queued record from `ready`. `wait_for_environment` sets or clears it.
@@ -57,10 +59,15 @@ let file = engine.open_result(&record.id, 0)?;  // re-verifies digest and length
    no authored code run.
 5. Read `Progress` until a terminal event, wait for exit, take output custody, commit one outcome.
 
-- Only explicit `cancel` cancels. Disconnect, EOF and submission closure never do. No time-based kill.
+- Only explicit `cancel` cancels. Disconnect, EOF and submission closure never do. No time-based
+  kill: after a cancel the runner's frames are the meter, and a runner that stops moving for
+  longer than eight times its longest gap (at least 30 s) is killed and the run is `canceled`.
+- After the terminal event the channel closes; a runner that then neither exits nor makes
+  measurable CPU/IO progress is killed before it is reaped.
 - A runner `Canceled` without a durable `cancel_actor` becomes `failed`.
-- Launch failure returns the record to `queued` with a `waiting_reason`. It stays there until the
-  owner clears the reason after a changed condition. A duplicate submission is not one.
+- A launch failure or an exit before `Ready` is `failed` with the reason (and stderr tail). Only a
+  transient OS shortage (EAGAIN, ENOMEM, EMFILE, ENFILE) returns the record to `queued` with a
+  `waiting_reason`.
 
 `reconcile` (records not supervised by this process):
 - birth alive, or liveness unknown: stays nonterminal;
@@ -106,5 +113,5 @@ component (no absolute, `..` or symlink), checked as a regular file via `O_PATH`
 `results/<id>/`, SHA-256 hashed, fsynced, made 0400 and renamed. Every `asset_binding` must name
 one held artifact of equal length.
 
-Not implemented: same-UID isolation (reads detect mutation), descendant containment,
-cleanup of orphan `*.pending` files, bounded log policy.
+Not implemented: same-UID isolation (reads detect mutation), containment of descendants that
+leave the runner's process group, cleanup of orphan `*.pending` files, bounded log policy.

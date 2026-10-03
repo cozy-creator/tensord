@@ -29,7 +29,8 @@ atomically last. A generation is never updated. `catalog.rs` resolves one only u
 
 ## Runner (`runner.py`, `runtime_bridge.py`)
 
-`<generation python> -m cozy_machine_client.runner --execution-fd N`
+`<generation python> -I -m cozy_runtime.internal.trampoline … -- <generation python> -m
+cozy_machine_client.runner --execution-fd N` (see durable execution).
 
 1. Send `Ready` before importing Runtime or package code.
 2. Accept exactly one `Invoke`.
@@ -42,8 +43,8 @@ Rules:
 - Progress counts positive `position` deltas per (stage, call request, call attempt), up to 256
   keys. SDK event sequence numbers are not work.
 - Progress goes through a bounded queue of 64 that drops when full.
-- Only a matching `Cancel` sets the cancel callback. EOF is owner loss: running code may finish,
-  and its result is not durable.
+- Only a matching `Cancel` sets the cancel callback. A dead owner kills the runner (parent-death
+  signal); a closed channel alone lets running code finish, and its result is not durable.
 - One runner, one attempt.
 
 ## Not implemented

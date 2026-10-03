@@ -5,7 +5,12 @@ use crate::journal::ProcessBirth;
 use std::{
     fs::{self, File},
     io,
-    os::fd::{AsRawFd, FromRawFd},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::process::ExitStatusExt,
+    },
+    process::{Child, ExitStatus},
+    sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
 
@@ -103,6 +108,10 @@ impl Exact {
 
     pub fn as_file(&self) -> &File {
         &self.pidfd
+    }
+
+    pub fn into_file(self) -> File {
+        self.pidfd
     }
 
     /// SIGKILL this birth and, while it still anchors its own process group, every member.
@@ -266,6 +275,218 @@ impl Pace {
             self.patience(floor).as_secs_f64()
         )
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Meter {
+    /// CPU plus bytes moved by the process (Runtime `ExecutorChild.watched`).
+    Burn,
+    /// Frames of the running invocation, judged only after a cancel (Runtime `cancel_stall`).
+    Frames,
+}
+
+#[derive(Default)]
+struct WatchState {
+    done: bool,
+    serving: bool,
+    frames: u64,
+    canceled_at: Option<Instant>,
+    killed: Option<String>,
+    worst_gap: Duration,
+}
+
+/// One exchange's progress observer, shared with whoever may cancel it. It kills the exact
+/// process (and its group) only on a measured wedge; the kill closes the channel, so the
+/// blocked exchange returns.
+pub struct Watch {
+    meter: Meter,
+    state: Mutex<WatchState>,
+    changed: Condvar,
+}
+impl Watch {
+    fn run(&self, exact: Exact, liveness: Liveness, worst_gap: Duration, what: &str) {
+        let floor = liveness.floor();
+        // Frame gaps teach only the frame meter; CPU-plus-bytes starts its own pace.
+        let mut pace = match self.meter {
+            Meter::Frames => Pace::seeded(worst_gap),
+            Meter::Burn => Pace::default(),
+        };
+        let mut state = self.state.lock().unwrap();
+        while !state.done {
+            let now = Instant::now();
+            let reading = match self.meter {
+                Meter::Burn => burn(exact.birth.pid),
+                Meter::Frames => Some(state.frames),
+            };
+            pace.observe(reading, now);
+            if state.serving {
+                pace.excuse(now);
+            }
+            state.worst_gap = pace.worst_pause;
+            let since = match self.meter {
+                Meter::Burn => pace.still_since(),
+                Meter::Frames => state
+                    .canceled_at
+                    .map(|at| pace.still_since().map_or(at, |moved| moved.max(at))),
+            };
+            if let Some(since) = since {
+                let still = now - since;
+                if still > pace.patience(floor) {
+                    let verdict = format!("wedged during {what}: {}", pace.verdict(still, floor));
+                    match exact.kill() {
+                        Ok(()) => state.killed = Some(verdict),
+                        Err(error) => eprintln!("{verdict}; kill failed: {error}"),
+                    }
+                    return;
+                }
+            }
+            state = self.changed.wait_timeout(state, liveness.sample).unwrap().0;
+        }
+    }
+    pub fn frame(&self) {
+        self.state.lock().unwrap().frames += 1;
+    }
+    /// Time the machine spends answering this process is not the process's stillness.
+    pub fn serving(&self, serving: bool) {
+        self.state.lock().unwrap().serving = serving;
+    }
+    pub fn canceled(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.canceled_at.get_or_insert_with(Instant::now);
+        self.changed.notify_all();
+    }
+}
+
+/// A running watch; dropping it stops the observer on every path.
+pub struct Watching {
+    watch: Arc<Watch>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+impl Watching {
+    pub fn start(
+        exact: Exact,
+        meter: Meter,
+        liveness: Liveness,
+        worst_gap: Duration,
+        what: &'static str,
+    ) -> io::Result<Self> {
+        let watch = Arc::new(Watch {
+            meter,
+            state: Mutex::new(WatchState::default()),
+            changed: Condvar::new(),
+        });
+        let observer = watch.clone();
+        let thread = std::thread::Builder::new()
+            .name(format!("watch-{what}"))
+            .spawn(move || observer.run(exact, liveness, worst_gap, what))?;
+        Ok(Self {
+            watch,
+            thread: Some(thread),
+        })
+    }
+    pub fn watch(&self) -> Arc<Watch> {
+        self.watch.clone()
+    }
+    /// The kill's measurement, if one was needed, and the longest frame gap seen.
+    pub fn finish(mut self) -> (Option<String>, Duration) {
+        self.stop();
+        let state = self.watch.state.lock().unwrap();
+        (state.killed.clone(), state.worst_gap)
+    }
+    fn stop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            self.watch.state.lock().unwrap().done = true;
+            self.watch.changed.notify_all();
+            let _ = thread.join();
+        }
+    }
+}
+impl Drop for Watching {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// After its channel closed: wait for this exact process to exit, killing it only on a
+/// measured wedge, then reap it. The sample period is the meter's cadence, not a deadline.
+pub fn reap(
+    exact: &Exact,
+    child: Option<&mut Child>,
+    liveness: Liveness,
+) -> io::Result<(ExitStatus, Option<String>)> {
+    let floor = liveness.floor();
+    let mut pace = Pace::default();
+    let mut killed = None;
+    while !readable_within(exact.as_file(), liveness.sample)? {
+        let now = Instant::now();
+        pace.observe(burn(exact.birth.pid), now);
+        if killed.is_some() {
+            continue;
+        }
+        if let Some(since) = pace.still_since() {
+            let still = now - since;
+            if still > pace.patience(floor) {
+                exact.kill()?;
+                killed = Some(format!(
+                    "wedged while ending: {}",
+                    pace.verdict(still, floor)
+                ));
+            }
+        }
+    }
+    let status = match child {
+        Some(child) => child.wait()?,
+        None => ExitStatus::from_raw(0),
+    };
+    Ok((status, killed))
+}
+
+fn readable_within(file: &File, period: Duration) -> io::Result<bool> {
+    let mut poll = libc::pollfd {
+        fd: file.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let milliseconds = period.as_millis().clamp(1, i32::MAX as u128) as i32;
+    loop {
+        let result = unsafe { libc::poll(&mut poll, 1, milliseconds) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if result == 0 {
+            return Ok(false);
+        }
+        if poll.revents & libc::POLLIN != 0 {
+            return Ok(true);
+        }
+        return Err(io::Error::other("process exit is not observable"));
+    }
+}
+
+/// An OS shortage that may clear by itself; nothing else justifies requeueing a launch.
+pub fn transient(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EAGAIN | libc::ENOMEM | libc::EMFILE | libc::ENFILE | libc::EINTR)
+    )
+}
+
+/// The last bytes of a log, for a failure reason.
+pub fn tail(path: &std::path::Path) -> String {
+    const TAIL: u64 = 2048;
+    let Ok(mut file) = File::open(path) else {
+        return String::new();
+    };
+    use std::io::{Read, Seek};
+    let length = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let _ = file.seek(io::SeekFrom::Start(length.saturating_sub(TAIL)));
+    let mut bytes = Vec::new();
+    let _ = file.read_to_end(&mut bytes);
+    String::from_utf8_lossy(&bytes).trim().to_string()
 }
 
 #[cfg(test)]

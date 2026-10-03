@@ -213,19 +213,14 @@ impl Seal {
         generation: &str,
         devices: &str,
     ) -> io::Result<Self> {
-        let safe = |value: &str| {
-            !value.is_empty()
-                && value.len() <= 128
-                && value
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-        };
-        if !safe(incarnation) || !safe(generation) {
+        if incarnation.is_empty() || !incarnation.bytes().all(|b| b.is_ascii_alphanumeric()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "seal scope names must be plain identifiers",
+                "a machine run is named by an alphanumeric incarnation",
             ));
         }
+        // Directory names never carry a caller's spelling of the generation.
+        let generation = &tensorfs_core::sha256::hex_digest(generation.as_bytes())[..32];
         let uid = identity.map_or_else(|| unsafe { libc::geteuid() }, |i| i.uid);
         let namespace = format!("u{uid}");
         let owned = |path: PathBuf| -> io::Result<PathBuf> {
@@ -240,6 +235,7 @@ impl Seal {
             }
             Ok(path)
         };
+        fs::create_dir_all(root)?;
         for boundary in ["home", "kernels", "jit"] {
             boundary_directory(&root.join(boundary))?;
         }
@@ -328,6 +324,21 @@ impl Seal {
             })
             .map(|(name, _)| name.clone())
             .collect()
+    }
+}
+
+/// JIT scopes belong to one machine run (Runtime: one worker boot); the executors of
+/// earlier runs are gone before a new one starts, so their scopes are unowned.
+pub fn remove_stale_jit(root: &Path, incarnation: &str) {
+    let Ok(entries) = fs::read_dir(root.join("jit")) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name() != incarnation {
+            if let Err(error) = fs::remove_dir_all(entry.path()) {
+                eprintln!("stale JIT scope {}: {error}", entry.path().display());
+            }
+        }
     }
 }
 
