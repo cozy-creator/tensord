@@ -235,6 +235,8 @@ struct Session {
     executor: DeviceExecutor,
     /// Budget cells by rank: rank 0's own, and each follower's (`rank_cells/1`).
     budget_cells: BTreeMap<u32, File>,
+    /// Its selected models' headers and assets, served on `model_source`.
+    sources: Arc<ModelSources>,
     actor: String,
     /// This executor in the host tier and the layouts it may adopt.
     peer: u64,
@@ -1701,7 +1703,7 @@ impl GpuPool {
             serving: self.serving.clone(),
             id,
         };
-        let sources = ModelSources::open_shared(self.store.clone(), &selections)?;
+        let sources = Arc::new(ModelSources::open_shared(self.store.clone(), &selections)?);
         let peer = self.host.register_peer(executor.observer_pidfd()?);
         let grants = selections
             .iter()
@@ -1722,6 +1724,7 @@ impl GpuPool {
             loaded: false,
             executor,
             budget_cells: BTreeMap::new(),
+            sources,
             actor: plan.actor.clone(),
             peer,
             grants,
@@ -1760,6 +1763,7 @@ impl GpuPool {
             cells: &mut session.budget_cells,
             completed: 0,
             host: &self.host,
+            sources: &session.sources,
             peer: session.peer,
             grants: &session.grants,
             actor: &session.actor,
@@ -1881,6 +1885,7 @@ impl GpuPool {
                     attention_pin: String::new(),
                     stages: false,
                     sealed_tiers: true,
+                    model_sources: true,
                     pinned_bytes: at_load.then_some(pinned),
                     device_weights: sharing,
                     cap_bytes: load_cap,
@@ -2822,6 +2827,7 @@ struct Callbacks<'a> {
     cells: &'a mut BTreeMap<u32, File>,
     completed: u64,
     host: &'a Arc<HostTier>,
+    sources: &'a Arc<ModelSources>,
     peer: u64,
     grants: &'a [HostGrant],
     actor: &'a str,
@@ -2956,6 +2962,19 @@ impl Services for Callbacks<'_> {
                     return Ok((answer, None));
                 }
             }
+        }
+        if frame.kind == Kind::ModelSource {
+            drop(descriptor);
+            // A refusal is an answer: that executor fails its load with the reason.
+            return Ok(match self.sources.serve(frame) {
+                Ok((answer, file)) => (answer, Some(file)),
+                Err(error) => {
+                    let mut answer = Answer::unavailable(frame.seq);
+                    answer.code = "model_source_refused".into();
+                    answer.detail = error.to_string();
+                    (answer, None)
+                }
+            });
         }
         if frame.kind == Kind::Publish {
             drop(descriptor);

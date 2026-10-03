@@ -61,6 +61,8 @@ struct Turns {
     phase: String,
     /// The host tier, this executor in it, and what it may adopt.
     host: Option<(Arc<HostTier>, u64, Vec<HostGrant>)>,
+    /// Its models' headers and assets (`model_source`), with the host tier.
+    sources: Option<ModelSources>,
 }
 impl Services for Turns {
     fn progress(&mut self, frame: &Frame) {
@@ -86,6 +88,13 @@ impl Services for Turns {
             let row = serde_json::json!({"phase":self.phase,"exchange":"SealedPrefetch","ok":answer.ok,"detail":answer.detail});
             writeln!(self.events, "{row}")?;
             return Ok((answer, None));
+        }
+        if let (Kind::ModelSource, Some(sources)) = (frame.kind, &self.sources) {
+            drop(descriptor);
+            let (answer, file) = sources.serve(frame)?;
+            let row = serde_json::json!({"phase":self.phase,"exchange":"ModelSource","name":frame.name,"length":answer.length});
+            writeln!(self.events, "{row}")?;
+            return Ok((answer, Some(file)));
         }
         if let (Kind::SealedTier, Some((tier, peer, grants))) = (frame.kind, &self.host) {
             let plan = descriptor.ok_or_else(|| io::Error::other("sealed tier omitted its plan"))?;
@@ -278,6 +287,7 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
         events: File::create(config.root.join("events.jsonl"))?,
         phase: "start".into(),
         host: None,
+        sources: None,
     };
     if let (true, Some(tier)) = (sealed, tier) {
         let selections = selected_sources(&config.binding)?;
@@ -294,6 +304,7 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
             .collect::<io::Result<Vec<_>>>()?;
         tier.prepare(grants.clone());
         turns.host = Some((tier.clone(), tier.register_peer(executor.observer_pidfd()?), grants));
+        turns.sources = Some(sources);
     }
     let disk_before = disk_read_bytes();
     let mut timings = BTreeMap::new();
@@ -335,6 +346,7 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
             device_weights: false,
             cap_bytes: None,
             sealed_tiers: sealed,
+            model_sources: sealed,
             pinned_bytes: at_load.then_some(config.pinned_budget_bytes),
         },
         &mut turns,

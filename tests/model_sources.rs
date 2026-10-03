@@ -1,6 +1,11 @@
-//! A session's model selection: its authority, its headers and its encoded size.
+//! A session's model selection: its authority, its headers and its encoded size, and the
+//! header and assets it serves an executor that reads no store.
 use cozy_machine::model_sources::{ModelSources, SelectedManifest};
-use std::{fs, io};
+use sha2::{Digest, Sha256};
+use std::{
+    fs, io,
+    os::{fd::AsRawFd, unix::fs::FileExt},
+};
 use tensorfs_core::{
     dtype::Dtype,
     header::{Asset, Header, Part, Tensor},
@@ -128,5 +133,63 @@ fn a_selection_grants_its_headers_and_sizes_and_nothing_else() {
         components: vec!["absent".into()],
     };
     assert!(ModelSources::open(&root, &[absent]).is_err());
+    fs::remove_dir_all(root).unwrap();
+}
+
+fn frame(manifest: &str, name: &str) -> cozy_machine::device_executor::Frame {
+    serde_json::from_value(serde_json::json!({
+        "event": "request", "seq": 7, "kind": "model_source", "manifest": manifest, "name": name,
+    }))
+    .unwrap()
+}
+
+/// What `model_source` hands an executor: the header and each asset, verified, in a sealed
+/// read-only memfd with its digest; nothing outside the selection.
+#[test]
+fn the_selection_serves_its_header_and_assets_sealed_and_nothing_else() {
+    let (root, manifest, _, _, _) = fixture();
+    let selected = SelectedManifest {
+        manifest: manifest.clone(),
+        components: vec!["allowed".into()],
+    };
+    let sources = ModelSources::open(&root, std::slice::from_ref(&selected)).unwrap();
+    for (name, want) in [
+        ("", None),
+        ("tokenizer/vocab.json", Some(&b"static tokenizer asset"[..])),
+    ] {
+        let (answer, file) = sources.serve(&frame(&manifest, name)).unwrap();
+        let mut got = vec![0; answer.length as usize];
+        file.read_exact_at(&mut got, 0).unwrap();
+        assert!(answer.ok && answer.held);
+        assert_eq!(answer.sha256, format!("{:x}", Sha256::digest(&got)));
+        match want {
+            Some(bytes) => assert_eq!(got, bytes),
+            None => assert!(
+                tensorfs_core::header::Header::parse(&got).is_ok(),
+                "the header"
+            ),
+        }
+        // SAFETY: scalar fcntl queries on a descriptor we hold.
+        unsafe {
+            assert_eq!(
+                libc::fcntl(file.as_raw_fd(), libc::F_GETFL) & libc::O_ACCMODE,
+                libc::O_RDONLY
+            );
+            assert_eq!(
+                libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) & 0x8,
+                0x8,
+                "write-sealed"
+            );
+        }
+    }
+    assert!(
+        sources.serve(&frame(&manifest, "../tfs.sqlite")).is_err(),
+        "only declared assets"
+    );
+    let other = "sha256:".to_string() + &"0".repeat(64);
+    assert!(
+        sources.serve(&frame(&other, "")).is_err(),
+        "only selected manifests"
+    );
     fs::remove_dir_all(root).unwrap();
 }

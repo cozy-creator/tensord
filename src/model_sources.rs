@@ -1,14 +1,19 @@
 //! A session's selected models: each manifest's verified header and the selected components'
-//! encoded size. Selection grants authority; the weights come from the sealed host tier.
+//! encoded size. Selection grants authority; the weights come from the sealed host tier, and
+//! the header and model assets from here (`ModelSource`): the executor reads no store.
+use crate::device_executor::{Answer, Frame};
+use crate::os;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
-    io::{self, Read},
+    fs::{self, File},
+    io::{self, Read, Write},
+    os::fd::AsRawFd,
     path::Path,
     sync::Arc,
 };
-use tensorfs_core::{header::Header, ids::ObjectRef, read, store::Store};
+use tensorfs_core::{header::Header, ids::ObjectRef, meta::Meta, read, store::Store};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SelectedManifest {
@@ -18,12 +23,14 @@ pub struct SelectedManifest {
 
 struct Selection {
     header: Header,
+    header_bytes: Vec<u8>,
     components: Vec<String>,
     encoded_bytes: u64,
     manifest_length: u64,
 }
 
 pub struct ModelSources {
+    store: Arc<Store>,
     selected: BTreeMap<String, Selection>,
 }
 
@@ -112,6 +119,7 @@ impl ModelSources {
                     manifest,
                     Selection {
                         header,
+                        header_bytes,
                         components,
                         encoded_bytes,
                         manifest_length: length,
@@ -125,7 +133,7 @@ impl ModelSources {
                 ));
             }
         }
-        Ok(Self { selected })
+        Ok(Self { store, selected })
     }
 
     /// Selected encoded source size, not GPU-resident/allocator memory. The SDK
@@ -154,5 +162,53 @@ impl ModelSources {
                     "manifest is outside selection",
                 )
             })
+    }
+
+    /// One selected model's header (`name` empty) or one header-declared asset, verified:
+    /// assets through a read lease over their own objects only.
+    pub fn source(&self, manifest: &str, name: &str) -> io::Result<Vec<u8>> {
+        let manifest = digest(manifest)?;
+        let selection = self.selected.get(manifest).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "manifest is outside selection",
+            )
+        })?;
+        if name.is_empty() {
+            return Ok(selection.header_bytes.clone());
+        }
+        let (_, asset) = selection
+            .header
+            .assets
+            .iter()
+            .find(|(asset, _)| asset == name)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "asset is outside the selected manifest",
+                )
+            })?;
+        let meta = Meta::open(&self.store).map_err(failure)?;
+        let (lease, _) =
+            read::acquire(&self.store, &meta, manifest, asset.segments.clone()).map_err(failure)?;
+        let bytes = read::read_asset(&lease, name, asset, asset.logical_length);
+        lease.release(&meta).map_err(failure)?;
+        bytes.map_err(failure)
+    }
+
+    /// Answer a `model_source` request: the bytes in a sealed memfd, with their digest.
+    pub fn serve(&self, frame: &Frame) -> io::Result<(Answer, File)> {
+        let bytes = self.source(&frame.manifest, &frame.name)?;
+        let mut file = os::memfd()?;
+        file.write_all(&bytes)?;
+        os::seal(&file)?;
+        let file = File::open(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
+        let mut answer = Answer::unavailable(frame.seq);
+        (answer.ok, answer.held) = (true, true);
+        answer.code.clear();
+        answer.detail.clear();
+        answer.sha256 = format!("{:x}", Sha256::digest(&bytes));
+        answer.length = bytes.len() as u64;
+        Ok((answer, file))
     }
 }

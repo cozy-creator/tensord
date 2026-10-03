@@ -214,6 +214,10 @@ pub enum DeviceCommand {
         /// `host_tiers.sealed/1`: every weight set asks for the machine's sealed layout.
         #[serde(skip_serializing_if = "is_false")]
         sealed_tiers: bool,
+        /// The machine serves the header and model assets (`model_source`): with sealed
+        /// tiers the executor reads no store. Older executors ignore it.
+        #[serde(skip_serializing_if = "is_false")]
+        model_sources: bool,
         /// `load_pinned/1`: the pinned budget, applied before any weight set registers.
         #[serde(skip_serializing_if = "Option::is_none")]
         pinned_bytes: Option<i64>,
@@ -350,6 +354,7 @@ pub enum Event {
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
+    ModelSource,
     SealedTier,
     SealedPrefetch,
     DeviceTier,

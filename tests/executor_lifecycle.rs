@@ -97,6 +97,7 @@ fn launch(generation: &Generation, hold: &File) -> (DeviceExecutor, PathBuf, Sea
             device_weights: false,
             cap_bytes: None,
             sealed_tiers: false,
+            model_sources: false,
             pinned_bytes: None,
         },
         DeviceCommand::Activate {
@@ -472,6 +473,7 @@ fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
             device_weights: false,
             cap_bytes: None,
             sealed_tiers: false,
+            model_sources: false,
             pinned_bytes: None,
         },
         DeviceCommand::Activate {

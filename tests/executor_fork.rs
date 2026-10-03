@@ -130,6 +130,7 @@ fn a_forked_executor_is_sealed_serves_and_is_reaped_with_its_status() {
                 device_weights: false,
                 cap_bytes: None,
                 sealed_tiers: false,
+                model_sources: false,
                 pinned_bytes: None,
             },
             DeviceCommand::Activate {

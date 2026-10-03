@@ -234,6 +234,7 @@ fn exec(
             attention_pin: String::new(),
             stages: false,
             sealed_tiers: false,
+            model_sources: false,
             pinned_bytes: Some(config.pinned_budget_bytes),
             device_weights: sharing,
             cap_bytes: None,

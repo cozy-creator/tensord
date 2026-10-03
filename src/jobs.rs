@@ -350,6 +350,7 @@ impl Jobs {
                 attention_pin: String::new(),
                 stages: false,
                 sealed_tiers: false,
+                model_sources: false,
                 pinned_bytes: None,
                 device_weights: false,
                 cap_bytes: None,
