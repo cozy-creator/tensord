@@ -51,7 +51,7 @@ def cg():   # cgroup v2, else v1 (v1 rss = anon without shmem; shmem sits inside
         r = sum(int(l.split()[2]) for l in open(f"{CG}/blkio/blkio.throttle.io_service_bytes_recursive")
                 if len(l.split()) == 3 and l.split()[1] == "Read")
         anon, shmem, mapped, file = m["total_rss"], m["total_shmem"], m["total_mapped_file"], m["total_cache"]
-    return {"anon": anon, "shmem": shmem, "file_mapped": mapped, "file": file, "host": anon + shmem, "read_bytes": r}
+    return {"anon": anon, "shmem": shmem, "file_mapped": mapped, "file": file, "host": anon + shmem, "read_bytes": r, "path": CG}
 def unit_reads(cg):   # no io controller (a user unit): the storage reads of the unit's live processes
     total = 0
     for d, _, fs in os.walk(cg):
@@ -428,6 +428,7 @@ def report(out: Path) -> dict:
     rows = [json.loads(line) for line in (out / "results.jsonl").read_text().splitlines()]
     samples = [json.loads(line) for line in (out / "samples.jsonl").read_text().splitlines() if line.strip()]
     requests = [r for r in rows if "wall_s" in r]
+    rental = bool(json.loads((out / "manifest.json").read_text()).get("rental"))
     summary: dict = {"failed": {a: [(r["scenario"], r["run"], r.get("error")) for r in requests if r["arm"] == a and not r["ok"]]
                                 for a in sorted({r["arm"] for r in requests})}, "arms": {}}
     for arm in sorted({r["arm"] for r in requests}):
@@ -449,7 +450,7 @@ def report(out: Path) -> dict:
             span = [r for r in mine if r["cycle"] == c]
             lo = min(r["t_start"] for r in span) + span[0]["offset"]
             hi = max(r["t_verified"] for r in span) + span[0]["offset"]
-            window = [s for s in samples if lo <= s["t"] <= hi]
+            window = [s for s in samples if lo <= s["t"] <= hi and (rental or s["cg"].get("path") != "/sys/fs/cgroup")]
             if window:
                 host.append(max(s["cg"]["host"] for s in window) / 2**30)
                 gpu.append(max(s["gpu"]["mem_mib"] or 0 for s in window) / 1024)
