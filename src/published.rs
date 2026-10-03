@@ -125,6 +125,27 @@ pub struct Publisher {
     sdk: PackageSdk,
     store: Arc<Store>,
     jobs: Mutex<HashMap<String, Arc<Job>>>,
+    /// Manifests preparations are fetching, counted per preparation (`Fetching`).
+    fetching: Mutex<HashMap<String, usize>>,
+}
+
+/// One preparation's manifests in `Publisher::fetching`, released when it ends.
+struct Fetching<'a> {
+    publisher: &'a Publisher,
+    manifests: Vec<String>,
+}
+impl Drop for Fetching<'_> {
+    fn drop(&mut self) {
+        let mut fetching = self.publisher.fetching.lock().unwrap();
+        for manifest in &self.manifests {
+            if let Some(count) = fetching.get_mut(manifest) {
+                *count -= 1;
+                if *count == 0 {
+                    fetching.remove(manifest);
+                }
+            }
+        }
+    }
 }
 
 impl Publisher {
@@ -135,6 +156,7 @@ impl Publisher {
             sdk,
             store,
             jobs: Mutex::new(HashMap::new()),
+            fetching: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -224,6 +246,43 @@ impl Publisher {
             ..Default::default()
         };
         self.work(service, actor, request, &job)
+    }
+
+    fn fetch(&self, manifests: Vec<String>) -> Fetching<'_> {
+        let mut fetching = self.fetching.lock().unwrap();
+        for manifest in &manifests {
+            *fetching.entry(manifest.clone()).or_default() += 1;
+        }
+        Fetching {
+            publisher: self,
+            manifests,
+        }
+    }
+
+    /// What a download's GC must never evict: what live executors read, every unfinished
+    /// run's prepared models, and what preparations are fetching (this one's included).
+    fn protected(&self, service: &Service, gpu: &GpuPool) -> Vec<String> {
+        let mut keep = gpu.serving();
+        keep.extend(self.fetching.lock().unwrap().keys().cloned());
+        for record in service.engine.nonterminal(usize::MAX).unwrap_or_default() {
+            let Some(submission) = record
+                .submission
+                .filter(|s| !s.preparation_id.is_empty())
+            else {
+                continue;
+            };
+            if let Ok(Some(preparation)) = service
+                .engine
+                .preparation(&submission.actor, &submission.preparation_id)
+            {
+                if let Ok(plan) = gpu.plan(&preparation) {
+                    keep.extend(plan.selections().into_iter().map(|s| s.manifest));
+                }
+            }
+        }
+        keep.sort();
+        keep.dedup();
+        keep
     }
 
     fn alias(&self, request: &Request) -> String {
@@ -831,7 +890,8 @@ impl Publisher {
                     .unwrap_or_default(),
             });
         }
-        let credential = catalog.credential();
+        let _fetching = self.fetch(grants.iter().map(|g| g.manifest.clone()).collect());
+        let keep = self.protected(service, gpu);
         let mut fetched = std::collections::BTreeSet::new();
         for grant in &grants {
             if !fetched.insert(grant.manifest.clone()) {
@@ -841,22 +901,7 @@ impl Publisher {
                 "downloading {}@{} {}",
                 grant.repository, grant.release, grant.lane
             ));
-            let refspec = format!("{}@{}", grant.repository, grant.manifest);
-            let keep = [grant.manifest.clone()];
-            let on_event = |event: &tensorfs_core::ensure::Event| {
-                job.bytes(event.bytes_done, event.bytes_total)
-            };
-            let mut ensure = tensorfs_core::ensure::Request::new(
-                &self.store,
-                catalog.origin(),
-                &refspec,
-                &credential,
-                catalog.policy(),
-            );
-            ensure.keep = &keep;
-            ensure.on_event = Some(&on_event);
-            tensorfs_core::ensure::ensure(&ensure)
-                .map_err(|e| ("model_download_failed", e.to_string()))?;
+            ensure(&self.store, catalog, &grant.repository, &grant.manifest, &keep, job)?;
         }
         for grant in &mut grants {
             let parameter = grant
@@ -870,7 +915,7 @@ impl Publisher {
                 .iter()
                 .find(|c| c.parameter == grant.slot || c.parameter == parameter)
             {
-                apply_adapters(&self.store, catalog, choice, grant, job)?;
+                apply_adapters(&self.store, catalog, choice, grant, &keep, job)?;
             }
         }
         job.stage(format!("preparing {}", request.package));
@@ -906,17 +951,19 @@ impl Publisher {
     }
 }
 
-/// Download one exact checkpoint into the store with the catalog's credential.
+/// Download one exact checkpoint; `keep` names what its GC must not evict (`protected`).
 fn ensure(
     store: &Store,
     catalog: &Catalog,
     repository: &str,
     manifest: &str,
+    keep: &[String],
     job: &Job,
 ) -> Result<(), Failure> {
     let credential = catalog.credential();
     let refspec = format!("{repository}@{manifest}");
-    let keep = [manifest.to_string()];
+    let mut keep = keep.to_vec();
+    keep.push(manifest.to_string());
     let on_event =
         |event: &tensorfs_core::ensure::Event| job.bytes(event.bytes_done, event.bytes_total);
     let mut request = tensorfs_core::ensure::Request::new(
@@ -1049,8 +1096,10 @@ fn apply_adapters(
     catalog: &Catalog,
     choice: &pb::ModelChoice,
     grant: &mut ModelGrant,
+    keep: &[String],
     job: &Job,
 ) -> Result<(), Failure> {
+    let mut keep = keep.to_vec();
     if choice.adapters.is_empty() {
         return Ok(());
     }
@@ -1074,7 +1123,8 @@ fn apply_adapters(
     let mut selections = vec![];
     for adapter in &choice.adapters {
         let (repository, manifest) = resolve_adapter(catalog, adapter)?;
-        ensure(store, catalog, &repository, &manifest, job)?;
+        ensure(store, catalog, &repository, &manifest, &keep, job)?;
+        keep.push(manifest.clone());
         let strength = if adapter.scale.is_empty() {
             1.0
         } else {

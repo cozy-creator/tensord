@@ -244,6 +244,8 @@ struct Session {
     launch: Launch,
     /// It has served a call: its next one is not its first.
     invoked: bool,
+    /// Its manifests stay out of every download's GC while it lives.
+    _serving: ServingHold,
 }
 
 /// How a session's executor came to exist, for the load record.
@@ -360,8 +362,27 @@ fn parent_key(generation: &str) -> String {
     format!("parent:{generation}")
 }
 
+/// The manifests live executors read. A download's GC must not evict them: an evicted file a
+/// session still reads frees no disk and breaks the session's next load.
+#[derive(Default)]
+struct Serving {
+    next: std::sync::atomic::AtomicU64,
+    held: Mutex<BTreeMap<u64, Vec<String>>>,
+}
+/// One session's entry in `Serving`, removed when the session ends.
+struct ServingHold {
+    serving: Arc<Serving>,
+    id: u64,
+}
+impl Drop for ServingHold {
+    fn drop(&mut self) {
+        self.serving.held.lock().unwrap().remove(&self.id);
+    }
+}
+
 pub struct GpuPool {
     root: PathBuf,
+    serving: Arc<Serving>,
     /// Scopes JIT caches to this machine run; earlier runs' scopes are removed at start.
     incarnation: String,
     config: GpuConfig,
@@ -463,6 +484,7 @@ impl GpuPool {
         Ok(Arc::new(Self {
             launcher: crate::child_launcher::ChildLauncher::new()?,
             root: root.to_path_buf(),
+            serving: Arc::default(),
             devices,
             incarnation,
             config,
@@ -477,6 +499,14 @@ impl GpuPool {
     }
     pub fn config(&self) -> &GpuConfig {
         &self.config
+    }
+    /// The manifests this pool's live executors read (`Serving`).
+    pub fn serving(&self) -> Vec<String> {
+        let held = self.serving.held.lock().unwrap();
+        let mut manifests: Vec<String> = held.values().flatten().cloned().collect();
+        manifests.sort();
+        manifests.dedup();
+        manifests
     }
     /// The kernel store and the namespaces live executors use. The pool's executors share
     /// one identity; a call in progress (the sessions lock is held) counts as live.
@@ -1647,6 +1677,15 @@ impl GpuPool {
             }
         }
         let selections = plan.selections();
+        let id = self.serving.next.fetch_add(1, Ordering::Relaxed);
+        self.serving.held.lock().unwrap().insert(
+            id,
+            selections.iter().map(|s| s.manifest.clone()).collect(),
+        );
+        let serving = ServingHold {
+            serving: self.serving.clone(),
+            id,
+        };
         let sources = ModelSources::open_shared(self.store.clone(), &selections)?;
         let peer = self.host.register_peer(executor.observer_pidfd()?);
         let grants = selections
@@ -1674,6 +1713,7 @@ impl GpuPool {
             sharing: false,
             launch,
             invoked: false,
+            _serving: serving,
         })
     }
 
