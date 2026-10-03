@@ -670,7 +670,7 @@ impl Publisher {
                     .and_then(Value::as_array)
                     .and_then(|rows| rows.iter().find(|row| row.get("slot").and_then(Value::as_str) == Some(path.as_str())))
                     .cloned()
-                    .or_else(|| slot.get("default_ladder").map(|ladder| json!({"model":slot.get("default_model"),"release":slot.get("default_release"),"ladder":ladder})))
+                    .or_else(|| authored(slot))
                     .ok_or(("model_binding_absent", format!("{} binds no model to {path}; bind one with `cozy package bind`", request.package)))?;
                 let mut model = row
                     .get("model")
@@ -1031,6 +1031,27 @@ fn io_failure(error: io::Error) -> Failure {
     ("release_root_preparation_failed", error.to_string())
 }
 
+/// A slot's authored default ladder (`[org/]model@release/lane` rungs) in an owner binding's
+/// shape: one model and release, each rung naming its lane.
+fn authored(slot: &Value) -> Option<Value> {
+    let rungs = slot.get("default_ladder")?.as_array()?;
+    let parse = |rung: &Value| {
+        let (model, rest) = rung.get("lane")?.as_str()?.split_once('@')?;
+        let (release, lane) = rest.split_once('/')?;
+        Some((model.to_string(), release.to_string(), lane.to_string()))
+    };
+    let (model, release, _) = parse(rungs.first()?)?;
+    let ladder: Vec<Value> = rungs
+        .iter()
+        .filter_map(|rung| {
+            let mut rung = rung.clone();
+            rung["lane"] = json!(parse(&rung)?.2);
+            Some(rung)
+        })
+        .collect();
+    Some(json!({"model": model, "release": release, "ladder": ladder}))
+}
+
 fn model_slots(interface: &Value, entrypoint: &str) -> Option<Vec<Value>> {
     interface
         .get("entrypoints")?
@@ -1247,5 +1268,24 @@ mod tests {
             rung(Some(&h3), "NVIDIA H100 80GB HBM3", 8),
             Some(("fp8-pruned".into(), 4))
         );
+    }
+
+    #[test]
+    fn an_authored_default_reads_as_a_binding_of_its_one_model() {
+        let slot = json!({"default_ladder":[{"gpu":"H100","gpus":2,"lane":"h3@1.2.0/fp8"},{"gpu":"*","lane":"h3@1.2.0/bf16"}]});
+        let row = authored(&slot).unwrap();
+        assert_eq!(row["model"], "h3");
+        assert_eq!(row["release"], "1.2.0");
+        assert_eq!(
+            rung(row.get("ladder"), "NVIDIA H100 80GB HBM3", 2),
+            Some(("fp8".into(), 2))
+        );
+        assert_eq!(
+            rung(row.get("ladder"), "NVIDIA A40", 1),
+            Some(("bf16".into(), 0))
+        );
+        let slot = json!({"default_ladder":[{"gpu":"*","lane":"cozy/sdxl@1/plain"}]});
+        assert_eq!(authored(&slot).unwrap()["model"], "cozy/sdxl");
+        assert_eq!(authored(&json!({})), None);
     }
 }
