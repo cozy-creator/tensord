@@ -9,7 +9,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use tensorfs_core::{
     sha256,
-    transport::{self, Deadline, HostToken, Ledger, SourcePolicy},
+    transport::{self, Deadline, Ledger, ScopedHeaders, SourcePolicy},
 };
 
 pub const ACTION: &str = "hub-access";
@@ -234,34 +234,74 @@ pub fn verify_capability(
 #[derive(Debug, Clone)]
 pub struct Refusal(pub String);
 
-/// Reads at the grant's Hub with its bearer, presented only to the Hub host.
+/// Where and as whom a machine reads a Hub: the owner's delegated access (a bearer), or on a
+/// rental the pod's own worker capability, which is what a run that names no Hub uses there
+/// (the Go agent and Python worker's default registration).
+#[derive(Clone, Debug)]
+pub struct Source {
+    pub origin: String,
+    /// TensorFS credential spelling: `bearer <token>` or `worker <id> <token>`.
+    pub credential: String,
+    pub ca_der: Option<Vec<u8>>,
+    pub object_hosts: Vec<String>,
+}
+
+impl Source {
+    pub fn delegated(access: &Access) -> Self {
+        Self {
+            origin: access.origin.trim_end_matches('/').to_string(),
+            credential: format!("bearer {}", access.token),
+            ca_der: URL_SAFE_NO_PAD
+                .decode(&access.ca)
+                .ok()
+                .filter(|der| !der.is_empty()),
+            object_hosts: access
+                .environment
+                .get("TENSORHUB_OBJECT_STORAGE_HOSTS")
+                .map(|hosts| {
+                    hosts
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|h| !h.is_empty())
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+    pub fn pod(
+        origin: &str,
+        worker_id: &str,
+        worker_token: &str,
+        ca_der: Option<Vec<u8>>,
+        object_hosts: Vec<String>,
+    ) -> Self {
+        Self {
+            origin: origin.trim_end_matches('/').to_string(),
+            credential: format!("worker {worker_id} {worker_token}"),
+            ca_der,
+            object_hosts,
+        }
+    }
+}
+
+/// Reads at a Hub with its credential, presented only to the Hub host.
 pub struct Catalog {
     origin: String,
     host: String,
-    token: String,
+    credential: String,
     policy: SourcePolicy,
 }
 
 impl Catalog {
-    pub fn new(access: &Access) -> Result<Self, Refusal> {
-        let origin = access.origin.trim_end_matches('/').to_string();
+    pub fn new(source: &Source) -> Result<Self, Refusal> {
+        let origin = source.origin.clone();
         let host = transport::base_host(&origin).map_err(|e| Refusal(e.to_string()))?;
-        if !access.ca.is_empty() {
-            let der = URL_SAFE_NO_PAD
-                .decode(&access.ca)
-                .map_err(|_| Refusal("invalid Hub CA".into()))?;
-            transport::trust_roots(pem(&der).as_bytes()).map_err(|e| Refusal(e.to_string()))?;
+        if let Some(der) = &source.ca_der {
+            transport::trust_roots(pem(der).as_bytes()).map_err(|e| Refusal(e.to_string()))?;
         }
         let mut allowed = vec![host.clone()];
-        if let Some(hosts) = access.environment.get("TENSORHUB_OBJECT_STORAGE_HOSTS") {
-            allowed.extend(
-                hosts
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|h| !h.is_empty())
-                    .map(String::from),
-            );
-        }
+        allowed.extend(source.object_hosts.iter().cloned());
         let policy = SourcePolicy {
             allowed_hosts: allowed,
             allow_local: origin_key(&origin).is_some_and(|key| loopback_host(&key)),
@@ -270,18 +310,20 @@ impl Catalog {
         Ok(Self {
             origin,
             host,
-            token: access.token.clone(),
+            credential: source.credential.clone(),
             policy,
         })
     }
     pub fn origin(&self) -> &str {
         &self.origin
     }
-    pub fn credential(&self) -> HostToken {
-        HostToken {
-            hosts: vec![self.host.clone()],
-            token: self.token.clone(),
-        }
+    pub fn credential(&self) -> ScopedHeaders {
+        transport::credential_from_spec(&self.credential, vec![self.host.clone()]).unwrap_or(
+            ScopedHeaders {
+                hosts: vec![],
+                headers: vec![],
+            },
+        )
     }
     pub fn policy(&self) -> &SourcePolicy {
         &self.policy
@@ -364,6 +406,51 @@ mod tests {
         assert!(verify_capability(&unknown, "w1", &keys, 100, ACTION).is_none());
         let run = mint(&key, &format!(r#"{{"m":"w1","r":"7","e":200,"k":"{id}"}}"#));
         assert!(verify_capability(&run, "w1", &keys, 100, ACTION).is_none());
+    }
+
+    #[test]
+    fn a_rental_reads_its_hub_as_the_pod_and_delegated_access_as_a_bearer() {
+        use tensorfs_core::transport::CredentialProvider;
+        let pod = Catalog::new(&Source::pod(
+            "https://hub.example/",
+            "wrk-1",
+            "tok",
+            None,
+            vec!["objects.example".into()],
+        ))
+        .unwrap();
+        assert_eq!(pod.origin(), "https://hub.example");
+        assert_eq!(
+            pod.credential().headers("hub.example"),
+            [
+                ("x-cozy-worker-id".to_string(), "wrk-1".to_string()),
+                ("x-cozy-worker-token".to_string(), "tok".to_string())
+            ]
+        );
+        assert!(
+            pod.credential().headers("objects.example").is_empty(),
+            "presigned hosts never see the credential"
+        );
+        assert!(pod.policy().allows_host("objects.example"));
+        let access = Access {
+            origin: "https://hub.example".into(),
+            token: "bearer-token".into(),
+            expires_at: 1,
+            environment: BTreeMap::from([(
+                "TENSORHUB_OBJECT_STORAGE_HOSTS".into(),
+                "objects.example".into(),
+            )]),
+            ca: String::new(),
+        };
+        let delegated = Catalog::new(&Source::delegated(&access)).unwrap();
+        assert_eq!(
+            delegated.credential().headers("hub.example"),
+            [(
+                "authorization".to_string(),
+                "Bearer bearer-token".to_string()
+            )]
+        );
+        assert!(delegated.policy().allows_host("objects.example"));
     }
 
     #[test]

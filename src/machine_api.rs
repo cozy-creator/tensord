@@ -31,6 +31,8 @@ pub struct NativeBackend {
     pub uploads: Arc<WorkspaceUploads>,
     pub installer: Option<crate::api::install::InstallerConfig>,
     pub publisher: Option<Arc<crate::published::Publisher>>,
+    /// On a rental: its own Hub, read with the pod's worker capability.
+    pub own_hub: Option<crate::hub::Source>,
     // Serialize native projection, not inference or observation. Only one result
     // projection may establish a given immutable output's native custody at once.
     projection: Mutex<()>,
@@ -50,6 +52,7 @@ impl NativeBackend {
             uploads,
             installer: None,
             publisher: None,
+            own_hub: None,
             projection: Mutex::new(()),
             installation: Mutex::new(()),
         }
@@ -510,6 +513,23 @@ impl NativeBackend {
         files.sort_by(|a, b| a.input_id.cmp(&b.input_id));
         Ok(files)
     }
+    /// Where a published root's packages and models come from. A root naming a Hub uses the
+    /// owner's delegated access there; one naming none uses a rental's own Hub with the pod's
+    /// worker capability (as the Go agent and Python worker do); elsewhere there is none.
+    fn hub_source(&self, actor: &str, origin: &str) -> Result<Option<crate::hub::Source>, Status> {
+        if origin.is_empty() {
+            return Ok(self.own_hub.clone());
+        }
+        match self.hub_grant(actor, origin) {
+            Ok(grant) => Ok(Some(crate::hub::Source::delegated(&grant.access))),
+            Err(refused) => self
+                .own_hub
+                .as_ref()
+                .filter(|own| crate::hub::origin_key(&own.origin) == crate::hub::origin_key(origin))
+                .map(|own| Some(own.clone()))
+                .ok_or(refused),
+        }
+    }
     /// This owner's usable access at a Hub: present, bound to this leaf, unexpired.
     fn hub_grant(&self, actor: &str, origin: &str) -> Result<crate::hub::Grant, Status> {
         let key = crate::hub::origin_key(origin)
@@ -832,23 +852,24 @@ impl MachineBackend for NativeBackend {
                 "release root carries an independently prepared offer",
             ));
         }
-        let (installed, published_plan) = if !root.hub.is_empty() {
-            if !root.installation_id.is_empty()
-                || root.package.is_empty()
-                || root.release.is_empty()
-            {
+        let source = if root.installation_id.is_empty() {
+            self.hub_source(&actor, &root.hub)?
+        } else {
+            None
+        };
+        let (installed, published_plan) = if let Some(source) = source {
+            if root.package.is_empty() || root.release.is_empty() {
                 return Err(Status::invalid_argument(
                     "a published root names its package and release",
                 ));
             }
-            let grant = self.hub_grant(&actor, &root.hub)?;
             let publisher = self.publisher.as_ref().ok_or_else(|| {
                 Status::unimplemented(
                     "published package preparation is not configured on this machine",
                 )
             })?;
             let published = crate::published::Request {
-                grant,
+                source,
                 package: root.package.clone(),
                 release: root.release.clone(),
                 entrypoint: root.entrypoint.clone(),

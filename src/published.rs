@@ -52,7 +52,7 @@ pub enum Progress {
 }
 
 pub struct Request {
-    pub grant: hub::Grant,
+    pub source: hub::Source,
     pub package: String,
     pub release: String,
     pub entrypoint: String,
@@ -170,7 +170,7 @@ impl Publisher {
     }
 
     fn alias(&self, request: &Request) -> String {
-        let origin = hub::origin_key(&request.grant.access.origin).unwrap_or_default();
+        let origin = hub::origin_key(&request.source.origin).unwrap_or_default();
         let sdk = format!(
             "{:?}{:?}{:?}",
             self.sdk.requirements, self.sdk.find_links, self.sdk.client_wheel
@@ -256,8 +256,7 @@ impl Publisher {
         request: &Request,
         job: &Job,
     ) -> Result<Prepared, Failure> {
-        let catalog =
-            Catalog::new(&request.grant.access).map_err(|e| ("catalog_read_failed", e.0))?;
+        let catalog = Catalog::new(&request.source).map_err(|e| ("catalog_read_failed", e.0))?;
         let installation = match service
             .engine
             .installation(actor, &self.alias(request))

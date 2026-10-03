@@ -86,7 +86,7 @@ fn run() -> io::Result<()> {
                 (Some(config),Some(listen))=>{
                     let identity=cozy_machine::api::MachineIdentity::retained(&cozy_machine::api::identity::MachineConfig::load(&config)?)?;
                     sdk.python=package_python.clone();
-                    start_api(&root,&generations,identity,std::net::TcpListener::bind(listen)?,&owner,&service,installer_python,client_wheel,package_python,sdk)?
+                    start_api(&root,&generations,identity,std::net::TcpListener::bind(listen)?,&owner,&service,installer_python,client_wheel,package_python,sdk,None)?
                 }
                 (None,None)=>(),
                 _=>return Err(io::Error::other("--machine-config and --listen are required together")),
@@ -216,6 +216,10 @@ fn run_machine(
         installer.1,
         "3.12".into(),
         image_sdk(&layout.root.join("opt/cozy/wheels")),
+        // A run naming no Hub reads this rental's own Hub as the pod (Go agent parity).
+        grant.hub.clone().filter(|_| rental).map(|hub| {
+            cozy_machine::hub::Source::pod(&hub.origin, &hub.worker_id, &hub.worker_token, hub.ca_der, hub.object_hosts)
+        }),
     )?;
     serve(owner, service, control)
 }
@@ -255,6 +259,7 @@ fn start_api(
     wheel: Option<PathBuf>,
     python: String,
     mut sdk: cozy_machine::published::PackageSdk,
+    own_hub: Option<cozy_machine::hub::Source>,
 ) -> io::Result<()> {
     use cozy_machine::{api, machine_api::NativeBackend};
     sdk.client_wheel = wheel.clone();
@@ -267,6 +272,7 @@ fn start_api(
         store.clone(),
         uploads,
     );
+    backend.own_hub = own_hub;
     backend.publisher = Some(cozy_machine::published::Publisher::new(
         &root.join("published"),
         sdk,
