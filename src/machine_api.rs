@@ -941,7 +941,8 @@ impl MachineBackend for NativeBackend {
                     "progress",
                     &json!({"type":"progress","payload":payload}),
                 )?);
-            } else if !running {
+            } else {
+                // Every cursor up to the head is answered, or a waiting client would spin.
                 events.push(event(record.revision, "state", &json!({"state":self.state(&record)?.state,"completed_units":record.completed_units,"waiting_reason":record.waiting_reason}))?);
             }
         }
