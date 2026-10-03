@@ -8,6 +8,7 @@ use crate::{
     gpu_service::{GpuPlan, GpuPool, ModelGrant},
     hub::{self, Catalog},
     journal::{Installation, Preparation},
+    objects::Refused,
     service::Service,
 };
 use fs2::FileExt;
@@ -300,6 +301,23 @@ impl Publisher {
                 .map(|h| h.components.into_iter().map(|(name, _)| name).collect())
                 .unwrap_or_default(),
         })
+    }
+
+    /// The store models are made and held in.
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+
+    /// A provider source made into a local model (`make_source`), as a run's refusal.
+    pub fn make_source(
+        &self,
+        source: &str,
+        profiles: &[String],
+        providers: &Providers,
+        progress: &(dyn Fn(&str, u64, u64) + Sync),
+    ) -> Result<tensorfs_core::source_model::Made, Refused> {
+        make_source(&self.store, source, profiles, providers, progress)
+            .map_err(|(code, message)| Refused { code, message })
     }
 
     fn fetch(&self, manifests: Vec<String>) -> Fetching<'_> {
