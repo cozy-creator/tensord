@@ -18,7 +18,7 @@ install -m 0755 "$target/release/cozy-machine" "$stage/opt/cozy/machine/cozy-mac
 # Both kinds share python:3.12.12-slim-bookworm at /opt/cozy/python, so the cpu image builds it.
 uv build -q --wheel --out-dir "$stage/opt/cozy/machine" "$repo"
 docker run --rm --entrypoint sh -v "$stage/opt/cozy/machine:/opt/cozy/machine" "tensorhub/worker@$(crane digest tensorhub/worker:cpu-linux-x86)" -c \
-  'uv venv -q --python /opt/cozy/python/bin/python3 /opt/cozy/machine/helper && uv pip install -q --python /opt/cozy/machine/helper/bin/python /opt/cozy/machine/*.whl"[installer]" && chown -R '"$(id -u):$(id -g)"' /opt/cozy/machine'
+  'w=$(ls /opt/cozy/machine/*.whl) && uv venv -q --python /opt/cozy/python/bin/python3 /opt/cozy/machine/helper && uv pip install -q --python /opt/cozy/machine/helper/bin/python "$w[installer]" && chown -R '"$(id -u):$(id -g)"' /opt/cozy/machine'
 
 if [ "$kind" = cuda ]; then
   install -m 0755 "$repo/scripts/machine-arm-dispatcher.sh" "$stage/usr/local/bin/cozy-machine"
