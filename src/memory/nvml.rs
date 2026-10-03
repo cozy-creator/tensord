@@ -45,7 +45,9 @@ pub struct Device {
     pub key: String,
     handle: Handle,
     memory: MemoryInfo,
-    display: [Display; 2],
+    /// `nvmlDeviceGetDisplayActive`: a desktop is initialized on it. A connector with a
+    /// display attached (`DisplayMode`, a dummy plug on many datacenter pods) is not one.
+    display: Display,
     processes: Processes,
 }
 // SAFETY: NVML handles are process-global and its calls are thread-safe; each Device is read
@@ -119,10 +121,7 @@ impl Device {
                 key,
                 handle,
                 memory: symbol(library, "nvmlDeviceGetMemoryInfo")?,
-                display: [
-                    symbol(library, "nvmlDeviceGetDisplayMode")?,
-                    symbol(library, "nvmlDeviceGetDisplayActive")?,
-                ],
+                display: symbol(library, "nvmlDeviceGetDisplayActive")?,
                 processes: symbol(library, "nvmlDeviceGetComputeRunningProcesses_v3")?,
             })
         }
@@ -139,10 +138,8 @@ impl Device {
             if (self.memory)(self.handle, &mut memory) != SUCCESS {
                 return Err(io::Error::other("nvmlDeviceGetMemoryInfo failed"));
             }
-            let display = self.display.iter().any(|query| {
-                let mut state: c_int = 0;
-                query(self.handle, &mut state) == SUCCESS && state == 1
-            });
+            let mut state: c_int = 0;
+            let display = (self.display)(self.handle, &mut state) == SUCCESS && state == 1;
             Ok(Sample {
                 total: memory.total,
                 free: memory.free,
