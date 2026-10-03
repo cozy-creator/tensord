@@ -35,6 +35,18 @@ executor death and model switches. No CUDA or NVML.
   shared memory; if memory did not come back, the bytes stay charged (`stranded_bytes`).
 - `release(want)` and `facts()` are the policy module's handles (see B1 `INTERFACE.md`).
 
+## Disk rung (streamed layouts)
+
+When admission cannot make room even after releases, an executor offering `host_tiers.filling/1`
+gets a streamed layout instead of `held: false`: a sealed window of as many of the layout's
+largest regions as `TierLimit::staging` allows (one at least, the indivisible working set),
+served on its own thread under a read lease. The executor claims a region while it reads it
+(TensorFS `HostMem::with_region`); the machine stages claimed regions first, reads ahead in
+order into unclaimed slots, and refills a slot only when nobody claims its region. The executor
+reads no store. The window is released with its last holder; `facts()` reports live windows,
+their bytes and reads, and the ledger `windows_opened` and `streamed_bytes`. A streamed layout
+cannot be pinned (the plane answers `BelowFloor`).
+
 ## Remembered plans
 
 A filled layout's verified plan is kept in `<gpu>/host-plans` (latest per manifest and

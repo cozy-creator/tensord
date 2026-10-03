@@ -545,7 +545,7 @@ fn in_scope(memory: &[&str], name: &str) {
     let inner = Command::new("systemd-run")
         .args(&scope)
         .arg(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--ignored", "--test-threads=1"])
+        .args(["--exact", name, "--ignored", "--test-threads=1", "--nocapture"])
         .status()
         .unwrap();
     assert!(inner.success());
