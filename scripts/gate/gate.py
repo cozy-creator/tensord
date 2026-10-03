@@ -297,7 +297,8 @@ class Gate:
         row = {"arm": arm, "cycle": cycle, "scenario": scenario, "model": model, "prompt": prompt, "seed": seed,
                "run": run, "exit": done.returncode, "dir": str(root), "runtime": show.get("runtime"),
                "t_start": start, "t_submit": submit, "t_cli_done": finished, "t_verified": verified,
-               "wall_s": verified - start, "cli_s": finished - submit, "offset": self.offset,
+               # Wall ends when the CLI exits with the output saved; the harness's own decode check is verify_s.
+               "wall_s": finished - start, "cli_s": finished - submit, "verify_s": verified - finished, "offset": self.offset,
                # Pod clock only, free of controller noise: machine birth (or acceptance) to outcome.
                "machine_s": (outcome - (t0 if t0 is not None else accepted)) if outcome and accepted else None,
                # Outcome on the pod until the client noticed it: the result path (request plane, daemon, network).
@@ -450,6 +451,8 @@ def report(out: Path) -> dict:
     rows = [json.loads(line) for line in (out / "results.jsonl").read_text().splitlines()]
     samples = [json.loads(line) for line in (out / "samples.jsonl").read_text().splitlines() if line.strip()]
     requests = [r for r in rows if "wall_s" in r]
+    for r in requests:   # older rows measured to the harness's decode check; the CLI exit is the user's boundary
+        r["wall_s"] = r["t_cli_done"] - r["t_start"]
     rental = bool(json.loads((out / "manifest.json").read_text()).get("rental"))
     proof = [r for r in requests if r["scenario"] == "kill_proof"]
     summary: dict = {"kill_proof": {a: {"cycles": sum(r["arm"] == a for r in proof), "failed": sum(r["arm"] == a and not r["ok"] for r in proof)}
@@ -474,7 +477,7 @@ def report(out: Path) -> dict:
         for c in cycles:
             span = [r for r in mine if r["cycle"] == c]
             lo = min(r["t_start"] for r in span) + span[0]["offset"]
-            hi = max(r["t_verified"] for r in span) + span[0]["offset"]
+            hi = max(r["t_cli_done"] for r in span) + span[0]["offset"]
             window = [s for s in samples if lo <= s["t"] <= hi and (rental or s["cg"].get("path") != "/sys/fs/cgroup")]
             if window:
                 host.append(max(s["cg"]["host"] for s in window) / 2**30)
