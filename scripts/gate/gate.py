@@ -447,11 +447,14 @@ def report(out: Path) -> dict:
     samples = [json.loads(line) for line in (out / "samples.jsonl").read_text().splitlines() if line.strip()]
     requests = [r for r in rows if "wall_s" in r]
     rental = bool(json.loads((out / "manifest.json").read_text()).get("rental"))
-    summary: dict = {"failed": {a: [(r["scenario"], r["run"], r.get("error")) for r in requests if r["arm"] == a and not r["ok"]]
+    proof = [r for r in requests if r["scenario"] == "kill_proof"]
+    summary: dict = {"kill_proof": {a: {"cycles": sum(r["arm"] == a for r in proof), "failed": sum(r["arm"] == a and not r["ok"] for r in proof)}
+                                    for a in sorted({r["arm"] for r in proof})},
+                     "failed": {a: [(r["scenario"], r["run"], r.get("error")) for r in requests if r["arm"] == a and not r["ok"]]
                                 for a in sorted({r["arm"] for r in requests})}, "arms": {}}
     for arm in sorted({r["arm"] for r in requests}):
-        mine = [r for r in requests if r["arm"] == arm and r["ok"]]
-        cycles = sorted({r["cycle"] for r in mine if r["cycle"] >= 0})
+        mine = [r for r in requests if r["arm"] == arm and r["ok"] and (r["cycle"] < 1000 or r["scenario"] == "kill_proof")]
+        cycles = sorted({r["cycle"] for r in mine if 0 <= r["cycle"] < 1000})
         cell: dict = {"runtime": sorted({r["runtime"] for r in mine if r["runtime"]}), "cycles": cycles}
         for s in SCENARIOS:
             cell[s] = spread([r["wall_s"] for r in mine if r["scenario"] == s])
