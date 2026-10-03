@@ -556,7 +556,7 @@ fn inside_a_256_mib_scope() {
         host.available > 0 && host.available <= 256 << 20,
         "{host:?}"
     );
-    let big = Fixture::new("big", &[160 * MIB]);
+    let big = Fixture::new("big", &[8 * MIB; 20]);
     let tier = HostTier::new(
         big.store.clone(),
         HostTierConfig::default(),
@@ -567,7 +567,7 @@ fn inside_a_256_mib_scope() {
     let streamed = ask(&tier, a, &big).expect("streamed, never refused");
     assert_eq!(stream_through(&big, &streamed, 1), 160 * MIB as u64);
     drop(streamed);
-    let small = Fixture::new("fits", &[16 * MIB]);
+    let small = Fixture::new("fits", &[8 * MIB; 2]);
     copy_store(&small, &big);
     let (plan, sha256, length) = small.plan(&["unet"]);
     let granted = tier

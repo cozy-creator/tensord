@@ -1632,14 +1632,10 @@ impl GpuPool {
         };
         executor.retain_until_exit(directory);
         executor.retain_until_exit(WakeOnExit(Arc::downgrade(engine)));
-        // Weights come only from the machine's sealed host tier: adopted while it fills, and
-        // streamed when it does not fit (TensorFS #313/#314, Runtime #1130). Header and configs
-        // come from the store.
-        for needed in [
-            "weight_plane/1",
-            "host_tiers.sealed/1",
-            "host_tiers.filling/1",
-        ] {
+        // Weights come only from the machine's sealed host tier: handed out while it fills, and
+        // streamed when it does not fit. Header and configs come from the store. (An executor
+        // whose TensorFS predates #313/#314 refuses such a layout and reads the store itself.)
+        for needed in ["weight_plane/1", "host_tiers.sealed/1"] {
             if !executor.hello.offers(needed) {
                 executor.shutdown()?;
                 return Err(io::Error::new(

@@ -11,15 +11,18 @@ executor death and model switches. No CUDA or NVML.
 
 ## Exchange
 
-- The executor offers `host_tiers.sealed/1` (and `weight_plane/1`); `GpuPool` then sets
+- Every executor must offer `host_tiers.sealed/1` and `weight_plane/1` (else its session is
+  refused: the machine has no store or descriptor source); `GpuPool` always sets
   `Load.sealed_tiers`.
 - Per weight set the executor sends `sealed_tier` with a sealed memfd holding its `SealedPlan`
   (manifest, traversal, window, components, regions, parts). The machine checks seals, length and
   SHA-256, that the manifest and components are the session's (`HostGrant`), and rebuilds the read
   plan and layout from its own header. Cache key: the TensorFS layout digest.
-- Answer `held: true` with a read-only reopen of the sealed memfd, at once if the executor offers
-  `host_tiers.filling/1`, else once the layout is complete; or `held: false` (no room): that
-  weight set reads the store. A refused plan is an answer too, never a session failure.
+- Answer `held: true` with a read-only reopen of the sealed memfd at once: whole and filling, or
+  streamed when it does not fit. A refused plan (outside the selection, unsealed) is an answer
+  too, never a session failure. An executor whose TensorFS predates adopting layouts still
+  filling (#313) or streamed (#314) refuses the layout and, until the cutover, reads the store
+  itself.
 - `sealed_prefetch` carries all of a construction's plans: each is opened and queued at once.
 
 ## Size and release
@@ -37,8 +40,7 @@ executor death and model switches. No CUDA or NVML.
 
 ## Disk rung (streamed layouts)
 
-When admission cannot make room even after releases, an executor offering `host_tiers.filling/1`
-gets a streamed layout instead of `held: false`: a sealed window of as many of the layout's
+When admission cannot make room even after releases, the executor gets a streamed layout: a sealed window of as many of the layout's
 largest regions as `TierLimit::staging` allows (one at least, the indivisible working set),
 served on its own thread under a read lease. The executor claims a region while it reads it
 (TensorFS `HostMem::with_region`); the machine stages claimed regions first, reads ahead in
@@ -63,9 +65,3 @@ Components without a plan get their memory reserved from the manifest at spawn.
 - `GpuPool` appends one line per Load to `<state>/gpu/loads.jsonl`: executor load facts and the
   host tier's facts (fills with ms, bytes by read mode and disk reads; hits; prefills;
   releases), and the machine's and executor's RSS/PSS.
-
-## Fallbacks (removed after F's gate: hard cut, the sealed tier becomes the only source)
-
-Executor without `host_tiers.sealed/1`: descriptors (`model_sources.descriptors/1`), else legacy
-store reads. Without `host_tiers.filling/1`: complete layouts only. With sealed tiers the header
-and configs come from the store, not descriptors.
