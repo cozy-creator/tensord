@@ -5,8 +5,8 @@ edition = "2021"
 publish = false
 
 [dependencies]
-tensorfs-core = { git = "https://github.com/cozy-creator/tensorfs.git", rev = "b32334ad8a06faf18bd6b2047023b00206b390dd" }
-tensorfs-plane = { git = "https://github.com/cozy-creator/tensorfs.git", rev = "b32334ad8a06faf18bd6b2047023b00206b390dd" }
+tensorfs-core = { git = "https://github.com/cozy-creator/tensorfs.git", rev = "fb5c4bc7972b8ad7c9bdd58770c68f1270c75047" }
+tensorfs-plane = { git = "https://github.com/cozy-creator/tensorfs.git", rev = "fb5c4bc7972b8ad7c9bdd58770c68f1270c75047" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 serde_json_canonicalizer = "0.3"
