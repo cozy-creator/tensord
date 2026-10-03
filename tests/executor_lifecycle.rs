@@ -1,4 +1,4 @@
-//! Executor lifecycle on real Runtime executors (current and older SDK generations of
+//! Executor lifecycle on real Runtime executors (the shipped SDK's generations of
 //! `tests/fixtures/cpu_lifecycle`), no doubles. CUDA is hidden by the seal; no torch.
 //! `COZY_MACHINE_LIFECYCLE_GENERATIONS` names the installed generations directory.
 use cozy_machine::{

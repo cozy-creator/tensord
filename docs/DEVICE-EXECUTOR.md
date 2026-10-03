@@ -33,7 +33,8 @@ PYTHON -I -m cozy_runtime.internal.trampoline --expect-parent <pid> --oom-adj 10
 - Startup waits on a pidfd and the listener, with no timeout. A child that exits first returns
   `EndedBeforeStart` (status and stderr tail). Until Hello is verified a launch guard kills and
   reaps the child on every early return. `SO_PEERCRED` must match the child pid, UID and GID;
-  Hello's pid, and its parent, group and sealed values when reported, must match.
+  Hello's pid, parent, group and every sealed value must match (the machine and its Runtime
+  ship together).
 - Start imports authored code, so journal authorization must come before `Start`.
 
 ## Wire

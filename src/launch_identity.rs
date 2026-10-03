@@ -327,18 +327,13 @@ impl Seal {
         environment
     }
 
-    /// Names the executor reports receiving that differ from what was imposed. Names only
-    /// one side knows are skipped: an older or newer Runtime reports its own allowlist.
+    /// Imposed names the executor did not report receiving exactly. The machine and its
+    /// Runtime ship together (hard cut), so every imposed name is in its allowlist.
     pub fn mismatches(&self, reported: &BTreeMap<String, String>) -> Vec<String> {
-        let imposed = self.imposed();
-        reported
-            .iter()
-            .filter(|(name, value)| {
-                imposed
-                    .get(*name)
-                    .is_some_and(|expected| expected != *value)
-            })
-            .map(|(name, _)| name.clone())
+        self.imposed()
+            .into_iter()
+            .filter(|(name, value)| reported.get(name) != Some(value))
+            .map(|(name, _)| name)
             .collect()
     }
 }

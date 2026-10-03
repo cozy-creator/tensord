@@ -156,18 +156,12 @@ fn invoke(
 }
 
 #[test]
-#[ignore = "actual SDK gate needs explicitly installed current/older generation fixtures"]
-fn current_and_older_stock_executor_reuse_actual_classifier_and_spooled_result() {
-    for (version, generation) in [
-        (
-            "0.18.99",
-            "current-generations/72c4d77b275a474b8c828de950020e18/generation.json",
-        ),
-        (
-            "0.18.89",
-            "older-generations/1b1fd9d131b34e0faf1568f5e360b694/generation.json",
-        ),
-    ] {
+#[ignore = "actual SDK gate needs an explicitly installed generation fixture"]
+fn stock_executor_reuses_actual_classifier_and_spooled_result() {
+    for (version, generation) in [(
+        "0.18.99",
+        "current-generations/72c4d77b275a474b8c828de950020e18/generation.json",
+    )] {
         let (mut executor, root) = prepared(version, generation);
         for (index, id) in ["first", "second", "third"].iter().enumerate() {
             let reply = invoke(&mut executor, &root, id, 2, &mut Baseline);

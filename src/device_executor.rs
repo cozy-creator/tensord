@@ -1325,12 +1325,11 @@ impl DeviceExecutor {
             worst_gap: Duration::ZERO,
         };
         let hello = executor.command(&DeviceCommand::Hello, &mut Baseline)?;
-        // Older Runtimes omit ppid/pgid; a reported value must match (Runtime worker hello).
         let mismatched = config.seal.mismatches(&hello.hello.sealed);
         if !hello.ok
             || hello.hello.pid != executor.birth.pid
-            || (hello.hello.ppid != 0 && hello.hello.ppid != parent)
-            || (hello.hello.pgid != 0 && hello.hello.pgid != executor.birth.pid)
+            || hello.hello.ppid != parent
+            || hello.hello.pgid != executor.birth.pid
             || !mismatched.is_empty()
         {
             return Err(io::Error::other(format!(
