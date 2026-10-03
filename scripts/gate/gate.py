@@ -36,11 +36,17 @@ STYLES = ("at dawn, watercolor", "in fog, oil painting", "at noon, photograph", 
 POD_HELPER = r'''
 import json, os, sys, time, subprocess
 CG = "/sys/fs/cgroup"
-def cg():
-    m = {l.split()[0]: int(l.split()[1]) for l in open(f"{CG}/memory.stat")}
-    r = sum(int(f.split("=")[1]) for l in open(f"{CG}/io.stat") for f in l.split() if f.startswith("rbytes="))
-    return {"anon": m["anon"], "shmem": m["shmem"], "file_mapped": m["file_mapped"], "file": m["file"],
-            "host": m["anon"] + m["shmem"], "read_bytes": r}
+def cg():   # cgroup v2, else v1 (v1 rss = anon without shmem; shmem sits inside cache)
+    if os.path.exists(f"{CG}/memory.stat"):
+        m = {l.split()[0]: int(l.split()[1]) for l in open(f"{CG}/memory.stat")}
+        r = sum(int(f.split("=")[1]) for l in open(f"{CG}/io.stat") for f in l.split() if f.startswith("rbytes="))
+        anon, shmem, mapped, file = m["anon"], m["shmem"], m["file_mapped"], m["file"]
+    else:
+        m = {l.split()[0]: int(l.split()[1]) for l in open(f"{CG}/memory/memory.stat")}
+        r = sum(int(l.split()[2]) for l in open(f"{CG}/blkio/blkio.throttle.io_service_bytes_recursive")
+                if len(l.split()) == 3 and l.split()[1] == "Read")
+        anon, shmem, mapped, file = m["total_rss"], m["total_shmem"], m["total_mapped_file"], m["total_cache"]
+    return {"anon": anon, "shmem": shmem, "file_mapped": mapped, "file": file, "host": anon + shmem, "read_bytes": r}
 def cmd(pid):
     try: return open(f"/proc/{pid}/cmdline", "rb").read().replace(b"\0", b" ").decode(errors="replace").strip()
     except OSError: return ""
@@ -173,8 +179,6 @@ class Gate:
         self.pod = Pod(self.m["rental"], self.m["hub"])
         self.offset = 0.0
         self.cache = f"{POD_DIR}/cache-files"
-        listed = self.pod.helper("list", json.dumps(self.m["cache_paths"]), self.cache)
-        log("cache files >= 1 MiB:", listed["files"])
 
     def record(self, row: dict) -> None:
         with self.results.open("a") as sink:
@@ -281,7 +285,9 @@ class Gate:
     def cycle(self, arm: str, cycle: int) -> None:
         subprocess.run(["cozy", "rental", "keepalive", self.m["rental"], f"--tensorhub={self.m['hub']}"],
                        capture_output=True)
-        self.record({"arm": arm, "cycle": cycle, "event": "begin", "clock": self.clock(), "cool": self.cool()})
+        listed = self.pod.helper("list", json.dumps(self.m["cache_paths"]), self.cache)   # after any download
+        self.record({"arm": arm, "cycle": cycle, "event": "begin", "clock": self.clock(), "cool": self.cool(),
+                     "cache_files": listed["files"]})
         self.first(arm, cycle, "cold_first")
         self.first(arm, cycle, "warm_first")
         for _ in range(self.m["warm"]):
