@@ -29,6 +29,18 @@ pub struct Service {
     retained: Mutex<HashMap<String, Arc<File>>>,
     gpu: Mutex<Option<Arc<crate::gpu_service::GpuPool>>>,
     startup_gpu_births: Mutex<Vec<ProcessBirth>>,
+    /// Package/model preparations in flight: work a rental's idle release must wait for.
+    preparing: std::sync::atomic::AtomicUsize,
+}
+/// Held while one preparation runs; the machine is not idle meanwhile.
+pub struct Preparing(Arc<Service>);
+impl Drop for Preparing {
+    fn drop(&mut self) {
+        self.0
+            .preparing
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.0.engine.notify_activity();
+    }
 }
 impl Service {
     pub fn open(root: &Path, generations: &Path, parallelism: usize) -> io::Result<Arc<Self>> {
@@ -70,6 +82,7 @@ impl Service {
             retained: Mutex::new(HashMap::new()),
             gpu: Mutex::new(None),
             startup_gpu_births: Mutex::new(startup_gpu_births),
+            preparing: std::sync::atomic::AtomicUsize::new(0),
         });
         service.engine.reconcile()?;
         // Keep queued generations alive, including accepted work from a prior boot.
@@ -172,7 +185,15 @@ impl Service {
         Ok(())
     }
     pub fn idle(&self) -> io::Result<bool> {
-        Ok(self.engine.nonterminal(1)?.is_empty())
+        Ok(
+            self.preparing.load(std::sync::atomic::Ordering::Acquire) == 0
+                && self.engine.nonterminal(1)?.is_empty(),
+        )
+    }
+    pub fn preparing(self: &Arc<Self>) -> Preparing {
+        self.preparing
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Preparing(self.clone())
     }
     pub fn stop(&self) -> io::Result<bool> {
         let mut stopped = self.stopped.lock().unwrap();
@@ -293,5 +314,26 @@ impl Service {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod preparing_tests {
+    use super::*;
+
+    #[test]
+    fn a_preparation_in_flight_keeps_the_machine_busy() {
+        let root = std::env::temp_dir().join(format!("service-preparing-{}", uuid::Uuid::new_v4()));
+        let service = Service::open(&root, &root.join("generations"), 1).unwrap();
+        assert!(service.idle().unwrap());
+        let preparing = service.preparing();
+        assert!(
+            !service.idle().unwrap(),
+            "a rental must not release itself mid-install"
+        );
+        drop(preparing);
+        assert!(service.idle().unwrap());
+        assert!(service.stop().unwrap());
+        let _ = std::fs::remove_dir_all(root);
     }
 }
