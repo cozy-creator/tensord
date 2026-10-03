@@ -145,6 +145,7 @@ fn run_machine(
     )?;
     identity.lifecycle = Some(lifecycle.clone());
     let engine = layout.engine();
+    identity.engine = Some(engine.clone());
     let generations = engine.join("generations");
     let owner = Owner::new(&engine, 16 * 1024 * 1024, Duration::from_secs(300))?;
     let service = cozy_machine::service::Service::open(&engine, &generations, 1)?;

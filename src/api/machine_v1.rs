@@ -1,6 +1,7 @@
 //! `cozy.machine.v1` (G/API.md): Run, Control and Read over the machine's engine, every call
 //! authorized by one `Cozy-Cap`. Until `worker.v1` is deleted at cutover this service reuses
-//! the backend's operations; Status (D2) and Write (D1) answer UNIMPLEMENTED until they land.
+//! the backend's operations; Status is `machine_status` (D2); Write (D1) answers UNIMPLEMENTED
+//! until it lands.
 use super::{
     auth::VerifiedActor,
     backend::MachineBackend,
@@ -110,7 +111,7 @@ fn query(
 }
 
 /// The run's state as the log's first frame (sequence 0: a snapshot, not a log entry).
-fn state(id: &str, state: &pb::MachineExecutionState) -> v1::RunState {
+pub(super) fn state(id: &str, state: &pb::MachineExecutionState) -> v1::RunState {
     v1::RunState {
         id: id.into(),
         number: state.number,
@@ -349,6 +350,26 @@ impl Log {
 
 #[tonic::async_trait]
 impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
+    async fn status(
+        &self,
+        request: Request<v1::StatusRequest>,
+    ) -> Result<Response<Events<v1::StatusFrame>>, Status> {
+        let caller = match request.metadata().get("authorization") {
+            None => None,
+            Some(_) => Some(self.caller(request.metadata())?),
+        };
+        let machine = caller.filter(|c| c.machine().is_ok()).map(|c| c.actor);
+        let keepalive = request.into_inner().keepalive;
+        super::machine_status::status(
+            self.identity.clone(),
+            self.backend.clone(),
+            machine,
+            keepalive,
+        )
+        .await
+        .map(Response::new)
+    }
+
     async fn run(
         &self,
         request: Request<v1::RunRequest>,

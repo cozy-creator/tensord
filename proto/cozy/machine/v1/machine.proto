@@ -198,17 +198,53 @@ message ReadFrame {
 
 // ---- Status (D2) -------------------------------------------------------------------------
 
+// Without a machine-scope cap Status answers one frame (identity and the sealed receipt) and
+// ends. With one it streams: each frame is the whole picture, sent again when it changes. An
+// open Status stream is not activity; `keepalive` resets the idle deadline once and the first
+// frame carries the new deadline.
 message StatusRequest {
-  bool keepalive = 1;  // reset the idle deadline once
+  bool keepalive = 1;
 }
 message StatusFrame {
   string worker_id = 1;
   string boot_id = 2;
-  string version = 3;
+  string version = 3;               // this machine's release
   repeated string capabilities = 4;
-  bytes receipt = 5;               // the sealed readiness receipt
-  int64 idle_deadline_unix_ms = 6; // 0: no idle release
-  repeated RunState runs = 7;      // live runs
+  bytes receipt = 5;                // the sealed readiness envelope; empty until sealed
+  int64 idle_deadline_unix_ms = 6;  // 0: no idle release
+  repeated RunState runs = 7;       // the caller's live runs
+  string phase = 8;                 // booting, ready, releasing
+  string platform = 9;              // os/arch
+  int64 started_at_unix_ms = 10;
+  repeated Gpu gpus = 11;           // measured at boot
+  repeated Hub hubs = 12;
+  string runtime = 13;              // the executors' cozy-runtime
+  string tensorfs = 14;
+  repeated Environment environments = 15;  // the caller's held package installations
+  Disk disk = 16;                   // the filesystem holding the machine's store
+}
+message Gpu {
+  uint32 index = 1;
+  string name = 2;
+  string uuid = 3;
+  string pci_bus_id = 4;
+  uint64 memory_bytes = 5;
+  string driver = 6;
+}
+message Hub {
+  string origin = 1;
+  string machine_id = 2;  // this machine's worker id there
+}
+message Environment {
+  string installation = 1;  // RunSpec.installation names it
+  string package = 2;
+  string release = 3;
+  repeated string entrypoints = 4;
+  string runtime = 5;       // the cozy-runtime installed in it
+}
+message Disk {
+  uint64 total_bytes = 1;
+  uint64 free_bytes = 2;
 }
 
 // ---- Write (D1) --------------------------------------------------------------------------

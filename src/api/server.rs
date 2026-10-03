@@ -36,6 +36,8 @@ pub struct MachineIdentity {
     pub updates: Option<Arc<crate::machine::update::Updates>>,
     /// A granted media port: the CLI's machine launcher reads the receipt there.
     pub media: Option<std::net::TcpListener>,
+    /// The engine directory; Status reports its filesystem. None on development front doors.
+    pub engine: Option<std::path::PathBuf>,
 }
 
 impl MachineIdentity {
@@ -71,6 +73,7 @@ impl MachineIdentity {
             hubs: vec![],
             updates: None,
             media: None,
+            engine: None,
         })
     }
 }

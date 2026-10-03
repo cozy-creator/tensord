@@ -866,4 +866,64 @@ mod v1_api {
         assert_eq!(outcome.status, "canceled", "{outcome:?}");
         assert_eq!(outcome.reason.as_ref().unwrap().code, "canceled");
     }
+
+    #[tokio::test]
+    async fn status_lists_the_callers_live_runs_and_held_environments() {
+        let machine = Machine::start_with(hold_classifier).await;
+        let mut client = client(&machine).await;
+        let all = cap(Grant {
+            action: MACHINE.into(),
+            ..Default::default()
+        });
+        let request = v1::RunRequest {
+            id: "live".into(),
+            after: 0,
+            spec: Some(spec(50_000_000)),
+        };
+        let mut stream = client
+            .run(authorized(request, &all))
+            .await
+            .unwrap()
+            .into_inner();
+        while !matches!(
+            stream.message().await.unwrap().expect("run ended").event,
+            Some(v1::run_event::Event::Progress(_))
+        ) {}
+        let mut status = client
+            .status(authorized(v1::StatusRequest { keepalive: false }, &all))
+            .await
+            .unwrap()
+            .into_inner();
+        let frame = status.message().await.unwrap().unwrap();
+        let live: Vec<_> = frame
+            .runs
+            .iter()
+            .map(|r| (r.id.as_str(), r.state.as_str()))
+            .collect();
+        assert_eq!(live, [("live", "running")], "{frame:?}");
+        let held: Vec<_> = frame
+            .environments
+            .iter()
+            .map(|e| e.installation.as_str())
+            .collect();
+        assert_eq!(held, ["fixture"], "{frame:?}");
+        let cancel = v1::ControlRequest {
+            id: "live".into(),
+            action: v1::Action::Cancel as i32,
+        };
+        client.control(authorized(cancel, &all)).await.unwrap();
+        collect(stream).await.unwrap();
+        // The held Status stream sends the change: no live run remains.
+        let until = Instant::now() + Duration::from_secs(30);
+        loop {
+            let next = tokio::time::timeout_at(until.into(), status.message())
+                .await
+                .expect("Status sent no frame without the run")
+                .unwrap()
+                .unwrap();
+            if next.runs.is_empty() {
+                break;
+            }
+        }
+    }
 }

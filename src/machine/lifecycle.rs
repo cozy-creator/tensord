@@ -121,8 +121,17 @@ impl Lifecycle {
         Ok(target)
     }
 
-    /// An explicit owner keepalive, idempotent per request id.
+    /// An explicit owner keepalive, idempotent per request id (worker.v1).
     pub fn keepalive(&self, id: &str) -> Result<(i64, i64), Status> {
+        self.reset(Some(id))
+    }
+
+    /// `Status{keepalive}`: one explicit reset of the idle deadline; answers the new deadline.
+    pub fn renew(&self) -> Result<i64, Status> {
+        self.reset(None).map(|(_, deadline)| deadline)
+    }
+
+    fn reset(&self, id: Option<&str>) -> Result<(i64, i64), Status> {
         let now = now_ms();
         let mut state = self.state.lock().unwrap();
         if self.rental && Self::due(&state, now) {
@@ -130,14 +139,16 @@ impl Lifecycle {
                 "this machine's idle release is already due or committed",
             ));
         }
-        if let Some(seen) = state.0.keepalives.get(id) {
+        if let Some(seen) = id.and_then(|id| state.0.keepalives.get(id)) {
             return Ok((seen[0], seen[1]));
         }
         if state.0.keepalives.len() >= 256 {
             state.0.keepalives.clear();
         }
         let deadline = now + IDLE_GRACE_MS;
-        state.0.keepalives.insert(id.to_owned(), [now, deadline]);
+        if let Some(id) = id {
+            state.0.keepalives.insert(id.to_owned(), [now, deadline]);
+        }
         state.0.deadline_ms = state.0.deadline_ms.max(deadline);
         self.save(&state.0).map_err(|e| {
             Status::unavailable(format!("the idle ledger could not be written: {e}"))

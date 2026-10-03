@@ -45,7 +45,8 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 | `api/identity.rs` | Persistent P-256 TLS identity, typed machine config, readiness secret | `MachineConfig`, `AuthorizedKeys`, `ReadinessSecret` | D2 |
 | `api/backend.rs` | The one backend trait the server calls | `MachineBackend`, `InputTreeReceiver`, `Observation` | D1 |
 | `api/workspaces.rs` | Resumable package uploads, scoped by owner key | `WorkspaceUploads`, `UploadSession`, `UploadedPackage` | D1 |
-| `api/machine_v1.rs` | `cozy.machine.v1` (`proto/cozy/machine/v1/machine.proto`, `MACHINE-API.md`): Run, Control, Read under one `Cozy-Cap`; Status (D2) and Write (D1) to come | `MachineV1` | G |
+| `api/machine_v1.rs` | `cozy.machine.v1` (`proto/cozy/machine/v1/machine.proto`, `MACHINE-API.md`): Run, Control, Read under one `Cozy-Cap`; Write (D1) to come | `MachineV1` | G |
+| `api/machine_status.rs` | Status: identity and receipt to anyone, the whole machine to a machine cap as it changes, `keepalive` | `status` | D2 |
 | `api/capability.rs` | `Cozy-Cap` grants (the Go agent's token) for run outputs and maintenance | `Grant`, `verify`, `mint` | G |
 | `api/install.rs` | Materialize uploaded packages, run the uv installer helper | `InstallerConfig`, `PreparedGeneration` | D1 |
 | `machine_api.rs` | `MachineBackend` implementation: submit, events, collect, list, inventory | `NativeBackend` | D1 |

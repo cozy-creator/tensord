@@ -175,6 +175,11 @@ impl Updates {
         Ok(())
     }
 
+    /// The executors' Runtime/TensorFS pair.
+    pub fn software(&self) -> Pair {
+        pair_in(&self.paths.sdk())
+    }
+
     /// GET /v1/machine/runtime.
     pub fn state(&self, agent_capabilities: &[&str]) -> serde_json::Value {
         let pair = pair_in(&self.paths.sdk());

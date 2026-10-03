@@ -173,6 +173,7 @@ impl MachineIdentity {
             hubs: vec![],
             updates: None,
             media: None,
+            engine: None,
         })
     }
 }
@@ -207,6 +208,7 @@ impl MachineIdentity {
             hubs: vec![],
             updates: None,
             media: None,
+            engine: None,
         })
     }
 }

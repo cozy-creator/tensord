@@ -3,6 +3,7 @@ pub mod backend;
 pub mod capability;
 pub mod identity;
 pub mod install;
+mod machine_status;
 mod machine_v1;
 mod server;
 pub mod workspaces;
