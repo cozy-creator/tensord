@@ -826,7 +826,7 @@ impl Engine {
             return Ok(());
         }
         let output_root = self.root.join("staging").join(id);
-        let _spool = Spool(output_root.clone());
+        let spool = Spool(output_root.clone());
         let logs = self.root.join("logs");
         let launch = (|| {
             fs::create_dir_all(&output_root)?;
@@ -873,42 +873,36 @@ impl Engine {
         let _ = reader.shutdown(std::net::Shutdown::Both);
         drop(reader);
         let (status, _) = crate::process::reap(&exact, Some(&mut child), Liveness::default())?;
-        match supervised {
-            Ok(terminal) => {
-                let outcome = match terminal {
-                    RunnerEvent::Result {
-                        value,
-                        artifacts,
-                        asset_bindings,
-                        ..
-                    } if status.success() => {
-                        match self.bound_custody(id, &output_root, value, artifacts, asset_bindings)
-                        {
-                            Ok(result) => Outcome::Completed(result),
-                            Err(error) => {
-                                Outcome::Failed(format!("result custody failed: {error}"))
-                            }
-                        }
+        let outcome = match supervised {
+            Ok(terminal) => match terminal {
+                RunnerEvent::Result {
+                    value,
+                    artifacts,
+                    asset_bindings,
+                    ..
+                } if status.success() => {
+                    match self.bound_custody(id, &output_root, value, artifacts, asset_bindings) {
+                        Ok(result) => Outcome::Completed(result),
+                        Err(error) => Outcome::Failed(format!("result custody failed: {error}")),
                     }
-                    RunnerEvent::Result { .. } => {
-                        Outcome::Failed(format!("executor reported result but exited {status}"))
-                    }
-                    RunnerEvent::Failed { code, detail, .. } => {
-                        Outcome::Failed(format!("{code}: {detail}"))
-                    }
-                    RunnerEvent::Canceled { .. } if self.get(id)?.cancel_actor.is_some() => {
-                        Outcome::Canceled
-                    }
-                    RunnerEvent::Canceled { .. } => Outcome::Failed(
-                        "runner canceled without durable cancellation authority".into(),
-                    ),
-                    _ => Outcome::Failed("runner ended without a terminal result".into()),
-                };
-                self.finish(id, outcome)?;
-            }
+                }
+                RunnerEvent::Result { .. } => {
+                    Outcome::Failed(format!("executor reported result but exited {status}"))
+                }
+                RunnerEvent::Failed { code, detail, .. } => {
+                    Outcome::Failed(format!("{code}: {detail}"))
+                }
+                RunnerEvent::Canceled { .. } if self.get(id)?.cancel_actor.is_some() => {
+                    Outcome::Canceled
+                }
+                RunnerEvent::Canceled { .. } => {
+                    Outcome::Failed("runner canceled without durable cancellation authority".into())
+                }
+                _ => Outcome::Failed("runner ended without a terminal result".into()),
+            },
             Err(error) => {
                 let record = self.get(id)?;
-                let outcome = if record.cancel_actor.is_some() {
+                if record.cancel_actor.is_some() {
                     Outcome::Canceled
                 } else if record.state == State::Starting {
                     // Ended before authorization: no authored code ran; its exit is the reason.
@@ -918,10 +912,12 @@ impl Engine {
                     ))
                 } else {
                     Outcome::Failed(format!("executor ended {status}: {error}"))
-                };
-                self.finish(id, outcome)?;
+                }
             }
-        }
+        };
+        // Custody is complete: a settled run never has a spool.
+        drop(spool);
+        self.finish(id, outcome)?;
         Ok(())
     }
 
