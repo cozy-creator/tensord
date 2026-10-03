@@ -45,15 +45,22 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 | `api/identity.rs` | Persistent P-256 TLS identity, typed machine config, readiness secret | `MachineConfig`, `AuthorizedKeys`, `ReadinessSecret` | D2 |
 | `api/backend.rs` | The one backend trait the server calls | `MachineBackend`, `InputTreeReceiver`, `Observation` | D1 |
 | `api/workspaces.rs` | Resumable package uploads, scoped by owner key | `WorkspaceUploads`, `UploadSession`, `UploadedPackage` | D1 |
+| `api/capability.rs` | `Cozy-Cap` grants (the Go agent's token) for run outputs and maintenance | `Grant`, `verify`, `mint` | G |
 | `api/install.rs` | Materialize uploaded packages, run the uv installer helper | `InstallerConfig`, `PreparedGeneration` | D1 |
 | `machine_api.rs` | `MachineBackend` implementation: submit, events, collect, list, inventory | `NativeBackend` | D1 |
+| `products.rs` | Run output log: `Outputs.publish` custody and `product` events (SET/APPEND, composite parts) | `publish`, `retain`, `document` | G |
+| `triage.rs` | One bounded triage bundle per failed attempt, named by its outcome | `TriageRef`, `Facts` | G |
+| `hub.rs` | Delegated Hub access and the catalog reads it authorizes | `Grant`, `Catalog` | D1 |
+| `published.rs` | Published package/model preparation from the Hub, held per release and resolution | `Publisher`, `Request`, `Prepared` | D1 |
+| `adapter_views.rs` | Caller LoRA adapters as a zero-copy TensorFS derivation | — | D1 |
+| `machine/` | Launch grant, lifetime identity, readiness receipt, rental lifecycle, supervision, SSH, runtime update | `Grant`, `Readiness`, `Lifecycle` | D2 |
 | `native_inputs.rs` | Native input custody into TensorFS + journal | `SourceIntake`, `IntakeJournal` | D1 |
 | `catalog.rs` | Immutable package environment generations and their holds | `Catalog`, `Generation`, `HeldGeneration` | D1 |
 | `service.rs` | Sole dispatch policy (CPU parallelism, one GPU slot, startup GPU fences) | `Service` | B2 |
 | `execution.rs` | Acceptance, runner supervision, cancellation, progress coalescing, output custody, reconcile | `Engine`, `RunnerConfig` | E |
 | `journal.rs` | SQLite journal: executions, installations, preparations, receipts, process births | `Journal`, `Execution`, `State`, `ProcessBirth` | E |
 | `gpu_service.rs` | GPU pool: published package/model mapping, executor retention, request callbacks | `GpuPool`, `GpuConfig`, `GpuPlan`, `ModelGrant` | B2 (admission, grants), E (spawn/fencing), D1 (published mapping) |
-| `memory/` | Per-GPU ledger and decisions (`policy`), NVML sampler thread (`nvml`), floor watchdog | `GpuMemory`, `policy::Gpu`, `Step`, `Decision` | B2 |
+| `memory/` | Per-GPU ledger and decisions (`policy`), NVML sampler thread (`nvml`), floor watchdog, per-host pinned budgets (`host`) | `GpuMemory`, `policy::Gpu`, `Step`, `Decision` | B2 |
 | `device_executor.rs` | Typed control seam to the Runtime device executor, per-request output encoding | `DeviceExecutor`, `ExecutorConfig`, `DeviceCommand`, `Frame`, `Answer` | E |
 | `launch_identity.rs` | Runtime trampoline command, the executor environment seal, optional UID/GID | `LaunchIdentity`, `Seal`, `trampoline` | E |
 | `process.rs` | Exact process births, group kill, the progress meter and watch, reaping | `Exact`, `Pace`, `Watching` | E |
@@ -68,7 +75,6 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 | `resident_custody.rs` | Degree 2: executor-exported GPU regions kept as driver fds (no CUDA), leases, revocation | `ResidentCustody`, `HoldingKey`, `SharedRegion` | C |
 | `boundary_json.rs` | Strict JSON parse (no duplicate keys) for boundary records | — | D1 |
 
-The host ledger (pinned tier, RSS/PSS, cgroup headroom) is not in `memory/` yet (B1, B2).
 
 ## Python package `cozy_machine_client`
 
