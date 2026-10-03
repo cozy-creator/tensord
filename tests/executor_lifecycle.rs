@@ -89,6 +89,7 @@ fn launch(generation: &Generation, hold: &File) -> (DeviceExecutor, PathBuf, Sea
                 ..Binding::default()
             }),
             budgets: Budgets::default(),
+            models: Vec::new(),
             authorized_device_limit_bytes: None,
             attention_pin: String::new(),
             stages: false,
@@ -407,6 +408,7 @@ fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
                 ..Binding::default()
             }),
             budgets: Budgets::default(),
+            models: Vec::new(),
             authorized_device_limit_bytes: None,
             attention_pin: String::new(),
             stages: false,

@@ -7,7 +7,8 @@ executor per plan; `memory::GpuMemory` decides every device byte. Acceptance, jo
 ## Configuration
 
 `cozy-machine serve --gpu-config <json>` loads a root-sealed `GpuConfig`:
-- `devices`: exactly one device, exported as `CUDA_VISIBLE_DEVICES`.
+- `devices`: the GPU envelope, `"0"` or `"0,1,..."`. A plan of degree K runs on the first K;
+  its executor is sealed to those K (`CUDA_VISIBLE_DEVICES`).
 - `models: [ModelGrant { package, slot, repository, release, lane, manifest, components }]`: the only
   authority over cached model bytes.
 - `packages: [{ package, release, distribution, generation }]`: published-package mapping.
@@ -21,10 +22,13 @@ executor per plan; `memory::GpuMemory` decides every device byte. Acceptance, jo
 ## Preparation
 
 `prepare_root` reads only the installed static interface.
-- The entrypoint must declare exactly one model at `<entrypoint>.models.<param>`.
+- Every model the entrypoint declares at `<entrypoint>.models.<param>` gets a slot (H3 turbo:
+  base and LoRA). Several slots load as one many-model construction (`Load.models`).
 - Choices with `source`, `profiles` or `adapters` are unsupported.
-- Exactly one `ModelGrant` must match. Declared `component_use` must be within its components.
-- The `GpuPlan` id hashes {actor, generation, entrypoint, binding}. It is journaled as a
+- Exactly one `ModelGrant` must match each slot. Declared `component_use` must be within its components.
+- Degree: the widest fitting ladder rung's `gpus` (published), else the widest group every slot
+  declares (`sequence_parallel.degrees`, one always) within the envelope (Runtime `machine_lanes.widths`).
+- The `GpuPlan` id hashes {actor, generation, entrypoint, slots, degree}. It is journaled as a
   `Preparation`, and `submit` records `preparation_id`.
 - An empty `installation_id` binds a `published-<hash>` installation from `packages`.
 
@@ -35,6 +39,16 @@ executor per plan; `memory::GpuMemory` decides every device byte. Acceptance, jo
 - Startup: every journaled birth still alive from a previous machine run (GPU births including
   completed requests', and any nonterminal run's) is killed, since nothing can adopt it. GPU
   dispatch stays fenced until each exit is observed.
+- Groups (degree K > 1): one executor sealed to the K GPUs with the NCCL seal (`NCCL_NVLS_ENABLE=0`,
+  `NCCL_P2P_LEVEL=NVL`); `Start`/`Load` carry `sequence_parallel_degree: K`. Rank 0 spawns, dials back
+  and forms its followers inside `Start` (Runtime `RankGroup`); the machine never talks to a follower.
+  Every command's watch meters rank 0 plus its process-group members, so formation ends only on
+  measured lack of progress. Each GPU of the group is admitted by its own memory decision (device
+  order); the cap is the smallest. Followers' pids from `Start` name their GPU's tenant for NVML.
+  Teardown waits for every group member's exit. Startup fences GPU dispatch until a previous
+  machine's leaders and their followers are gone. A refusal or poisoned group call fails the run
+  with the executor's own code (a group's first fault names its GPU). Descriptor sources and
+  Degree 2 custody stay world-one.
 - A cold session is admitted first: its context estimate (twice the largest measured here, else
   1 GiB) and known first working set are reserved, making room by the ladder below. It is spawned by
   the pool's `ChildLauncher`, which journals the birth, then sent Start, Load (with that cap),
@@ -87,7 +101,8 @@ thread.
 
 ## Known gaps
 
-- One device, world one, one model slot. No adapters. One call per GPU at a time.
+- Groups always take the first K envelope GPUs; one GPU call runs at a time machine-wide. No adapters.
+- A follower GPU's floor watchdog does not write the budget cell (it caps rank 0's process only).
 - No host ledger (pinned tier, RSS/PSS, cgroup headroom) in the policy yet.
 - Executors before `process_cap/1` get only a plane budget: their context and activations are
   estimated, not capped.

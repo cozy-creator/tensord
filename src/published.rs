@@ -228,7 +228,7 @@ impl Publisher {
         let key = Self::resolution_key(
             &installation.alias,
             request,
-            &gpu_name(&gpu.config().devices),
+            &format!("{}x{}", gpu.width(), gpu_name(&gpu.config().envelope()[0])),
         );
         let Some(id) = service.engine.with_journal(|j| j.resolution(actor, &key))? else {
             return Ok(None);
@@ -238,13 +238,7 @@ impl Publisher {
         };
         let plan = gpu.plan(&preparation)?;
         // The bytes may have been reclaimed since; then the model is fetched again.
-        if gpu
-            .source_facts(&[crate::model_sources::SelectedManifest {
-                manifest: plan.binding.snapshot.clone(),
-                components: plan.binding.components.clone(),
-            }])
-            .is_err()
-        {
+        if gpu.source_facts(&plan.selections()).is_err() {
             return Ok(None);
         }
         Ok(Some(Prepared {
@@ -600,158 +594,186 @@ impl Publisher {
                 "held interface is corrupt".to_string(),
             )
         })?;
-        let slot = model_slots(&interface, &request.entrypoint)
-            .and_then(|slots| slots.first().cloned())
+        let slots = model_slots(&interface, &request.entrypoint)
+            .filter(|slots| !slots.is_empty())
             .ok_or((
                 "package_prepare_interface_invalid",
                 "declared model slot absent".to_string(),
             ))?;
-        let path = slot
-            .get("path")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let gpu_model = gpu_name(&gpu.config().devices);
-        job.stage(format!("resolving the model for {path}"));
-        let choice = request.choices.first().cloned().unwrap_or_default();
+        let gpu_model = gpu_name(&gpu.config().envelope()[0]);
+        let width = gpu.width();
         let (org, name) = request.package.split_once('/').unwrap_or_default();
-        let (model, release, lane, manifest) = if let Some(reference) =
-            choice.manifest.as_ref().filter(|m| m.digest.len() == 32)
-        {
-            (
-                choice.repository.clone(),
-                format!("sha256:{}", sha256::hex(&reference.digest)),
-                choice.lane.clone(),
-                true,
-            )
-        } else if !choice.repository.is_empty() {
-            (
-                choice.repository.clone(),
-                choice.release.clone(),
-                choice.lane.clone(),
-                false,
-            )
-        } else {
-            let bindings = catalog
-                .json(&format!(
-                    "/v1/packages/{}/{}/bindings",
-                    hub::escape(org),
-                    hub::escape(name)
-                ))
-                .map_err(|e| ("catalog_read_failed", e.0))?;
-            let row = bindings
-                .get("bindings")
-                .and_then(Value::as_array)
-                .and_then(|rows| rows.iter().find(|row| row.get("slot").and_then(Value::as_str) == Some(path.as_str())))
-                .cloned()
-                .or_else(|| slot.get("default_ladder").map(|ladder| json!({"model":slot.get("default_model"),"release":slot.get("default_release"),"ladder":ladder})))
-                .ok_or(("model_binding_absent", format!("{} binds no model to {path}; bind one with `cozy package bind`", request.package)))?;
-            let mut model = row
-                .get("model")
+        let mut bindings: Option<Value> = None;
+        let mut grants = vec![];
+        // The widest fitting rung's GPU count is the group's width (Runtime
+        // `machine_model_defaults.select`); 0 lets every slot's declared degrees decide.
+        let mut degree = 0u32;
+        for slot in &slots {
+            let path = slot
+                .get("path")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            if !model.contains('/') && !model.is_empty() {
-                model = format!("{org}/{model}");
-            }
-            let lane = rung(row.get("ladder"), &gpu_model).ok_or((
-                "model_binding_absent",
-                format!("no rung of {path}'s ladder fits {gpu_model:?}"),
-            ))?;
-            (
-                model,
-                row.get("release")
+            let parameter = path.rsplit('.').next().unwrap_or_default().to_string();
+            job.stage(format!("resolving the model for {path}"));
+            let choice = request
+                .choices
+                .iter()
+                .find(|c| c.parameter == path || c.parameter == parameter)
+                .cloned()
+                .unwrap_or_default();
+            let (model, release, lane, manifest) = if let Some(reference) =
+                choice.manifest.as_ref().filter(|m| m.digest.len() == 32)
+            {
+                (
+                    choice.repository.clone(),
+                    format!("sha256:{}", sha256::hex(&reference.digest)),
+                    choice.lane.clone(),
+                    true,
+                )
+            } else if !choice.repository.is_empty() {
+                (
+                    choice.repository.clone(),
+                    choice.release.clone(),
+                    choice.lane.clone(),
+                    false,
+                )
+            } else {
+                if bindings.is_none() {
+                    bindings = Some(
+                        catalog
+                            .json(&format!(
+                                "/v1/packages/{}/{}/bindings",
+                                hub::escape(org),
+                                hub::escape(name)
+                            ))
+                            .map_err(|e| ("catalog_read_failed", e.0))?,
+                    );
+                }
+                let row = bindings
+                    .as_ref()
+                    .and_then(|b| b.get("bindings"))
+                    .and_then(Value::as_array)
+                    .and_then(|rows| rows.iter().find(|row| row.get("slot").and_then(Value::as_str) == Some(path.as_str())))
+                    .cloned()
+                    .or_else(|| slot.get("default_ladder").map(|ladder| json!({"model":slot.get("default_model"),"release":slot.get("default_release"),"ladder":ladder})))
+                    .ok_or(("model_binding_absent", format!("{} binds no model to {path}; bind one with `cozy package bind`", request.package)))?;
+                let mut model = row
+                    .get("model")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
-                    .to_string(),
-                lane,
-                false,
-            )
-        };
-        if model.is_empty() {
-            return Err((
-                "model_binding_absent",
-                format!("{path} names no model repository"),
-            ));
-        }
-        let reference = if release.is_empty() {
-            model.clone()
-        } else {
-            format!("{model}@{release}")
-        };
-        let mut query = format!("/v1/models/resolve?ref={}", hub::escape(&reference));
-        if !lane.is_empty() && !manifest {
-            query.push_str(&format!("&lane={}", hub::escape(&lane)));
-        }
-        let resolved = catalog
-            .json(&query)
-            .map_err(|e| ("catalog_read_failed", e.0))?;
-        let manifest_id = resolved
-            .get("manifest_id")
-            .and_then(Value::as_str)
-            .ok_or((
-                "catalog_read_failed",
-                "model resolution named no manifest".to_string(),
-            ))?
-            .to_string();
-        let manifest_id = if manifest_id.starts_with("sha256:") {
-            manifest_id
-        } else {
-            format!("sha256:{manifest_id}")
-        };
-        let field = |name: &str, fallback: &str| {
-            resolved
-                .get(name)
+                    .to_string();
+                if !model.contains('/') && !model.is_empty() {
+                    model = format!("{org}/{model}");
+                }
+                let (lane, gpus) = rung(row.get("ladder"), &gpu_model, width).ok_or((
+                    "model_binding_absent",
+                    format!("no rung of {path}'s ladder fits {width}x {gpu_model:?}"),
+                ))?;
+                degree = degree.max(gpus);
+                (
+                    model,
+                    row.get("release")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    lane,
+                    false,
+                )
+            };
+            if model.is_empty() {
+                return Err((
+                    "model_binding_absent",
+                    format!("{path} names no model repository"),
+                ));
+            }
+            let reference = if release.is_empty() {
+                model.clone()
+            } else {
+                format!("{model}@{release}")
+            };
+            let mut query = format!("/v1/models/resolve?ref={}", hub::escape(&reference));
+            if !lane.is_empty() && !manifest {
+                query.push_str(&format!("&lane={}", hub::escape(&lane)));
+            }
+            let resolved = catalog
+                .json(&query)
+                .map_err(|e| ("catalog_read_failed", e.0))?;
+            let manifest_id = resolved
+                .get("manifest_id")
                 .and_then(Value::as_str)
-                .unwrap_or(fallback)
-                .to_string()
-        };
-        let grant = ModelGrant {
-            package: installation.package.clone(),
-            slot: path.clone(),
-            repository: field("model", &model),
-            release: field("release", &release),
-            lane: field("lane", &lane),
-            manifest: manifest_id.clone(),
-            components: resolved
-                .get("components")
-                .and_then(Value::as_array)
-                .map(|c| {
-                    c.iter()
-                        .filter_map(Value::as_str)
-                        .map(String::from)
-                        .collect()
-                })
-                .unwrap_or_default(),
-        };
-        job.stage(format!(
-            "downloading {}@{} {}",
-            grant.repository, grant.release, grant.lane
-        ));
+                .ok_or((
+                    "catalog_read_failed",
+                    "model resolution named no manifest".to_string(),
+                ))?
+                .to_string();
+            let manifest_id = if manifest_id.starts_with("sha256:") {
+                manifest_id
+            } else {
+                format!("sha256:{manifest_id}")
+            };
+            let field = |name: &str, fallback: &str| {
+                resolved
+                    .get(name)
+                    .and_then(Value::as_str)
+                    .unwrap_or(fallback)
+                    .to_string()
+            };
+            grants.push(ModelGrant {
+                package: installation.package.clone(),
+                slot: path.clone(),
+                repository: field("model", &model),
+                release: field("release", &release),
+                lane: field("lane", &lane),
+                manifest: manifest_id,
+                components: resolved
+                    .get("components")
+                    .and_then(Value::as_array)
+                    .map(|c| {
+                        c.iter()
+                            .filter_map(Value::as_str)
+                            .map(String::from)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            });
+        }
         let credential = catalog.credential();
-        let refspec = format!("{}@{manifest_id}", grant.repository);
-        let keep = [manifest_id.clone()];
-        let on_event =
-            |event: &tensorfs_core::ensure::Event| job.bytes(event.bytes_done, event.bytes_total);
-        let mut ensure = tensorfs_core::ensure::Request::new(
-            &self.store,
-            catalog.origin(),
-            &refspec,
-            &credential,
-            catalog.policy(),
-        );
-        ensure.keep = &keep;
-        ensure.on_event = Some(&on_event);
-        tensorfs_core::ensure::ensure(&ensure)
-            .map_err(|e| ("model_download_failed", e.to_string()))?;
-        job.stage(format!("preparing {}", grant.repository));
+        let mut fetched = std::collections::BTreeSet::new();
+        for grant in &grants {
+            if !fetched.insert(grant.manifest.clone()) {
+                continue; // two slots of one checkpoint download it once
+            }
+            job.stage(format!(
+                "downloading {}@{} {}",
+                grant.repository, grant.release, grant.lane
+            ));
+            let refspec = format!("{}@{}", grant.repository, grant.manifest);
+            let keep = [grant.manifest.clone()];
+            let on_event = |event: &tensorfs_core::ensure::Event| {
+                job.bytes(event.bytes_done, event.bytes_total)
+            };
+            let mut ensure = tensorfs_core::ensure::Request::new(
+                &self.store,
+                catalog.origin(),
+                &refspec,
+                &credential,
+                catalog.policy(),
+            );
+            ensure.keep = &keep;
+            ensure.on_event = Some(&on_event);
+            tensorfs_core::ensure::ensure(&ensure)
+                .map_err(|e| ("model_download_failed", e.to_string()))?;
+        }
+        job.stage(format!("preparing {}", request.package));
         let plan = gpu
             .prepare_root(
                 actor,
                 installation,
                 &request.entrypoint,
                 &request.choices,
-                Some(&grant),
+                &grants,
+                degree,
             )
             .map_err(|e| ("model_preparation_failed", e.to_string()))?;
         service
@@ -763,7 +785,11 @@ impl Publisher {
                 document: serde_json::to_vec(&plan).map_err(|e| io_failure(io::Error::other(e)))?,
             })
             .map_err(io_failure)?;
-        let key = Self::resolution_key(&installation.alias, request, &gpu_model);
+        let key = Self::resolution_key(
+            &installation.alias,
+            request,
+            &format!("{width}x{gpu_model}"),
+        );
         service
             .engine
             .with_journal(|j| j.bind_resolution(actor, &key, &installation.package, &plan.id))
@@ -801,8 +827,9 @@ fn declares_models(installation: &Installation, entrypoint: &str) -> bool {
         .is_some_and(|m| !m.is_empty())
 }
 
-/// The widest one-GPU rung whose GPU pattern fits this device (the first among equals); its lane.
-fn rung(ladder: Option<&Value>, gpu: &str) -> Option<String> {
+/// The widest rung this machine holds (its GPU pattern fits the device and it asks for at
+/// most `available` of them; the first among equals): its lane and GPU count (0 unstated).
+fn rung(ladder: Option<&Value>, gpu: &str, available: usize) -> Option<(String, u32)> {
     let fits = |pattern: &str| {
         if pattern == "*" {
             return true;
@@ -820,15 +847,15 @@ fn rung(ladder: Option<&Value>, gpu: &str) -> Option<String> {
             .filter(|t| !t.is_empty())
             .all(|token| rest.any(|t| t == token))
     };
+    let gpus = |r: &Value| r.get("gpus").and_then(Value::as_u64).unwrap_or(0);
     ladder?
         .as_array()?
         .iter()
         .rev()
-        .filter(|r| r.get("gpus").and_then(Value::as_u64).unwrap_or(0) <= 1)
+        .filter(|r| gpus(r) as usize <= available)
         .filter(|r| fits(r.get("gpu").and_then(Value::as_str).unwrap_or("*")))
-        .max_by_key(|r| r.get("gpus").and_then(Value::as_u64).unwrap_or(0))
-        .and_then(|r| r.get("lane").and_then(Value::as_str))
-        .map(String::from)
+        .max_by_key(|r| gpus(r))
+        .and_then(|r| Some((r.get("lane")?.as_str()?.to_string(), gpus(r) as u32)))
 }
 
 /// The configured device's model name from the NVIDIA driver's proc files (no CUDA/NVML).
@@ -976,17 +1003,27 @@ mod tests {
     }
 
     #[test]
-    fn rung_is_the_widest_one_gpu_fit() {
+    fn rung_is_the_widest_group_the_machine_holds() {
         let ladder = json!([{"gpu":"*","lane":"bf16"},{"gpu":"rtx 4090","lane":"fp8"},{"gpu":"h100","gpus":4,"lane":"bf16"}]);
         assert_eq!(
-            rung(Some(&ladder), "NVIDIA GeForce RTX 4090").as_deref(),
-            Some("bf16")
+            rung(Some(&ladder), "NVIDIA GeForce RTX 4090", 1),
+            Some(("bf16".into(), 0))
         );
         let ladder = json!([{"gpu":"rtx 4090","lane":"fp8"}]);
         assert_eq!(
-            rung(Some(&ladder), "NVIDIA GeForce RTX 4090").as_deref(),
-            Some("fp8")
+            rung(Some(&ladder), "NVIDIA GeForce RTX 4090", 1),
+            Some(("fp8".into(), 0))
         );
-        assert_eq!(rung(Some(&ladder), "NVIDIA A40"), None);
+        assert_eq!(rung(Some(&ladder), "NVIDIA A40", 2), None);
+        let h3 = json!([{"gpu":"H100","gpus":2,"lane":"fp8-pruned"},{"gpu":"H100","gpus":4,"lane":"fp8-pruned"},{"gpu":"H200","gpus":1,"lane":"fp8-pruned"}]);
+        assert_eq!(rung(Some(&h3), "NVIDIA H100 80GB HBM3", 1), None);
+        assert_eq!(
+            rung(Some(&h3), "NVIDIA H100 80GB HBM3", 2),
+            Some(("fp8-pruned".into(), 2))
+        );
+        assert_eq!(
+            rung(Some(&h3), "NVIDIA H100 80GB HBM3", 8),
+            Some(("fp8-pruned".into(), 4))
+        );
     }
 }

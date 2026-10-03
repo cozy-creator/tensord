@@ -96,6 +96,7 @@ fn prepared(version: &str, generation_path: &str) -> (DeviceExecutor, PathBuf) {
                 sequence_parallel_degree: 1,
                 binding: Box::new(binding),
                 budgets: Budgets::default(),
+                models: Vec::new(),
                 authorized_device_limit_bytes: None,
                 attention_pin: String::new(),
                 stages: false,

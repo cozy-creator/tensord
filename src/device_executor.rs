@@ -3,7 +3,7 @@ use crate::{
     execution::open_artifact,
     journal::ProcessBirth,
     launch_identity::{LaunchIdentity, Seal},
-    process::{process_birth, reap, tail, Exact, Liveness, Meter, Watch, Watching},
+    process::{process_birth, reap_group, tail, Exact, Liveness, Meter, Watch, Watching},
     protocol,
 };
 use serde::{Deserialize, Serialize};
@@ -154,6 +154,13 @@ pub struct Budgets {
     pub declared_weight_bytes: u64,
 }
 
+/// One model of a many-model construction (an entrypoint with several model slots).
+#[derive(Clone, Debug, Serialize)]
+pub struct ModelLoad {
+    pub binding: Binding,
+    pub budgets: Budgets,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum DeviceCommand {
@@ -173,6 +180,10 @@ pub enum DeviceCommand {
         sequence_parallel_degree: u32,
         binding: Box<Binding>,
         budgets: Budgets,
+        /// Several model slots in one construction; the executor loads these instead of
+        /// `binding` (which then names the first, for executors before many-model loads).
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        models: Vec<ModelLoad>,
         #[serde(skip_serializing_if = "Option::is_none")]
         authorized_device_limit_bytes: Option<u64>,
         #[serde(skip_serializing_if = "String::is_empty")]
@@ -479,6 +490,8 @@ pub struct Frame {
     pub quiescent: bool,
     pub poisoned: String,
     pub reused: bool,
+    /// `start` of a group (degree > 1): the follower ranks' pids, rank 1 first.
+    pub follower_pids: Vec<u32>,
     pub result_ref: Option<ResultRef>,
     pub outputs: Vec<Output>,
     pub frames: Vec<HostFrame>,
@@ -1619,7 +1632,8 @@ impl Ending {
                 )));
             }
         };
-        let (mut status, killed) = match reap(exact, self.child.as_mut(), self.liveness) {
+        // Followers (degree > 1) stay in the leader's group and are waited for too.
+        let (mut status, killed) = match reap_group(exact, self.child.as_mut(), self.liveness) {
             Ok(ended) => ended,
             Err(error) => {
                 std::mem::forget(std::mem::take(&mut self.retained));

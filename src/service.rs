@@ -31,6 +31,9 @@ pub struct Service {
     startup_gpu_births: Mutex<Vec<ProcessBirth>>,
     /// Package/model preparations in flight: work a rental's idle release must wait for.
     preparing: std::sync::atomic::AtomicUsize,
+    /// This machine's birth: a fenced leader's group members born before it are its
+    /// previous incarnation's followers.
+    started_ticks: u64,
 }
 /// Held while one preparation runs; the machine is not idle meanwhile.
 pub struct Preparing(Arc<Service>);
@@ -57,6 +60,7 @@ impl Service {
         let mut cursor = 0;
         let mut seen = HashSet::new();
         let mut startup_gpu_births = vec![];
+        let started_ticks = crate::process::own_start_ticks()?;
         loop {
             let page = engine.gpu_births_after(cursor, 256)?;
             if page.is_empty() {
@@ -64,9 +68,17 @@ impl Service {
             }
             for (id, birth) in page {
                 cursor = id;
-                if !process_ended(&birth).unwrap_or(false)
-                    && seen.insert((birth.pid, birth.boot_id.clone(), birth.start_ticks))
-                {
+                let alive = !process_ended(&birth).unwrap_or(false)
+                    || crate::process::group_outlives(&birth, started_ticks);
+                if alive && seen.insert((birth.pid, birth.boot_id.clone(), birth.start_ticks)) {
+                    // A follower left behind by a leader that already ended is ended too.
+                    for member in crate::process::group_members(&birth) {
+                        if member.start_ticks < started_ticks {
+                            if let Ok(Some(exact)) = crate::process::Exact::open(&member) {
+                                let _ = exact.kill();
+                            }
+                        }
+                    }
                     if let Err(error) = engine.end_orphan(birth.clone()) {
                         eprintln!("GPU startup birth remains fenced: {error}");
                     }
@@ -83,6 +95,7 @@ impl Service {
             gpu: Mutex::new(None),
             startup_gpu_births: Mutex::new(startup_gpu_births),
             preparing: std::sync::atomic::AtomicUsize::new(0),
+            started_ticks,
         });
         service.engine.reconcile()?;
         // Keep queued generations alive, including accepted work from a prior boot.
@@ -110,7 +123,11 @@ impl Service {
     /// Observation only. Unknown births stay reserved; CPU dispatch stays available.
     pub fn gpu_startup_fences(&self) -> usize {
         let mut births = self.startup_gpu_births.lock().unwrap();
-        births.retain(|birth| !process_ended(birth).unwrap_or(false));
+        // A group's followers die with their leader (one group kill); each exit is observed.
+        births.retain(|birth| {
+            !process_ended(birth).unwrap_or(false)
+                || crate::process::group_outlives(birth, self.started_ticks)
+        });
         births.len()
     }
     pub fn configure_gpu(&self, gpu: Arc<crate::gpu_service::GpuPool>) -> io::Result<()> {

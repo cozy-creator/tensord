@@ -200,6 +200,61 @@ pub fn burn(pid: u32) -> Option<u64> {
     Some(cpu.saturating_add(moved.unwrap_or(0)))
 }
 
+/// Every process still in `leader`'s process group and born with or after it: an executor's
+/// followers (Runtime `RankGroup` keeps rank 0's PGID). A group number is not reused while a
+/// member lives, so a scan before or right after the leader is reaped names only its own.
+pub fn group_members(leader: &ProcessBirth) -> Vec<ProcessBirth> {
+    let Ok(boot) = boot_id() else {
+        return vec![];
+    };
+    if boot != leader.boot_id {
+        return vec![];
+    }
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return vec![];
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| *pid != leader.pid)
+        .filter_map(|pid| {
+            let stat = process_stat(pid).ok()?;
+            (stat.pgrp as u32 == leader.pid && stat.start_ticks >= leader.start_ticks).then(|| {
+                ProcessBirth {
+                    pid,
+                    boot_id: boot.clone(),
+                    start_ticks: stat.start_ticks,
+                }
+            })
+        })
+        .collect()
+}
+
+/// Whether a member of `leader`'s group born before `before` (start ticks) still lives: a
+/// previous machine's follower, killed with its leader, until its exit is observed.
+pub fn group_outlives(leader: &ProcessBirth, before: u64) -> bool {
+    group_members(leader)
+        .iter()
+        .any(|member| member.start_ticks < before && !process_ended(member).unwrap_or(true))
+}
+
+/// This process's own birth, in start ticks.
+pub fn own_start_ticks() -> io::Result<u64> {
+    Ok(process_stat(std::process::id())?.start_ticks)
+}
+
+/// The leader's meter plus its group members': a follower's imports, fills and collectives
+/// are the executor's work. `None` only when the leader itself is unreadable.
+pub fn group_burn(leader: &ProcessBirth) -> Option<u64> {
+    let own = burn(leader.pid)?;
+    Some(
+        group_members(leader)
+            .iter()
+            .filter_map(|member| burn(member.pid))
+            .fold(own, u64::saturating_add),
+    )
+}
+
 /// Sampling resolution and noise floor of the wedge rule (Runtime `liveness.py`). A sample
 /// period is how often the meter is read, never a deadline.
 #[derive(Clone, Copy, Debug)]
@@ -315,7 +370,7 @@ impl Watch {
         while !state.done {
             let now = Instant::now();
             let reading = match self.meter {
-                Meter::Burn => burn(exact.birth.pid),
+                Meter::Burn => group_burn(&exact.birth),
                 Meter::Frames => Some(state.frames),
             };
             pace.observe(reading, now);
@@ -419,7 +474,7 @@ pub fn reap(
     let mut killed = None;
     while !readable_within(exact.as_file(), liveness.sample)? {
         let now = Instant::now();
-        pace.observe(burn(exact.birth.pid), now);
+        pace.observe(group_burn(&exact.birth), now);
         if killed.is_some() {
             continue;
         }
@@ -438,6 +493,29 @@ pub fn reap(
         Some(child) => child.wait()?,
         None => ExitStatus::from_raw(0),
     };
+    Ok((status, killed))
+}
+
+/// `reap` the leader, then every member left in its group (followers die with their leader
+/// by parent-death signal; their device teardown is waited for, a wedged one killed).
+pub fn reap_group(
+    exact: &Exact,
+    child: Option<&mut Child>,
+    liveness: Liveness,
+) -> io::Result<(ExitStatus, Option<String>)> {
+    let (status, mut killed) = reap(exact, child, liveness)?;
+    for member in group_members(&exact.birth) {
+        let Some(member) = Exact::open(&member)? else {
+            continue;
+        };
+        let (_, member_killed) = reap(&member, None, liveness)?;
+        if let Some(verdict) = member_killed {
+            killed = Some(match killed {
+                Some(first) => format!("{first}; process {}: {verdict}", member.birth.pid),
+                None => format!("process {}: {verdict}", member.birth.pid),
+            });
+        }
+    }
     Ok((status, killed))
 }
 
@@ -541,6 +619,40 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
         assert!(process_ended(&birth).unwrap());
+    }
+
+    #[test]
+    fn reap_group_waits_for_members_left_behind_and_ends_a_still_one() {
+        // The leader leaves two members in its group; killing only the leader (no group
+        // signal) orphans them, as a follower can outlive rank 0 for a moment.
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 1000 & sleep 1000 & wait"])
+            .process_group(0)
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let birth = process_birth(child.id()).unwrap();
+        let members = loop {
+            let members = group_members(&birth);
+            if members.len() == 2 {
+                break members;
+            }
+            std::thread::yield_now();
+        };
+        let exact = Exact::open(&birth).unwrap().unwrap();
+        unsafe { libc::kill(birth.pid as i32, libc::SIGKILL) };
+        let liveness = Liveness {
+            sample: Duration::from_millis(50),
+        };
+        let (status, killed) = reap_group(&exact, Some(&mut child), liveness).unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        // A sleeping member shows no progress: it is ended on that measurement, then waited.
+        let killed = killed.expect("still members are ended on their measurement");
+        assert!(killed.contains("no measurable progress"), "{killed}");
+        for member in members {
+            assert!(process_ended(&member).unwrap(), "{member:?}");
+        }
+        assert!(group_members(&birth).is_empty());
     }
 
     #[test]

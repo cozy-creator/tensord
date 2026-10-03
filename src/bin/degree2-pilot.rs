@@ -228,6 +228,7 @@ fn exec(
             budgets: Budgets {
                 declared_weight_bytes: config.logical_weight_bytes,
             },
+            models: Vec::new(),
             authorized_device_limit_bytes: Some(config.authorized_device_limit_bytes),
             attention_pin: String::new(),
             stages: false,

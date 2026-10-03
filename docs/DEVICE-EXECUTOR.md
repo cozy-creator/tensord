@@ -103,7 +103,8 @@ longer than eight times the longest pause it has shown, and at least six samples
   then on the invocation's frames are the meter; if they stop, it is killed. An invocation without
   a cancel is never judged. Observer teardown never cancels.
 - `terminate()` closes the channel, lets the executor stop at its next exchange, kills only a
-  measured wedge, then reaps it and frees `retain_until_exit` resources. `shutdown()` asks first.
+  measured wedge, then reaps it and every member left in its process group (a group's followers),
+  and frees `retain_until_exit` resources. `shutdown()` asks first.
   `Drop` does the same before returning, so a slot or reservation is released only after the exit. If exit cannot be observed, resources are leaked, not released.
 
 ## Known gaps
@@ -114,4 +115,5 @@ longer than eight times the longest pause it has shown, and at least six samples
 - Containment is the process group: a descendant that calls `setsid` escapes kills. Same-UID
   package code can reopen store paths.
 - Descriptor sources still use native TensorFS plane, header and read-plan code inside the executor.
-- Degree > 1 and multi-GPU/NCCL are not covered by descriptor or host-tier owner paths.
+- Degree > 1 reads the store or the sealed tier (rank 0 shares it with followers); descriptor
+  sources are world-one.

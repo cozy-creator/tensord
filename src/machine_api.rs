@@ -1062,7 +1062,7 @@ impl MachineBackend for NativeBackend {
         {
             let gpu = self.service.gpu().ok_or_else(|| Status::unimplemented("this installed callable needs the GPU execution operation; CPU peers remain usable"))?;
             let plan = gpu
-                .prepare_root(&actor, &installed, &root.entrypoint, &root.models, None)
+                .prepare_root(&actor, &installed, &root.entrypoint, &root.models, &[], 0)
                 .map_err(problem)?;
             self.service
                 .engine
@@ -2127,6 +2127,7 @@ print(json.dumps({"identity": generation.identity}))
                     ..Binding::default()
                 }),
                 budgets: Budgets::default(),
+                models: Vec::new(),
                 authorized_device_limit_bytes: None,
                 attention_pin: String::new(),
                 stages: false,
@@ -2335,6 +2336,7 @@ print(json.dumps({"identity": generation.identity}))
                                 ..Binding::default()
                             }),
                             budgets: Budgets::default(),
+                            models: Vec::new(),
                             authorized_device_limit_bytes: None,
                             attention_pin: String::new(),
                             stages: false,

@@ -1,0 +1,16 @@
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13"]
+build-backend = "uv_build"
+
+[project]
+name = "cozy-machine-cpu-group"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["cozy-runtime>=0.18.67", "msgspec>=0.19,<1"]
+
+[project.entry-points."cozy.application"]
+default = "cpu_group:app"
+
+[tool.uv.build-backend]
+module-name = "cpu_group"
+module-root = ""

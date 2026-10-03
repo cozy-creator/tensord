@@ -1,9 +1,10 @@
-//! Trusted world-one device execution; acceptance, scheduling and custody stay in Engine.
+//! Trusted device execution on one GPU or a group of K (one executor sealed to all K; rank 0
+//! forms the followers); acceptance, scheduling and custody stay in Engine.
 use crate::{
     catalog::HeldGeneration,
     device_executor::{
         self, Answer, Binding, Budgets, Cancellation, DeviceCommand, DeviceExecutor,
-        ExecutorConfig, Forked, Frame, Kind, Services,
+        ExecutorConfig, Forked, Frame, Kind, ModelLoad, Services,
     },
     execution::{process_ended, Engine},
     host_tier::{HostGrant, HostTier, HostTierConfig, SealedRequest},
@@ -87,6 +88,7 @@ pub struct GpuConfig {
     pub identity: Option<crate::launch_identity::LaunchIdentity>,
     #[serde(default)]
     pub source_mode: SourceMode,
+    /// The GPU envelope, `"0"` or `"0,1,..."`: a degree-K plan runs on the first K.
     pub devices: String,
     /// Load's device limit where NVML cannot read the device total.
     pub authorized_device_limit_bytes: Option<u64>,
@@ -118,10 +120,12 @@ pub struct GpuConfig {
 impl GpuConfig {
     pub fn load(path: &Path) -> io::Result<Self> {
         let config: Self = serde_json::from_reader(File::open(path)?).map_err(io::Error::other)?;
-        if config.devices.is_empty() || config.devices.contains(',') {
+        let envelope = config.envelope();
+        let unique: std::collections::BTreeSet<_> = envelope.iter().collect();
+        if envelope.iter().any(String::is_empty) || unique.len() != envelope.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "GPU scope requires one configured device",
+                "GPU scope names one device or a list of distinct devices",
             ));
         }
         if config
@@ -136,6 +140,21 @@ impl GpuConfig {
         }
         Ok(config)
     }
+    /// The configured devices in order (`CUDA_VISIBLE_DEVICES` entries).
+    pub fn envelope(&self) -> Vec<String> {
+        self.devices
+            .split(',')
+            .map(|d| d.trim().to_string())
+            .collect()
+    }
+}
+
+/// One declared model slot of a plan and its bound checkpoint.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PlanSlot {
+    pub binding: Binding,
+    /// Native selected encoded source bytes; not a GPU-fit or full-memory charge.
+    pub selected_encoded_bytes: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -145,13 +164,79 @@ pub struct GpuPlan {
     pub installation: String,
     pub generation: String,
     pub entrypoint: String,
-    pub binding: Binding,
-    /// Native selected encoded source bytes; not a GPU-fit or full-memory charge.
-    pub selected_encoded_bytes: u64,
+    /// Every model slot the entrypoint declares, in declaration order.
+    pub slots: Vec<PlanSlot>,
+    /// GPUs of the group this plan runs on (the first `degree` envelope devices).
+    pub degree: u32,
+}
+impl GpuPlan {
+    pub fn selections(&self) -> Vec<SelectedManifest> {
+        let mut rows: Vec<SelectedManifest> = vec![];
+        for slot in &self.slots {
+            match rows
+                .iter_mut()
+                .find(|r| r.manifest == slot.binding.snapshot)
+            {
+                Some(row) => {
+                    for c in &slot.binding.components {
+                        if !row.components.contains(c) {
+                            row.components.push(c.clone());
+                        }
+                    }
+                }
+                None => rows.push(SelectedManifest {
+                    manifest: slot.binding.snapshot.clone(),
+                    components: slot.binding.components.clone(),
+                }),
+            }
+        }
+        rows
+    }
+}
+
+/// The widest group every slot declares (`sequence_parallel.degrees`, one always) that fits
+/// `available` GPUs, or `wanted` exactly; Runtime `machine_lanes.widths`.
+pub fn group_degree(
+    models: &[serde_json::Value],
+    wanted: u32,
+    available: usize,
+) -> io::Result<u32> {
+    let mut common: std::collections::BTreeSet<u32> = (1..=64).collect();
+    for model in models {
+        let mut declared = std::collections::BTreeSet::from([1u32]);
+        if let Some(rows) = model
+            .pointer("/sequence_parallel/degrees")
+            .and_then(serde_json::Value::as_array)
+        {
+            declared.extend(rows.iter().filter_map(|d| d.as_u64()).map(|d| d as u32));
+        }
+        common = common.intersection(&declared).copied().collect();
+    }
+    if wanted > 0 {
+        if !common.contains(&wanted) || wanted as usize > available {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "gpu_count_unavailable: {wanted} GPUs is not a group every model slot declares \
+                     ({common:?}) within this machine's {available}"
+                ),
+            ));
+        }
+        return Ok(wanted);
+    }
+    Ok(common
+        .into_iter()
+        .filter(|d| *d as usize <= available)
+        .max()
+        .unwrap_or(1))
 }
 
 struct Session {
     plan: String,
+    /// GPUs of its group; its followers (rank 1 first) once it started, held by pidfd so a
+    /// call that fails can name the GPU whose process ended first.
+    degree: u32,
+    followers: Vec<crate::process::Exact>,
     loaded: bool,
     executor: DeviceExecutor,
     sources: Arc<Mutex<ModelSources>>,
@@ -240,7 +325,8 @@ pub struct GpuPool {
     /// Per generation, the import-only executor sessions fork from. Declared after
     /// `sessions`: executors end before the parent they were forked from.
     zygotes: Mutex<BTreeMap<String, Arc<Zygote>>>,
-    memory: GpuMemory,
+    /// Each envelope GPU with its own memory decisions, in envelope order.
+    devices: Vec<Device>,
     host: Arc<HostTier>,
     /// The memory policy's host ledger; the tier's limit reads it.
     host_ledger: Arc<crate::memory::host::HostLedger>,
@@ -249,6 +335,11 @@ pub struct GpuPool {
     // Drop session/resource custody before ending the actual spawning thread.
     launcher: crate::child_launcher::ChildLauncher,
 }
+struct Device {
+    entry: String,
+    memory: GpuMemory,
+}
+
 struct Permit {
     pool: Arc<GpuPool>,
     engine: Weak<Engine>,
@@ -296,15 +387,36 @@ impl GpuPool {
         )?;
         // Fill leases and GPU custody hold one descriptor per object or chunk.
         raise_fd_limit();
+        let envelope = config.envelope();
+        // Degree 2 is world-one, on the first device; off where it drives a display.
         let custody =
-            (!display_active(&config.devices)).then(|| Mutex::new(ResidentCustody::default()));
+            (!display_active(&envelope[0])).then(|| Mutex::new(ResidentCustody::default()));
         let incarnation = uuid::Uuid::new_v4().simple().to_string();
         crate::launch_identity::remove_stale_jit(root, &incarnation);
         remove_old_executor_roots(root);
+        let mut devices = vec![];
+        for entry in &envelope {
+            // Per GPU: its own sample log and learned file (two writers would tear them).
+            let mut memory = config.memory.clone();
+            let mut learned = root.to_path_buf();
+            if envelope.len() > 1 {
+                memory.sample_log = memory.sample_log.map(|path| {
+                    let mut name = path.into_os_string();
+                    name.push(format!(".gpu{entry}"));
+                    name.into()
+                });
+                learned = root.join(format!("memory-gpu{entry}"));
+                fs::create_dir_all(&learned)?;
+            }
+            devices.push(Device {
+                entry: entry.clone(),
+                memory: GpuMemory::start(entry, &memory, &learned),
+            });
+        }
         Ok(Arc::new(Self {
             launcher: crate::child_launcher::ChildLauncher::new()?,
             root: root.to_path_buf(),
-            memory: GpuMemory::start(&config.devices, &config.memory, root),
+            devices,
             incarnation,
             config,
             store,
@@ -318,6 +430,72 @@ impl GpuPool {
     }
     pub fn config(&self) -> &GpuConfig {
         &self.config
+    }
+    /// The first GPU's ledger: every plan runs there (groups take the first K), so it also
+    /// orders the host's pinned shares.
+    fn first(&self) -> &GpuMemory {
+        &self.devices[0].memory
+    }
+    /// GPUs this machine may group.
+    pub fn width(&self) -> usize {
+        self.devices.len()
+    }
+    /// The GPUs a plan of `degree` runs on: the first `degree` envelope devices.
+    fn lane(&self, degree: u32) -> io::Result<&[Device]> {
+        let wanted = degree.max(1) as usize;
+        self.devices.get(..wanted).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "gpu_count_unavailable: a {wanted}-GPU group on a machine with {} GPU(s)",
+                    self.devices.len()
+                ),
+            )
+        })
+    }
+    fn lane_devices(&self, degree: u32) -> io::Result<String> {
+        Ok(self
+            .lane(degree)?
+            .iter()
+            .map(|d| d.entry.as_str())
+            .collect::<Vec<_>>()
+            .join(","))
+    }
+    /// `plan`'s executor is gone: no GPU charges it any more.
+    fn ended(&self, plan: &str) {
+        for device in &self.devices {
+            device.memory.with(|gpu| gpu.ended(plan));
+        }
+        self.host_ledger.private(plan, None);
+    }
+    fn observe(&self, plan: &str, degree: u32, facts: Facts, mapped: Option<bool>) {
+        for device in self.lane(degree).unwrap_or_default() {
+            device.memory.observe(plan, facts, mapped);
+        }
+    }
+    /// Each GPU of the group decides for itself (device order, so two groups never wait
+    /// on each other); the group's cap is the smallest. None: no GPU could say.
+    fn decide(
+        &self,
+        plan: &str,
+        degree: u32,
+        spawn: bool,
+        sessions: &mut BTreeMap<String, Session>,
+    ) -> io::Result<Option<u64>> {
+        let mut cap: Option<u64> = None;
+        for (index, device) in self.lane(degree)?.iter().enumerate() {
+            let got = device.memory.decide(
+                plan,
+                spawn,
+                || if index == 0 { self.holdings() } else { vec![] },
+                |step| self.carry_out(step, sessions),
+            )?;
+            cap = match (cap, got) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+        }
+        Ok(cap)
     }
     pub fn host_tier(&self) -> &Arc<HostTier> {
         &self.host
@@ -393,17 +571,20 @@ impl GpuPool {
             .map(Some)
     }
 
-    /// Derive a binding from the installed SDK's real static interface and the model the
-    /// Hub resolved under the owner's access (or configured cached byte authority). No
-    /// model code executes during description/preparation.
+    /// Derive each model slot's binding from the installed SDK's real static interface and
+    /// the models the Hub resolved under the owner's access (`resolved`, one per slot), or
+    /// configured cached byte authority. `degree` 0 takes the widest group every slot
+    /// declares on this machine. No model code executes during description/preparation.
     pub fn prepare_root(
         &self,
         actor: &str,
         installed: &crate::journal::Installation,
         entrypoint: &str,
         choices: &[crate::api::pb::ModelChoice],
-        resolved: Option<&ModelGrant>,
+        resolved: &[ModelGrant],
+        degree: u32,
     ) -> io::Result<GpuPlan> {
+        let invalid = |detail: &str| io::Error::new(io::ErrorKind::InvalidData, detail.to_string());
         let interface: serde_json::Value =
             serde_json::from_slice(&installed.interface).map_err(io::Error::other)?;
         let entry = interface
@@ -423,44 +604,30 @@ impl GpuPool {
         let models = entry
             .get("models")
             .and_then(serde_json::Value::as_array)
+            .filter(|models| !models.is_empty())
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "model declarations absent")
             })?;
-        if models.len() != 1 || choices.len() > 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "this GPU operation supports one declared model slot/world-one only",
-            ));
-        }
-        let model = &models[0];
-        let path = model
-            .get("path")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "declared model path absent")
-            })?;
         let prefix = format!("{entrypoint}.models.");
-        let parameter = path
-            .strip_prefix(&prefix)
-            .filter(|v| !v.is_empty() && !v.contains('.'))
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "declared model path is not a root parameter",
-                )
-            })?;
-        let class = model
-            .get("class")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "declared model class absent")
-            })?;
-        let chosen = choices.first();
-        if let Some(choice) = chosen {
-            if choice.parameter != path && choice.parameter != parameter {
+        let slot_of = |model: &serde_json::Value| -> io::Result<(String, String)> {
+            let path = model
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| invalid("declared model path absent"))?;
+            let parameter = path
+                .strip_prefix(&prefix)
+                .filter(|v| !v.is_empty() && !v.contains('.'))
+                .ok_or_else(|| invalid("declared model path is not a root parameter"))?;
+            Ok((path.to_string(), parameter.to_string()))
+        };
+        let slots = models.iter().map(slot_of).collect::<io::Result<Vec<_>>>()?;
+        for choice in choices {
+            if !slots.iter().any(|(path, parameter)| {
+                choice.parameter == *path || choice.parameter == *parameter
+            }) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "model choice does not name the declared root slot",
+                    "model choice does not name a declared root slot",
                 ));
             }
             if !choice.source.is_empty()
@@ -473,107 +640,117 @@ impl GpuPool {
                 ));
             }
         }
-        let grants: Vec<_> = resolved
-            .into_iter()
-            .chain(self.config.models.iter().filter(|_| resolved.is_none()))
-            .filter(|grant| {
-                grant.package == installed.package
-                    && grant.slot == path
-                    && chosen.is_none_or(|choice| {
-                        (choice.repository.is_empty() || choice.repository == grant.repository)
-                            && (choice.release.is_empty() || choice.release == grant.release)
-                            && (choice.lane.is_empty() || choice.lane == grant.lane)
-                            && choice.manifest.as_ref().is_none_or(|reference| {
-                                tensorfs_core::sha256::hex(&reference.digest)
-                                    == grant.manifest.trim_start_matches("sha256:")
-                            })
-                    })
-            })
-            .collect();
-        if grants.len() != 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "cached model selection has no unique configured authority",
-            ));
-        }
-        let grant = grants[0];
-        let mut wanted = std::collections::BTreeSet::new();
-        if let Some(use_map) = model
-            .get("component_use")
-            .and_then(serde_json::Value::as_object)
-        {
-            for components in use_map.values() {
-                for component in components.as_array().ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "declared component use is not an array",
-                    )
-                })? {
-                    wanted.insert(
-                        component
-                            .as_str()
-                            .ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "declared component is not a name",
-                                )
-                            })?
-                            .to_string(),
-                    );
+        let degree = group_degree(models, degree, self.devices.len())?;
+        let mut planned = vec![];
+        for (model, (path, parameter)) in models.iter().zip(&slots) {
+            let class = model
+                .get("class")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| invalid("declared model class absent"))?;
+            let chosen = choices
+                .iter()
+                .find(|c| c.parameter == *path || c.parameter == *parameter);
+            let authority: Vec<&ModelGrant> = if resolved.is_empty() {
+                self.config.models.iter().collect()
+            } else {
+                resolved.iter().collect()
+            };
+            let grants: Vec<_> = authority
+                .into_iter()
+                .filter(|grant| {
+                    grant.package == installed.package
+                        && grant.slot == *path
+                        && chosen.is_none_or(|choice| {
+                            (choice.repository.is_empty() || choice.repository == grant.repository)
+                                && (choice.release.is_empty() || choice.release == grant.release)
+                                && (choice.lane.is_empty() || choice.lane == grant.lane)
+                                && choice.manifest.as_ref().is_none_or(|reference| {
+                                    tensorfs_core::sha256::hex(&reference.digest)
+                                        == grant.manifest.trim_start_matches("sha256:")
+                                })
+                        })
+                })
+                .collect();
+            if grants.len() != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("cached model selection for {path} has no unique configured authority"),
+                ));
+            }
+            let grant = grants[0];
+            let mut wanted = std::collections::BTreeSet::new();
+            if let Some(use_map) = model
+                .get("component_use")
+                .and_then(serde_json::Value::as_object)
+            {
+                for components in use_map.values() {
+                    for component in components
+                        .as_array()
+                        .ok_or_else(|| invalid("declared component use is not an array"))?
+                    {
+                        wanted.insert(
+                            component
+                                .as_str()
+                                .ok_or_else(|| invalid("declared component is not a name"))?
+                                .to_string(),
+                        );
+                    }
                 }
             }
+            let components: Vec<_> = grant
+                .components
+                .iter()
+                .filter(|c| wanted.is_empty() || wanted.contains(*c))
+                .cloned()
+                .collect();
+            if components.is_empty() || wanted.iter().any(|c| !components.contains(c)) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("declared components of {path} exceed authorized cached model scope"),
+                ));
+            }
+            let sources = self.source_facts(&[SelectedManifest {
+                manifest: grant.manifest.clone(),
+                components: components.clone(),
+            }])?;
+            let (_, selected_encoded_bytes, length) = sources.selected_facts(&grant.manifest)?;
+            if chosen
+                .and_then(|c| c.manifest.as_ref())
+                .is_some_and(|r| r.length != 0 && r.length != length)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "selected manifest length differs from cached bytes",
+                ));
+            }
+            let binding = Binding {
+                application: interface
+                    .get("application")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| invalid("declared application absent"))?
+                    .into(),
+                model_class: class.into(),
+                model_binding_path: path.clone(),
+                model_parameter_name: parameter.clone(),
+                model_parameter_names: vec![parameter.clone()],
+                component: components[0].clone(),
+                components: components.clone(),
+                snapshots: components
+                    .into_iter()
+                    .map(|c| (c, grant.manifest.clone()))
+                    .collect(),
+                snapshot: grant.manifest.clone(),
+                release: format!("{}@{}", installed.package, installed.release),
+                package: installed.package.clone(),
+                model: format!("{}@{}", grant.repository, grant.release),
+                ..Default::default()
+            };
+            planned.push(PlanSlot {
+                binding,
+                selected_encoded_bytes,
+            });
         }
-        let components: Vec<_> = grant
-            .components
-            .iter()
-            .filter(|c| wanted.is_empty() || wanted.contains(*c))
-            .cloned()
-            .collect();
-        if components.is_empty() || wanted.iter().any(|c| !components.contains(c)) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "declared components exceed authorized cached model scope",
-            ));
-        }
-        let sources = self.source_facts(&[SelectedManifest {
-            manifest: grant.manifest.clone(),
-            components: components.clone(),
-        }])?;
-        let (_, selected_encoded_bytes, length) = sources.selected_facts(&grant.manifest)?;
-        if chosen
-            .and_then(|c| c.manifest.as_ref())
-            .is_some_and(|r| r.length != 0 && r.length != length)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "selected manifest length differs from cached bytes",
-            ));
-        }
-        let binding = Binding {
-            application: interface
-                .get("application")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "declared application absent")
-                })?
-                .into(),
-            model_class: class.into(),
-            model_binding_path: path.into(),
-            model_parameter_name: parameter.into(),
-            model_parameter_names: vec![parameter.into()],
-            component: components[0].clone(),
-            components: components.clone(),
-            snapshots: components
-                .into_iter()
-                .map(|c| (c, grant.manifest.clone()))
-                .collect(),
-            snapshot: grant.manifest.clone(),
-            release: format!("{}@{}", installed.package, installed.release),
-            package: installed.package.clone(),
-            model: format!("{}@{}", grant.repository, grant.release),
-            ..Default::default()
-        };
-        let semantic = serde_json::json!({"actor":actor,"generation":installed.generation,"entrypoint":entrypoint,"binding":binding});
+        let semantic = serde_json::json!({"actor":actor,"generation":installed.generation,"entrypoint":entrypoint,"slots":planned,"degree":degree});
         let canonical = serde_json_canonicalizer::to_vec(&semantic).map_err(io::Error::other)?;
         Ok(GpuPlan {
             actor: actor.into(),
@@ -581,8 +758,8 @@ impl GpuPool {
             installation: installed.alias.clone(),
             generation: installed.generation.clone(),
             entrypoint: entrypoint.into(),
-            binding,
-            selected_encoded_bytes,
+            slots: planned,
+            degree,
         })
     }
     pub fn plan(&self, preparation: &Preparation) -> io::Result<GpuPlan> {
@@ -671,8 +848,7 @@ impl GpuPool {
         let sessions = std::mem::take(&mut *self.sessions.lock().unwrap());
         for (plan, session) in sessions {
             session.executor.shutdown()?;
-            self.memory.with(|gpu| gpu.ended(&plan));
-            self.host_ledger.private(&plan, None);
+            self.ended(&plan);
         }
         for zygote in std::mem::take(&mut *self.zygotes.lock().unwrap()).into_values() {
             if let ZygoteState::Ready(parent) = std::mem::take(&mut *zygote.state.lock().unwrap()) {
@@ -724,7 +900,7 @@ impl GpuPool {
         let started = (|| {
             let (root, socket, directory) = self.executor_endpoint()?;
             let mut executor = DeviceExecutor::spawn_owned(
-                self.executor_config(held, root, socket)?,
+                self.executor_config(held, root, socket, 1)?,
                 &self.launcher,
                 |_, _| Ok(()),
             )?;
@@ -741,7 +917,7 @@ impl GpuPool {
             let interface = self.interface_file(&executor, held)?;
             let reply = executor.command(
                 &DeviceCommand::Start {
-                    devices: self.config.devices.clone(),
+                    devices: self.lane_devices(1)?,
                     application: held.record.application.clone(),
                     package_interface: interface,
                     sequence_parallel_degree: 1,
@@ -794,14 +970,17 @@ impl GpuPool {
         held: &HeldGeneration,
         root: PathBuf,
         socket: PathBuf,
+        degree: u32,
     ) -> io::Result<ExecutorConfig> {
         let mut seal = Seal::prepare(
             &self.root,
             self.config.identity,
             &self.incarnation,
             &held.record.identity,
-            &self.config.devices,
+            &self.lane_devices(degree)?,
         )?;
+        // A group's NCCL seal (NVLS off, peer memory only over NVLink).
+        seal.group = degree > 1;
         seal.alloc_conf = self.config.alloc_conf.clone();
         seal.threads = self.config.threads;
         Ok(ExecutorConfig {
@@ -838,15 +1017,16 @@ impl GpuPool {
         let mut sessions = self.sessions.lock().unwrap();
         let key = plan.id.clone();
         let result = self.run_locked(engine, id, held, plan, &mut sessions);
-        self.memory.finished(&key);
+        for device in &self.devices {
+            device.memory.finished(&key);
+        }
         if result.is_err() {
             // Broken/failed exchanges close the owner channel. Sources and the
             // journal reservation survive until the exact receiver has exited.
             sessions.remove(&key);
         }
         if !sessions.contains_key(&key) {
-            self.memory.with(|gpu| gpu.ended(&key));
-            self.host_ledger.private(&key, None);
+            self.ended(&key);
         }
         result
     }
@@ -908,8 +1088,12 @@ impl GpuPool {
                         &mut device_executor::Baseline,
                     );
                     if let Some(reply) = reply.ok().filter(|reply| reply.ok) {
-                        self.memory
-                            .observe(plan, plane_facts(reply.plane.as_ref()), Some(false));
+                        self.observe(
+                            plan,
+                            session.degree,
+                            plane_facts(reply.plane.as_ref()),
+                            Some(false),
+                        );
                         return Ok(true);
                     }
                 }
@@ -926,8 +1110,7 @@ impl GpuPool {
         if let Err(error) = session.executor.shutdown() {
             eprintln!("memory: ending idle executor {plan}: {error}");
         }
-        self.memory.with(|gpu| gpu.ended(plan));
-        self.host_ledger.private(plan, None);
+        self.ended(plan);
         Ok(true)
     }
 
@@ -950,27 +1133,26 @@ impl GpuPool {
         }
         for key in ended {
             sessions.remove(&key);
-            self.memory.with(|gpu| gpu.ended(&key));
-            self.host_ledger.private(&key, None);
+            self.ended(&key);
         }
         let cold = !sessions.contains_key(&plan.id);
         let mut load_cap = None;
         if cold {
             self.host_room(&plan.id, sessions);
-            // A context and the first working set are reserved before the process exists.
-            load_cap = self.memory.decide(
-                &plan.id,
-                true,
-                || self.holdings(),
-                |step| self.carry_out(step, sessions),
-            )?;
-            self.memory
-                .with(|gpu| gpu.starting(&plan.id, gpu.spawn_need(&plan.id)));
+            // A context and the first working set are reserved on every GPU of the group
+            // before the process exists.
+            load_cap = self.decide(&plan.id, plan.degree, true, sessions)?;
+            for device in self.lane(plan.degree)? {
+                device
+                    .memory
+                    .with(|gpu| gpu.starting(&plan.id, gpu.spawn_need(&plan.id)));
+            }
             let launched = Instant::now();
             let (root, socket, directory) = self.executor_endpoint()?;
-            let config = self.executor_config(&held, root, socket)?;
+            let config = self.executor_config(&held, root, socket, plan.degree)?;
             let on_birth = |birth: &ProcessBirth, cancel: &Cancellation| {
-                self.memory.with(|gpu| gpu.spawned(&plan.id, birth.pid));
+                // Rank 0 drives the first GPU; followers are named after Start.
+                self.first().with(|gpu| gpu.spawned(&plan.id, birth.pid));
                 let cancel = cancel.clone();
                 let request = id.to_string();
                 engine.register_managed(
@@ -979,7 +1161,9 @@ impl GpuPool {
                     Arc::new(move || cancel.cancel(&request)),
                 )
             };
-            let (mut executor, mode) = match self.zygote(&held) {
+            // The import-only parent is sealed to one GPU: a group is always spawned.
+            let zygote = (plan.degree == 1).then(|| self.zygote(&held)).flatten();
+            let (mut executor, mode) = match zygote {
                 Some((zygote, start)) => {
                     if start {
                         zygote.set(self.import_only(&held));
@@ -1013,8 +1197,15 @@ impl GpuPool {
                 && executor.hello.offers("host_tiers.sealed/1");
             let descriptors = match self.config.source_mode {
                 SourceMode::Legacy => false,
-                SourceMode::Auto => !sealed && executor.hello.offers("model_sources.descriptors/1"),
-                SourceMode::Descriptors if executor.hello.offers("model_sources.descriptors/1") => {
+                // Descriptor sources are world-one; a group reads the store or the sealed tier.
+                SourceMode::Auto => {
+                    !sealed
+                        && plan.degree == 1
+                        && executor.hello.offers("model_sources.descriptors/1")
+                }
+                SourceMode::Descriptors
+                    if plan.degree == 1 && executor.hello.offers("model_sources.descriptors/1") =>
+                {
                     true
                 }
                 SourceMode::Descriptors => {
@@ -1023,23 +1214,26 @@ impl GpuPool {
                     return Ok(());
                 }
             };
+            let selections = plan.selections();
             let sources = Arc::new(Mutex::new(ModelSources::open_shared(
                 self.store.clone(),
-                &[SelectedManifest {
-                    manifest: plan.binding.snapshot.clone(),
-                    components: plan.binding.components.clone(),
-                }],
+                &selections,
             )?));
             executor.retain_until_exit(sources.clone());
             let peer = self.host.register_peer(executor.observer_pidfd()?);
-            let grants = vec![HostGrant {
-                manifest: plan.binding.snapshot.clone(),
-                header: sources
-                    .lock()
-                    .unwrap()
-                    .authorized_header(&plan.binding.snapshot)?,
-                components: plan.binding.components.iter().cloned().collect(),
-            }];
+            let grants = selections
+                .iter()
+                .map(|selected| {
+                    Ok(HostGrant {
+                        manifest: selected.manifest.clone(),
+                        header: sources
+                            .lock()
+                            .unwrap()
+                            .authorized_header(&selected.manifest)?,
+                        components: selected.components.iter().cloned().collect(),
+                    })
+                })
+                .collect::<io::Result<Vec<_>>>()?;
             // Start on this model's layouts while the executor imports and constructs.
             if sealed {
                 self.host.prepare(grants.clone());
@@ -1048,6 +1242,8 @@ impl GpuPool {
                 plan.id.clone(),
                 Session {
                     plan: plan.id.clone(),
+                    degree: plan.degree,
+                    followers: vec![],
                     loaded: false,
                     executor,
                     sources,
@@ -1111,11 +1307,16 @@ impl GpuPool {
             // Degree 2 keeps every component resident until revoked, and a running call never
             // revokes what it reads: only when the whole construction and its activations fit
             // beside the other tenants. Unmeasured: off (Degree 1 lets stages evict each other).
+            // World-one only: the executor shares nothing from a group.
             session.sharing = self.custody.is_some()
+                && plan.degree == 1
                 && session.executor.hello.offers("weights.attach/1")
-                && self.memory.fits_resident(&plan.id, || self.holdings());
+                && self.lane(1)?[0]
+                    .memory
+                    .fits_resident(&plan.id, || self.holdings());
         }
         let sharing = session.sharing;
+        let lane = self.lane_devices(plan.degree)?;
         let mut callbacks = Callbacks {
             engine,
             id,
@@ -1131,6 +1332,7 @@ impl GpuPool {
             exit: session.executor.observer_pidfd()?,
             pool: self,
             plan: &plan.id,
+            degree: plan.degree,
             others,
             store: &self.store,
             spool: None,
@@ -1138,33 +1340,87 @@ impl GpuPool {
         if !session.loaded {
             let interface_path = self.interface_file(&session.executor, held)?;
             let starting = Instant::now();
+            // Rank 0 spawns and forms every follower inside this command; its watch meters
+            // the whole group's work, so formation ends only on measured lack of progress.
             let started = command_ok(session.executor.command(
                 &DeviceCommand::Start {
-                    devices: self.config.devices.clone(),
+                    devices: lane.clone(),
                     application: held.record.application.clone(),
                     package_interface: interface_path.clone(),
-                    sequence_parallel_degree: 1,
+                    sequence_parallel_degree: plan.degree,
                     import_only: false,
                 },
                 &mut callbacks,
             )?)?;
             session.launch.start_ms = starting.elapsed().as_secs_f64() * 1e3;
-            session.launch.start = serde_json::from_value(started.stages).unwrap_or_default();
-            let mut binding = plan.binding.clone();
-            binding.package_interface = interface_path.to_string_lossy().into();
-            binding.store = if session.descriptors {
+            session.launch.start =
+                serde_json::from_value(started.stages.clone()).unwrap_or_default();
+            if started.follower_pids.len() + 1 != plan.degree as usize {
+                return Err(io::Error::other(Refused {
+                    code: "group_unformed".into(),
+                    detail: format!(
+                        "a {}-GPU start reported followers {:?}",
+                        plan.degree, started.follower_pids
+                    ),
+                }));
+            }
+            // Only processes in rank 0's own group are taken as its followers.
+            let members = crate::process::group_members(&session.executor.birth);
+            session.followers = started
+                .follower_pids
+                .iter()
+                .filter_map(|pid| members.iter().find(|m| m.pid == *pid))
+                .filter_map(|birth| crate::process::Exact::open(birth).ok().flatten())
+                .collect();
+            // NVML charges each GPU's own process: rank r drives the group's GPU r.
+            for (device, pid) in self
+                .lane(plan.degree)?
+                .iter()
+                .skip(1)
+                .zip(&started.follower_pids)
+            {
+                device.memory.with(|gpu| gpu.spawned(&plan.id, *pid));
+            }
+            let store = if session.descriptors {
                 String::new()
             } else {
-                self.store.root().to_string_lossy().into()
+                self.store.root().to_string_lossy().into_owned()
             };
-            let device_total = self.memory.sample().map(|sample| sample.total);
+            let mut models: Vec<ModelLoad> = plan
+                .slots
+                .iter()
+                .map(|slot| {
+                    let mut binding = slot.binding.clone();
+                    binding.package_interface = interface_path.to_string_lossy().into();
+                    binding.store = store.clone();
+                    ModelLoad {
+                        binding,
+                        budgets: Budgets {
+                            declared_weight_bytes: slot.selected_encoded_bytes,
+                        },
+                    }
+                })
+                .collect();
+            let first = models.first().cloned().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "GPU plan binds no model")
+            })?;
+            if models.len() == 1 {
+                models.clear(); // the one-model form
+            }
+            // The group's per-GPU ceiling: the smallest card.
+            let device_total = self
+                .lane(plan.degree)?
+                .iter()
+                .map(|device| device.memory.sample().map(|sample| sample.total))
+                .collect::<Option<Vec<_>>>()
+                .and_then(|totals| totals.into_iter().min());
             let plane = session.executor.hello.offers("weight_plane/1");
             // The pinned budget comes with the Load, so no fill pins past it; an executor
             // without `load_pinned/1` gets it after, as before.
             let at_load = plane && session.executor.hello.offers("load_pinned/1");
             // Its share of the machine's pinned total, ahead of every other tenant.
             let pinned = self
-                .memory
+                .first()
                 .pinned_budgets(&plan.id)
                 .and_then(|split| split.get(&plan.id).copied())
                 .map_or(-1, |share| i64::try_from(share).unwrap_or(i64::MAX));
@@ -1172,12 +1428,11 @@ impl GpuPool {
             let loaded = command_ok(session.executor.command(
                 &DeviceCommand::Load {
                     construction: plan.id.clone(),
-                    devices: self.config.devices.clone(),
-                    sequence_parallel_degree: 1,
-                    binding: Box::new(binding),
-                    budgets: Budgets {
-                        declared_weight_bytes: plan.selected_encoded_bytes,
-                    },
+                    devices: lane.clone(),
+                    sequence_parallel_degree: plan.degree,
+                    binding: Box::new(first.binding),
+                    budgets: first.budgets,
+                    models,
                     authorized_device_limit_bytes:
                         device_total.or(self.config.authorized_device_limit_bytes),
                     attention_pin: String::new(),
@@ -1190,8 +1445,12 @@ impl GpuPool {
                 },
                 &mut callbacks,
             )?)?;
-            self.memory
-                .observe(&plan.id, load_facts(loaded.facts.as_ref()), Some(false));
+            self.observe(
+                &plan.id,
+                plan.degree,
+                load_facts(loaded.facts.as_ref()),
+                Some(false),
+            );
             self.record_load(
                 &plan.id,
                 session.sealed,
@@ -1266,7 +1525,9 @@ impl GpuPool {
         }
         let prepared = command_ok(prepared)?;
         let shape = crate::memory::learned::shape_cell(&prepared.features);
-        self.memory.with(|gpu| gpu.set_shape(&plan.id, &shape));
+        for device in self.lane(plan.degree)? {
+            device.memory.with(|gpu| gpu.set_shape(&plan.id, &shape));
+        }
         let spool = if let Some(identity) = self.config.identity {
             // Keep Journal/results/admin paths private to the core. A separate peer-owned
             // spool lives only inside this executor's already authorized output directory.
@@ -1286,27 +1547,31 @@ impl GpuPool {
         )?;
         self.shed(&plan.id, callbacks.others);
         // A real grant for the whole call: one tenant needs no per-stage turns.
-        let cap = self.memory.decide(
-            &plan.id,
-            false,
-            || self.holdings(),
-            |step| self.carry_out(step, callbacks.others),
-        )?;
+        // A group's cap holds on every GPU of it (each rank caps its own process).
+        let cap = self.decide(&plan.id, plan.degree, false, callbacks.others)?;
+        let first = &self.lane(plan.degree)?[0].memory;
         let (plane_budget_bytes, cap_bytes) = match cap {
             Some(cap) if capped => (-1, Some(cap)),
             Some(cap) if session.executor.hello.offers("weight_plane/1") => {
-                let facts = self.memory.with(|gpu| gpu.facts(&plan.id));
+                let facts = first.with(|gpu| gpu.facts(&plan.id));
                 let context = facts
                     .context
-                    .unwrap_or(self.memory.with(|gpu| gpu.context_estimate()));
+                    .unwrap_or(first.with(|gpu| gpu.context_estimate()));
                 let plane = cap.saturating_sub(context + facts.activation.unwrap_or(0) + MARGIN);
                 (i64::try_from(plane).unwrap_or(i64::MAX), None)
             }
             _ => (-1, None),
         };
         if let Some(cap) = cap {
-            let cell = callbacks.cells.first().map(File::try_clone).transpose()?;
-            self.memory.running(&plan.id, cap, cell);
+            // The budget cell caps rank 0's process: only its GPU's floor watchdog writes it
+            // (two watchdogs on one cell would overwrite each other's asks).
+            for (index, device) in self.lane(plan.degree)?.iter().enumerate() {
+                let cell = match index {
+                    0 => callbacks.cells.first().map(File::try_clone).transpose()?,
+                    _ => None,
+                };
+                device.memory.running(&plan.id, cap, cell);
+            }
         }
         callbacks.spool = Some(spool.clone());
         let reply = session.executor.command(
@@ -1321,12 +1586,18 @@ impl GpuPool {
                 stages: false,
                 cap_bytes,
                 inputs,
-                floor_bytes: self.memory.floor(),
-                activation_bytes: self.memory.with(|gpu| gpu.seeds(&plan.id)),
+                floor_bytes: self.first().floor(),
+                activation_bytes: self.first().with(|gpu| gpu.seeds(&plan.id)),
             },
             &mut callbacks,
         )?;
-        self.learn(&plan.id, &shape, &reply, session.executor.birth.pid);
+        self.learn(
+            &plan.id,
+            plan.degree,
+            &shape,
+            &reply,
+            session.executor.birth.pid,
+        );
         let mut facts = plane_facts(reply.plane.as_ref());
         facts.activation = facts.activation.or_else(|| {
             reply
@@ -1335,29 +1606,43 @@ impl GpuPool {
                 .and_then(|m| m.activation_peak_bytes)
                 .and_then(|v| u64::try_from(v).ok())
         });
-        self.memory.observe(&plan.id, facts, Some(true));
+        self.observe(&plan.id, plan.degree, facts, Some(true));
         // Pinned bytes outside the machine's tier count against the tier's limit.
         self.host_ledger
             .private(&plan.id, facts.pinned.filter(|_| !session.sealed));
         if let Some(plane) = &reply.plane {
             crate::memory::note(
-                serde_json::json!({"event": "call", "plan": plan.id, "id": id,
+                serde_json::json!({"event": "call", "plan": plan.id, "id": id, "degree": plan.degree,
                 "cap": cap, "cap_bytes": plane.cap_bytes, "process": plane.process_bytes,
                 "context": plane.context_bytes, "committed": plane.committed_bytes,
                 "activation": plane.activation_peak_bytes, "oom_retries": plane.oom_retries,
                 "evictions": plane.evictions, "h2d_bytes": plane.h2d_bytes}),
             );
         }
-        if !reply.quiescent || !reply.poisoned.is_empty() {
-            // The run ends once the executor is gone; its own reason travels with it.
-            let reason = reply
+        // Rank 0 answered, so a follower that ended during the call is the group's first fault.
+        let lost = self.lost_followers(plan.degree, &session.followers);
+        if !reply.quiescent || !reply.poisoned.is_empty() || !lost.is_empty() {
+            // The run ends once the executor is gone; its own reason travels with it, typed.
+            let (code, message) = reply
                 .outcome
                 .as_ref()
-                .map(|o| format!("{}: {}; ", o.code, o.message))
-                .unwrap_or_default();
-            return Err(io::Error::other(format!(
-                "{reason}the executor did not settle quiescent"
-            )));
+                .filter(|o| !o.code.is_empty())
+                .map(|o| (o.code.clone(), o.message.clone()))
+                .unwrap_or_else(|| ("executor_poisoned".into(), String::new()));
+            let (code, message) = match lost.is_empty() {
+                true => (code, message),
+                false => (
+                    "group_broken".into(),
+                    format!("{lost} during the call, first; then {code}: {message}"),
+                ),
+            };
+            return Err(io::Error::other(Refused {
+                code,
+                detail: format!(
+                    "{message}; the executor did not settle quiescent (poisoned: {})",
+                    reply.poisoned
+                ),
+            }));
         }
         let outcome = reply
             .outcome
@@ -1420,7 +1705,7 @@ impl GpuPool {
     /// the page cache or the store again), then idle executors, least recently used first.
     /// A plan never measured asks nothing; nothing is refused for the room that is left.
     fn host_room(&self, plan: &str, sessions: &mut BTreeMap<String, Session>) {
-        let need = self.memory.with(|gpu| {
+        let need = self.first().with(|gpu| {
             gpu.learned
                 .plans
                 .get(plan)
@@ -1439,7 +1724,7 @@ impl GpuPool {
             }
             let released = self.host.release(need - available);
             let ended = released == 0
-                && match self.memory.with(|gpu| gpu.lru_idle(plan)) {
+                && match self.first().with(|gpu| gpu.lru_idle(plan)) {
                     Some(victim) => self
                         .carry_out(&Step::End(victim), sessions)
                         .unwrap_or(false),
@@ -1455,7 +1740,7 @@ impl GpuPool {
 
     /// What a call measured, for later executors and runs: its shape's activation growth
     /// (the call's peak and each stage method's), its context, its private host bytes.
-    fn learn(&self, plan: &str, shape: &str, reply: &Frame, pid: u32) {
+    fn learn(&self, plan: &str, degree: u32, shape: &str, reply: &Frame, pid: u32) {
         let metrics = reply.metrics.clone().unwrap_or_default();
         let plane = reply.plane.clone().unwrap_or_default();
         let peak = known(plane.activation_peak_bytes)
@@ -1467,10 +1752,14 @@ impl GpuPool {
             .filter_map(|(method, bytes)| Some((method.clone(), u64::try_from(*bytes).ok()?)))
             .collect();
         let shape = metrics.shape_cell.as_deref().unwrap_or(shape);
-        self.memory
-            .learn_call(plan, shape, peak, &methods, known(plane.context_bytes));
+        // Every rank of a group runs the same shape on its own GPU.
+        for device in self.lane(degree).unwrap_or_default() {
+            device
+                .memory
+                .learn_call(plan, shape, peak, &methods, known(plane.context_bytes));
+        }
         if let Ok(host) = crate::host_memory::process(pid) {
-            self.memory
+            self.first()
                 .learn_host(plan, host.pss.saturating_sub(host.pss_shmem));
         }
     }
@@ -1479,11 +1768,11 @@ impl GpuPool {
     /// (their planes punch the least recently used regions; page cache and disk stay beneath)
     /// before `plan` runs. An idle executor's pinned tier is optional: a failure is noted.
     fn shed(&self, plan: &str, others: &mut BTreeMap<String, Session>) {
-        let Some(split) = self.memory.pinned_budgets(plan) else {
+        let Some(split) = self.first().pinned_budgets(plan) else {
             return;
         };
         for (other, session) in others.iter_mut() {
-            let budget = self.memory.with(|gpu| gpu.facts(other).pinned_budget);
+            let budget = self.first().with(|gpu| gpu.facts(other).pinned_budget);
             let Some(share) = split.get(other).copied() else {
                 continue;
             };
@@ -1502,8 +1791,8 @@ impl GpuPool {
             );
             match reply {
                 Ok(reply) if reply.ok => {
-                    self.memory
-                        .observe(other, plane_facts(reply.plane.as_ref()), None);
+                    let degree = session.degree;
+                    self.observe(other, degree, plane_facts(reply.plane.as_ref()), None);
                     crate::memory::note(serde_json::json!({"event": "shed", "plan": other,
                         "pinned_budget": share, "for": plan}));
                 }
@@ -1513,20 +1802,45 @@ impl GpuPool {
         }
     }
 
+    /// Followers whose process has ended, as people name their GPUs ("GPU 1's process 3224
+    /// ended"); empty while the whole group lives.
+    fn lost_followers(&self, degree: u32, followers: &[crate::process::Exact]) -> String {
+        let lane = self.lane(degree).unwrap_or_default();
+        followers
+            .iter()
+            .enumerate()
+            .filter(|(_, follower)| follower.ended())
+            .map(|(index, follower)| {
+                let gpu = lane.get(index + 1).map_or("?", |d| d.entry.as_str());
+                format!("GPU {gpu}'s process {} ended", follower.birth.pid)
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// An executor's out-of-memory retry asks for `free_bytes` from the other tenants: idle
     /// weights leave first, then idle processes; its cap rises into what they gave.
     fn room_for(
         &self,
         plan: &str,
+        degree: u32,
         free_bytes: u64,
         others: &mut BTreeMap<String, Session>,
     ) -> io::Result<Option<u64>> {
-        self.memory.make_room(
-            plan,
-            free_bytes,
-            || self.holdings(),
-            |step| self.carry_out(step, others),
-        )
+        let mut cap: Option<u64> = None;
+        for (index, device) in self.lane(degree)?.iter().enumerate() {
+            let got = device.memory.make_room(
+                plan,
+                free_bytes,
+                || if index == 0 { self.holdings() } else { vec![] },
+                |step| self.carry_out(step, others),
+            )?;
+            cap = match (cap, got) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+        }
+        Ok(cap)
     }
 }
 
@@ -1674,7 +1988,13 @@ fn ended_with(error: io::Error, executor: DeviceExecutor) -> io::Error {
         Ok(device_executor::Ended {
             killed: Some(killed),
             ..
-        }) => io::Error::other(format!("{error}; {killed}")),
+        }) => match refused(&error) {
+            Some(refusal) => io::Error::other(Refused {
+                code: refusal.code.clone(),
+                detail: format!("{}; {killed}", refusal.detail),
+            }),
+            None => io::Error::other(format!("{error}; {killed}")),
+        },
         Ok(_) => error,
         Err(unproven) => io::Error::other(format!("{error}; executor exit unproven: {unproven}")),
     }
@@ -1702,6 +2022,11 @@ fn settle(engine: &Arc<Engine>, id: &str, error: &io::Error) -> io::Result<()> {
     }
     let outcome = if record.cancel_actor.is_some() {
         Outcome::Canceled
+    } else if let Some(refusal) = refused(error) {
+        // The executor's own reason, typed: a group's first fault names its GPU.
+        Outcome::Failed(
+            Failure::executor("failed", "runtime", &refusal.code, &refusal.detail).encode(),
+        )
     } else if record.state == State::Starting {
         Outcome::Failed(
             Failure::abandoned(&format!("device executor did not start: {error}")).encode(),
@@ -1802,7 +2127,12 @@ pub(crate) fn stage_inputs(
 
 /// The failed attempt's triage bundle, kept before the run settles: the executor's own terminal
 /// and traceback, and its stderr tail.
-pub(crate) fn keep_triage(engine: &Engine, id: &str, executor: &DeviceExecutor, outcome: &device_executor::Outcome) {
+pub(crate) fn keep_triage(
+    engine: &Engine,
+    id: &str,
+    executor: &DeviceExecutor,
+    outcome: &device_executor::Outcome,
+) {
     let record = engine.get(id).ok();
     let request = record
         .as_ref()
@@ -1855,14 +2185,31 @@ pub(crate) fn output_bindings(
         .collect()
 }
 
+/// An executor's refusal of a lifecycle command (start, load, activate), in its own words:
+/// a group's names the GPU whose fault came first (Runtime `RankGroup` latches it).
+#[derive(Debug)]
+struct Refused {
+    code: String,
+    detail: String,
+}
+impl std::fmt::Display for Refused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.detail)
+    }
+}
+impl std::error::Error for Refused {}
+fn refused(error: &io::Error) -> Option<&Refused> {
+    error.get_ref()?.downcast_ref::<Refused>()
+}
+
 fn command_ok(frame: Frame) -> io::Result<Frame> {
     if frame.ok {
         Ok(frame)
     } else {
-        Err(io::Error::other(format!(
-            "{}: {}",
-            frame.code, frame.detail
-        )))
+        Err(io::Error::other(Refused {
+            code: frame.code,
+            detail: frame.detail,
+        }))
     }
 }
 struct Callbacks<'a> {
@@ -1881,6 +2228,7 @@ struct Callbacks<'a> {
     exit: File,
     pool: &'a GpuPool,
     plan: &'a str,
+    degree: u32,
     others: &'a mut BTreeMap<String, Session>,
     store: &'a Store,
     /// The invoking request's spool, where its published assets' bytes are.
@@ -1967,8 +2315,12 @@ impl Services for Callbacks<'_> {
     ) -> io::Result<(Answer, Option<File>)> {
         if frame.kind == Kind::SealedPrefetch {
             let mut answer = Answer::unavailable(frame.seq);
-            let plans = descriptor.ok_or_else(|| io::Error::other("sealed prefetch omitted its plans"))?;
-            let request = SealedRequest { sha256: &frame.sha256, length: frame.length };
+            let plans =
+                descriptor.ok_or_else(|| io::Error::other("sealed prefetch omitted its plans"))?;
+            let request = SealedRequest {
+                sha256: &frame.sha256,
+                length: frame.length,
+            };
             match self.host.prefetch(self.peer, self.grants, request, plans) {
                 Ok(()) => {
                     answer.ok = true;
@@ -2036,9 +2388,9 @@ impl Services for Callbacks<'_> {
             }
             Kind::DeviceRoom => {
                 drop(descriptor);
-                let cap = self
-                    .pool
-                    .room_for(self.plan, frame.free_bytes, self.others)?;
+                let cap =
+                    self.pool
+                        .room_for(self.plan, self.degree, frame.free_bytes, self.others)?;
                 answer.ok = true;
                 answer.cap_bytes = cap.map_or(-1, |cap| i64::try_from(cap).unwrap_or(i64::MAX));
             }
@@ -2049,5 +2401,30 @@ impl Services for Callbacks<'_> {
             answer.detail.clear();
         }
         Ok((answer, None))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_group_is_the_widest_degree_every_slot_declares_on_this_machine() {
+        let h3 = [
+            json!({"path":"e.models.base_model","sequence_parallel":{"degrees":[2,4,7,8]}}),
+            json!({"path":"e.models.turbo_lora","sequence_parallel":{"degrees":[2,4,7,8]}}),
+        ];
+        assert_eq!(group_degree(&h3, 0, 1).unwrap(), 1);
+        assert_eq!(group_degree(&h3, 0, 2).unwrap(), 2);
+        assert_eq!(group_degree(&h3, 0, 6).unwrap(), 4);
+        assert_eq!(group_degree(&h3, 1, 4).unwrap(), 1);
+        assert_eq!(group_degree(&h3, 2, 4).unwrap(), 2);
+        let refused = group_degree(&h3, 3, 4).unwrap_err().to_string();
+        assert!(refused.starts_with("gpu_count_unavailable"), "{refused}");
+        assert!(group_degree(&h3, 4, 2).is_err());
+        // A slot without a declaration runs on one GPU only, so the group is one.
+        let mixed = [h3[0].clone(), json!({"path":"e.models.vae"})];
+        assert_eq!(group_degree(&mixed, 0, 4).unwrap(), 1);
     }
 }
