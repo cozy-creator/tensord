@@ -1575,28 +1575,44 @@ impl GpuPool {
             engine.finish(id, Outcome::Canceled)?;
             return Ok(());
         }
-        // Out of the map for the call: its requests may unmap or end the others.
-        let mut session = sessions.remove(&plan.id).expect("session retained above");
-        match self.call(
-            engine,
-            id,
-            &held,
-            plan,
-            &load_caps,
-            &mut session,
-            sessions,
-            false,
-        ) {
-            Ok(true) => {
-                sessions.insert(session.plan.clone(), session);
-                Ok(())
+        let fresh = plan.clone();
+        let error = {
+            // Out of the map for the call: its requests may unmap or end the others.
+            let mut session = sessions.remove(&plan.id).expect("session retained above");
+            match self.call(
+                engine,
+                id,
+                &held,
+                plan,
+                &load_caps,
+                &mut session,
+                sessions,
+                false,
+            ) {
+                Ok(true) => {
+                    sessions.insert(session.plan.clone(), session);
+                    return Ok(());
+                }
+                // Not reusable: gone (exit observed) before its context is released.
+                Ok(false) => return session.executor.terminate().map(drop),
+                Err(error) if undelivered(&error) => ending(error, session.executor),
+                Err(error) => return Err(ended_with(engine, id, error, session.executor)),
             }
-            // Not reusable: gone (exit observed) before its context is released.
-            Ok(false) => session.executor.terminate().map(drop),
-            // No triage: the run returns to the queue once this exit is observed.
-            Err(error) if undelivered(&error) => Err(ending(error, session.executor)),
-            Err(error) => Err(ended_with(engine, id, error, session.executor)),
+        }; // the rest of the ended session (sources, grants) goes here
+        // Never started: once that exit is observed, this dispatch runs it on a fresh executor
+        // (cold, so a second loss is FAILED). An unproven exit stays charged.
+        if !undelivered(&error) {
+            return Err(error);
         }
+        eprintln!("execution {id}: {error}; starting it on a fresh executor");
+        for device in &self.devices {
+            device.memory.finished(&fresh.id);
+        }
+        self.ended(&fresh.id);
+        if !engine.redeliver(id)? {
+            return Ok(()); // canceled meanwhile
+        }
+        self.run_locked(engine, id, held, fresh, sessions)
     }
 
     /// Launch an executor for `plan` (fork from its generation's import-only executor, else
@@ -1931,7 +1947,7 @@ impl GpuPool {
             &mut callbacks,
         );
         // A retained executor that went away while idle: PrepareRequest enters no handler,
-        // so the attempt never started and runs again on a fresh executor.
+        // so the attempt never started (see `run_locked`).
         let prepared = prepared.map_err(|error| match retained && channel_lost(&error) {
             true => io::Error::other(Undelivered(format!(
                 "retained executor gone before the request reached it: {error}"
@@ -2553,9 +2569,6 @@ fn settle(engine: &Arc<Engine>, id: &str, error: &io::Error) -> io::Result<()> {
         .unwrap_or(true);
     if !ended {
         return Ok(()); // exit unproven: the reservation stays charged and nonterminal
-    }
-    if undelivered(error) {
-        return engine.defer_undelivered(id, error.to_string());
     }
     if record.state == State::Starting && crate::process::transient(error) {
         return engine.defer_managed(id, format!("device startup unavailable: {error}"));

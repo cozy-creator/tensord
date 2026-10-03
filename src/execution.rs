@@ -278,10 +278,12 @@ impl Engine {
         self.notify_activity();
         Ok(())
     }
-    pub(crate) fn defer_undelivered(&self, id: &str, reason: String) -> io::Result<()> {
-        self.journal.lock().unwrap().defer_undelivered(id, reason)?;
+    /// The attempt stays with its dispatcher, awaiting a fresh executor; false if a cancel
+    /// ended it.
+    pub(crate) fn redeliver(&self, id: &str) -> io::Result<bool> {
+        let record = self.journal.lock().unwrap().redeliver(id)?;
         self.notify_activity();
-        Ok(())
+        Ok(record.state == State::Starting)
     }
     pub fn public_terminal(&self, id: &str) -> io::Result<Option<crate::journal::PublicTerminal>> {
         self.journal.lock().unwrap().public_terminal(id)

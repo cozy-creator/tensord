@@ -762,19 +762,21 @@ fn never_authorized_restart_can_retry_only_after_exact_birth_ends() {
 }
 
 #[test]
-fn an_authorized_attempt_that_never_reached_a_handler_runs_again() {
+fn an_authorized_attempt_that_never_reached_a_handler_starts_again_under_its_claim() {
     let fixture = Fixture::new();
-    let journal_root = fixture.root.join("undelivered-state");
-    let mut journal = Journal::open(&journal_root).unwrap();
-    let authorize = |journal: &mut Journal, key: &str| {
-        let id = journal.accept(key, fixture.invocation("infer")).unwrap().id;
-        assert!(journal.claim(&id).unwrap());
-        let mut retained = Command::new("/usr/bin/python3")
+    let mut journal = Journal::open(&fixture.root.join("undelivered-state")).unwrap();
+    let executor = || {
+        Command::new("/usr/bin/python3")
             .arg("-c")
             .arg("import sys;sys.stdin.read()")
             .stdin(Stdio::piped())
             .spawn()
-            .unwrap();
+            .unwrap()
+    };
+    let authorize = |journal: &mut Journal, key: &str| {
+        let id = journal.accept(key, fixture.invocation("infer")).unwrap().id;
+        assert!(journal.claim(&id).unwrap());
+        let mut retained = executor();
         journal
             .register_process(&id, process_birth(retained.id()).unwrap())
             .unwrap();
@@ -784,23 +786,23 @@ fn an_authorized_attempt_that_never_reached_a_handler_runs_again() {
         id
     };
     let id = authorize(&mut journal, "undelivered");
-    let record = journal.defer_undelivered(&id, "gone".into()).unwrap();
-    assert_eq!(record.state, State::Queued);
+    let record = journal.redeliver(&id).unwrap();
+    assert_eq!(record.state, State::Starting);
     assert!(record.process.is_none() && record.executor.is_none() && record.started_at_ms == 0);
-    assert!(journal.defer_undelivered(&id, "again".into()).is_err());
+    assert!(record.waiting_reason.is_none());
+    // Still its dispatcher's: no other claims it, and it takes a fresh executor.
+    assert!(!journal.claim(&id).unwrap());
+    let mut fresh = executor();
+    journal
+        .register_process(&id, process_birth(fresh.id()).unwrap())
+        .unwrap();
+    assert_eq!(journal.running(&id, None).unwrap().state, State::Running);
+    drop(fresh.stdin.take());
+    fresh.wait().unwrap();
     let canceled = authorize(&mut journal, "undelivered-canceled");
     journal.cancel(&canceled, "owner").unwrap();
-    let record = journal.defer_undelivered(&canceled, "gone".into()).unwrap();
-    assert_eq!(record.state, State::Canceled);
-    drop(journal);
-    let reopened = Engine::open(&journal_root).unwrap();
-    assert!(reopened.dispatch(&id, fixture.config()).unwrap());
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while !reopened.get(&id).unwrap().state.terminal() {
-        assert!(Instant::now() < deadline);
-        thread::sleep(Duration::from_millis(5));
-    }
-    assert_eq!(reopened.get(&id).unwrap().state, State::Completed);
+    assert_eq!(journal.redeliver(&canceled).unwrap().state, State::Canceled);
+    assert!(journal.redeliver(&canceled).is_err());
 }
 
 #[test]

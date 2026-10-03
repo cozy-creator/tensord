@@ -1616,20 +1616,20 @@ impl Journal {
     }
 
     /// Authorized, but the request never reached a handler: a retained executor's channel was
-    /// gone before Invoke (PrepareRequest enters none). Called after exact termination.
-    pub fn defer_undelivered(&mut self, id: &str, reason: String) -> io::Result<Execution> {
+    /// gone before Invoke (PrepareRequest enters none). After its exact termination the attempt
+    /// stays claimed, back to awaiting its first executor.
+    pub fn redeliver(&mut self, id: &str) -> io::Result<Execution> {
         self.update(id, |record| {
             if !matches!(record.state, State::Starting | State::Running) {
-                return Err(db_error("only an active attempt may return to queued"));
+                return Err(db_error("only an active attempt is redelivered"));
             }
             record.process = None;
             record.executor = None;
             record.started_at_ms = 0;
-            record.waiting_reason = Some(reason);
             record.state = if record.cancel_actor.is_some() {
                 State::Canceled
             } else {
-                State::Queued
+                State::Starting
             };
             Ok(true)
         })
