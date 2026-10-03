@@ -119,8 +119,7 @@ pub struct GpuConfig {
     /// At machine start, load each installed GPU generation's most recently used
     /// construction where it fits beside the tenants already there (it never makes room).
     /// They stay as idle tenants the memory policy evicts least recently used first.
-    /// Off until proven on a rental (J/INTERFACE.md).
-    #[serde(default)]
+    #[serde(default = "yes")]
     pub prewarm: bool,
 }
 impl GpuConfig {
