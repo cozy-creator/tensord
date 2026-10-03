@@ -171,7 +171,7 @@ impl GpuMemory {
                 let decision = gpu.decide(plan, want, need, &sample, &mut round);
                 note(
                     serde_json::json!({"event": if spawn {"admit"} else {"grant"}, "plan": plan,
-                    "free": sample.free, "external": gpu.external(&sample),
+                    "gpu": gpu.device, "free": sample.free, "external": gpu.external(&sample),
                     "room": gpu.room(plan, &sample), "want": want, "need": need,
                     "decision": format!("{decision:?}")}),
                 );

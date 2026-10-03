@@ -2017,7 +2017,9 @@ impl GpuPool {
                 "activation": plane.activation_peak_bytes, "oom_retries": plane.oom_retries,
                 "evictions": plane.evictions, "h2d_bytes": plane.h2d_bytes,
                 "rank_process": reply.rank_planes.iter()
-                    .map(|r| r.as_ref().map(|r| r.process_bytes)).collect::<Vec<_>>()}),
+                    .map(|r| r.as_ref().map(|r| r.process_bytes)).collect::<Vec<_>>(),
+                "rank_cap": reply.rank_planes.iter()
+                    .map(|r| r.as_ref().map(|r| r.cap_bytes)).collect::<Vec<_>>()}),
             );
         }
         // Rank 0 answered, so a follower that ended during the call is the group's first fault.
