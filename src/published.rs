@@ -195,7 +195,21 @@ impl Publisher {
                     c.lane,
                     c.manifest
                         .as_ref()
-                        .map(|m| (sha256::hex(&m.digest), m.length))
+                        .map(|m| (sha256::hex(&m.digest), m.length)),
+                    // Adapter order and scale are part of what the slot runs.
+                    c.adapters
+                        .iter()
+                        .map(|a| [
+                            &a.model,
+                            &a.release,
+                            &a.lane,
+                            &a.manifest,
+                            &a.component,
+                            &a.source_component,
+                            &a.scale,
+                            &a.source
+                        ])
+                        .collect::<Vec<_>>()
                 ])
             })
             .collect();
@@ -765,6 +779,21 @@ impl Publisher {
             tensorfs_core::ensure::ensure(&ensure)
                 .map_err(|e| ("model_download_failed", e.to_string()))?;
         }
+        for grant in &mut grants {
+            let parameter = grant
+                .slot
+                .rsplit('.')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            if let Some(choice) = request
+                .choices
+                .iter()
+                .find(|c| c.parameter == grant.slot || c.parameter == parameter)
+            {
+                apply_adapters(&self.store, catalog, choice, grant, job)?;
+            }
+        }
         job.stage(format!("preparing {}", request.package));
         let plan = gpu
             .prepare_root(
@@ -796,6 +825,199 @@ impl Publisher {
             .map_err(io_failure)?;
         Ok(plan)
     }
+}
+
+/// Download one exact checkpoint into the store with the catalog's credential.
+fn ensure(
+    store: &Store,
+    catalog: &Catalog,
+    repository: &str,
+    manifest: &str,
+    job: &Job,
+) -> Result<(), Failure> {
+    let credential = catalog.credential();
+    let refspec = format!("{repository}@{manifest}");
+    let keep = [manifest.to_string()];
+    let on_event =
+        |event: &tensorfs_core::ensure::Event| job.bytes(event.bytes_done, event.bytes_total);
+    let mut request = tensorfs_core::ensure::Request::new(
+        store,
+        catalog.origin(),
+        &refspec,
+        &credential,
+        catalog.policy(),
+    );
+    request.keep = &keep;
+    request.on_event = Some(&on_event);
+    tensorfs_core::ensure::ensure(&request)
+        .map(drop)
+        .map_err(|e| ("model_download_failed", e.to_string()))
+}
+
+/// One caller adapter's exact checkpoint at the Hub (the worker's `checkpoint()` for an
+/// adapter: no ladder; a named lane, else the release's bf16/fp16/fp32 lane, else its
+/// smallest), returned as (repository, "sha256:<hex>").
+fn resolve_adapter(
+    catalog: &Catalog,
+    adapter: &pb::DownloadAdapterRef,
+) -> Result<(String, String), Failure> {
+    if !adapter.source.is_empty() || !adapter.profiles.is_empty() {
+        return Err((
+            "model_source_unsupported",
+            "provider-source adapters are not taken by this machine yet".into(),
+        ));
+    }
+    let model = adapter.model.clone();
+    let Some((org, name)) = model.split_once('/') else {
+        return Err((
+            "model_override_invalid",
+            format!("adapter {model:?} names no org/model repository"),
+        ));
+    };
+    let mut lane = adapter.lane.clone();
+    let reference = if !adapter.manifest.is_empty() {
+        format!("{model}@{}", adapter.manifest)
+    } else {
+        if lane.is_empty() {
+            let card = catalog
+                .json(&format!(
+                    "/v1/models/{}/{}",
+                    hub::escape(org),
+                    hub::escape(name)
+                ))
+                .map_err(|e| ("catalog_read_failed", e.0))?;
+            let releases = card
+                .get("releases")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let release = releases
+                .iter()
+                .rev()
+                .find(|r| {
+                    r.get("yanked").and_then(Value::as_bool) != Some(true)
+                        && (adapter.release.is_empty()
+                            || r.get("release").and_then(Value::as_str)
+                                == Some(adapter.release.as_str()))
+                })
+                .ok_or((
+                    "model_override_invalid",
+                    format!("{model} has no such release"),
+                ))?;
+            let lanes: Vec<(String, u64)> = release
+                .get("lanes")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|l| {
+                    Some((
+                        l.get("lane")?.as_str()?.to_string(),
+                        l.get("bytes").and_then(Value::as_u64).unwrap_or(u64::MAX),
+                    ))
+                })
+                .collect();
+            lane = ["bf16", "fp16", "fp32"]
+                .into_iter()
+                .find(|full| lanes.iter().any(|(l, _)| l == full))
+                .map(String::from)
+                .or_else(|| {
+                    lanes
+                        .iter()
+                        .min_by_key(|(l, bytes)| (*bytes, l.clone()))
+                        .map(|(l, _)| l.clone())
+                })
+                .ok_or((
+                    "model_override_invalid",
+                    format!("{model} has no lane to serve as an adapter"),
+                ))?;
+        }
+        if adapter.release.is_empty() {
+            model.clone()
+        } else {
+            format!("{model}@{}", adapter.release)
+        }
+    };
+    let mut query = format!("/v1/models/resolve?ref={}", hub::escape(&reference));
+    if adapter.manifest.is_empty() && !lane.is_empty() {
+        query.push_str(&format!("&lane={}", hub::escape(&lane)));
+    }
+    let resolved = catalog
+        .json(&query)
+        .map_err(|e| ("catalog_read_failed", e.0))?;
+    let manifest = resolved.get("manifest_id").and_then(Value::as_str).ok_or((
+        "catalog_read_failed",
+        "adapter resolution named no manifest".to_string(),
+    ))?;
+    let manifest = if manifest.starts_with("sha256:") {
+        manifest.to_string()
+    } else {
+        format!("sha256:{manifest}")
+    };
+    Ok((
+        resolved
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or(&model)
+            .to_string(),
+        manifest,
+    ))
+}
+
+/// A slot's caller adapters applied to its resolved base: each adapter downloaded, then one
+/// adapter view composed (`adapter_views`); the grant then names the view.
+fn apply_adapters(
+    store: &Store,
+    catalog: &Catalog,
+    choice: &pb::ModelChoice,
+    grant: &mut ModelGrant,
+    job: &Job,
+) -> Result<(), Failure> {
+    if choice.adapters.is_empty() {
+        return Ok(());
+    }
+    job.stage(format!("preparing model adapters for {}", grant.slot));
+    let object = |manifest: &str| -> Result<tensorfs_core::ids::ObjectRef, Failure> {
+        let hex = manifest.trim_start_matches("sha256:");
+        // A held manifest's file is its exact canonical bytes.
+        let length = fs::metadata(store.manifest_path(hex))
+            .map_err(|e| {
+                (
+                    "model_download_failed",
+                    format!("manifest {hex} is not held: {e}"),
+                )
+            })?
+            .len();
+        Ok(tensorfs_core::ids::ObjectRef {
+            sha256: hex.to_string(),
+            length,
+        })
+    };
+    let mut selections = vec![];
+    for adapter in &choice.adapters {
+        let (repository, manifest) = resolve_adapter(catalog, adapter)?;
+        ensure(store, catalog, &repository, &manifest, job)?;
+        let strength = if adapter.scale.is_empty() {
+            1.0
+        } else {
+            adapter.scale.parse::<f64>().map_err(|_| {
+                (
+                    "model_override_invalid",
+                    format!("adapter scale {:?} is not a decimal", adapter.scale),
+                )
+            })?
+        };
+        selections.push(crate::adapter_views::Selection {
+            manifest: object(&manifest)?,
+            component: adapter.component.clone(),
+            source_component: adapter.source_component.clone(),
+            strength,
+        });
+    }
+    let composed = crate::adapter_views::compose(store, &object(&grant.manifest)?, &selections)
+        .map_err(|e| ("model_adapter_refused", e.to_string()))?;
+    grant.repository = composed.repository;
+    grant.manifest = format!("sha256:{}", composed.manifest.sha256);
+    Ok(())
 }
 
 fn stage_of(progress: &Progress) -> String {

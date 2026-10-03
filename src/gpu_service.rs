@@ -642,13 +642,15 @@ impl GpuPool {
                     "model choice does not name a declared root slot",
                 ));
             }
+            // Hub-resolved grants already carry a slot's adapters (as its adapter view);
+            // configured cached authority has no resolution step to apply them.
             if !choice.source.is_empty()
                 || !choice.profiles.is_empty()
-                || !choice.adapters.is_empty()
+                || (!choice.adapters.is_empty() && resolved.is_empty())
             {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "provider sources/adapters need their own qualified model-resolution operation",
+                    "provider sources (and adapters without Hub resolution) are not taken by this machine yet",
                 ));
             }
         }
@@ -672,7 +674,8 @@ impl GpuPool {
                 .filter(|grant| {
                     grant.package == installed.package
                         && grant.slot == *path
-                        && chosen.is_none_or(|choice| {
+                        // A resolved grant was resolved from the choice itself.
+                        && (!resolved.is_empty() || chosen.is_none_or(|choice| {
                             (choice.repository.is_empty() || choice.repository == grant.repository)
                                 && (choice.release.is_empty() || choice.release == grant.release)
                                 && (choice.lane.is_empty() || choice.lane == grant.lane)
@@ -680,7 +683,7 @@ impl GpuPool {
                                     tensorfs_core::sha256::hex(&reference.digest)
                                         == grant.manifest.trim_start_matches("sha256:")
                                 })
-                        })
+                        }))
                 })
                 .collect();
             if grants.len() != 1 {
