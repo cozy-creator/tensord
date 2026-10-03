@@ -588,6 +588,8 @@ pub struct Answer {
     pub budget_bytes: i64,
     /// A `DeviceRoom` answer: the process cap raised into the room made; -1 keeps it.
     pub cap_bytes: i64,
+    /// One fd follows the answer. Sent only when true: a `Tier` answer types it as the fd.
+    #[serde(skip_serializing_if = "is_false")]
     pub descriptor: bool,
     pub sha256: String,
     pub length: u64,
