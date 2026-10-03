@@ -87,6 +87,7 @@ fn seed(state: PathBuf, gib: u64, key_seed: &str) -> io::Result<()> {
             input: serde_json::json!({}),
             attention_kernel: String::new(),
             inputs: Default::default(),
+            ..Default::default()
         },
     )?;
     journal.claim(&record.id)?;
@@ -129,15 +130,33 @@ fn sha2_digest(mut source: impl Read) -> io::Result<[u8; 32]> {
     }
 }
 
-async fn measure(
-    limit: u64,
-    address: &str,
-    pem: &str,
-    worker: &str,
-    key_seed: &str,
-    number: u64,
-    repeat: u32,
-) -> Result<(), Box<dyn std::error::Error>> {
+/// `measure HOST:PORT LEAF.pem WORKER KEYSEED RUN_NUMBER REPEAT [LIMIT_BYTES [SERVER_PID
+/// [WINDOWS]]]`: per attempt, one Read per HTTP/2 window mode, then one HTTPS GET.
+async fn measure(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (address, pem, worker, key_seed) = (
+        &args[2],
+        &std::fs::read_to_string(&args[3])?,
+        &args[4],
+        &args[5],
+    );
+    let (number, repeat): (u64, u32) = (args[6].parse()?, args[7].parse()?);
+    let limit: u64 = args.get(8).map_or(Ok(u64::MAX), |l| l.parse())?;
+    let server: Option<u32> = args.get(9).map(|p| p.parse()).transpose()?;
+    let window = args.get(10).map_or("adaptive", String::as_str);
+    // CPU seconds from /proc stat: utime+stime (self or server) and cutime+cstime (curl).
+    let ticks = |pid: &str, field: usize| -> f64 {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        let rest: Vec<&str> = stat
+            .rsplit_once(") ")
+            .map_or(vec![], |(_, r)| r.split(' ').collect());
+        let get = |i: usize| {
+            rest.get(i)
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.0)
+        };
+        (get(field) + get(field + 1)) / 100.0
+    };
+    let server_cpu = || server.map_or(0.0, |pid| ticks(&pid.to_string(), 11));
     let signer = key(key_seed);
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
     let machine = mint(
@@ -161,47 +180,61 @@ async fn measure(
     let (host, port) = address.rsplit_once(':').ok_or("address is host:port")?;
     let ca = std::env::temp_dir().join("read-bench-leaf.pem");
     std::fs::write(&ca, pem)?;
-    let channel = Endpoint::from_shared(format!("https://{address}"))?
-        .http2_adaptive_window(true)
-        .tls_config(
-            ClientTlsConfig::new()
-                .ca_certificate(Certificate::from_pem(pem))
-                .domain_name("localhost"),
-        )?
-        .connect()
-        .await?;
-    let mut client =
-        v1::machine_client::MachineClient::new(channel).max_decoding_message_size(16 << 20);
+    // One connection per window mode: adaptive (BDP), fixed (16 MiB stream / 32 MiB
+    // connection) or default (hyper's own).
+    let mut clients = vec![];
+    for window in window.split(',') {
+        let channel = Endpoint::from_shared(format!("https://{address}"))?
+            .http2_adaptive_window(window == "adaptive")
+            .initial_stream_window_size((window == "fixed").then_some(16 << 20))
+            .initial_connection_window_size((window == "fixed").then_some(32 << 20))
+            .tls_config(
+                ClientTlsConfig::new()
+                    .ca_certificate(Certificate::from_pem(pem))
+                    .domain_name("localhost"),
+            )?
+            .connect()
+            .await?;
+        clients.push((
+            window,
+            v1::machine_client::MachineClient::new(channel).max_decoding_message_size(16 << 20),
+        ));
+    }
     for attempt in 1..=repeat {
-        let started = Instant::now();
-        let mut request = tonic::Request::new(v1::ReadRequest {
-            target: Some(v1::read_request::Target::Output(v1::OutputTarget {
-                run: "bench".into(),
-                output: "blob".into(),
-                index: 0,
-            })),
-            ..Default::default()
-        });
-        request
-            .metadata_mut()
-            .insert("authorization", format!("Cozy-Cap {machine}").parse()?);
-        let mut stream = client.read(request).await?.into_inner();
-        let mut bytes = 0u64;
-        while let Some(frame) = stream.message().await? {
-            bytes += frame.data.len() as u64;
-            if bytes >= limit {
-                break;
+        for (window, client) in &mut clients {
+            let (cpu, served) = (ticks("self", 11), server_cpu());
+            let started = Instant::now();
+            let mut request = tonic::Request::new(v1::ReadRequest {
+                target: Some(v1::read_request::Target::Output(v1::OutputTarget {
+                    run: "bench".into(),
+                    output: "blob".into(),
+                    index: 0,
+                })),
+                ..Default::default()
+            });
+            request
+                .metadata_mut()
+                .insert("authorization", format!("Cozy-Cap {machine}").parse()?);
+            let mut stream = client.read(request).await?.into_inner();
+            let mut bytes = 0u64;
+            while let Some(frame) = stream.message().await? {
+                bytes += frame.data.len() as u64;
+                if bytes >= limit {
+                    break;
+                }
             }
+            let seconds = started.elapsed().as_secs_f64();
+            let (cpu, served) = (ticks("self", 11) - cpu, server_cpu() - served);
+            println!("{{\"path\":\"grpc-read-{}\",\"attempt\":{attempt},\"bytes\":{bytes},\"seconds\":{seconds:.3},\"mb_per_s\":{:.1},\"client_cpu_s\":{cpu:.2},\"server_cpu_s\":{served:.2}}}", window, bytes as f64 / seconds / 1e6);
         }
-        let seconds = started.elapsed().as_secs_f64();
-        println!("{{\"path\":\"grpc-read\",\"attempt\":{attempt},\"bytes\":{bytes},\"seconds\":{seconds:.3},\"mb_per_s\":{:.1}}}", bytes as f64 / seconds / 1e6);
+        let (cpu, served) = (ticks("self", 13), server_cpu());
         let output = Command::new("curl")
             .args([
                 "-sS",
                 "-o",
                 "/dev/null",
                 "-w",
-                "%{size_download} %{time_total}",
+                "%{size_download} %{time_total} %{http_version}",
                 "--cacert",
             ])
             .arg(&ca)
@@ -220,9 +253,14 @@ async fn measure(
             ))
             .output()?;
         let text = String::from_utf8_lossy(&output.stdout);
-        let (size, total) = text.split_once(' ').ok_or("curl reported nothing")?;
-        let (size, total): (f64, f64) = (size.parse()?, total.parse()?);
-        println!("{{\"path\":\"https-get\",\"attempt\":{attempt},\"bytes\":{size},\"seconds\":{total:.3},\"mb_per_s\":{:.1}}}", size / total / 1e6);
+        let mut words = text.split(' ');
+        let (size, total, version) = (words.next(), words.next(), words.next().unwrap_or("?"));
+        let (size, total): (f64, f64) = (
+            size.ok_or("curl reported nothing")?.parse()?,
+            total.ok_or("curl reported nothing")?.parse()?,
+        );
+        let (cpu, served) = (ticks("self", 13) - cpu, server_cpu() - served);
+        println!("{{\"path\":\"https-get-http{version}\",\"attempt\":{attempt},\"bytes\":{size},\"seconds\":{total:.3},\"mb_per_s\":{:.1},\"client_cpu_s\":{cpu:.2},\"server_cpu_s\":{served:.2}}}", size / total / 1e6);
     }
     Ok(())
 }
@@ -233,8 +271,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match args.get(1).map(String::as_str) {
         Some("seed") => seed(PathBuf::from(&args[2]), args[3].parse()?, &args[4])?,
         Some("key") => println!("{}", URL_SAFE_NO_PAD.encode(key(&args[2]).verifying_key().as_bytes())),
-        Some("measure") => measure(args.get(8).map_or(Ok(u64::MAX), |l| l.parse())?, &args[2], &std::fs::read_to_string(&args[3])?, &args[4], &args[5], args[6].parse()?, args[7].parse()?).await?,
-        _ => eprintln!("usage: read-bench seed STATE GIB KEYSEED | key KEYSEED | measure HOST:PORT LEAF.pem WORKER KEYSEED RUN_NUMBER REPEAT [LIMIT_BYTES]"),
+        Some("measure") => measure(&args).await?,
+        _ => eprintln!("usage: read-bench seed STATE GIB KEYSEED | key KEYSEED | measure HOST:PORT LEAF.pem WORKER KEYSEED RUN_NUMBER REPEAT [LIMIT_BYTES [SERVER_PID [WINDOWS: adaptive,fixed,default]]]"),
     }
     Ok(())
 }
