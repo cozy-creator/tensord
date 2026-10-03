@@ -216,7 +216,8 @@ impl NativeBackend {
                 .ok_or_else(|| Status::data_loss("held installation interface absent"))?;
             let interface: Value = serde_json::from_slice(&held.interface)
                 .map_err(|_| Status::data_loss("held installation interface corrupt"))?;
-            let declaration = entrypoint(&interface, &record.invocation.entrypoint)?;
+            let declaration =
+                entrypoint(&interface, &record.invocation.entrypoint, record.invocation.job)?;
             schema_digest =
                 Some(identity(declaration.get("result").ok_or_else(|| {
                     Status::failed_precondition("result schema absent")
@@ -1084,7 +1085,7 @@ impl MachineBackend for NativeBackend {
         };
         let interface: Value = serde_json::from_slice(&installed.interface)
             .map_err(|_| Status::data_loss("held installation interface is corrupt"))?;
-        let entry = entrypoint(&interface, &root.entrypoint)?;
+        let entry = entrypoint(&interface, &root.entrypoint, false)?;
         let gpu_plan = if let Some(plan) = published_plan {
             plan
         } else if entry
@@ -1169,6 +1170,7 @@ impl MachineBackend for NativeBackend {
                     input,
                     attention_kernel: root.attention_kernel.clone(),
                     inputs,
+                    ..Default::default()
                 },
                 &self.authority.boot_id,
             )
@@ -1724,9 +1726,10 @@ fn digest_bytes(value: &str) -> Result<Vec<u8>, Status> {
         })
         .collect()
 }
-fn entrypoint<'a>(interface: &'a Value, name: &str) -> Result<&'a Value, Status> {
+/// A callable's declaration: an entrypoint, or a job's (`jobs`).
+fn entrypoint<'a>(interface: &'a Value, name: &str, job: bool) -> Result<&'a Value, Status> {
     interface
-        .get("entrypoints")
+        .get(if job { "jobs" } else { "entrypoints" })
         .and_then(Value::as_array)
         .and_then(|entries| {
             entries
@@ -2304,6 +2307,7 @@ print(json.dumps({"identity": generation.identity}))
                     input: input(&root),
                     attention_kernel: String::new(),
                     inputs: vec![],
+                    ..Default::default()
                 },
             )
             .unwrap();

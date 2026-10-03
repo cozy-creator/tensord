@@ -289,6 +289,30 @@ pub enum DeviceCommand {
         root: PathBuf,
         environment: BTreeMap<String, String>,
     },
+    /// One `@app.job` to completion; its child calls come back as `child_*` requests.
+    RunJob {
+        request_id: String,
+        job: String,
+        payload: Value,
+        application: String,
+        package_interface: PathBuf,
+        spool: PathBuf,
+        deadline_s: Option<f64>,
+        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+        inputs: BTreeMap<String, Value>,
+        call_interfaces: Vec<CallInterface>,
+    },
+}
+
+/// One callable a job may call: here, the package's own invocables (`self`).
+#[derive(Clone, Debug, Serialize)]
+pub struct CallInterface {
+    pub module: String,
+    pub export: String,
+    pub interface_path: PathBuf,
+    #[serde(rename = "self")]
+    pub self_call: bool,
+    pub kind: String,
 }
 impl DeviceCommand {
     fn name(&self) -> &'static str {
@@ -307,6 +331,7 @@ impl DeviceCommand {
             Self::Unload { .. } => "unload",
             Self::Probe { .. } => "probe",
             Self::Fork { .. } => "fork",
+            Self::RunJob { .. } => "run_job",
         }
     }
 }
@@ -335,6 +360,13 @@ pub enum Kind {
     StageMemoStore,
     Progress,
     ExecutionActivity,
+    ChildCall,
+    ChildPoll,
+    ChildCancel,
+    ChildForget,
+    ChildEvents,
+    GpuRelease,
+    ModelPrefetch,
     #[default]
     #[serde(other)]
     Unknown,
@@ -555,6 +587,12 @@ pub struct Frame {
     pub parts: Vec<PublishPart>,
     /// `start`: the executor's legs, `[[name, ms], ...]`; read leniently.
     pub stages: Value,
+    // `child_*` (a job's managed calls): the call's index, callee and canonical request.
+    pub call_index: u64,
+    pub module: String,
+    pub export: String,
+    pub payload: String,
+    pub progress_label: String,
 }
 
 /// One part of a composite product: a spool file and the media time it adds.
@@ -593,6 +631,17 @@ pub struct Answer {
     pub digest: String,
     #[serde(skip_serializing_if = "is_zero")]
     pub sequence: u64,
+    /// `CallState` (a managed call): its state, child, canonical result and byte grants.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub state: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub child_request_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub result: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub byte_grants: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<Value>,
 }
 impl Answer {
     pub fn unavailable(seq: u64) -> Self {
@@ -614,6 +663,26 @@ impl Answer {
             descriptors: 0,
             digest: String::new(),
             sequence: 0,
+            state: String::new(),
+            child_request_id: String::new(),
+            result: String::new(),
+            byte_grants: Vec::new(),
+            progress: None,
+        }
+    }
+    pub fn ok(seq: u64) -> Self {
+        Self {
+            ok: true,
+            code: String::new(),
+            detail: String::new(),
+            ..Self::unavailable(seq)
+        }
+    }
+    pub fn refused(seq: u64, code: &str, detail: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            detail: detail.into().chars().take(1024).collect(),
+            ..Self::unavailable(seq)
         }
     }
 }

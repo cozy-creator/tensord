@@ -3,6 +3,7 @@ child call of its own invocable, which takes the reference image and the previou
 context and returns a file; after every segment the parent publishes the film so far."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from typing import Annotated
 
@@ -30,6 +31,8 @@ class SegmentInput(msgspec.Struct):
     prompt: str
     reference: Reference
     context: str = ""
+    #: Seconds a segment takes (a cancel test holds one running).
+    hold: float = 0.0
 
 
 class SegmentOutput(msgspec.Struct):
@@ -41,6 +44,9 @@ class SegmentOutput(msgspec.Struct):
 async def render_segment(ctx: Context, *, payload: SegmentInput, out: Outputs) -> SegmentOutput:
     """One segment: its bytes name the reference it saw and the context it continued."""
     ctx.raise_if_cancelled()
+    for _ in range(int(payload.hold * 20)):
+        await asyncio.sleep(0.05)
+        ctx.raise_if_cancelled()
     seen = hashlib.sha256(payload.reference.read_bytes()).hexdigest()
     body = f"{payload.index}|{payload.prompt}|{seen}|{payload.context}\n".encode()
     return SegmentOutput(
@@ -52,6 +58,7 @@ async def render_segment(ctx: Context, *, payload: SegmentInput, out: Outputs) -
 class LongFormInput(msgspec.Struct):
     reference: Reference
     segments: list[str]
+    hold: float = 0.0
 
 
 class LongFormOutput(msgspec.Struct):
@@ -67,7 +74,7 @@ async def long_form(
     for index, prompt in enumerate(payload.segments):
         ctx.raise_if_cancelled()
         result = await render_segment(
-            payload=SegmentInput(index, prompt, payload.reference, context)
+            payload=SegmentInput(index, prompt, payload.reference, context, payload.hold)
         )
         film += result.video.read_bytes()
         context = result.context

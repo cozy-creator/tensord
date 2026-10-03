@@ -368,6 +368,7 @@ fn seed_run(state: &Path, actor: &str) {
                 input: serde_json::json!({}),
                 attention_kernel: String::new(),
                 inputs: Default::default(),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -967,10 +968,8 @@ mod v1_api {
         Ok(client.write(request).await?.into_inner().held)
     }
 
-    /// Write and run sources on the real serve process: an object resumes from what is held,
-    /// and unpublished code written with Write prepares inside its run (warm, then a call).
-    #[tokio::test]
-    async fn written_local_code_prepares_inside_its_run() {
+    /// A serve process that installs unpublished code (the client wheel built from this repo).
+    async fn installing_machine() -> (Machine, PathBuf) {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
         let tools = std::env::temp_dir().join(format!("cm-tools-{}", uuid::Uuid::new_v4()));
         assert!(Command::new("uv")
@@ -987,15 +986,87 @@ mod v1_api {
             .unwrap();
         let helper = Command::new("uv")
             .current_dir(repo)
-            .args(["run", "--locked", "--extra", "test", "python", "-c", "import sys; print(sys.executable)"])
+            .args([
+                "run",
+                "--locked",
+                "--extra",
+                "test",
+                "python",
+                "-c",
+                "import sys; print(sys.executable)",
+            ])
             .output()
             .unwrap();
         let helper = String::from_utf8(helper.stdout).unwrap().trim().to_string();
         let machine = Machine::start_args(
             |_, _| (),
-            &["--installer-python".into(), helper.into(), "--client-wheel".into(), wheel.into()],
+            &[
+                "--installer-python".into(),
+                helper.into(),
+                "--client-wheel".into(),
+                wheel.into(),
+            ],
         )
         .await;
+        (machine, tools)
+    }
+
+    /// A fixture package written with Write: its manifest's digest.
+    async fn write_package(
+        client: &mut v1::machine_client::MachineClient<Channel>,
+        cap: &str,
+        fixture: &str,
+        package: &str,
+    ) -> String {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(fixture);
+        let mut archive = tar::Builder::new(Vec::new());
+        for name in [
+            "pyproject.toml",
+            "package.toml",
+            &format!("{fixture}/__init__.py"),
+        ] {
+            archive
+                .append_path_with_name(directory.join(name), name)
+                .unwrap();
+        }
+        let source = archive.into_inner().unwrap();
+        let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&source));
+        let length = source.len() as u64;
+        assert_eq!(
+            write(client, cap, &digest, length, 0, &source)
+                .await
+                .unwrap(),
+            length
+        );
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "package": package, "release": "0.1.0",
+            "python_version": "3.12", "source": {"digest": digest, "length": length}}))
+        .unwrap();
+        let manifest_digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&manifest));
+        let size = manifest.len() as u64;
+        assert_eq!(
+            write(client, cap, &manifest_digest, size, 0, &manifest)
+                .await
+                .unwrap(),
+            size
+        );
+        manifest_digest
+    }
+
+    fn outcome(events: &[v1::RunEvent]) -> v1::Outcome {
+        match &events.last().unwrap().event {
+            Some(v1::run_event::Event::Outcome(outcome)) => outcome.clone(),
+            _ => panic!("{events:?}"),
+        }
+    }
+
+    /// Write and run sources on the real serve process: an object resumes from what is held,
+    /// and unpublished code written with Write prepares inside its run (warm, then a call).
+    #[tokio::test]
+    async fn written_local_code_prepares_inside_its_run() {
+        let (machine, tools) = installing_machine().await;
         let mut client = client(&machine).await;
         let all = cap(Grant {
             action: MACHINE.into(),
@@ -1003,24 +1074,58 @@ mod v1_api {
         });
 
         let mut archive = tar::Builder::new(Vec::new());
-        let fixture = repo.join("tests/fixtures/cpu_lifecycle");
-        for name in ["pyproject.toml", "package.toml", "cpu_lifecycle/__init__.py"] {
-            archive.append_path_with_name(fixture.join(name), name).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cpu_lifecycle");
+        for name in [
+            "pyproject.toml",
+            "package.toml",
+            "cpu_lifecycle/__init__.py",
+        ] {
+            archive
+                .append_path_with_name(fixture.join(name), name)
+                .unwrap();
         }
         let source = archive.into_inner().unwrap();
         let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&source));
         let length = source.len() as u64;
         // A probe holds nothing; half, then the rest from the held offset.
-        assert_eq!(write(&mut client, &all, &digest, length, 0, &[]).await.unwrap(), 0);
+        assert_eq!(
+            write(&mut client, &all, &digest, length, 0, &[])
+                .await
+                .unwrap(),
+            0
+        );
         let half = length / 2;
         assert_eq!(
-            write(&mut client, &all, &digest, length, 0, &source[..half as usize]).await.unwrap(),
+            write(
+                &mut client,
+                &all,
+                &digest,
+                length,
+                0,
+                &source[..half as usize]
+            )
+            .await
+            .unwrap(),
             half
         );
-        let ahead = write(&mut client, &all, &digest, length, half + 1, b"x").await.unwrap_err();
-        assert_eq!(ahead.metadata().get("cozy-error-code").unwrap(), "object_offset_ahead");
+        let ahead = write(&mut client, &all, &digest, length, half + 1, b"x")
+            .await
+            .unwrap_err();
         assert_eq!(
-            write(&mut client, &all, &digest, length, half, &source[half as usize..]).await.unwrap(),
+            ahead.metadata().get("cozy-error-code").unwrap(),
+            "object_offset_ahead"
+        );
+        assert_eq!(
+            write(
+                &mut client,
+                &all,
+                &digest,
+                length,
+                half,
+                &source[half as usize..]
+            )
+            .await
+            .unwrap(),
             length
         );
         let manifest = serde_json::to_vec(&serde_json::json!({
@@ -1030,7 +1135,9 @@ mod v1_api {
         let manifest_digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&manifest));
         let size = manifest.len() as u64;
         assert_eq!(
-            write(&mut client, &all, &manifest_digest, size, 0, &manifest).await.unwrap(),
+            write(&mut client, &all, &manifest_digest, size, 0, &manifest)
+                .await
+                .unwrap(),
             size
         );
 
@@ -1048,10 +1155,6 @@ mod v1_api {
             id: id.into(),
             after: 0,
             spec: Some(spec),
-        };
-        let outcome = |events: &[v1::RunEvent]| match &events.last().unwrap().event {
-            Some(v1::run_event::Event::Outcome(outcome)) => outcome.clone(),
-            _ => panic!("{events:?}"),
         };
         let warm = collect(
             client
@@ -1088,6 +1191,210 @@ mod v1_api {
             .await
             .unwrap_err();
         assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
+        let _ = fs::remove_dir_all(tools);
+    }
+
+    /// H3 long-form's shape on CPU: a job (`kind: job`) renders each segment through a child run
+    /// of its own invocable, handing it the job's file input; each child's file comes back into
+    /// the job's spool, and the job publishes the film after every segment.
+    #[tokio::test]
+    async fn a_job_renders_its_segments_through_child_runs() {
+        let (machine, tools) = installing_machine().await;
+        let mut client = client(&machine).await;
+        let all = cap(Grant {
+            action: MACHINE.into(),
+            ..Default::default()
+        });
+        let manifest = write_package(
+            &mut client,
+            &all,
+            "cpu_longform",
+            "local/cozy-machine-cpu-longform",
+        )
+        .await;
+        let mut reference = vec![];
+        {
+            let mut encoder = png::Encoder::new(&mut reference, 2, 2);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&[7; 12])
+                .unwrap();
+        }
+        let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&reference));
+        let length = reference.len() as u64;
+        assert_eq!(
+            write(&mut client, &all, &digest, length, 0, &reference)
+                .await
+                .unwrap(),
+            length
+        );
+        let segments = ["a dawn", "a storm", "a calm"];
+        let spec = v1::RunSpec {
+            kind: v1::RunKind::Job as i32,
+            source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
+            entrypoint: "long_form".into(),
+            payload: serde_json::to_vec(
+                &serde_json::json!({"reference": digest, "segments": segments}),
+            )
+            .unwrap(),
+            inputs: vec![v1::InputFile {
+                field: "reference".into(),
+                digest: digest.clone(),
+                length,
+                media_type: "image/png".into(),
+                order: 0,
+            }],
+            owner: "alice".into(),
+            ..Default::default()
+        };
+        let events = collect(
+            client
+                .run(authorized(
+                    v1::RunRequest {
+                        id: "film".into(),
+                        after: 0,
+                        spec: Some(spec.clone()),
+                    },
+                    &all,
+                ))
+                .await
+                .unwrap()
+                .into_inner(),
+        )
+        .await
+        .unwrap();
+        let done = outcome(&events);
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        assert_eq!(result["segments"], 3, "{result}");
+
+        // Each segment saw the job's reference and continued the previous segment's context.
+        let seen = tensorfs_core::sha256::hex_digest(&reference);
+        let mut film = String::new();
+        let mut context = String::new();
+        for (index, prompt) in segments.iter().enumerate() {
+            let body = format!("{index}|{prompt}|{seen}|{context}\n");
+            context = tensorfs_core::sha256::hex_digest(body.as_bytes());
+            film.push_str(&body);
+        }
+        // The film after every segment is a product of the job's `video` output.
+        let products: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.event {
+                Some(v1::run_event::Event::Product(p)) if p.output == "video" => Some(p.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            products
+                .iter()
+                .map(|p| p.label.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Video (segments 1-1)",
+                "Video (segments 1-2)",
+                "Video (segments 1-3)"
+            ],
+            "{events:?}"
+        );
+        let (meta, bytes) = read(
+            &mut client,
+            &all,
+            v1::ReadRequest {
+                target: Some(v1::read_request::Target::Output(v1::OutputTarget {
+                    run: "film".into(),
+                    output: "video".into(),
+                    index: 0,
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), film, "{meta:?}");
+
+        // Every child is a run of its own under the job, settled.
+        for index in 0..3 {
+            let child = collect(
+                client
+                    .run(authorized(
+                        v1::RunRequest {
+                            id: format!("film/{index}"),
+                            after: 0,
+                            spec: None,
+                        },
+                        &all,
+                    ))
+                    .await
+                    .unwrap()
+                    .into_inner(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome(&child).status, "succeeded", "{child:?}");
+        }
+
+        // A canceled job ends its running child with it.
+        let mut held = spec.clone();
+        held.payload = serde_json::to_vec(
+            &serde_json::json!({"reference": digest, "segments": segments, "hold": 60.0}),
+        )
+        .unwrap();
+        let stream = client
+            .run(authorized(
+                v1::RunRequest {
+                    id: "held".into(),
+                    after: 0,
+                    spec: Some(held),
+                },
+                &all,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let watch = |id: &str| v1::RunRequest {
+            id: id.into(),
+            after: 0,
+            spec: None,
+        };
+        let until = Instant::now() + Duration::from_secs(60);
+        loop {
+            let child = client.run(authorized(watch("held/0"), &all)).await;
+            let running = match child {
+                Ok(child) => match child.into_inner().message().await {
+                    Ok(Some(v1::RunEvent {
+                        event: Some(v1::run_event::Event::State(s)),
+                        ..
+                    })) => s.state == "running",
+                    _ => false,
+                },
+                Err(_) => false,
+            };
+            if running {
+                break;
+            }
+            assert!(Instant::now() < until, "the first child never ran");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let cancel = v1::ControlRequest {
+            id: "held".into(),
+            action: v1::Action::Cancel as i32,
+        };
+        client.control(authorized(cancel, &all)).await.unwrap();
+        let parent = collect(stream).await.unwrap();
+        assert_eq!(outcome(&parent).status, "canceled", "{parent:?}");
+        let child = collect(
+            client
+                .run(authorized(watch("held/0"), &all))
+                .await
+                .unwrap()
+                .into_inner(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome(&child).status, "canceled", "{child:?}");
         let _ = fs::remove_dir_all(tools);
     }
 }

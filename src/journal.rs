@@ -11,7 +11,7 @@ use std::{
 // Status observation cursor allocation, not a duration or liveness policy.
 const REVISION_WINDOW: u64 = 1 << 32;
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct Invocation {
     pub package: String,
     pub generation: String,
@@ -24,6 +24,12 @@ pub struct Invocation {
     /// File inputs the caller imported, verified at acceptance.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<InputFile>,
+    /// An `@app.job`: it runs in a deviceless executor and calls children through its seam.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub job: bool,
+    /// A child run's parent (its execution id): children end with it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub parent: String,
 }
 
 /// One file input: the declared field path, its exact bytes (sha256 and length, held in the

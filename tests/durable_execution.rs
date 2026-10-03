@@ -54,6 +54,7 @@ impl Fixture {
             module: "cpu_package".into(),
             entrypoint: "infer".into(),
             input: json!({"mode":mode,"side_effect":self.root.join("effect"),"release":self.root.join("release"),"advance":self.root.join("advance")}),
+            ..Default::default()
         }
     }
     fn submit(&self, mode: &str) -> String {

@@ -111,6 +111,7 @@ fn complete(journal: &mut Journal, n: usize, generation: &str, birth: ProcessBir
                 module: "fixture:app".into(),
                 entrypoint: "infer".into(),
                 input: json!({"n":n}),
+                ..Default::default()
             },
         )
         .unwrap();

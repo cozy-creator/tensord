@@ -216,8 +216,12 @@ fn commit(
         .installation_for_generation(&context.actor, &record.invocation.generation)?
         .ok_or_else(|| io::Error::other("held installation interface absent"))?;
     let interface: Value = serde_json::from_slice(&installed.interface).map_err(storage)?;
+    let section = match record.invocation.job {
+        true => "jobs",
+        false => "entrypoints",
+    };
     let result = interface
-        .get("entrypoints")
+        .get(section)
         .and_then(Value::as_array)
         .and_then(|rows| {
             rows.iter().find(|row| {

@@ -420,7 +420,7 @@ impl Drop for Permit {
         }
     }
 }
-struct WakeOnExit(Weak<Engine>);
+pub(crate) struct WakeOnExit(pub(crate) Weak<Engine>);
 impl Drop for WakeOnExit {
     fn drop(&mut self) {
         if let Some(engine) = self.0.upgrade() {
@@ -2556,7 +2556,7 @@ fn ending(error: io::Error, executor: DeviceExecutor) -> io::Error {
 /// Every error ends the run once its executor is gone: FAILED with the reason, or CANCELED
 /// when a cancel was journaled. Only a never-authorized attempt hit by a transient OS
 /// shortage returns to the queue; a deterministic pre-start failure is FAILED.
-fn settle(engine: &Arc<Engine>, id: &str, error: &io::Error) -> io::Result<()> {
+pub(crate) fn settle(engine: &Arc<Engine>, id: &str, error: &io::Error) -> io::Result<()> {
     let record = engine.get(id)?;
     if record.state.terminal() {
         return Ok(());
@@ -2599,7 +2599,7 @@ fn settle(engine: &Arc<Engine>, id: &str, error: &io::Error) -> io::Result<()> {
 
 /// Executor roots keep each ended executor's logs for a day; every executor of an earlier
 /// machine run has ended before this pool exists.
-fn remove_old_executor_roots(root: &Path) {
+pub(crate) fn remove_old_executor_roots(root: &Path) {
     const KEEP: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
     let Ok(entries) = fs::read_dir(root) else {
         return;
@@ -2631,6 +2631,25 @@ pub(crate) fn stage_inputs(
     spool: &Path,
     inputs: &[crate::journal::InputFile],
 ) -> io::Result<BTreeMap<String, serde_json::Value>> {
+    stage_inputs_with(identity, spool, inputs, |input| {
+        let sha = input
+            .digest
+            .strip_prefix("sha256:")
+            .unwrap_or(&input.digest);
+        Ok(store
+            .open_verified(sha)
+            .map_err(io::Error::other)?
+            .into_file())
+    })
+}
+
+/// Read-only copies of `inputs` in `spool`, each read from `open`, by field path.
+pub(crate) fn stage_inputs_with(
+    identity: Option<crate::launch_identity::LaunchIdentity>,
+    spool: &Path,
+    inputs: &[crate::journal::InputFile],
+    open: impl Fn(&crate::journal::InputFile) -> io::Result<File>,
+) -> io::Result<BTreeMap<String, serde_json::Value>> {
     let mut granted = BTreeMap::new();
     if inputs.is_empty() {
         return Ok(granted);
@@ -2651,14 +2670,7 @@ pub(crate) fn stage_inputs(
             .take(96)
             .collect();
         let local = directory.join(format!("{position:03}-{field}"));
-        let sha = input
-            .digest
-            .strip_prefix("sha256:")
-            .unwrap_or(&input.digest);
-        let mut source = store
-            .open_verified(sha)
-            .map_err(io::Error::other)?
-            .into_file();
+        let mut source = open(input)?;
         let mut copy = std::os::unix::fs::OpenOptionsExt::mode(
             fs::OpenOptions::new().write(true).create_new(true),
             0o444,
@@ -2804,7 +2816,7 @@ fn refused(error: &io::Error) -> Option<&Refused> {
     error.get_ref()?.downcast_ref::<Refused>()
 }
 
-fn command_ok(frame: Frame) -> io::Result<Frame> {
+pub(crate) fn command_ok(frame: Frame) -> io::Result<Frame> {
     if frame.ok {
         Ok(frame)
     } else {

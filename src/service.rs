@@ -14,11 +14,15 @@ use std::{
 };
 
 /// What one public submission calls on its generation.
+#[derive(Default)]
 pub struct Call {
     pub entrypoint: String,
     pub input: Value,
     pub attention_kernel: String,
     pub inputs: Vec<crate::journal::InputFile>,
+    pub job: bool,
+    /// A child run's parent execution id.
+    pub parent: String,
 }
 
 pub struct Service {
@@ -28,6 +32,8 @@ pub struct Service {
     stopped: Mutex<bool>,
     retained: Mutex<HashMap<String, Arc<File>>>,
     gpu: Mutex<Option<Arc<crate::gpu_service::GpuPool>>>,
+    /// Jobs and model-less child runs, in deviceless executors.
+    jobs: Mutex<Option<Arc<crate::jobs::Jobs>>>,
     startup_gpu_births: Mutex<Vec<ProcessBirth>>,
     /// Package/model preparations in flight: work a rental's idle release must wait for.
     preparing: std::sync::atomic::AtomicUsize,
@@ -103,6 +109,7 @@ impl Service {
             stopped: Mutex::new(false),
             retained: Mutex::new(HashMap::new()),
             gpu: Mutex::new(None),
+            jobs: Mutex::new(None),
             startup_gpu_births: Mutex::new(startup_gpu_births),
             preparing: std::sync::atomic::AtomicUsize::new(0),
             started_ticks,
@@ -131,6 +138,10 @@ impl Service {
     }
     pub fn gpu(&self) -> Option<Arc<crate::gpu_service::GpuPool>> {
         self.gpu.lock().unwrap().clone()
+    }
+    pub fn configure_jobs(&self, jobs: Arc<crate::jobs::Jobs>) {
+        *self.jobs.lock().unwrap() = Some(jobs);
+        self.engine.notify_activity();
     }
     /// Observation only. Unknown births stay reserved; CPU dispatch stays available.
     pub fn gpu_startup_fences(&self) -> usize {
@@ -239,6 +250,8 @@ impl Service {
         let mut invocation = held.invocation(&call.entrypoint, call.input)?;
         invocation.attention_kernel = call.attention_kernel;
         invocation.inputs = call.inputs;
+        invocation.job = call.job;
+        invocation.parent = call.parent;
         let record = self.engine.bind_prepared(id, invocation, preparation)?;
         self.retain(&record, held.retention());
         Ok(record)
@@ -352,10 +365,16 @@ impl Service {
                 .is_some_and(|s| !s.preparation_id.is_empty())
         };
         let mut gpu_active = self.gpu_startup_fences() != 0 || active.iter().any(is_gpu);
-        let mut room = self
-            .parallelism
-            .saturating_sub(active.iter().filter(|r| !is_gpu(r)).count());
-        if room == 0 && (gpu_active || self.gpu().is_none()) {
+        // A job mostly waits on its children; only they take CPU room.
+        let mut room = self.parallelism.saturating_sub(
+            active
+                .iter()
+                .filter(|r| !is_gpu(r) && !r.invocation.job)
+                .count(),
+        );
+        let jobs = self.jobs.lock().unwrap().clone();
+        // A queued job needs no room, so with jobs every ready record is looked at.
+        if room == 0 && (gpu_active || self.gpu().is_none()) && jobs.is_none() {
             return Ok(());
         }
         let mut cursor = 0;
@@ -388,7 +407,20 @@ impl Service {
                     )?;
                     continue;
                 }
-                if let Some(context) = record
+                if crate::jobs::Jobs::takes(&record) {
+                    let Some(jobs) = &jobs else {
+                        self.engine.wait_for_environment(
+                            &record.id,
+                            Some("jobs are not configured on this machine".into()),
+                        )?;
+                        continue;
+                    };
+                    if record.invocation.job {
+                        jobs.dispatch(&self.engine, &record, held)?;
+                    } else if room > 0 && jobs.dispatch(&self.engine, &record, held)? {
+                        room -= 1;
+                    }
+                } else if let Some(context) = record
                     .submission
                     .as_ref()
                     .filter(|s| !s.preparation_id.is_empty())
@@ -417,7 +449,7 @@ impl Service {
                 } else if room > 0 && self.engine.dispatch(&record.id, held.runner())? {
                     room -= 1;
                 }
-                if room == 0 && gpu_active {
+                if room == 0 && gpu_active && jobs.is_none() {
                     return Ok(());
                 }
             }

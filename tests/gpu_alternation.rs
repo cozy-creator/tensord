@@ -131,8 +131,7 @@ fn published_models_alternate_on_one_gpu_under_the_memory_policy() {
                 cozy_machine::service::Call {
                     entrypoint: model.entrypoint.clone(),
                     input: input.clone(),
-                    attention_kernel: String::new(),
-                    inputs: vec![],
+                    ..Default::default()
                 },
                 "",
             )

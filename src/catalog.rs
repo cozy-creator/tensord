@@ -138,6 +138,7 @@ impl HeldGeneration {
             input,
             attention_kernel: String::new(),
             inputs: vec![],
+            ..Default::default()
         })
     }
     pub fn runner(&self) -> RunnerConfig {

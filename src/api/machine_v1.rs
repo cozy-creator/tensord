@@ -128,12 +128,13 @@ pub(super) fn state(id: &str, state: &pb::MachineExecutionState) -> v1::RunState
 /// A Run spec as this machine's run sources (`runs`). Its digest (the token cleared) makes the
 /// id idempotent: the same id with another spec is refused.
 fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
-    let warm = match v1::RunKind::try_from(spec.kind) {
-        Ok(v1::RunKind::Call) => false,
-        Ok(v1::RunKind::Warm) => true,
+    let (warm, job) = match v1::RunKind::try_from(spec.kind) {
+        Ok(v1::RunKind::Call) => (false, false),
+        Ok(v1::RunKind::Warm) => (true, false),
+        Ok(v1::RunKind::Job) => (false, true),
         _ => {
             return Err(Status::unimplemented(
-                "Run takes calls, warm-ups and updates; jobs come next",
+                "Run takes calls, jobs, warm-ups and updates",
             ))
         }
     };
@@ -220,6 +221,7 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
         .collect::<Result<_, _>>()?;
     Ok(crate::runs::Spec {
         warm,
+        job,
         source,
         entrypoint: spec.entrypoint,
         input,

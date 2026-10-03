@@ -25,6 +25,8 @@ pub enum Source {
 pub struct Spec {
     /// Prepare only (`kind: warm`): install and download, then succeed.
     pub warm: bool,
+    /// `kind: job`: `entrypoint` names an `@app.job`, run in a deviceless executor.
+    pub job: bool,
     pub source: Source,
     pub entrypoint: String,
     pub input: Value,
@@ -88,6 +90,8 @@ impl Runs {
             input: spec.input.clone(),
             attention_kernel: spec.attention_kernel.clone(),
             inputs: spec.inputs.clone(),
+            job: spec.job,
+            ..Default::default()
         };
         let (record, new) = self
             .service
@@ -214,16 +218,20 @@ impl Runs {
         };
         let interface: Value = serde_json::from_slice(&installation.interface)
             .map_err(|_| refused("package_interface_invalid", "held interface is corrupt"))?;
-        let declared = interface["entrypoints"]
+        let (rows, noun) = match spec.job {
+            true => ("jobs", "job"),
+            false => ("entrypoints", "entrypoint"),
+        };
+        let declared = interface[rows]
             .as_array()
             .is_some_and(|rows| rows.iter().any(|row| row["name"] == spec.entrypoint.as_str()));
         if !declared {
             return Err(refused(
                 "invalid_entrypoint",
-                format!("{} declares no entrypoint {:?}", installation.package, spec.entrypoint),
+                format!("{} declares no {noun} {:?}", installation.package, spec.entrypoint),
             ));
         }
-        if !spec.inputs.is_empty() && plan.is_none() {
+        if !spec.inputs.is_empty() && plan.is_none() && !spec.job {
             return Err(refused(
                 "invalid_request",
                 "file inputs reach device executors only; this CPU callable takes none",
@@ -244,6 +252,8 @@ impl Runs {
                 input: spec.input,
                 attention_kernel: spec.attention_kernel,
                 inputs: spec.inputs,
+                job: spec.job,
+                parent: String::new(),
             },
             plan.as_ref().map(|plan| plan.id.as_str()).unwrap_or_default(),
         )?;
@@ -314,6 +324,7 @@ mod tests {
     fn spec(source: Source, warm: bool, digest: &str) -> Spec {
         Spec {
             warm,
+            job: false,
             source,
             entrypoint: "steps".into(),
             input: json!({"steps": 2, "seconds": 0.01}),
@@ -436,6 +447,7 @@ mod tests {
             input: json!({}),
             attention_kernel: String::new(),
             inputs: vec![],
+            ..Default::default()
         };
         let accepted = engine.accept_run("alice", "run-1", "d", draft).unwrap().0;
         engine
@@ -459,6 +471,7 @@ mod tests {
             input: json!({}),
             attention_kernel: String::new(),
             inputs: vec![],
+            ..Default::default()
         };
         let id = {
             let engine = Engine::open(&root).unwrap();
