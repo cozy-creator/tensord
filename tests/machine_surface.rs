@@ -617,7 +617,8 @@ mod v1_api {
                 .unwrap();
         let channel = Endpoint::from_shared(format!("https://{}", machine.address))
             .unwrap()
-            .http2_adaptive_window(true)
+            .initial_stream_window_size(16 << 20)
+            .initial_connection_window_size(32 << 20)
             .tls_config(
                 ClientTlsConfig::new()
                     .ca_certificate(Certificate::from_pem(ready["cert_pem"].as_str().unwrap()))

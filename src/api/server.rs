@@ -239,9 +239,10 @@ pub async fn serve<B: MachineBackend>(
         );
     Server::builder()
         .accept_http1(true)
-        // Windows follow the measured bandwidth-delay product: a far client is not capped by
-        // the 64 KiB HTTP/2 default (Read and Write move 1 MiB frames).
-        .http2_adaptive_window(Some(true))
+        // Fixed receive windows (Write's uploads): BDP probing from 64 KiB lost 16% to a fixed
+        // window on a lossy 160 ms link (G/read-bench); 16 MiB covers 150 Mbit/s at 800 ms.
+        .initial_stream_window_size(Some(16 << 20))
+        .initial_connection_window_size(Some(32 << 20))
         .tls_config(tls)?
         .add_routes(routes)
         .serve_with_incoming(TcpListenerStream::new(listener))
