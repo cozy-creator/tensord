@@ -153,6 +153,8 @@ struct Session {
     grants: Vec<HostGrant>,
     sealed: bool,
     descriptors: bool,
+    /// Its weights stay on the GPU under custody (Degree 2), decided once at its load.
+    sharing: bool,
 }
 pub struct GpuPool {
     root: PathBuf,
@@ -827,6 +829,7 @@ impl GpuPool {
                     grants,
                     sealed,
                     descriptors,
+                    sharing: false,
                 },
             );
         } else {
@@ -875,7 +878,15 @@ impl GpuPool {
         others: &mut BTreeMap<String, Session>,
     ) -> io::Result<bool> {
         let capped = session.executor.hello.offers("process_cap/1");
-        let sharing = self.custody.is_some() && session.executor.hello.offers("weights.attach/1");
+        if !session.loaded {
+            // Degree 2 keeps every component resident until revoked, and a running call never
+            // revokes what it reads: only when the whole construction and its activations fit
+            // beside the other tenants. Unmeasured: off (Degree 1 lets stages evict each other).
+            session.sharing = self.custody.is_some()
+                && session.executor.hello.offers("weights.attach/1")
+                && self.memory.fits_resident(&plan.id, || self.holdings());
+        }
+        let sharing = session.sharing;
         let mut callbacks = Callbacks {
             engine,
             id,

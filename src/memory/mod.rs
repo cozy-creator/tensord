@@ -201,6 +201,28 @@ impl GpuMemory {
         }
     }
 
+    /// Whether `plan`'s whole construction and its activations fit beside the other tenants,
+    /// counting holdings no live executor reads (they are reclaimable, or its own to attach).
+    /// False when its facts were never measured or NVML cannot say.
+    pub fn fits_resident(&self, plan: &str, holdings: impl Fn() -> Vec<Holding>) -> bool {
+        let Some(sample) = self.sample() else {
+            return false;
+        };
+        let held = holdings();
+        let fits = self.with(|gpu| {
+            let unread: u64 = held
+                .iter()
+                .filter(|h| h.readers.is_empty())
+                .map(|h| h.bytes)
+                .sum();
+            gpu.holdings = held;
+            gpu.want(plan)
+                .is_some_and(|want| gpu.room(plan, &sample) + unread >= want)
+        });
+        note(serde_json::json!({"event": "degree2", "plan": plan, "fits": fits}));
+        fits
+    }
+
     /// Idle tenants give room until `free_bytes` are free beside the floor (weights first, then
     /// processes); then `plan`'s cap rises into what is there. None: no NVML.
     pub fn make_room(
