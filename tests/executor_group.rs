@@ -250,7 +250,7 @@ fn a_forked_rank_zero_takes_the_group_seal_and_spawns_its_follower() {
         .unwrap()
     {
         Forked::Ready(child) => *child,
-        Forked::Refused(_, reason) => panic!("fork refused: {reason}"),
+        Forked::Refused(_, reason) | Forked::Lost(_, reason) => panic!("fork refused: {reason}"),
     };
     assert_eq!(
         child

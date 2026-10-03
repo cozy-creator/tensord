@@ -717,6 +717,8 @@ pub enum Forked {
     Ready(Box<DeviceExecutor>),
     /// No process was made; the configuration is free for a spawn.
     Refused(Box<ExecutorConfig>, String),
+    /// The parent's channel failed (it died): no process was made, and it forks no more.
+    Lost(Box<ExecutorConfig>, String),
 }
 
 /// A forked executor's wait status while it is its parent's zombie (`/proc` `exit_code`).
@@ -1178,11 +1180,13 @@ impl DeviceExecutor {
             refused => {
                 drop(listener);
                 fs::remove_file(&config.socket)?;
-                let reason = match refused {
-                    Ok(reply) => format!("{}: {}", reply.code, reply.detail),
-                    Err(error) => error.to_string(),
-                };
-                return Ok(Forked::Refused(Box::new(config), reason));
+                return Ok(match refused {
+                    Ok(reply) => Forked::Refused(
+                        Box::new(config),
+                        format!("{}: {}", reply.code, reply.detail),
+                    ),
+                    Err(error) => Forked::Lost(Box::new(config), error.to_string()),
+                });
             }
         };
         let mut launched = Unready {
@@ -1342,7 +1346,10 @@ impl DeviceExecutor {
         }
         if let Some(scope) = unready.scope.as_deref() {
             let member = fs::read_to_string(format!("/proc/{}/cgroup", executor.birth.pid))?;
-            if !member.lines().any(|line| line == format!("0::{}", scope.relative)) {
+            if !member
+                .lines()
+                .any(|line| line == format!("0::{}", scope.relative))
+            {
                 return Err(io::Error::other("executor is outside its own cgroup"));
             }
         }

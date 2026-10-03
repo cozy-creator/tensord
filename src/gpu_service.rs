@@ -329,9 +329,9 @@ impl Zygote {
                 self.children.lock().unwrap().push(child.birth.clone());
                 *self.used.lock().unwrap() = Some(Instant::now());
             }
-            Forked::Refused(..) if process_ended(&parent.birth)? => {
-                // Its children ended with it; the next executors spawn.
-                *state = ZygoteState::Off("import-only executor ended".into());
+            Forked::Lost(..) => {
+                // Its children ended with it; the pool replaces it (`new_session`).
+                *state = ZygoteState::Off(ENDED.into());
             }
             Forked::Refused(..) => {}
         }
@@ -355,6 +355,9 @@ impl Zygote {
         }
     }
 }
+
+/// A parent that died (killed, out of memory): the pool starts a new one.
+const ENDED: &str = "import-only executor ended";
 
 /// What a parent costs before any is measured: an import-only SDXL or Anima executor is
 /// 0.78 GiB RSS (J/RESULTS.md).
@@ -1190,6 +1193,17 @@ impl GpuPool {
         host.available < 0 || host.available as u64 >= need
     }
 
+    /// Drop a dead parent, if it is still the generation's: the next launch starts another.
+    fn forget_parent(&self, generation: &str, dead: &Arc<Zygote>) {
+        let mut zygotes = self.zygotes.lock().unwrap();
+        if zygotes
+            .get(generation)
+            .is_some_and(|current| Arc::ptr_eq(current, dead))
+        {
+            zygotes.remove(generation);
+        }
+    }
+
     /// End the least recently used parent with no live child, for host room: the bytes it
     /// held privately (at least 1 when one ended unmeasured), 0 when there is none to end.
     fn end_idle_parent(&self) -> u64 {
@@ -1567,23 +1581,42 @@ impl GpuPool {
         let config = self.executor_config(held, root, socket, plan.degree)?;
         // A forked child takes its lane and seal with its environment, so a group forks from
         // the same import-only parent (sealed to the first GPU) as a single GPU does.
-        let (mut executor, mode) = match self.zygote(held) {
-            Some((zygote, start)) => {
-                if start {
-                    zygote.set(self.import_only(held));
+        let mut config = Some(config);
+        let mut forked = None;
+        // A parent found dead is replaced at once: importing a new one costs this executor
+        // what a spawn would, and the next ones fork again.
+        for _ in 0..2 {
+            let Some((zygote, start)) = self.zygote(held) else {
+                break;
+            };
+            if start {
+                zygote.set(self.import_only(held));
+            }
+            match zygote.fork(config.take().expect("one config per launch"), &on_birth)? {
+                Forked::Ready(executor) => {
+                    forked = Some(*executor);
+                    break;
                 }
-                match zygote.fork(config, &on_birth)? {
-                    Forked::Ready(executor) => (*executor, "fork"),
-                    Forked::Refused(config, reason) => {
-                        eprintln!("executor fork refused, spawning: {reason}");
-                        let spawned =
-                            DeviceExecutor::spawn_owned(*config, &self.launcher, &on_birth)?;
-                        (spawned, "spawn")
-                    }
+                Forked::Refused(returned, reason) => {
+                    eprintln!("executor fork refused, spawning: {reason}");
+                    config = Some(*returned);
+                    break;
+                }
+                Forked::Lost(returned, reason) => {
+                    eprintln!("import-only executor lost ({reason}); starting another");
+                    config = Some(*returned);
+                    self.forget_parent(&held.record.identity, &zygote);
                 }
             }
+        }
+        let (mut executor, mode) = match forked {
+            Some(executor) => (executor, "fork"),
             None => (
-                DeviceExecutor::spawn_owned(config, &self.launcher, &on_birth)?,
+                DeviceExecutor::spawn_owned(
+                    config.expect("a refused fork returns its config"),
+                    &self.launcher,
+                    &on_birth,
+                )?,
                 "spawn",
             ),
         };

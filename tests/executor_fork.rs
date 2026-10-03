@@ -90,7 +90,7 @@ fn parent(generation: &Generation, hold: &File) -> (DeviceExecutor, PathBuf, Pat
 fn fork(parent: &mut DeviceExecutor, config: ExecutorConfig) -> DeviceExecutor {
     match parent.fork(config, |_, _| Ok(())).unwrap() {
         Forked::Ready(executor) => *executor,
-        Forked::Refused(_, reason) => panic!("fork refused: {reason}"),
+        Forked::Refused(_, reason) | Forked::Lost(_, reason) => panic!("fork refused: {reason}"),
     }
 }
 
@@ -208,7 +208,7 @@ fn a_parent_refuses_before_its_imports_and_its_children_die_with_it() {
                 assert!(reason.contains("fork_unready"), "{reason}");
                 config
             }
-            Forked::Ready(_) => panic!("forked before its imports"),
+            Forked::Ready(_) | Forked::Lost(..) => panic!("forked before its imports"),
         };
         // Refused means no process: the same configuration spawns.
         DeviceExecutor::spawn(*config_back)
@@ -225,6 +225,28 @@ fn a_parent_refuses_before_its_imports_and_its_children_die_with_it() {
         Exact::open(&parent.birth).unwrap().unwrap().kill().unwrap();
         exact.wait().unwrap(); // parent death reaches the child (PDEATHSIG)
         drop(child);
+        drop(parent);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+#[ignore = "needs installed cpu_lifecycle generations offering fork/1"]
+fn a_dead_parent_is_lost_and_its_configuration_spawns() {
+    for (generation, hold) in generations() {
+        let (mut parent, root, _) = parent(&generation, &hold);
+        // Killed (as the gate kills every executor): its channel fails, no process is made.
+        Exact::open(&parent.birth).unwrap().unwrap().kill().unwrap();
+        Exact::open(&parent.birth).unwrap().unwrap().wait().unwrap();
+        let config = match parent
+            .fork(config(&generation, &hold, &root, "after"), |_, _| Ok(()))
+            .unwrap()
+        {
+            Forked::Lost(config, _) => config,
+            Forked::Refused(_, reason) => panic!("a dead parent refused: {reason}"),
+            Forked::Ready(_) => panic!("a dead parent forked"),
+        };
+        DeviceExecutor::spawn(*config).unwrap().shutdown().unwrap();
         drop(parent);
         fs::remove_dir_all(root).unwrap();
     }
