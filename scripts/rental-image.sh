@@ -32,5 +32,6 @@ fi
 find "$stage" -mindepth 1 -type d -exec chmod 0755 {} +  # a layer's directory entries replace the base's modes
 tar --numeric-owner --owner=0 --group=0 --mtime=@0 --sort=name -C "$stage" -czf "$stage.tgz" $(ls -A "$stage")
 [ "$push" = push ] || { echo "staged $kind layer: $stage (base tensorhub/worker@$base)"; exit 0; }
-digest=$(crane mutate "tensorhub/worker@$base" --append "$stage.tgz" -l cozy.machine_impl=rust -l "cozy.machine_impl.commit=$commit" -l "cozy.machine_impl.base=$base" | cut -d@ -f2)
+pushed=$(crane mutate "tensorhub/worker@$base" --append "$stage.tgz" -l cozy.machine_impl=rust -l "cozy.machine_impl.commit=$commit" -l "cozy.machine_impl.base=$base")
+digest=${pushed#*@}; [ "$digest" != "$pushed" ] || { echo "push failed" >&2; exit 1; }
 echo "$kind $digest commit=$commit base=$base"
