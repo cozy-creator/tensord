@@ -3,12 +3,18 @@ pub mod backend;
 pub mod capability;
 pub mod identity;
 pub mod install;
+mod machine_v1;
 mod server;
 pub mod workspaces;
 
 #[allow(clippy::large_enum_variant)] // generated protobuf message shapes
 pub mod pb {
     tonic::include_proto!("cozy.worker.v1");
+}
+
+/// `cozy.machine.v1`, the machine's API (G/API.md).
+pub mod v1 {
+    tonic::include_proto!("cozy.machine.v1");
 }
 
 pub use backend::MachineBackend;

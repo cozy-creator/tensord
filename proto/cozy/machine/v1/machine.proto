@@ -1,0 +1,227 @@
+// The machine's API (G/API.md): five calls on the machine's one TLS listener, whose leaf the
+// client pins. Every call carries `authorization: Cozy-Cap <token>` metadata; Status may omit
+// it (then it answers identity and the sealed readiness receipt only). Unknown fields are
+// ignored. There are no version ranges: Status lists capabilities.
+syntax = "proto3";
+package cozy.machine.v1;
+
+service Machine {
+  rpc Status(StatusRequest) returns (stream StatusFrame);
+  // Submits when `spec` is set and `id` is new (idempotent on id per signer), then streams the
+  // run's log from `after`. Without `spec` it attaches. Closing the stream never cancels.
+  rpc Run(RunRequest) returns (stream RunEvent);
+  rpc Control(ControlRequest) returns (RunState);
+  rpc Read(ReadRequest) returns (stream ReadFrame);
+  rpc Write(stream WriteFrame) returns (WriteResult);
+}
+
+// ---- Run ---------------------------------------------------------------------------------
+
+message RunRequest {
+  string id = 1;     // the caller's run id
+  uint64 after = 2;  // stream the events after this sequence
+  RunSpec spec = 3;  // absent: attach to an existing run
+}
+
+enum RunKind {
+  RUN_KIND_CALL = 0;
+  RUN_KIND_JOB = 1;
+  RUN_KIND_WARM = 2;    // prepare only: install and download, then succeed
+  RUN_KIND_UPDATE = 3;  // stage, verify and activate a software cohort at idle
+}
+
+message RunSpec {
+  RunKind kind = 1;
+  oneof source {
+    Release release = 2;
+    string installation = 3;  // one this machine already holds for the signer
+    LocalSource local = 4;
+    PrivateSource private = 5;
+  }
+  string entrypoint = 6;
+  bytes payload = 7;              // canonical JSON object of the function's parameters
+  repeated InputFile inputs = 8;  // objects uploaded with Write, bound to payload fields
+  repeated ModelChoice models = 9;
+  string binding_revision = 10;   // the owner's binding revision the caller knows
+  repeated MemoResult known_results = 11;
+  string attention_kernel = 12;
+  string weights_destination = 13;  // model://… for a job's weights outputs
+  HubAccess hub = 14;               // held in memory for this run's preparation only
+  string owner = 15;                // the account that org-relative references of local code name
+}
+
+message Release {
+  string package = 1;  // org/name
+  string release = 2;
+}
+message LocalSource {
+  string manifest = 1;  // sha256:<hex> of the uploaded source tree manifest
+}
+message PrivateSource {
+  string placement = 1;
+}
+message InputFile {
+  string field = 1;   // the payload field path, list index included
+  string digest = 2;  // sha256:<hex>
+  uint64 length = 3;
+  string media_type = 4;
+  uint32 order = 5;
+}
+message ModelChoice {
+  string parameter = 1;  // a root slot parameter or full slot path
+  string repository = 2;
+  string release = 3;
+  string lane = 4;
+  string manifest = 5;   // sha256:<hex>, optional exact checkpoint
+  uint64 manifest_length = 6;
+  repeated Adapter adapters = 7;
+}
+message Adapter {
+  string component = 1;
+  string model = 2;
+  string release = 3;
+  string lane = 4;
+  string manifest = 5;
+  string scale = 6;  // canonical decimal; empty means 1
+}
+message MemoResult {
+  string operation = 1;
+  string computation_digest = 2;  // sha256:<hex>
+  bytes result = 3;               // the recorded canonical result document
+}
+message HubAccess {
+  string origin = 1;
+  string token = 2;
+  int64 expires_at = 3;  // unix seconds
+  bytes ca_der = 4;      // an origin's private CA, when it has one
+}
+
+message RunEvent {
+  uint64 sequence = 1;  // 0: a preparation progress frame before the run is accepted
+  int64 at_ms = 2;
+  oneof event {
+    RunState state = 3;
+    Progress progress = 4;
+    Product product = 5;
+    LogLine log = 6;
+    Outcome outcome = 7;
+    MemoRecord memo = 8;
+  }
+}
+message RunState {
+  string id = 1;
+  uint64 number = 2;   // this machine's run number
+  string state = 3;    // queued, preparing, running, paused, succeeded, failed, canceled
+  uint64 sequence = 4; // the log's head
+  uint32 attempt = 5;
+  string waiting = 6;  // why a queued run waits, for people
+}
+message Progress {
+  string stage = 1;
+  double fraction = 2;  // -1: unknown
+  uint64 completed = 3;
+  uint64 total = 4;
+  uint64 bytes_done = 5;
+  uint64 bytes_total = 6;
+}
+// One revision of an output: a single output is replaced by each, a list output grows.
+message Product {
+  string output = 1;
+  uint32 index = 2;  // a list item's 1-based index; 0 for a single output
+  uint64 rev = 3;
+  uint64 length = 4;
+  string digest = 5; // sha256:<hex> of these bytes
+  string media_type = 6;
+  string label = 7;
+  uint64 duration_us = 8;  // media time, for a growing video
+}
+message LogLine {
+  string level = 1;
+  string text = 2;
+}
+message Outcome {
+  string status = 1;  // succeeded, failed, canceled
+  Reason reason = 2;
+  bytes result = 3;   // the result's canonical JSON, assets as digests
+  repeated Product outputs = 4;
+  bool triage = 5;    // Read{triage} answers its bundle
+}
+message Reason {
+  string code = 1;
+  string message = 2;
+  string origin = 3;  // request, runtime, author, machine
+}
+message MemoRecord {
+  string operation = 1;
+  string computation_digest = 2;
+  bytes result = 3;
+}
+
+// ---- Control -----------------------------------------------------------------------------
+
+enum Action {
+  ACTION_UNSPECIFIED = 0;
+  ACTION_CANCEL = 1;
+  ACTION_PAUSE = 2;
+  ACTION_RESUME = 3;
+}
+message ControlRequest {
+  string id = 1;
+  Action action = 2;
+}
+
+// ---- Read --------------------------------------------------------------------------------
+
+message ReadRequest {
+  oneof target {
+    OutputTarget output = 1;
+    string triage = 2;  // a run id
+    string log = 3;     // a machine log's name
+  }
+  uint64 offset = 4;
+  uint64 if_rev = 5;  // nonzero: refuse (FAILED_PRECONDITION) unless the output is at this rev
+  uint64 tail = 6;    // a log's newest bytes, from a line start
+}
+message OutputTarget {
+  string run = 1;
+  string output = 2;
+  uint32 index = 3;  // a list item's 1-based index; 0 for a single output
+}
+// The first frame describes the bytes (data may be empty); the rest carry data in order.
+message ReadFrame {
+  uint64 rev = 1;
+  uint64 length = 2;
+  string digest = 3;  // sha256:<hex>, once the output is final
+  string media_type = 4;
+  bytes data = 5;
+}
+
+// ---- Status (D2) -------------------------------------------------------------------------
+
+message StatusRequest {
+  bool keepalive = 1;  // reset the idle deadline once
+}
+message StatusFrame {
+  string worker_id = 1;
+  string boot_id = 2;
+  string version = 3;
+  repeated string capabilities = 4;
+  bytes receipt = 5;               // the sealed readiness receipt
+  int64 idle_deadline_unix_ms = 6; // 0: no idle release
+  repeated RunState runs = 7;      // live runs
+}
+
+// ---- Write (D1) --------------------------------------------------------------------------
+
+// The first frame names the object; frames carry its bytes from `offset` (the length the
+// machine already holds, from WriteResult or a previous attempt).
+message WriteFrame {
+  string digest = 1;  // sha256:<hex>
+  uint64 length = 2;
+  uint64 offset = 3;
+  bytes data = 4;
+}
+message WriteResult {
+  string digest = 1;
+  uint64 held = 2;  // bytes held; equal to length once complete
+}

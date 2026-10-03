@@ -127,6 +127,10 @@ pub async fn serve<B: MachineBackend>(
     let (post_access, delete_access) = (service.clone(), service.clone());
     let (output, listed) = (service.clone(), service.clone());
     let (state_api, stage_api, update_api) = (service.clone(), service.clone(), service.clone());
+    let machine = super::machine_v1::MachineV1 {
+        identity: service.identity.clone(),
+        backend: service.backend.clone(),
+    };
     let mut routes = tonic::service::Routes::new(
         pb::pod_host_server::PodHostServer::new(service.clone())
             .max_decoding_message_size(16 << 20)
@@ -134,6 +138,11 @@ pub async fn serve<B: MachineBackend>(
     )
     .add_service(
         pb::worker_control_server::WorkerControlServer::new(service)
+            .max_decoding_message_size(16 << 20)
+            .max_encoding_message_size(16 << 20),
+    )
+    .add_service(
+        super::v1::machine_server::MachineServer::new(machine)
             .max_decoding_message_size(16 << 20)
             .max_encoding_message_size(16 << 20),
     );
@@ -227,6 +236,9 @@ pub async fn serve<B: MachineBackend>(
         );
     Server::builder()
         .accept_http1(true)
+        // Windows follow the measured bandwidth-delay product: a far client is not capped by
+        // the 64 KiB HTTP/2 default (Read and Write move 1 MiB frames).
+        .http2_adaptive_window(Some(true))
         .tls_config(tls)?
         .add_routes(routes)
         .serve_with_incoming(TcpListenerStream::new(listener))

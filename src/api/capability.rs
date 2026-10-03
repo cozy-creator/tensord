@@ -77,6 +77,20 @@ pub fn verify(
     now: i64,
     binding: &str,
 ) -> Result<Grant, Refusal> {
+    verify_signer(token, machine, keys, now, binding).map(|(grant, _)| grant)
+}
+
+/// The machine-wide scope: every `cozy.machine.v1` call (`a: "machine"`).
+pub const MACHINE: &str = "machine";
+
+/// [`verify`], also answering which authorized key signed: the run's actor.
+pub fn verify_signer(
+    token: &str,
+    machine: &str,
+    keys: &[VerifyingKey],
+    now: i64,
+    binding: &str,
+) -> Result<(Grant, VerifyingKey), Refusal> {
     let (encoded, signature) = token.split_once('.').ok_or(Refusal::Invalid)?;
     let payload = URL_SAFE_NO_PAD
         .decode(encoded)
@@ -94,19 +108,17 @@ pub fn verify(
         return Err(Refusal::Invalid);
     }
     let signed = [DOMAIN, &payload].concat();
-    if !keys
+    let signer = *keys
         .iter()
-        .any(|key| key_id(key) == grant.key && key.verify_strict(&signed, &signature).is_ok())
-    {
-        return Err(Refusal::Invalid);
-    }
+        .find(|key| key_id(key) == grant.key && key.verify_strict(&signed, &signature).is_ok())
+        .ok_or(Refusal::Invalid)?;
     if grant.machine != machine || !grant.binding.is_empty() && grant.binding != binding {
         return Err(Refusal::Invalid);
     }
     if now >= grant.expires {
         return Err(Refusal::Expired);
     }
-    Ok(grant)
+    Ok((grant, signer))
 }
 
 impl Grant {
