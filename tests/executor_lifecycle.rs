@@ -319,3 +319,164 @@ fn pre_start_exit_is_a_typed_failure_with_its_stderr() {
     );
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+#[ignore = "root only: the SDK slot identity (uid 64000, gid 65533) in a rootful CPU container"]
+fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
+    use cozy_machine::launch_identity::LaunchIdentity;
+    use std::os::unix::fs::{chown, PermissionsExt};
+    assert_eq!(unsafe { libc::geteuid() }, 0, "run as root");
+    let identity = LaunchIdentity {
+        uid: 64000,
+        gid: 65533,
+    };
+    let (generation, hold) = generations().remove(0);
+    let hold_path = generation
+        .python
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(".hold");
+    let root = std::env::temp_dir().join(format!("machine-identity-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+    // The machine's private state (journal, store) is never readable by package code.
+    let mut private = vec![];
+    for name in ["journal", "store"] {
+        let directory = root.join(name);
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(directory.join("record"), b"machine only").unwrap();
+        private.push(directory.join("record"));
+    }
+    let seal = Seal::prepare(
+        &root.join("seal"),
+        Some(identity),
+        "identity",
+        &generation.identity,
+        "",
+    )
+    .unwrap();
+    let mut executor = DeviceExecutor::spawn(ExecutorConfig {
+        python: generation.python.clone(),
+        root: root.join("executor"),
+        socket: root.join("e.sock"),
+        environment: BTreeMap::new(),
+        seal,
+        generation_hold: Some(Arc::new(hold.try_clone().unwrap())),
+        identity: Some(identity),
+    })
+    .unwrap();
+    let status = fs::read_to_string(format!("/proc/{}/status", executor.birth.pid)).unwrap();
+    assert!(
+        status.contains("Uid:\t64000\t64000\t64000\t64000"),
+        "{status}"
+    );
+    assert!(
+        status.contains("Gid:\t65533\t65533\t65533\t65533"),
+        "{status}"
+    );
+    assert!(status.contains("NoNewPrivs:\t1"));
+    assert_eq!(executor.hello.pgid, executor.birth.pid);
+    let interface = root.join("package-interface.json");
+    fs::write(
+        &interface,
+        serde_json::to_vec(&generation.interface).unwrap(),
+    )
+    .unwrap();
+    for command in [
+        DeviceCommand::Start {
+            devices: String::new(),
+            application: generation.application.clone(),
+            package_interface: interface.clone(),
+            sequence_parallel_degree: 1,
+            import_only: false,
+        },
+        DeviceCommand::Load {
+            construction: "lifecycle".into(),
+            devices: String::new(),
+            sequence_parallel_degree: 1,
+            binding: Box::new(Binding {
+                application: generation.application.clone(),
+                package_interface: interface.display().to_string(),
+                ..Binding::default()
+            }),
+            budgets: Budgets::default(),
+            authorized_device_limit_bytes: None,
+            attention_pin: String::new(),
+            stages: false,
+            descriptor_sources: false,
+            device_weights: false,
+            cap_bytes: None,
+            sealed_tiers: false,
+            pinned_bytes: None,
+        },
+        DeviceCommand::Activate {
+            construction: "lifecycle".into(),
+        },
+    ] {
+        let reply = executor.command(&command, &mut Baseline).unwrap();
+        assert!(reply.ok, "{reply:?}");
+    }
+    let spool = root.join("probe");
+    fs::create_dir(&spool).unwrap();
+    chown(&spool, Some(identity.uid), Some(identity.gid)).unwrap();
+    fs::set_permissions(&spool, fs::Permissions::from_mode(0o700)).unwrap();
+    let paths: Vec<String> = private
+        .iter()
+        .chain([&hold_path])
+        .map(|p| p.display().to_string())
+        .collect();
+    let prepared = executor
+        .command(
+            &DeviceCommand::PrepareRequest {
+                request_id: "probe".into(),
+                construction: "lifecycle".into(),
+                entrypoint: "probe".into(),
+                payload: json!({ "paths": paths }),
+                attention_kernel: String::new(),
+            },
+            &mut Baseline,
+        )
+        .unwrap();
+    assert!(prepared.ok, "{prepared:?}");
+    let reply = executor
+        .command(
+            &DeviceCommand::Invoke {
+                request_id: "probe".into(),
+                construction: "lifecycle".into(),
+                entrypoint: "probe".into(),
+                spool: spool.clone(),
+                deadline_s: None,
+                attention_kernel: String::new(),
+                plane_budget_bytes: -1,
+                stages: false,
+                cap_bytes: None,
+            },
+            &mut Baseline,
+        )
+        .unwrap();
+    assert_eq!(terminal(&reply), "succeeded", "{reply:?}");
+    let reach = cozy_machine::device_executor::read_result(&spool, &reply).unwrap();
+    println!("{}", serde_json::to_string(&reach).unwrap());
+    assert_eq!(
+        (reach["uid"].as_u64(), reach["gid"].as_u64()),
+        (Some(64000), Some(65533))
+    );
+    for path in &private {
+        assert_eq!(reach["reach"][path.display().to_string()], "denied");
+    }
+    assert_eq!(reach["home_writable"], true);
+    let fds: Vec<String> = serde_json::from_value(reach["fds"].clone()).unwrap();
+    assert!(
+        fds.iter().any(|fd| fd == &hold_path.display().to_string()),
+        "{fds:?}"
+    );
+    let birth = executor.birth.clone();
+    executor.shutdown().unwrap();
+    assert!(process_ended(&birth).unwrap());
+    fs::remove_dir_all(root).unwrap();
+}

@@ -44,3 +44,55 @@ def wedge(payload: Steps, ctx: Context, tel: Telemetry) -> Done:
 def exit_now(payload: Steps, ctx: Context) -> Done:
     """The process ends in the middle of a request."""
     os._exit(17)
+
+
+class Probe(msgspec.Struct):
+    paths: list[str] = []
+
+
+class Reach(msgspec.Struct):
+    uid: int
+    gid: int
+    groups: list[int]
+    reach: dict[str, str]
+    home_writable: bool
+    fds: list[str]
+    parent_death_signal: int = 0
+
+
+@app.entrypoint
+def probe(payload: Probe, ctx: Context) -> Reach:
+    """What package code can reach: its identity, the named paths, its home, its fds."""
+    reach = {}
+    for path in payload.paths:
+        try:
+            if os.path.isdir(path):
+                os.listdir(path)
+            else:
+                with open(path, "rb") as stream:
+                    stream.read(1)
+            reach[path] = "read"
+        except PermissionError:
+            reach[path] = "denied"
+        except FileNotFoundError:
+            reach[path] = "absent"
+    home = os.environ.get("COZY_HOME", "")
+    try:
+        marker = os.path.join(home, "qualification-probe")
+        with open(marker, "w") as stream:
+            stream.write("ok")
+        os.unlink(marker)
+        writable = True
+    except OSError:
+        writable = False
+    fds = []
+    for fd in os.listdir("/proc/self/fd"):
+        try:
+            fds.append(os.readlink(f"/proc/self/fd/{fd}"))
+        except OSError:
+            pass
+    import ctypes
+    signal = ctypes.c_int()
+    ctypes.CDLL(None).prctl(2, ctypes.byref(signal), 0, 0, 0)  # PR_GET_PDEATHSIG
+    return Reach(os.getuid(), os.getgid(), sorted(os.getgroups()), reach, writable, sorted(fds),
+                 signal.value)
