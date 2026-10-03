@@ -4,7 +4,7 @@ use crate::{
     catalog::HeldGeneration,
     device_executor::{
         self, Answer, Binding, Budgets, Cancellation, DeviceCommand, DeviceExecutor,
-        ExecutorConfig, Forked, Frame, Group, Kind, ModelLoad, Services, RANK_CELLS,
+        ExecutorConfig, Forked, Frame, Group, Kind, ModelLoad, Services,
     },
     execution::{process_ended, Engine},
     host_tier::{HostGrant, HostTier, HostTierConfig, SealedRequest},
@@ -543,10 +543,20 @@ impl GpuPool {
         }
         self.host_ledger.private(plan, None);
     }
-    fn observe(&self, plan: &str, degree: u32, facts: Facts, mapped: Option<bool>) {
-        for device in self.lane(degree).unwrap_or_default() {
-            device.memory.observe(plan, facts, mapped);
+    /// Each GPU of `plan`'s lane observes its own rank's facts; returns the first GPU's.
+    fn observe(
+        &self,
+        plan: &str,
+        degree: u32,
+        facts: Facts,
+        ranks: &[Option<device_executor::PlaneFacts>],
+        mapped: Option<bool>,
+    ) -> Facts {
+        let each = rank_facts(facts, ranks, degree);
+        for (device, facts) in self.lane(degree).unwrap_or_default().iter().zip(&each) {
+            device.memory.observe(plan, *facts, mapped);
         }
+        each[0]
     }
     /// Each GPU of the group decides for itself, in device order (so two groups never wait
     /// on each other): one cap per GPU, rank 0's first. None: that GPU could not say.
@@ -1450,6 +1460,7 @@ impl GpuPool {
                             plan,
                             session.degree,
                             plane_facts(reply.plane.as_ref()),
+                            &reply.rank_planes,
                             Some(false),
                         );
                         return Ok(true);
@@ -1708,9 +1719,8 @@ impl GpuPool {
         others: &mut BTreeMap<String, Session>,
         load_only: bool,
     ) -> io::Result<bool> {
-        // A group whose followers each read their own cap and cell; otherwise every rank
-        // takes the smallest cap and only rank 0's GPU has a cell.
-        let ranked = plan.degree > 1 && session.executor.hello.offers(RANK_CELLS);
+        // Every rank of a group reads its own GPU's cap and cell (`rank_cells/1`).
+        let ranked = plan.degree > 1;
         if !session.loaded {
             // Degree 2 keeps every component resident until revoked, and a running call never
             // revokes what it reads: only when the whole construction and its activations fit
@@ -1843,7 +1853,7 @@ impl GpuPool {
                 .and_then(|split| split.get(&plan.id).copied())
                 .map_or(-1, |share| i64::try_from(share).unwrap_or(i64::MAX));
             let started = std::time::Instant::now();
-            let (load_cap, load_group) = rank_grant(load_caps, ranked);
+            let (load_cap, load_group) = rank_grant(load_caps);
             let loaded = command_ok(session.executor.command_with(
                 &DeviceCommand::Load {
                     construction: plan.id.clone(),
@@ -1869,6 +1879,7 @@ impl GpuPool {
                 &plan.id,
                 plan.degree,
                 load_facts(loaded.facts.as_ref()),
+                &loaded.rank_planes,
                 Some(false),
             );
             self.record_load(
@@ -1972,24 +1983,18 @@ impl GpuPool {
         // A real grant for the whole call: one tenant needs no per-stage turns.
         // A group's cap holds on every GPU of it (each rank caps its own process).
         let caps = self.decide(&plan.id, plan.degree, false, callbacks.others)?;
-        let (cap, group) = rank_grant(&caps, ranked);
+        let (cap, group) = rank_grant(&caps);
         // Every executor of the cohort caps its whole process (`process_cap/1`): the plane
         // derives its budget inside the cap.
         let (plane_budget_bytes, cap_bytes) = (-1, cap);
-        if let Some(cap) = cap {
-            // Each GPU's floor watchdog writes the cell of the process on that GPU. Without
-            // per-rank cells only rank 0's GPU has one (a cell caps one process).
-            for (index, device) in self.lane(plan.degree)?.iter().enumerate() {
-                let rank = index as u32;
-                let cell = match (rank, ranked) {
-                    (0, _) | (_, true) => callbacks
-                        .cells
-                        .get(&rank)
-                        .map(File::try_clone)
-                        .transpose()?,
-                    _ => None,
-                };
-                let own = group.rank_caps.get(index).copied().unwrap_or(cap);
+        // Each GPU's floor watchdog writes the cell of its own rank's process.
+        for ((rank, device), own) in (0u32..).zip(self.lane(plan.degree)?).zip(&caps) {
+            if let Some(own) = *own {
+                let cell = callbacks
+                    .cells
+                    .get(&rank)
+                    .map(File::try_clone)
+                    .transpose()?;
                 device.memory.running(&plan.id, own, cell);
             }
         }
@@ -2031,8 +2036,8 @@ impl GpuPool {
                 .and_then(|m| m.activation_peak_bytes)
                 .and_then(|v| u64::try_from(v).ok())
         });
-        self.observe(&plan.id, plan.degree, facts, Some(true));
-        // Pinned bytes outside the machine's tier count against the tier's limit.
+        let facts = self.observe(&plan.id, plan.degree, facts, &reply.rank_planes, Some(true));
+        // Pinned bytes outside the machine's tier (every rank's) count against its limit.
         self.host_ledger
             .private(&plan.id, facts.pinned.filter(|_| !session.sealed));
         if let Some(plane) = &reply.plane {
@@ -2041,7 +2046,9 @@ impl GpuPool {
                 "cap": cap, "cap_bytes": plane.cap_bytes, "process": plane.process_bytes,
                 "context": plane.context_bytes, "committed": plane.committed_bytes,
                 "activation": plane.activation_peak_bytes, "oom_retries": plane.oom_retries,
-                "evictions": plane.evictions, "h2d_bytes": plane.h2d_bytes}),
+                "evictions": plane.evictions, "h2d_bytes": plane.h2d_bytes,
+                "rank_process": reply.rank_planes.iter()
+                    .map(|r| r.as_ref().map(|r| r.process_bytes)).collect::<Vec<_>>()}),
             );
         }
         // Rank 0 answered, so a follower that ended during the call is the group's first fault.
@@ -2221,7 +2228,8 @@ impl GpuPool {
             match reply {
                 Ok(reply) if reply.ok => {
                     let degree = session.degree;
-                    self.observe(other, degree, plane_facts(reply.plane.as_ref()), None);
+                    let facts = plane_facts(reply.plane.as_ref());
+                    self.observe(other, degree, facts, &reply.rank_planes, None);
                     crate::memory::note(serde_json::json!({"event": "shed", "plan": other,
                         "pinned_budget": share, "for": plan}));
                 }
@@ -2273,20 +2281,23 @@ impl GpuPool {
     }
 }
 
-/// A grant from one cap per GPU: rank 0's cap and, for a group whose followers read their
-/// own (`ranked`), every rank's; otherwise the smallest for all. None: no GPU could say.
-fn rank_grant(caps: &[Option<u64>], ranked: bool) -> (Option<u64>, Group) {
-    let smallest = caps.iter().flatten().min().copied();
-    match caps.iter().copied().collect::<Option<Vec<u64>>>() {
-        Some(each) if ranked && !each.is_empty() => (
-            Some(each[0]),
-            Group {
-                rank_caps: each,
-                ..Group::default()
-            },
-        ),
-        _ => (smallest, Group::default()),
-    }
+/// A grant from one cap per GPU: rank 0's, and for a group every rank's own. A GPU that
+/// cannot say lifts its own rank's cap (-1). None: rank 0's GPU could not say.
+fn rank_grant(caps: &[Option<u64>]) -> (Option<u64>, Group) {
+    let rank_caps = if caps.len() > 1 {
+        caps.iter()
+            .map(|cap| cap.map_or(-1, |cap| i64::try_from(cap).unwrap_or(i64::MAX)))
+            .collect()
+    } else {
+        vec![]
+    };
+    (
+        caps.first().copied().flatten(),
+        Group {
+            rank_caps,
+            ..Group::default()
+        },
+    )
 }
 
 fn holding_id(key: &HoldingKey, generation: u64) -> String {
@@ -2306,6 +2317,45 @@ fn plane_facts(plane: Option<&device_executor::PlaneFacts>) -> Facts {
         pinned_budget: known(plane.pinned_budget_bytes),
         ..Facts::default()
     })
+}
+
+/// One `Facts` per GPU of a group from rank 0's and each follower's own plane facts
+/// (`rank_planes`, rank 1 first): a GPU's own process and context; weights and activation
+/// are rank 0's (its activation is the group's largest peak), as is a follower's whole set
+/// before it stated its own. The host tier is the group's, so the first GPU's pinned bytes
+/// and budget are every rank's.
+fn rank_facts(
+    facts: Facts,
+    ranks: &[Option<device_executor::PlaneFacts>],
+    degree: u32,
+) -> Vec<Facts> {
+    let host = Facts {
+        pinned: None,
+        pinned_budget: None,
+        ..facts
+    };
+    let mut each = vec![facts];
+    for rank in 1..degree.max(1) as usize {
+        each.push(match ranks.get(rank - 1).and_then(Option::as_ref) {
+            Some(own) => Facts {
+                weights: facts.weights,
+                weights_floor: facts.weights_floor,
+                activation: facts.activation,
+                pinned: None,
+                pinned_budget: None,
+                ..plane_facts(Some(own))
+            },
+            None => host,
+        });
+    }
+    let stated = |of: fn(&device_executor::PlaneFacts) -> Option<i64>| -> u64 {
+        ranks.iter().flatten().filter_map(|r| known(of(r))).sum()
+    };
+    each[0].pinned = facts.pinned.map(|own| own + stated(|r| r.pinned_bytes));
+    each[0].pinned_budget = facts
+        .pinned_budget
+        .map(|own| own + stated(|r| r.pinned_budget_bytes));
+    each
 }
 
 /// A load's facts: its weights as stages count them (decoded copies included where the
@@ -2901,15 +2951,55 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn a_ranked_group_gets_each_gpus_cap_and_otherwise_the_smallest() {
-        let (cap, group) = rank_grant(&[Some(30), Some(20)], true);
+    fn every_rank_of_a_group_gets_its_own_gpus_cap() {
+        let (cap, group) = rank_grant(&[Some(30), Some(20)]);
         assert_eq!((cap, group.rank_caps), (Some(30), vec![30, 20]));
-        let (cap, group) = rank_grant(&[Some(30), Some(20)], false);
-        assert_eq!((cap, group.is_empty()), (Some(20), true));
-        // A GPU that cannot say leaves the whole group on the smallest known cap.
-        let (cap, group) = rank_grant(&[Some(30), None], true);
+        // A GPU that cannot say lifts only its own rank's cap.
+        let (cap, group) = rank_grant(&[Some(30), None]);
+        assert_eq!((cap, group.rank_caps), (Some(30), vec![30, -1]));
+        let (cap, group) = rank_grant(&[Some(30)]);
         assert_eq!((cap, group.is_empty()), (Some(30), true));
-        assert_eq!(rank_grant(&[], true).0, None);
+        assert_eq!(rank_grant(&[]).0, None);
+    }
+
+    #[test]
+    fn each_gpu_of_a_group_is_charged_its_own_ranks_process() {
+        let rank0 = Facts {
+            process: Some(9),
+            context: Some(1),
+            weights: Some(6),
+            activation: Some(3),
+            pinned: Some(4),
+            pinned_budget: Some(5),
+            ..Facts::default()
+        };
+        let follower = device_executor::PlaneFacts {
+            process_bytes: Some(7),
+            context_bytes: Some(2),
+            pinned_bytes: Some(4),
+            pinned_budget_bytes: Some(5),
+            ..Default::default()
+        };
+        let each = rank_facts(rank0, &[Some(follower), None], 3);
+        assert_eq!(each.len(), 3);
+        // The host tier is the group's: the first GPU holds every stated rank's pinned bytes.
+        assert_eq!(
+            (each[0].process, each[0].pinned, each[0].pinned_budget),
+            (Some(9), Some(8), Some(10))
+        );
+        assert_eq!(
+            (
+                each[1].process,
+                each[1].context,
+                each[1].weights,
+                each[1].activation,
+                each[1].pinned
+            ),
+            (Some(7), Some(2), Some(6), Some(3), None)
+        );
+        // A follower that has not stated its own yet is charged rank 0's.
+        assert_eq!((each[2].process, each[2].pinned), (Some(9), None));
+        assert_eq!(rank_facts(rank0, &[], 1), vec![rank0]);
     }
 
     #[test]

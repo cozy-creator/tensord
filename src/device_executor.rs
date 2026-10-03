@@ -165,9 +165,9 @@ pub struct Group {
     /// `Start`: rank 0 hands its owner one budget cell per follower (`BudgetCell.rank`).
     #[serde(skip_serializing_if = "is_false")]
     pub rank_cells: bool,
-    /// `Load`/`Invoke`: each rank's own process cap, rank 0 first.
+    /// `Load`/`Invoke`: each rank's own process cap, rank 0 first (-1: uncapped).
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub rank_caps: Vec<u64>,
+    pub rank_caps: Vec<i64>,
 }
 impl Group {
     pub fn is_empty(&self) -> bool {
@@ -540,6 +540,8 @@ pub struct Frame {
     pub free_bytes: u64,
     pub facts: Option<LoadFacts>,
     pub plane: Option<PlaneFacts>,
+    /// A group's followers' own plane facts, rank 1 first (None: not stated yet).
+    pub rank_planes: Vec<Option<PlaneFacts>>,
     pub metrics: Option<Metrics>,
     pub stage: String,
     pub position: Option<u64>,
