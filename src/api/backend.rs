@@ -209,6 +209,11 @@ pub trait MachineBackend: Send + Sync + 'static {
     ) -> Result<Vec<u8>, Status> {
         unsupported()
     }
+    /// A complete content-addressed object this signer wrote with `Write`, verified against
+    /// `sha256` (hex).
+    fn object(&self, _: VerifiedActor, _sha256: &str) -> Result<std::fs::File, Status> {
+        unsupported()
+    }
 }
 /// One consistent view of an output's current bytes: its parts in order.
 pub struct OutputSnapshot {

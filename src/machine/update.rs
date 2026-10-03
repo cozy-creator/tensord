@@ -1,6 +1,6 @@
-//! `runtime-update/1` through the CLI's maintenance contract (`cozy rental update`): stage and
-//! verify a Runtime/TensorFS pair, wait for measured idleness, then restart the service on it
-//! in place. Executors' package environments take the new pair; a candidate Runtime wheel that
+//! A software update, as `Run kind: update` on `cozy.machine.v1` and (until cutover)
+//! `runtime-update/1` behind the CLI's maintenance routes: stage and verify a Runtime/TensorFS
+//! pair, wait for measured idleness, then restart the service on it in place. Executors' package environments take the new pair; a candidate Runtime wheel that
 //! bundles a Rust machine also replaces the service binary (the stable parent runs it). The
 //! previous pair and binary stay installed; a candidate that never proves readiness is rolled
 //! back by the parent. Boot id, leaf, journal and outputs are kept.
@@ -37,10 +37,27 @@ pub struct Status {
     pub to: Pair,
     #[serde(default)]
     pub pinned: bool,
+    /// Every state it passed through: the update's run log.
+    #[serde(default)]
+    pub history: Vec<Step>,
+}
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Step {
+    pub state: String,
+    pub at_ms: i64,
 }
 impl Status {
-    fn terminal(&self) -> bool {
+    pub fn terminal(&self) -> bool {
         matches!(self.state.as_str(), "succeeded" | "rolled_back" | "failed")
+    }
+    fn enter(&mut self, state: &str) {
+        if self.state != state || self.history.is_empty() {
+            self.state = state.into();
+            self.history.push(Step {
+                state: state.into(),
+                at_ms: super::lifecycle::now_ms(),
+            });
+        }
     }
 }
 
@@ -127,12 +144,21 @@ pub fn rollback_pending(paths: &Paths, cause: &str) -> io::Result<bool> {
     let pending: Pending = serde_json::from_slice(&raw)?;
     relink(&paths.current_sdk_link(), pending.sdk_before.as_deref())?;
     relink(&paths.current_agent_link(), pending.agent_before.as_deref())?;
-    let mut status = pending.status;
-    status.state = "rolled_back".into();
+    let mut status = latest(paths, pending.status);
     status.error = cause.into();
+    status.enter("rolled_back");
     write_json(&paths.update("status.json"), &status)?;
     fs::remove_file(paths.update("pending.json"))?;
     Ok(true)
+}
+
+/// The activation's status as last written (its later steps), else as it was when pending.
+fn latest(paths: &Paths, pending: Status) -> Status {
+    fs::read(paths.update("status.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<Status>(&raw).ok())
+        .filter(|s| s.operation == pending.operation)
+        .unwrap_or(pending)
 }
 
 pub struct Updates {
@@ -166,13 +192,22 @@ impl Updates {
             return Ok(());
         };
         let pending: Pending = serde_json::from_slice(&raw)?;
-        let mut status = pending.status;
-        status.state = "succeeded".into();
+        let mut status = latest(&self.paths, pending.status);
         status.to = pair_in(&self.paths.sdk());
+        status.enter("succeeded");
         write_json(&self.paths.update("status.json"), &status)?;
         fs::remove_file(self.paths.update("pending.json"))?;
         *self.status.lock().unwrap() = Some(status);
         Ok(())
+    }
+
+    /// The update `operation` names, if it is this machine's latest.
+    pub fn update(&self, operation: &str) -> Option<Status> {
+        self.status
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|s| s.operation == operation)
     }
 
     /// The executors' Runtime/TensorFS pair.
@@ -290,13 +325,13 @@ impl Updates {
                 ));
             }
         }
-        let status = Status {
+        let mut status = Status {
             operation: request.operation.clone(),
-            state: "waiting".into(),
             from: pair_in(&self.paths.sdk()),
             pinned: request.pin.unwrap_or(false),
             ..Status::default()
         };
+        status.enter("waiting");
         write_json(&self.paths.update("status.json"), &status).map_err(server)?;
         *current = Some(status.clone());
         drop(current);
@@ -306,8 +341,8 @@ impl Updates {
             .spawn(move || {
                 if let Err(error) = updates.run(&request, exit) {
                     updates.set(|s| {
-                        s.state = "failed".into();
                         s.error = error.to_string();
+                        s.enter("failed");
                     });
                 }
             })
@@ -326,7 +361,7 @@ impl Updates {
     }
 
     fn run(&self, request: &Request, exit: fn(i32)) -> io::Result<()> {
-        self.set(|s| s.state = "preparing".into());
+        self.set(|s| s.enter("preparing"));
         let candidate = self.paths.engine.join("sdk").join(&request.operation);
         let _ = fs::remove_dir_all(&candidate);
         fs::create_dir_all(&candidate)?;
@@ -353,12 +388,12 @@ impl Updates {
         let to = pair_in(&candidate);
         self.set(|s| s.to = to.clone());
         if !(self.idle)() {
-            self.set(|s| s.state = "waiting_activation".into());
+            self.set(|s| s.enter("waiting_activation"));
             while !(self.idle)() {
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
         }
-        self.set(|s| s.state = "installing".into());
+        self.set(|s| s.enter("installing"));
         let pending = Pending {
             status: self.status.lock().unwrap().clone().unwrap_or_default(),
             sdk_before: fs::read_link(self.paths.current_sdk_link()).ok(),
@@ -369,7 +404,7 @@ impl Updates {
         if let Some(binary) = agent {
             relink(&self.paths.current_agent_link(), Some(&binary))?;
         }
-        self.set(|s| s.state = "starting".into());
+        self.set(|s| s.enter("starting"));
         eprintln!(
             "cozy-machine: Runtime update {}: restarting on {} / {}",
             request.operation, to.runtime, to.tensorfs

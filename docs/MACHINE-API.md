@@ -43,7 +43,9 @@ with a self-signed leaf; the CLI does not use it. Caller: the `cozy run play` li
 - **List** is deleted. Status shows live runs; history is the CLI's own records plus Run by id.
 - **Update** is `Run kind: update` (D2). It stages and verifies a software cohort, activates it at
   measured idle and keeps the known-good install for rollback. The rental keeps its downloaded
-  weights; progress and outcome come with the run.
+  weights; progress and outcome come with the run. The payload is `{runtime, tensorfs, agent}`:
+  a published version, or a wheel file name whose bytes an input binds to an object sent with
+  Write. A client that loses the stream across the restart attaches again with `Run{id, after}`.
 - **Memo, derived retention, forget and prune** become one self-managing cache: TTL plus low-disk
   eviction, delivered entries first, and no verbs.
 - **Memo across machines** is a real flow today. The CLI records each memoized operation whose

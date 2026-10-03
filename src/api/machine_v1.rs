@@ -1,7 +1,7 @@
 //! `cozy.machine.v1` (G/API.md): Run, Control and Read over the machine's engine, every call
 //! authorized by one `Cozy-Cap`. Until `worker.v1` is deleted at cutover this service reuses
-//! the backend's operations; Status is `machine_status` (D2); Write (D1) answers UNIMPLEMENTED
-//! until it lands.
+//! the backend's operations; Status and `Run kind: update` are `machine_status` and
+//! `machine_update` (D2); Write (D1) answers UNIMPLEMENTED until it lands.
 use super::{
     auth::VerifiedActor,
     backend::MachineBackend,
@@ -378,6 +378,13 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
         let request = request.into_inner();
         if request.id.is_empty() || request.id.len() > 256 {
             return Err(Status::invalid_argument("a run id is 1-256 bytes"));
+        }
+        if super::machine_update::owns(&self.identity, &request) {
+            caller.machine()?;
+            let (identity, backend) = (self.identity.clone(), self.backend.clone());
+            return super::machine_update::run(identity, backend, caller.actor, request)
+                .await
+                .map(Response::new);
         }
         match &request.spec {
             Some(_) => caller.machine()?,

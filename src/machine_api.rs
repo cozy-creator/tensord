@@ -774,6 +774,18 @@ impl MachineBackend for NativeBackend {
         }
         Ok(data)
     }
+    fn object(&self, actor: VerifiedActor, sha256: &str) -> Result<std::fs::File, Status> {
+        // Only an object this signer wrote: another signer's reads as absent.
+        let held = self
+            .service
+            .engine
+            .with_journal(|j| j.object(&actor_id(actor), sha256))
+            .map_err(problem)?;
+        if held.is_none() {
+            return Err(Status::not_found("this signer wrote no such object"));
+        }
+        Ok(self.store.open_verified(sha256).map_err(storage)?.into_file())
+    }
     fn list_packages(
         &self,
         actor: VerifiedActor,
