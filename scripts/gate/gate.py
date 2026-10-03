@@ -40,6 +40,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 def cg():   # cgroup v2, else v1 (v1 rss = anon without shmem; shmem sits inside cache)
     try: CG = open(os.path.join(HERE, "cgroup")).read().strip()   # the measured arm's unit (local)
     except OSError: CG = "/sys/fs/cgroup"                          # the whole container (rental)
+    if not os.path.isdir(CG): CG = "/sys/fs/cgroup"                # the arm's unit is between runs
     if os.path.exists(f"{CG}/memory.stat"):
         m = {l.split()[0]: int(l.split()[1]) for l in open(f"{CG}/memory.stat")}
         r = sum(int(f.split("=")[1]) for l in open(f"{CG}/io.stat") for f in l.split() if f.startswith("rbytes=")) \
