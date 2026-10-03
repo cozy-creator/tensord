@@ -639,6 +639,12 @@ pub struct Answer {
     pub duplicate: bool,
     #[serde(skip_serializing_if = "is_zero")]
     pub descriptors: u64,
+    /// `device_tier`: the holding's layout digest, which the reader's plane verifies.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub layout: String,
+    /// `device_tier`: the last fd after the answer is the reader's lease socket.
+    #[serde(skip_serializing_if = "is_false")]
+    pub lease: bool,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub digest: String,
     #[serde(skip_serializing_if = "is_zero")]
@@ -678,6 +684,8 @@ impl Answer {
             regions: Vec::new(),
             duplicate: false,
             descriptors: 0,
+            layout: String::new(),
+            lease: false,
             digest: String::new(),
             sequence: 0,
             state: String::new(),
@@ -717,7 +725,7 @@ pub trait Services {
         Ok((Answer::unavailable(frame.seq), None))
     }
     /// `device_tier` (`weights.attach/1`): `fds` arrived with the request; the returned ones
-    /// follow the answer.
+    /// follow the answer, the lease socket last when `answer.lease`.
     fn device_tier(
         &mut self,
         frame: &Frame,
@@ -1629,7 +1637,8 @@ impl DeviceExecutor {
                     answer.event = "answer";
                     answer.seq = frame.seq;
                     answer.descriptor = false;
-                    answer.descriptors = out.len() as u64;
+                    // Chunk fds, then the lease socket when there is one.
+                    answer.descriptors = out.len().saturating_sub(usize::from(answer.lease)) as u64;
                     write_frame(&mut self.stream, &answer)?;
                     for fd in &out {
                         protocol::send_fd(&self.stream, fd)?;

@@ -1,15 +1,17 @@
 //! Degree 2 custody: GPU weight regions an executor filled, exported and offered stay alive
 //! here as the driver's own fds. This process never loads CUDA: an exported fd is the
 //! allocation's reference, closing the last reference anywhere frees it. Other executors on
-//! the GPU attach duplicates read-only. Bytes are counted once per GPU, until every reader has
-//! released or ended and the fds here are closed.
+//! the GPU attach duplicates read-only. Each reader holds a lease: one end of a socket pair whose
+//! close (release, or the kernel at process death) ends it. Bytes are counted once per GPU, until
+//! every lease ended and the fds here are closed.
 use crate::execution::process_ended;
 use crate::journal::ProcessBirth;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::unix::net::UnixStream;
 use std::time::Instant;
 
 /// Region spans are multiples of the VMM granularity every supported GPU divides.
@@ -68,10 +70,47 @@ pub enum Offered {
     Duplicate,
 }
 
-/// An executor that maps a holding: its exact birth and its pidfd.
+/// One reader lease on one holding. The executor holds the other end of `lease` while it maps
+/// the holding; its close, by the executor once it let the bytes go or by the kernel when the
+/// process dies, ends the lease with no message (as GMS ties a lease to its connection). The
+/// pidfd and exact birth are the machine's own observation of that death, as everywhere else.
 pub struct Reader {
     pub birth: ProcessBirth,
     pub exit: File,
+    lease: UnixStream,
+}
+
+impl Reader {
+    /// A new lease and the end the executor keeps (close-on-exec until it is sent).
+    pub fn lease(birth: ProcessBirth, exit: File) -> io::Result<(Reader, OwnedFd)> {
+        let (ours, theirs) = UnixStream::pair()?;
+        ours.set_nonblocking(true)?;
+        Ok((
+            Reader {
+                birth,
+                exit,
+                lease: ours,
+            },
+            theirs.into(),
+        ))
+    }
+
+    fn ended(&self) -> bool {
+        hung_up(&self.lease)
+            || (crate::os::ended(&self.exit) && process_ended(&self.birth).unwrap_or(false))
+    }
+}
+
+/// The peer end of a lease is closed: the reader released, or its process is gone.
+fn hung_up(lease: &UnixStream) -> bool {
+    let mut poll = libc::pollfd {
+        fd: lease.as_raw_fd(),
+        events: libc::POLLIN | libc::POLLRDHUP,
+        revents: 0,
+    };
+    // SAFETY: one live descriptor, instantaneous observation.
+    let ready = unsafe { libc::poll(&mut poll, 1, 0) } > 0;
+    ready && poll.revents & (libc::POLLHUP | libc::POLLRDHUP | libc::POLLERR) != 0
 }
 
 struct Holding {
@@ -92,8 +131,9 @@ pub struct ResidentCustody {
 }
 
 impl ResidentCustody {
-    /// Keep an executor's exported regions. The offering executor is the first reader (its
-    /// own mapping is a reference too).
+    /// Keep an executor's exported regions. The offering executor is a reader (its own
+    /// mapping is a reference too). Regions a Ready holding lacks extend it; an overlap is a
+    /// duplicate.
     pub fn offer(
         &mut self,
         key: HoldingKey,
@@ -103,14 +143,27 @@ impl ResidentCustody {
         reader: Reader,
     ) -> io::Result<Offered> {
         validate(&key, &regions, &fds)?;
-        if let Some(held) = self.holdings.get(&key) {
-            return match held.phase {
-                Phase::Ready => Ok(Offered::Duplicate),
-                Phase::Revoking => Err(io::Error::new(
+        if let Some(held) = self.holdings.get_mut(&key) {
+            if held.phase == Phase::Revoking {
+                return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "this layout is being revoked on this GPU",
-                )),
-            };
+                ));
+            }
+            let overlap = regions
+                .iter()
+                .any(|r| held.regions.iter().any(|h| h.region == r.region));
+            if overlap {
+                return Ok(Offered::Duplicate);
+            }
+            held.bytes += regions.iter().flat_map(|r| &r.chunks).sum::<u64>();
+            held.regions.extend(regions);
+            held.fds.extend(fds);
+            held.readers.push(reader);
+            held.used = Instant::now();
+            return Ok(Offered::Kept {
+                generation: held.generation,
+            });
         }
         self.generation += 1;
         let bytes = regions.iter().flat_map(|r| &r.chunks).sum();
@@ -145,9 +198,7 @@ impl ResidentCustody {
             .iter()
             .map(|fd| fd.try_clone())
             .collect::<io::Result<Vec<_>>>()?;
-        if !held.readers.iter().any(|r| r.birth == reader.birth) {
-            held.readers.push(reader);
-        }
+        held.readers.push(reader);
         held.used = Instant::now();
         Ok(Some(Attachment {
             generation: held.generation,
@@ -183,13 +234,12 @@ impl ResidentCustody {
         }
     }
 
-    /// Forget readers whose processes ended (their driver references ended with them), then
-    /// close every revoked holding no reader maps. Returns what was released.
+    /// End every lease whose connection closed (released, or the process died; their driver
+    /// references ended with them), then close every revoked holding no reader maps. Returns
+    /// what was released.
     pub fn collect(&mut self) -> Vec<(HoldingKey, u64)> {
         for held in self.holdings.values_mut() {
-            held.readers.retain(|r| {
-                !(crate::os::ended(&r.exit) && process_ended(&r.birth).unwrap_or(false))
-            });
+            held.readers.retain(|r| !r.ended());
         }
         let done: Vec<HoldingKey> = self
             .holdings
@@ -229,7 +279,12 @@ impl ResidentCustody {
                 generation: h.generation,
                 bytes: h.bytes,
                 phase: h.phase,
-                readers: h.readers.iter().map(|r| r.birth.clone()).collect(),
+                readers: h.readers.iter().fold(Vec::new(), |mut births, r| {
+                    if !births.contains(&r.birth) {
+                        births.push(r.birth.clone());
+                    }
+                    births
+                }),
                 idle_ms: h.used.elapsed().as_millis() as u64,
             })
             .collect()
@@ -280,6 +335,7 @@ mod tests {
     use super::*;
     use crate::execution::process_birth;
     use std::os::fd::FromRawFd;
+    use std::process::{Child, Command, Stdio};
 
     fn devnull() -> OwnedFd {
         // A character device stands in for a driver fd: custody never interprets it.
@@ -290,11 +346,21 @@ mod tests {
         assert!(raw >= 0);
         unsafe { File::from_raw_fd(raw) }
     }
-    fn reader(pid: u32) -> Reader {
-        Reader {
-            birth: process_birth(pid).unwrap(),
-            exit: pidfd(pid),
-        }
+    /// A lease whose executor end this test process keeps.
+    fn mine() -> (Reader, OwnedFd) {
+        let me = std::process::id();
+        Reader::lease(process_birth(me).unwrap(), pidfd(me)).unwrap()
+    }
+    /// A real executor stand-in: a child process holding its lease end as stdin. The reader's
+    /// birth is this test process, which stays alive: only the connection can end the lease.
+    fn held_by_child() -> (Reader, Child) {
+        let (reader, end) = mine();
+        let child = Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::from(end))
+            .spawn()
+            .unwrap();
+        (reader, child)
     }
     fn key(actor: &str) -> HoldingKey {
         HoldingKey {
@@ -303,115 +369,116 @@ mod tests {
             layout: "a".repeat(64),
         }
     }
+    fn region(index: u32, chunks: Vec<u64>) -> SharedRegion {
+        SharedRegion {
+            region: index,
+            chunks,
+        }
+    }
     fn regions() -> Vec<SharedRegion> {
         vec![
-            SharedRegion {
-                region: 0,
-                chunks: vec![GRANULE],
-            },
-            SharedRegion {
-                region: 2,
-                chunks: vec![64 << 20, 2 * GRANULE],
-            },
+            region(0, vec![GRANULE]),
+            region(2, vec![64 << 20, 2 * GRANULE]),
         ]
+    }
+    fn fds(n: usize) -> Vec<OwnedFd> {
+        (0..n).map(|_| devnull()).collect()
     }
 
     #[test]
-    fn a_holding_is_counted_once_and_outlives_its_offerer_until_revoked() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("60")
-            .spawn()
-            .unwrap();
+    fn a_crashed_readers_lease_ends_with_its_connection_and_the_holding_stays() {
         let mut custody = ResidentCustody::default();
-        let fds: Vec<OwnedFd> = (0..3).map(|_| devnull()).collect();
+        let (offerer, mut child) = held_by_child();
         let kept = custody
-            .offer(key("x"), "sdxl/unet", regions(), fds, reader(child.id()))
+            .offer(key("x"), "sdxl/unet", regions(), fds(3), offerer)
             .unwrap();
         assert_eq!(kept, Offered::Kept { generation: 1 });
         let total = GRANULE + (64 << 20) + 2 * GRANULE;
         assert_eq!(custody.charged_bytes("GPU-1"), total);
-
-        // A second offer of the same layout is a duplicate; another actor's is its own.
-        let dup = custody.offer(
-            key("x"),
-            "sdxl/unet",
-            regions(),
-            (0..3).map(|_| devnull()).collect(),
-            reader(std::process::id()),
+        assert!(custody.collect().is_empty());
+        assert_eq!(
+            custody.holdings()[0].readers.len(),
+            1,
+            "the live connection is a lease"
         );
-        assert_eq!(dup.unwrap(), Offered::Duplicate);
-        assert_eq!(custody.charged_bytes("GPU-1"), total);
-        assert!(custody
-            .attach(&key("y"), reader(std::process::id()))
-            .unwrap()
-            .is_none());
 
-        // The offerer dies; the holding stays and a replacement attaches duplicates.
+        // The executor crashes: no message, its kernel-closed connection ends the lease.
         child.kill().unwrap();
         child.wait().unwrap();
-        assert!(custody.collect().is_empty());
-        let me = process_birth(std::process::id()).unwrap();
-        let a = custody
-            .attach(&key("x"), reader(std::process::id()))
-            .unwrap()
-            .unwrap();
-        assert_eq!((a.generation, a.fds.len(), a.regions), (1, 3, regions()));
-        assert_eq!(custody.holdings()[0].readers, vec![me.clone()]);
-
-        // Revoke fences new attachments; the bytes stay charged until the reader releases.
-        assert_eq!(
-            custody.begin_revoke(&key("x"), 1).unwrap(),
-            vec![me.clone()]
+        assert!(
+            custody.collect().is_empty(),
+            "a Ready holding outlives its readers"
         );
-        assert!(custody
-            .attach(&key("x"), reader(std::process::id()))
-            .unwrap()
-            .is_none());
+        assert!(custody.holdings()[0].readers.is_empty());
+
+        // A replacement attaches duplicates under a lease of its own.
+        let (reader, end) = mine();
+        let a = custody.attach(&key("x"), reader).unwrap().unwrap();
+        assert_eq!((a.generation, a.fds.len(), a.regions), (1, 3, regions()));
+        assert!(
+            custody.attach(&key("y"), mine().0).unwrap().is_none(),
+            "actors never share"
+        );
+
+        // Revoke fences new attachments; the bytes stay charged until the lease ends, which
+        // the reader does by closing its end once it let the bytes go (still alive here).
+        custody.begin_revoke(&key("x"), 1).unwrap();
+        assert!(custody.attach(&key("x"), mine().0).unwrap().is_none());
         assert!(custody.collect().is_empty());
         assert_eq!(custody.charged_bytes("GPU-1"), total);
-        custody.released(&key("x"), 1, &me);
+        drop(end);
         assert_eq!(custody.collect(), vec![(key("x"), total)]);
         assert_eq!(custody.charged_bytes("GPU-1"), 0);
     }
 
     #[test]
+    fn regions_a_holding_lacks_extend_it_and_an_overlap_is_a_duplicate() {
+        let mut custody = ResidentCustody::default();
+        let (first, _end) = mine();
+        let one = vec![region(0, vec![GRANULE])];
+        assert_eq!(
+            custody.offer(key("x"), "n", one, fds(1), first).unwrap(),
+            Offered::Kept { generation: 1 }
+        );
+        let (more, _more_end) = mine();
+        let two = vec![region(1, vec![2 * GRANULE])];
+        assert_eq!(
+            custody.offer(key("x"), "n", two, fds(1), more).unwrap(),
+            Offered::Kept { generation: 1 }
+        );
+        assert_eq!(custody.charged_bytes("GPU-1"), 3 * GRANULE);
+        let (dup, _) = mine();
+        let again = vec![region(1, vec![2 * GRANULE])];
+        assert_eq!(
+            custody.offer(key("x"), "n", again, fds(1), dup).unwrap(),
+            Offered::Duplicate
+        );
+        let a = custody.attach(&key("x"), mine().0).unwrap().unwrap();
+        assert_eq!((a.regions.len(), a.fds.len()), (2, 2));
+        assert_eq!(
+            custody.holdings()[0].readers.len(),
+            1,
+            "one process, counted once"
+        );
+    }
+
+    #[test]
     fn offers_are_validated_before_custody() {
         let mut custody = ResidentCustody::default();
-        let me = std::process::id();
         let mut bad = key("x");
         bad.layout = "not-a-digest".into();
         assert!(custody
-            .offer(
-                bad,
-                "n",
-                regions(),
-                (0..3).map(|_| devnull()).collect(),
-                reader(me)
-            )
+            .offer(bad, "n", regions(), fds(3), mine().0)
             .is_err());
         assert!(custody
-            .offer(
-                key("x"),
-                "n",
-                regions(),
-                (0..2).map(|_| devnull()).collect(),
-                reader(me)
-            )
+            .offer(key("x"), "n", regions(), fds(2), mine().0)
             .is_err());
-        let odd = vec![SharedRegion {
-            region: 0,
-            chunks: vec![GRANULE + 1],
-        }];
-        assert!(custody
-            .offer(key("x"), "n", odd, vec![devnull()], reader(me))
-            .is_err());
+        let odd = vec![region(0, vec![GRANULE + 1])];
+        assert!(custody.offer(key("x"), "n", odd, fds(1), mine().0).is_err());
         let file: OwnedFd = File::open("/proc/self/stat").unwrap().into();
-        let one = vec![SharedRegion {
-            region: 0,
-            chunks: vec![GRANULE],
-        }];
+        let one = vec![region(0, vec![GRANULE])];
         assert!(custody
-            .offer(key("x"), "n", one, vec![file], reader(me))
+            .offer(key("x"), "n", one, vec![file], mine().0)
             .is_err());
         assert_eq!(custody.charged_bytes("GPU-1"), 0);
     }

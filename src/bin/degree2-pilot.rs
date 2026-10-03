@@ -81,32 +81,39 @@ impl Services for Pilot {
             device: frame.device.clone(),
             layout: frame.layout.clone(),
         };
-        let reader = Reader {
-            birth: birth.clone(),
-            exit: exit.try_clone()?,
-        };
+        let (reader, lease) = Reader::lease(birth.clone(), exit.try_clone()?)?;
         answer.ok = true;
         answer.code.clear();
         answer.detail.clear();
+        answer.layout = key.layout.clone();
         let mut custody = self.custody.lock().unwrap();
         let count = fds.len();
         let (out, fds) = if frame.offer {
             match custody.offer(key, &frame.name, frame.regions.clone(), fds, reader) {
-                Ok(Offered::Kept { generation }) => answer.generation = generation,
-                Ok(Offered::Duplicate) => answer.duplicate = true,
+                Ok(Offered::Kept { generation }) => {
+                    answer.generation = generation;
+                    answer.lease = true;
+                    ("offer", vec![lease])
+                }
+                Ok(Offered::Duplicate) => {
+                    answer.duplicate = true;
+                    ("duplicate", Vec::new())
+                }
                 Err(error) => {
                     answer.ok = false;
                     answer.detail = error.to_string();
+                    ("refused", Vec::new())
                 }
             }
-            ("offer", Vec::new())
         } else {
             drop(fds);
             match custody.attach(&key, reader)? {
-                Some(a) => {
+                Some(mut a) => {
                     answer.held = true;
+                    answer.lease = true;
                     answer.generation = a.generation;
                     answer.regions = a.regions;
+                    a.fds.push(lease);
                     ("attach", a.fds)
                 }
                 None => ("miss", Vec::new()),

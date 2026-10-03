@@ -2858,17 +2858,21 @@ impl Services for Callbacks<'_> {
             device: frame.device.clone(),
             layout: frame.layout.clone(),
         };
-        let reader = Reader {
-            birth: self.birth.clone(),
-            exit: self.exit.try_clone()?,
-        };
+        // The reader's lease is a connection: the executor keeps one end while it maps the
+        // holding, and its close (release or death) ends the lease.
+        let (reader, lease) = Reader::lease(self.birth.clone(), self.exit.try_clone()?)?;
         answer.ok = true;
         answer.code.clear();
         answer.detail.clear();
+        answer.layout = key.layout.clone();
         let mut custody = custody.lock().unwrap();
         if frame.offer {
             match custody.offer(key, &frame.name, frame.regions.clone(), fds, reader) {
-                Ok(Offered::Kept { generation }) => answer.generation = generation,
+                Ok(Offered::Kept { generation }) => {
+                    answer.generation = generation;
+                    answer.lease = true;
+                    return Ok((answer, vec![lease]));
+                }
                 Ok(Offered::Duplicate) => answer.duplicate = true,
                 Err(error) => {
                     answer.ok = false;
@@ -2880,10 +2884,12 @@ impl Services for Callbacks<'_> {
         }
         drop(fds);
         Ok(match custody.attach(&key, reader)? {
-            Some(attached) => {
+            Some(mut attached) => {
                 answer.held = true;
+                answer.lease = true;
                 answer.generation = attached.generation;
                 answer.regions = attached.regions;
+                attached.fds.push(lease);
                 (answer, attached.fds)
             }
             None => (answer, Vec::new()),
