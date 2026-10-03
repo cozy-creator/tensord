@@ -138,7 +138,9 @@ class Host:
         if m.get("rental"):
             info = json.loads(subprocess.check_output(["cozy", "rental", "ssh-info", m["rental"], "--json", f"--tensorhub={m['hub']}"]))
             host, port = info["ssh_address"].rsplit(":", 1)
-            self.ssh = ["ssh", "-p", port, "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes",
+            key = Path(m.get("ssh_identity", "~/.ssh/cozy_rental")).expanduser()   # the rental's key, not the agent's list
+            ident = ["-o", "IdentitiesOnly=yes", "-i", str(key)] if key.exists() else []
+            self.ssh = ["ssh", "-p", port, "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes", *ident,
                         "-o", "ControlPath=/tmp/gate-ssh-%C", "-o", "ControlMaster=auto", "-o", "ControlPersist=900",
                         f"root@{host}"]
         else:
@@ -152,6 +154,8 @@ class Host:
             done = subprocess.run(self.ssh + [command], capture_output=True, text=True)
             if done.returncode != 255 or self.ssh[0] != "ssh":
                 break
+            if "Permission denied" in done.stderr or "authentication failures" in done.stderr:
+                raise RuntimeError(f"ssh authentication refused: {done.stderr.strip()}")
             time.sleep(0.2)
         if check and done.returncode:
             raise RuntimeError(f"host command failed ({done.returncode}): {command}\n{done.stderr}")
