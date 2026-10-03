@@ -95,6 +95,8 @@ fn launch(generation: &Generation, hold: &File) -> (DeviceExecutor, PathBuf, Sea
             stages: false,
             descriptor_sources: false,
             host_tier_owner: false,
+            device_weights: false,
+            cap_bytes: None,
         },
         DeviceCommand::Activate {
             construction: "lifecycle".into(),
@@ -135,6 +137,7 @@ fn invoke(
             attention_kernel: String::new(),
             plane_budget_bytes: -1,
             stages: false,
+            cap_bytes: None,
         },
         &mut Baseline,
     )
