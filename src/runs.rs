@@ -423,6 +423,30 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// A preparing run's stages are observed like a running attempt's.
+    #[test]
+    fn a_preparing_run_shows_its_progress() {
+        let root = std::env::temp_dir().join(format!("cm-observed-{}", uuid::Uuid::new_v4()));
+        let engine = Engine::open(&root).unwrap();
+        let draft = crate::journal::Invocation {
+            package: "org/pkg".into(),
+            generation: String::new(),
+            module: String::new(),
+            entrypoint: "run".into(),
+            input: json!({}),
+            attention_kernel: String::new(),
+            inputs: vec![],
+        };
+        let accepted = engine.accept_run("alice", "run-1", "d", draft).unwrap().0;
+        engine
+            .observe_progress(&accepted.id, 0, r#"{"stage":"downloading"}"#.into())
+            .unwrap();
+        let seen = engine.get(&accepted.id).unwrap();
+        assert!(seen.revision > accepted.revision);
+        assert_eq!(seen.progress.as_deref(), Some(r#"{"stage":"downloading"}"#));
+        let _ = fs::remove_dir_all(root);
+    }
+
     /// No preparation survives a restart: the token is gone, so the run ends FAILED.
     #[test]
     fn a_restart_ends_a_preparing_run_failed() {

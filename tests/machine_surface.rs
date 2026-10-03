@@ -844,15 +844,20 @@ mod v1_api {
             .await
             .unwrap()
             .into_inner();
-        // Cancel once the run reports progress: it is executing package code.
+        // Cancel once the running run reports progress: it is executing package code.
+        let mut running = false;
         loop {
             let event = stream
                 .message()
                 .await
                 .unwrap()
                 .expect("run ended before progress");
-            if matches!(event.event, Some(v1::run_event::Event::Progress(_))) {
-                break;
+            match event.event {
+                Some(v1::run_event::Event::State(state)) if state.state == "running" => {
+                    running = true
+                }
+                Some(v1::run_event::Event::Progress(_)) if running => break,
+                _ => {}
             }
         }
         client
@@ -891,10 +896,17 @@ mod v1_api {
             .await
             .unwrap()
             .into_inner();
-        while !matches!(
-            stream.message().await.unwrap().expect("run ended").event,
-            Some(v1::run_event::Event::Progress(_))
-        ) {}
+        // Progress once it runs (a run also reports progress while it prepares).
+        let mut running = false;
+        loop {
+            match stream.message().await.unwrap().expect("run ended").event {
+                Some(v1::run_event::Event::State(state)) if state.state == "running" => {
+                    running = true
+                }
+                Some(v1::run_event::Event::Progress(_)) if running => break,
+                _ => {}
+            }
+        }
         let mut status = client
             .status(authorized(v1::StatusRequest { keepalive: false }, &all))
             .await

@@ -220,6 +220,14 @@ pub struct Execution {
     pub failure: Option<String>,
 }
 
+impl Execution {
+    /// Its progress is observed: an attempt running, or a run preparing inside itself.
+    pub fn observed(&self) -> bool {
+        self.state == State::Running
+            || (self.state == State::Queued && self.waiting_reason.as_deref() == Some(PREPARING))
+    }
+}
+
 /// One journaled product of an execution's output log (`api::pb::RunProduct` bytes).
 #[derive(Clone, Debug)]
 pub struct StoredProduct {
@@ -1487,7 +1495,7 @@ impl Journal {
                 .max(record.revision_ceiling)
                 .checked_add(1)
                 .ok_or_else(|| db_error("execution observation cursor exhausted"))?;
-            record.revision_ceiling = if record.state == State::Running {
+            record.revision_ceiling = if record.observed() {
                 record
                     .revision
                     .checked_add(REVISION_WINDOW)
@@ -1665,9 +1673,9 @@ impl Journal {
         progress: Option<&ProgressSnapshot>,
     ) -> io::Result<Execution> {
         self.update_observed(id, progress, |record| {
-            if record.state != State::Running {
+            if !record.observed() {
                 return Err(db_error(
-                    "only running executions reserve observation cursors",
+                    "only running or preparing executions reserve observation cursors",
                 ));
             }
             Ok(true)
