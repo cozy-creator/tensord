@@ -396,6 +396,11 @@ impl Publisher {
         let write = |name: &str, body: &str| fs::write(dir.join(name), body).map_err(io_failure);
         write("requirements.txt", &split.exact)?;
         write("constraints.txt", &split.constraints)?;
+        let mut sdk_choice = if self.sdk.requirements.is_empty() {
+            "locked"
+        } else {
+            "machine"
+        };
         let env = dir.join("env");
         let interpreter = env.join("bin/python");
         let py = interpreter.to_string_lossy().to_string();
@@ -439,7 +444,34 @@ impl Publisher {
                 args.extend(["--find-links", links]);
             }
             args.extend(self.sdk.requirements.iter().map(String::as_str));
-            self.uv(&args)?;
+            // As the Go stack chooses: this machine's own pair where the package's bounds admit
+            // it (uv's check of every installed requirement), else the release's locked SDK.
+            // A package's bounds are never overridden.
+            let own = self
+                .uv(&args)
+                .and_then(|()| self.uv(&["pip", "check", "--no-config", "--python", &py]));
+            if let Err((code, detail)) = own {
+                if !split.sdk.lines().any(|l| !l.starts_with("--")) {
+                    return Err((code, detail));
+                }
+                write("sdk-requirements.txt", &split.sdk)?;
+                let rows = dir
+                    .join("sdk-requirements.txt")
+                    .to_string_lossy()
+                    .to_string();
+                self.uv(&[
+                    "pip",
+                    "install",
+                    "--no-config",
+                    "--python",
+                    &py,
+                    "--require-hashes",
+                    "--no-deps",
+                    "--requirements",
+                    &rows,
+                ])?;
+                sdk_choice = "locked";
+            }
         }
         if let Some(wheel) = &self.sdk.client_wheel {
             let constraints = dir.join("constraints.txt").to_string_lossy().to_string();
@@ -463,7 +495,7 @@ impl Publisher {
                 "the package interface names no application".to_string(),
             ))?;
         File::create(dir.join(".hold")).map_err(io_failure)?;
-        let record = json!({"identity":identity,"package":split.distribution,"version":release,"application":application,"python":interpreter,"dependencies":[],"interface":interface});
+        let record = json!({"identity":identity,"package":split.distribution,"version":release,"application":application,"python":interpreter,"dependencies":[],"interface":interface,"sdk":sdk_choice});
         let staged = dir.join(".generation.json.new");
         let mut file = OpenOptions::new()
             .create_new(true)
@@ -798,6 +830,8 @@ struct Lock {
     exact: String,
     constraints: String,
     distribution: String,
+    /// The lock's own SDK rows (with its index options), held back for an own-SDK machine.
+    sdk: String,
 }
 
 fn normalized(name: &str) -> String {
@@ -814,7 +848,8 @@ fn normalized(name: &str) -> String {
 /// The release's lock as uv input: index lines and every row, minus the SDK rows when the
 /// machine supplies its own SDK, whose resolution the other pins then constrain.
 fn split_lock(lock: &str, name: &str, release: &str, own_sdk: bool) -> Result<Lock, Failure> {
-    let (mut exact, mut constraints, mut distribution) = (String::new(), String::new(), None);
+    let (mut exact, mut constraints, mut distribution, mut sdk) =
+        (String::new(), String::new(), None, String::new());
     for line in lock
         .lines()
         .map(str::trim)
@@ -823,6 +858,8 @@ fn split_lock(lock: &str, name: &str, release: &str, own_sdk: bool) -> Result<Lo
         if line.starts_with("--") {
             exact.push_str(line);
             exact.push('\n');
+            sdk.push_str(line);
+            sdk.push('\n');
             continue;
         }
         let end = line
@@ -840,6 +877,8 @@ fn split_lock(lock: &str, name: &str, release: &str, own_sdk: bool) -> Result<Lo
             distribution = Some(line[..end].to_string());
         }
         if own_sdk && matches!(row.as_str(), "cozy-runtime" | "tensorfs") {
+            sdk.push_str(line);
+            sdk.push('\n');
             continue;
         }
         exact.push_str(line);
@@ -868,6 +907,7 @@ fn split_lock(lock: &str, name: &str, release: &str, own_sdk: bool) -> Result<Lo
         exact,
         constraints,
         distribution,
+        sdk,
     })
 }
 
@@ -884,6 +924,12 @@ mod tests {
             own.exact.contains("--extra-index-url")
                 && own.exact.contains("torch==2.14.0")
                 && !own.exact.contains("cozy-runtime")
+        );
+        // The locked SDK stays available for a package whose bounds exclude the machine's.
+        assert!(
+            own.sdk.contains("cozy-runtime==0.18.67")
+                && own.sdk.contains("--index-url")
+                && !own.sdk.contains("torch")
         );
         assert!(
             own.constraints
