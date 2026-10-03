@@ -1607,6 +1607,26 @@ impl Journal {
         })
     }
 
+    /// Authorized, but the request never reached a handler: a retained executor's channel was
+    /// gone before Invoke (PrepareRequest enters none). Called after exact termination.
+    pub fn defer_undelivered(&mut self, id: &str, reason: String) -> io::Result<Execution> {
+        self.update(id, |record| {
+            if !matches!(record.state, State::Starting | State::Running) {
+                return Err(db_error("only an active attempt may return to queued"));
+            }
+            record.process = None;
+            record.executor = None;
+            record.started_at_ms = 0;
+            record.waiting_reason = Some(reason);
+            record.state = if record.cancel_actor.is_some() {
+                State::Canceled
+            } else {
+                State::Queued
+            };
+            Ok(true)
+        })
+    }
+
     /// Called while the runner is blocked awaiting Invoke, before package execution.
     pub fn register_process(&mut self, id: &str, process: ProcessBirth) -> io::Result<Execution> {
         self.update(id, |record| {

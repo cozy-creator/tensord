@@ -295,6 +295,28 @@ fn executor_killed_mid_request_returns_and_is_reaped() {
 
 #[test]
 #[ignore = "needs installed cpu_lifecycle generations"]
+fn retained_executors_killed_while_idle_lose_their_channel_before_any_handler() {
+    // The gate's kill scenario: SIGKILL the retained executor, the next request ~1 s later.
+    // Each cycle's first request is the previous one's rerun, on a fresh executor.
+    for (generation, hold) in generations() {
+        let steps = json!({"steps": 1, "seconds": 0.01});
+        for cycle in 0..20 {
+            let (mut executor, root, _) = launch(&generation, &hold);
+            let reply = invoke(&mut executor, &root, "first", "steps", steps.clone()).unwrap();
+            assert_eq!(terminal(&reply), "succeeded", "cycle {cycle}: {reply:?}");
+            Exact::open(&executor.birth).unwrap().unwrap().kill().unwrap();
+            std::thread::sleep(Duration::from_secs(1));
+            let error = invoke(&mut executor, &root, "next", "steps", steps.clone()).unwrap_err();
+            assert!(cozy_machine::device_executor::channel_lost(&error), "cycle {cycle}: {error}");
+            eprintln!("cycle {cycle}: {:?}: {error}", error.kind());
+            assert_eq!(executor.terminate().unwrap().status.signal(), Some(libc::SIGKILL));
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs installed cpu_lifecycle generations"]
 fn a_setsid_descendant_is_killed_with_its_executor_cgroup() {
     for (generation, hold) in generations() {
         let (mut executor, root, _) = launch(&generation, &hold);

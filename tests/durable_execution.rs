@@ -762,6 +762,48 @@ fn never_authorized_restart_can_retry_only_after_exact_birth_ends() {
 }
 
 #[test]
+fn an_authorized_attempt_that_never_reached_a_handler_runs_again() {
+    let fixture = Fixture::new();
+    let journal_root = fixture.root.join("undelivered-state");
+    let mut journal = Journal::open(&journal_root).unwrap();
+    let authorize = |journal: &mut Journal, key: &str| {
+        let id = journal.accept(key, fixture.invocation("infer")).unwrap().id;
+        assert!(journal.claim(&id).unwrap());
+        let mut retained = Command::new("/usr/bin/python3")
+            .arg("-c")
+            .arg("import sys;sys.stdin.read()")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        journal
+            .register_process(&id, process_birth(retained.id()).unwrap())
+            .unwrap();
+        journal.running(&id, None).unwrap();
+        retained.kill().unwrap();
+        retained.wait().unwrap();
+        id
+    };
+    let id = authorize(&mut journal, "undelivered");
+    let record = journal.defer_undelivered(&id, "gone".into()).unwrap();
+    assert_eq!(record.state, State::Queued);
+    assert!(record.process.is_none() && record.executor.is_none() && record.started_at_ms == 0);
+    assert!(journal.defer_undelivered(&id, "again".into()).is_err());
+    let canceled = authorize(&mut journal, "undelivered-canceled");
+    journal.cancel(&canceled, "owner").unwrap();
+    let record = journal.defer_undelivered(&canceled, "gone".into()).unwrap();
+    assert_eq!(record.state, State::Canceled);
+    drop(journal);
+    let reopened = Engine::open(&journal_root).unwrap();
+    assert!(reopened.dispatch(&id, fixture.config()).unwrap());
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !reopened.get(&id).unwrap().state.terminal() {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(reopened.get(&id).unwrap().state, State::Completed);
+}
+
+#[test]
 fn idempotency_compares_semantics_and_additive_runner_fields_are_tolerated() {
     let fixture = Fixture::new();
     fixture

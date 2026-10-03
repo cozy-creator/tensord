@@ -740,6 +740,14 @@ fn parent_of(pid: u32) -> io::Result<u32> {
         .ok_or_else(|| io::Error::other("process status names no parent"))
 }
 
+/// The executor's end of the channel is gone: a write broke or no reply came.
+pub fn channel_lost(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset | io::ErrorKind::UnexpectedEof
+    )
+}
+
 /// The executor exited before it connected: no authored code ran. Deterministic causes
 /// (an SDK without this module, a broken environment) fail the run with this evidence.
 #[derive(Debug)]
@@ -1507,7 +1515,9 @@ impl DeviceExecutor {
         }
         loop {
             let frame = read_frame(&mut self.stream)?
-                .ok_or_else(|| io::Error::other("stock executor EOF before reply"))?;
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "stock executor EOF before reply")
+                })?;
             watch.frame();
             match frame.event {
                 Some(Event::Progress) => services.progress(&frame),

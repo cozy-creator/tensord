@@ -29,9 +29,14 @@ pub fn process_ended(birth: &ProcessBirth) -> io::Result<bool> {
     }
     match process_stat(birth.pid) {
         Ok(stat) => Ok(stat.start_ticks != birth.start_ticks || matches!(stat.state, 'Z' | 'X')),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) if gone(&error) => Ok(true),
         Err(error) => Err(error),
     }
+}
+
+/// `/proc/<pid>` vanished: ENOENT, or ESRCH when the process was reaped mid-read.
+pub fn gone(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
 }
 
 fn boot_id() -> io::Result<String> {
@@ -98,7 +103,7 @@ impl Exact {
                 cgroup: None,
             })),
             Ok(_) => Ok(None),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) if gone(&error) => Ok(None),
             Err(error) => Err(error),
         }
     }

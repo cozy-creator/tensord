@@ -76,8 +76,12 @@ executor per plan; `memory::GpuMemory` decides every device byte. Acceptance, jo
   `failed`.
 - On error the session is terminated (exit observed, wedge killed) before the run is settled:
   CANCELED if a cancel was journaled, otherwise FAILED with the reason, including a pre-start exit
-  with its stderr tail. Only a never-authorized attempt hit by a transient OS shortage (EAGAIN,
-  ENOMEM, EMFILE, ENFILE) is requeued. An unprovable exit leaves the run charged and nonterminal.
+  with its stderr tail. Two never-started cases are requeued: a never-authorized attempt hit by a
+  transient OS shortage (EAGAIN, ENOMEM, EMFILE, ENFILE), and a retained session whose channel is
+  lost (EPIPE, ECONNRESET, EOF) at PrepareRequest, which enters no handler. A killed executor
+  closes its socket before it is a zombie, so the pre-reuse check can miss it. The requeued run
+  starts a fresh executor, and that executor's failure is FAILED. An unprovable exit leaves the run
+  charged and nonterminal.
 
 Executor requests:
 - `device_room`: idle tenants give room (unmap, then end); the answer's `cap_bytes` raises the

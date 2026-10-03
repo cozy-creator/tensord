@@ -278,6 +278,11 @@ impl Engine {
         self.notify_activity();
         Ok(())
     }
+    pub(crate) fn defer_undelivered(&self, id: &str, reason: String) -> io::Result<()> {
+        self.journal.lock().unwrap().defer_undelivered(id, reason)?;
+        self.notify_activity();
+        Ok(())
+    }
     pub fn public_terminal(&self, id: &str) -> io::Result<Option<crate::journal::PublicTerminal>> {
         self.journal.lock().unwrap().public_terminal(id)
     }

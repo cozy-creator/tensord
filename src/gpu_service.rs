@@ -3,8 +3,8 @@
 use crate::{
     catalog::HeldGeneration,
     device_executor::{
-        self, Answer, Binding, Budgets, Cancellation, DeviceCommand, DeviceExecutor,
-        ExecutorConfig, Forked, Frame, Group, Kind, ModelLoad, Services,
+        self, channel_lost, Answer, Binding, Budgets, Cancellation, DeviceCommand,
+        DeviceExecutor, ExecutorConfig, Forked, Frame, Group, Kind, ModelLoad, Services,
     },
     execution::{process_ended, Engine},
     host_tier::{HostGrant, HostTier, HostTierConfig, SealedRequest},
@@ -1563,6 +1563,8 @@ impl GpuPool {
             }
             // Not reusable: gone (exit observed) before its context is released.
             Ok(false) => session.executor.terminate().map(drop),
+            // No triage: the run returns to the queue once this exit is observed.
+            Err(error) if undelivered(&error) => Err(ending(error, session.executor)),
             Err(error) => Err(ended_with(engine, id, error, session.executor)),
         }
     }
@@ -1689,6 +1691,7 @@ impl GpuPool {
         others: &mut BTreeMap<String, Session>,
         load_only: bool,
     ) -> io::Result<bool> {
+        let retained = session.loaded;
         // Every rank of a group reads its own GPU's cap and cell (`rank_cells/1`).
         let ranked = plan.degree > 1;
         if !session.loaded {
@@ -1890,7 +1893,15 @@ impl GpuPool {
                     .collect(),
             },
             &mut callbacks,
-        )?;
+        );
+        // A retained executor that went away while idle: PrepareRequest enters no handler,
+        // so the attempt never started and runs again on a fresh executor.
+        let prepared = prepared.map_err(|error| match retained && channel_lost(&error) {
+            true => io::Error::other(Undelivered(format!(
+                "retained executor gone before the request reached it: {error}"
+            ))),
+            false => error,
+        })?;
         if !prepared.ok
             && !matches!(
                 prepared.code.as_str(),
@@ -2460,6 +2471,7 @@ fn ending(error: io::Error, executor: DeviceExecutor) -> io::Error {
                 code: refusal.code.clone(),
                 detail: format!("{}; {killed}", refusal.detail),
             }),
+            None if undelivered(&error) => io::Error::other(Undelivered(format!("{error}; {killed}"))),
             None => io::Error::other(format!("{error}; {killed}")),
         },
         Ok(_) => error,
@@ -2483,6 +2495,9 @@ fn settle(engine: &Arc<Engine>, id: &str, error: &io::Error) -> io::Result<()> {
         .unwrap_or(true);
     if !ended {
         return Ok(()); // exit unproven: the reservation stays charged and nonterminal
+    }
+    if undelivered(error) {
+        return engine.defer_undelivered(id, error.to_string());
     }
     if record.state == State::Starting && crate::process::transient(error) {
         return engine.defer_managed(id, format!("device startup unavailable: {error}"));
@@ -2701,6 +2716,19 @@ impl std::fmt::Display for Refused {
     }
 }
 impl std::error::Error for Refused {}
+/// The request never reached a handler; see `call`.
+#[derive(Debug)]
+struct Undelivered(String);
+impl std::fmt::Display for Undelivered {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+impl std::error::Error for Undelivered {}
+fn undelivered(error: &io::Error) -> bool {
+    error.get_ref().is_some_and(|inner| inner.is::<Undelivered>())
+}
+
 fn refused(error: &io::Error) -> Option<&Refused> {
     error.get_ref()?.downcast_ref::<Refused>()
 }
