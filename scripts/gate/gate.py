@@ -26,7 +26,7 @@ from pathlib import Path
 from PIL import Image, ImageStat
 
 POD_DIR = "/root/gate"
-SCENARIOS = ("cold_first", "warm_first", "warm", "to_anima", "to_sdxl", "kill_next")
+SCENARIOS = ("cold_first", "warm_first", "warm", "to_anima", "to_sdxl", "kill_next", "kill_proof")
 SUBJECTS = ("a lighthouse", "a red fox", "an old tram", "a glass teapot", "a mountain hut",
             "a koi pond", "a violin", "a desert caravan", "a paper crane", "a clock tower",
             "a sailboat", "a snow owl", "a market stall", "a bonsai tree", "a steam train")
@@ -403,6 +403,22 @@ class Gate:
         self.request(arm, -1, "prime", "sdxl")
         self.request(arm, -1, "prime", "anima")
 
+    def kill_proof(self, arm: str, n: int) -> None:
+        """N times: SIGKILL every executor of the idle arm, submit SDXL at once; one attempt each, failures count."""
+        cycle = 1000
+        if not self.pod.sh(self.m["arms"][arm]["root"]).split():
+            self.first(arm, cycle, "warm_first")
+        failed = 0
+        for i in range(n):
+            victims = self.pod.helper("now")["executors"]
+            self.record({"arm": arm, "cycle": cycle + i, "event": "kill", "executors": victims})
+            killed = time.time()
+            if victims:
+                self.pod.sh("kill -9 " + " ".join(str(v["pid"]) for v in victims))   # exact PIDs listed above
+            failed += not self.request(arm, cycle + i, "kill_proof", "sdxl", start=killed, allow_fail=True)["ok"]
+        self.record({"arm": arm, "event": "kill_proof", "cycles": n, "failed": failed})
+        log(f"kill proof on {arm}: {n} cycles, {failed} failed")
+
     def run(self) -> None:
         samples = f"{self.pod.dir}/samples-{self.m['salt']}.jsonl"
         sampler = self.pod.sh(f"nohup {self.pod.py} {POD_DIR}/pod.py sample {samples} >/dev/null 2>&1 & echo $!").strip()
@@ -411,6 +427,8 @@ class Gate:
                 self.prime(arm)
             for cycle, arm in enumerate(self.m["order"]):
                 self.cycle(arm, cycle)
+            if self.m.get("kill_proof"):
+                self.kill_proof(self.m["kill_proof"]["arm"], self.m["kill_proof"]["n"])
         finally:
             self.pod.sh(f"kill {sampler}", check=False)   # the sampler PID this run started
             with (self.out / "samples.jsonl").open("w") as sink:
