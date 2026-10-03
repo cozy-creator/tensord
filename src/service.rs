@@ -121,8 +121,11 @@ impl Service {
                 "GPU service is already configured",
             ));
         }
-        *current = Some(gpu);
+        *current = Some(gpu.clone());
         drop(current);
+        for held in self.catalog.installed() {
+            gpu.prespawn(held);
+        }
         self.changed_environment()
     }
     pub fn submit(

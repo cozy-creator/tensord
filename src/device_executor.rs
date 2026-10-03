@@ -17,7 +17,7 @@ use std::{
         unix::{
             fs::{OpenOptionsExt, PermissionsExt},
             net::{UnixListener, UnixStream},
-            process::CommandExt,
+            process::{CommandExt, ExitStatusExt},
         },
     },
     path::{Path, PathBuf},
@@ -246,6 +246,12 @@ pub enum DeviceCommand {
     Probe {
         collect: bool,
     },
+    /// Fork this import-only executor into a new one on its own seam (`fork/1`).
+    Fork {
+        socket: PathBuf,
+        root: PathBuf,
+        environment: BTreeMap<String, String>,
+    },
 }
 impl DeviceCommand {
     fn name(&self) -> &'static str {
@@ -263,6 +269,7 @@ impl DeviceCommand {
             Self::Revoke { .. } => "revoke",
             Self::Unload { .. } => "unload",
             Self::Probe { .. } => "probe",
+            Self::Fork { .. } => "fork",
         }
     }
 }
@@ -508,6 +515,8 @@ pub struct Frame {
     pub size_bytes: u64,
     pub digest: String,
     pub parts: Vec<PublishPart>,
+    /// `start`: the executor's legs, `[[name, ms], ...]`; read leniently.
+    pub stages: Value,
 }
 
 /// One part of a composite product: a spool file and the media time it adds.
@@ -596,6 +605,8 @@ impl Services for Baseline {}
 
 pub struct DeviceExecutor {
     child: Option<Child>,
+    /// Forked from an import-only executor (`fork/1`), which is its parent and reaps it.
+    forked: bool,
     exact: Exact,
     stream: UnixStream,
     pub birth: ProcessBirth,
@@ -646,6 +657,47 @@ impl Cancellation {
 }
 
 type Watched = Arc<Mutex<Option<Arc<Watch>>>>;
+
+/// Executors fork from an import-only executor that offers this (Runtime `fork/1`).
+pub const FORK: &str = "fork/1";
+
+pub enum Forked {
+    Ready(Box<DeviceExecutor>),
+    /// No process was made; the configuration is free for a spawn.
+    Refused(Box<ExecutorConfig>, String),
+}
+
+/// A forked executor's wait status while it is its parent's zombie (`/proc` `exit_code`).
+fn zombie_status(birth: &ProcessBirth) -> Option<ExitStatus> {
+    let stat = fs::read_to_string(format!("/proc/{}/stat", birth.pid)).ok()?;
+    let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+    let start: u64 = fields.get(19)?.parse().ok()?;
+    let code: i32 = fields.get(49)?.parse().ok()?;
+    (fields.first() == Some(&"Z") && start == birth.start_ticks).then(|| ExitStatus::from_raw(code))
+}
+
+/// The executor's root and listening socket, and the sealed environment it starts with.
+fn endpoint(config: &ExecutorConfig) -> io::Result<(UnixListener, BTreeMap<String, String>)> {
+    fs::create_dir_all(&config.root)?;
+    fs::set_permissions(&config.root, fs::Permissions::from_mode(0o700))?;
+    if let Some(identity) = config.identity {
+        identity.own(&config.root)?;
+    }
+    let listener = UnixListener::bind(&config.socket)?;
+    fs::set_permissions(&config.socket, fs::Permissions::from_mode(0o600))?;
+    if let Some(identity) = config.identity {
+        identity.socket(&config.socket)?;
+    }
+    Ok((listener, config.seal.environment(&config.environment)))
+}
+
+fn parent_of(pid: u32) -> io::Result<u32> {
+    fs::read_to_string(format!("/proc/{pid}/status"))?
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))
+        .and_then(|value| value.trim().parse().ok())
+        .ok_or_else(|| io::Error::other("process status names no parent"))
+}
 
 /// The executor exited before it connected: no authored code ran. Deterministic causes
 /// (an SDK without this module, a broken environment) fail the run with this evidence.
@@ -1011,25 +1063,7 @@ impl DeviceExecutor {
         launcher: Option<&crate::child_launcher::ChildLauncher>,
         on_birth: impl FnOnce(&ProcessBirth, &Cancellation) -> io::Result<()>,
     ) -> io::Result<Self> {
-        let environment = config.seal.environment(&config.environment);
-        let codec = Arc::new(Codec::new(
-            CodecConfig {
-                python: config.python.clone(),
-                environment: environment.clone(),
-                generation_hold: config.generation_hold.clone(),
-            },
-            config.root.join("codec.stderr.log"),
-        ));
-        fs::create_dir_all(&config.root)?;
-        fs::set_permissions(&config.root, fs::Permissions::from_mode(0o700))?;
-        if let Some(identity) = config.identity {
-            identity.own(&config.root)?;
-        }
-        let listener = UnixListener::bind(&config.socket)?;
-        fs::set_permissions(&config.socket, fs::Permissions::from_mode(0o600))?;
-        if let Some(identity) = config.identity {
-            identity.socket(&config.socket)?;
-        }
+        let (listener, environment) = endpoint(&config)?;
         let mut command = crate::launch_identity::trampoline(&config.python, config.identity)?;
         command
             .args(["-I", "-m", "cozy_runtime.internal.executor", "--socket"])
@@ -1058,13 +1092,86 @@ impl DeviceExecutor {
             Some(launcher) => launcher.spawn(command)?,
             None => command.spawn()?,
         };
-        // Until Hello proves the connection, every early return kills and reaps this child.
-        // Nothing authored has run, so no measurement is needed to end it.
-        let mut unready = Unready(Some(child));
-        let pid = unready.child().id();
+        let launched = Unready {
+            pid: child.id(),
+            parent: std::process::id(),
+            child: Some(child),
+            exact: None,
+            birth: None,
+        };
+        Self::connect(config, listener, environment, launched, on_birth)
+    }
+
+    /// An executor forked from this import-only one (`fork/1`), its imports done. It dials
+    /// its own seam and is checked exactly as a spawned one is, with this process as its
+    /// parent. Refused (no process exists) gives the configuration back for a spawn.
+    pub fn fork(
+        &mut self,
+        config: ExecutorConfig,
+        on_birth: impl FnOnce(&ProcessBirth, &Cancellation) -> io::Result<()>,
+    ) -> io::Result<Forked> {
+        let (listener, environment) = endpoint(&config)?;
+        let reply = self.command(
+            &DeviceCommand::Fork {
+                socket: config.socket.clone(),
+                root: config.root.clone(),
+                environment: environment.clone(),
+            },
+            &mut Baseline,
+        );
+        let pid = match reply {
+            Ok(reply) if reply.ok && reply.hello.pid != 0 => reply.hello.pid,
+            refused => {
+                drop(listener);
+                fs::remove_file(&config.socket)?;
+                let reason = match refused {
+                    Ok(reply) => format!("{}: {}", reply.code, reply.detail),
+                    Err(error) => error.to_string(),
+                };
+                return Ok(Forked::Refused(Box::new(config), reason));
+            }
+        };
+        let launched = Unready {
+            pid,
+            parent: self.birth.pid,
+            child: None,
+            exact: None,
+            birth: None,
+        };
+        Self::connect(config, listener, environment, launched, on_birth)
+            .map(|executor| Forked::Ready(Box::new(executor)))
+    }
+
+    /// Wait for the launched process to dial or end, prove the connection is that process,
+    /// and take its Hello. Until then every early return kills and reaps it: nothing
+    /// authored has run, so no measurement is needed to end it.
+    fn connect(
+        config: ExecutorConfig,
+        listener: UnixListener,
+        environment: BTreeMap<String, String>,
+        mut unready: Unready,
+        on_birth: impl FnOnce(&ProcessBirth, &Cancellation) -> io::Result<()>,
+    ) -> io::Result<Self> {
+        let codec = Arc::new(Codec::new(
+            CodecConfig {
+                python: config.python.clone(),
+                environment,
+                generation_hold: config.generation_hold.clone(),
+            },
+            config.root.join("codec.stderr.log"),
+        ));
+        let pid = unready.pid;
         let birth = process_birth(pid)?;
         let exact = Exact::open(&birth)?
             .ok_or_else(|| io::Error::other("launched executor has no exact birth"))?;
+        unready.exact = Some(exact.try_clone()?);
+        unready.birth = Some(birth.clone());
+        if unready.child.is_none() && parent_of(pid)? != unready.parent {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "forked executor is not a child of the process it was forked from",
+            ));
+        }
         let watched: Watched = Arc::default();
         on_birth(
             &birth,
@@ -1100,7 +1207,7 @@ impl DeviceExecutor {
                 break;
             }
             if poll[1].revents != 0 {
-                let status = unready.child().wait()?;
+                let status = unready.ended()?;
                 return Err(io::Error::other(EndedBeforeStart {
                     status,
                     stderr_tail: tail(&config.root.join("stderr.log")),
@@ -1137,8 +1244,10 @@ impl DeviceExecutor {
                 "device executor connection differs from launched process",
             ));
         }
+        let parent = unready.parent;
         let mut executor = Self {
             child: None,
+            forked: unready.child.is_none(),
             exact,
             stream,
             birth,
@@ -1158,7 +1267,7 @@ impl DeviceExecutor {
         let mismatched = config.seal.mismatches(&hello.hello.sealed);
         if !hello.ok
             || hello.hello.pid != executor.birth.pid
-            || (hello.hello.ppid != 0 && hello.hello.ppid != std::process::id())
+            || (hello.hello.ppid != 0 && hello.hello.ppid != parent)
             || (hello.hello.pgid != 0 && hello.hello.pgid != executor.birth.pid)
             || !mismatched.is_empty()
         {
@@ -1169,7 +1278,9 @@ impl DeviceExecutor {
             )));
         }
         // Proven: the executor now owns the child; the launch guard no longer kills it.
-        executor.child = unready.0.take();
+        executor.child = unready.child.take();
+        unready.exact = None;
+        unready.pid = 0;
         executor.hello = hello.hello;
         Ok(executor)
     }
@@ -1198,6 +1309,12 @@ impl DeviceExecutor {
     }
 
     fn offered(&self, command: &DeviceCommand) -> io::Result<()> {
+        if matches!(command, DeviceCommand::Fork { .. }) && !self.hello.offers(FORK) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "fork capability absent",
+            ));
+        }
         if let DeviceCommand::Start {
             import_only: true, ..
         } = command
@@ -1415,6 +1532,7 @@ impl DeviceExecutor {
         Ending {
             exact: self.exact.try_clone(),
             child: self.child.take(),
+            forked: std::mem::take(&mut self.forked),
             retained: std::mem::take(&mut self.retained),
             socket: std::mem::take(&mut self.socket),
             liveness: self.liveness,
@@ -1422,20 +1540,44 @@ impl DeviceExecutor {
     }
 }
 
-struct Unready(Option<Child>);
+/// A launched process before its Hello proves it: dropped, it is killed (and reaped by its
+/// parent: this machine, or the executor it was forked from).
+struct Unready {
+    /// 0 once the executor owns the process.
+    pid: u32,
+    /// The process it must be a child of: this machine, or the executor it was forked from.
+    parent: u32,
+    child: Option<Child>,
+    exact: Option<Exact>,
+    birth: Option<ProcessBirth>,
+}
 impl Unready {
-    fn child(&mut self) -> &mut Child {
-        self.0.as_mut().expect("launch guard holds the child")
+    /// Its exit status, once the process is seen to have exited.
+    fn ended(&mut self) -> io::Result<ExitStatus> {
+        match self.child.as_mut() {
+            Some(child) => child.wait(),
+            None => Ok(self
+                .birth
+                .as_ref()
+                .and_then(zombie_status)
+                .unwrap_or_else(|| ExitStatus::from_raw(0))),
+        }
     }
 }
 impl Drop for Unready {
     fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
-            if let Ok(birth) = process_birth(child.id()) {
-                if let Ok(Some(exact)) = Exact::open(&birth) {
-                    let _ = exact.kill();
-                }
-            }
+        if self.pid == 0 {
+            return;
+        }
+        let exact = self.exact.take().or_else(|| {
+            process_birth(self.pid)
+                .ok()
+                .and_then(|birth| Exact::open(&birth).ok().flatten())
+        });
+        if let Some(exact) = &exact {
+            let _ = exact.kill();
+        }
+        if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -1446,6 +1588,7 @@ impl Drop for Unready {
 struct Ending {
     exact: io::Result<Exact>,
     child: Option<Child>,
+    forked: bool,
     retained: Vec<Box<dyn Send>>,
     socket: PathBuf,
     liveness: Liveness,
@@ -1462,13 +1605,16 @@ impl Ending {
                 )));
             }
         };
-        let (status, killed) = match reap(exact, self.child.as_mut(), self.liveness) {
+        let (mut status, killed) = match reap(exact, self.child.as_mut(), self.liveness) {
             Ok(ended) => ended,
             Err(error) => {
                 std::mem::forget(std::mem::take(&mut self.retained));
                 return Err(error);
             }
         };
+        if self.forked {
+            status = zombie_status(&exact.birth).unwrap_or(status);
+        }
         if !self.socket.as_os_str().is_empty() {
             let _ = fs::remove_file(&self.socket);
         }
@@ -1481,7 +1627,7 @@ impl Ending {
 /// reservation next does so after its exit, on every path including early returns.
 impl Drop for DeviceExecutor {
     fn drop(&mut self) {
-        if self.child.is_none() && self.retained.is_empty() {
+        if self.child.is_none() && !self.forked && self.retained.is_empty() {
             return;
         }
         if let Err(error) = self.parts().end() {

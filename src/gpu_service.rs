@@ -2,8 +2,8 @@
 use crate::{
     catalog::HeldGeneration,
     device_executor::{
-        self, Answer, Binding, Budgets, DeviceCommand, DeviceExecutor, ExecutorConfig, Frame, Kind,
-        Services,
+        self, Answer, Binding, Budgets, Cancellation, DeviceCommand, DeviceExecutor,
+        ExecutorConfig, Forked, Frame, Kind, Services,
     },
     execution::{process_ended, Engine},
     host_tier::{HalfOfHeadroom, HostGrant, HostTier, HostTierConfig, SealedRequest},
@@ -27,8 +27,9 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, Weak,
+        Arc, Condvar, Mutex, Weak,
     },
+    time::Instant,
 };
 use tensorfs_core::store::Store;
 
@@ -37,6 +38,9 @@ fn alloc_conf() -> String {
 }
 fn threads() -> u32 {
     crate::launch_identity::DEFAULT_THREADS
+}
+fn yes() -> bool {
+    true
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
@@ -105,6 +109,11 @@ pub struct GpuConfig {
     pub packages: Vec<PublishedPackage>,
     #[serde(default)]
     pub host: HostOptions,
+    /// Keep one import-only executor per installed GPU generation and fork executors from
+    /// it (`fork/1`), so a new executor's imports are already done. It costs that process's
+    /// host memory (no device memory); false spawns every executor, which imports again.
+    #[serde(default = "yes")]
+    pub prespawn: bool,
 }
 impl GpuConfig {
     pub fn load(path: &Path) -> io::Result<Self> {
@@ -155,7 +164,70 @@ struct Session {
     descriptors: bool,
     /// Its weights stay on the GPU under custody (Degree 2), decided once at its load.
     sharing: bool,
+    launch: Launch,
 }
+
+/// How a session's executor came to exist, for the load record.
+#[derive(Clone, Debug, Serialize)]
+struct Launch {
+    /// `fork` (from the generation's import-only executor) or `spawn`.
+    mode: &'static str,
+    /// From the launch decision to the executor's Hello.
+    ms: f64,
+    /// Its Start: wall time and the executor's own legs.
+    start_ms: f64,
+    start: Vec<(String, f64)>,
+}
+
+/// A generation's import-only executor that executors fork from (`fork/1`). Its children
+/// die with it, so it lives as long as the pool.
+#[derive(Default)]
+struct Zygote {
+    state: Mutex<ZygoteState>,
+    changed: Condvar,
+}
+#[derive(Default)]
+enum ZygoteState {
+    #[default]
+    Starting,
+    Ready(Box<DeviceExecutor>),
+    /// Executors of this generation spawn: its Runtime does not fork, or the parent ended.
+    Off(String),
+}
+impl Zygote {
+    fn set(&self, state: ZygoteState) {
+        if let ZygoteState::Off(reason) = &state {
+            eprintln!("executor prespawn off: {reason}");
+        }
+        *self.state.lock().unwrap() = state;
+        self.changed.notify_all();
+    }
+    /// Fork an executor, waiting while the parent imports. A refusal or an ended parent
+    /// gives the configuration back for a spawn.
+    fn fork(
+        &self,
+        config: ExecutorConfig,
+        on_birth: impl FnOnce(&ProcessBirth, &Cancellation) -> io::Result<()>,
+    ) -> io::Result<Forked> {
+        let mut state = self.state.lock().unwrap();
+        while matches!(*state, ZygoteState::Starting) {
+            state = self.changed.wait(state).unwrap();
+        }
+        let ZygoteState::Ready(parent) = &mut *state else {
+            return Ok(Forked::Refused(
+                Box::new(config),
+                "no import-only executor".into(),
+            ));
+        };
+        let forked = parent.fork(config, on_birth)?;
+        if matches!(forked, Forked::Refused(..)) && process_ended(&parent.birth)? {
+            // Its children ended with it; the next executors spawn.
+            *state = ZygoteState::Off("import-only executor ended".into());
+        }
+        Ok(forked)
+    }
+}
+
 pub struct GpuPool {
     root: PathBuf,
     /// Scopes JIT caches to this machine run; earlier runs' scopes are removed at start.
@@ -165,6 +237,9 @@ pub struct GpuPool {
     reserved: AtomicBool,
     /// One retained executor per plan; the memory policy decides which keep weights mapped.
     sessions: Mutex<BTreeMap<String, Session>>,
+    /// Per generation, the import-only executor sessions fork from. Declared after
+    /// `sessions`: executors end before the parent they were forked from.
+    zygotes: Mutex<BTreeMap<String, Arc<Zygote>>>,
     memory: GpuMemory,
     host: Arc<HostTier>,
     /// Degree 2: GPU weights kept across executors. None on a GPU that drives a display.
@@ -232,6 +307,7 @@ impl GpuPool {
             store,
             reserved: AtomicBool::new(false),
             sessions: Mutex::new(BTreeMap::new()),
+            zygotes: Mutex::new(BTreeMap::new()),
             host,
             custody,
         }))
@@ -555,6 +631,7 @@ impl GpuPool {
         took: std::time::Duration,
         loaded: &Frame,
         executor: u32,
+        launch: &Launch,
     ) -> io::Result<()> {
         use crate::host_memory::{process, ProcessMemory};
         #[derive(Serialize)]
@@ -566,6 +643,7 @@ impl GpuPool {
             host_tier: crate::host_tier::HostTierFacts,
             machine: ProcessMemory,
             executor: ProcessMemory,
+            launch: &'a Launch,
         }
         let line = Line {
             plan,
@@ -575,6 +653,7 @@ impl GpuPool {
             host_tier: self.host.facts(),
             machine: process(std::process::id()).unwrap_or_default(),
             executor: process(executor).unwrap_or_default(),
+            launch,
         };
         let mut bytes = serde_json::to_vec(&line)?;
         bytes.push(b'\n');
@@ -590,7 +669,159 @@ impl GpuPool {
             session.executor.shutdown()?;
             self.memory.with(|gpu| gpu.ended(&plan));
         }
+        for zygote in std::mem::take(&mut *self.zygotes.lock().unwrap()).into_values() {
+            if let ZygoteState::Ready(parent) = std::mem::take(&mut *zygote.state.lock().unwrap()) {
+                parent.shutdown()?;
+            }
+        }
         Ok(())
+    }
+
+    /// Start a generation's import-only executor in the background (machine start, after
+    /// an install), so its imports overlap everything before the first request.
+    pub fn prespawn(self: &Arc<Self>, held: HeldGeneration) {
+        let Some((zygote, true)) = self.zygote(&held) else {
+            return;
+        };
+        let pool = Arc::downgrade(self);
+        let started = std::thread::Builder::new()
+            .name("executor-prespawn".into())
+            .spawn(move || {
+                let state = match pool.upgrade() {
+                    Some(pool) => pool.import_only(&held),
+                    None => ZygoteState::Off("the GPU pool ended".into()),
+                };
+                zygote.set(state);
+            });
+        if let Err(error) = started {
+            eprintln!("executor prespawn: {error}");
+        }
+    }
+
+    /// The generation's import-only executor, and whether the caller must start it. None
+    /// when this pool spawns every executor or the generation binds no model.
+    fn zygote(&self, held: &HeldGeneration) -> Option<(Arc<Zygote>, bool)> {
+        if !self.config.prespawn || !binds_models(&held.record.interface) {
+            return None;
+        }
+        let mut zygotes = self.zygotes.lock().unwrap();
+        if let Some(zygote) = zygotes.get(&held.record.identity) {
+            return Some((zygote.clone(), false));
+        }
+        let zygote = Arc::new(Zygote::default());
+        zygotes.insert(held.record.identity.clone(), zygote.clone());
+        Some((zygote, true))
+    }
+
+    /// Spawn an executor of `held` and import torch, the Runtime and the package with no
+    /// device (`Start.import_only`), to fork executors from.
+    fn import_only(&self, held: &HeldGeneration) -> ZygoteState {
+        let started = (|| {
+            let (root, socket, directory) = self.executor_endpoint()?;
+            let mut executor = DeviceExecutor::spawn_owned(
+                self.executor_config(held, root, socket)?,
+                &self.launcher,
+                |_, _| Ok(()),
+            )?;
+            executor.retain_until_exit(directory);
+            if !executor.hello.offers(device_executor::FORK)
+                || !executor.hello.offers("import_only")
+            {
+                executor.shutdown()?;
+                return Ok(ZygoteState::Off(format!(
+                    "Runtime {} does not fork executors",
+                    held.record.identity
+                )));
+            }
+            let interface = self.interface_file(&executor, held)?;
+            let reply = executor.command(
+                &DeviceCommand::Start {
+                    devices: self.config.devices.clone(),
+                    application: held.record.application.clone(),
+                    package_interface: interface,
+                    sequence_parallel_degree: 1,
+                    import_only: true,
+                },
+                &mut device_executor::Baseline,
+            )?;
+            if !reply.ok {
+                executor.shutdown()?;
+                return Ok(ZygoteState::Off(format!(
+                    "import-only start refused: {}: {}",
+                    reply.code, reply.detail
+                )));
+            }
+            io::Result::Ok(ZygoteState::Ready(Box::new(executor)))
+        })();
+        started.unwrap_or_else(|error| ZygoteState::Off(format!("import-only executor: {error}")))
+    }
+
+    /// A new executor root and its socket path. The socket is named through this process's
+    /// descriptor of the root (Linux `sun_path` limit), or inside it for another identity.
+    fn executor_endpoint(&self) -> io::Result<(PathBuf, PathBuf, File)> {
+        let root = self.root.join(uuid::Uuid::new_v4().simple().to_string());
+        fs::create_dir(&root)?;
+        let directory = File::open(&root)?;
+        let socket = if self.config.identity.is_some() {
+            // Another UID cannot traverse this owner's /proc/fd magic link.
+            // A deliberately short owned state root is required for this operation.
+            let socket = root.join("executor");
+            use std::os::unix::ffi::OsStrExt;
+            if socket.as_os_str().as_bytes().len() > 107 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "configured identity needs a short owned executor socket path (Linux sun_path)",
+                ));
+            }
+            socket
+        } else {
+            PathBuf::from(format!(
+                "/proc/{}/fd/{}/executor",
+                std::process::id(),
+                directory.as_raw_fd()
+            ))
+        };
+        Ok((root, socket, directory))
+    }
+
+    fn executor_config(
+        &self,
+        held: &HeldGeneration,
+        root: PathBuf,
+        socket: PathBuf,
+    ) -> io::Result<ExecutorConfig> {
+        let mut seal = Seal::prepare(
+            &self.root,
+            self.config.identity,
+            &self.incarnation,
+            &held.record.identity,
+            &self.config.devices,
+        )?;
+        seal.alloc_conf = self.config.alloc_conf.clone();
+        seal.threads = self.config.threads;
+        Ok(ExecutorConfig {
+            python: held.record.python.clone(),
+            root,
+            socket,
+            environment: self.config.environment.clone(),
+            seal,
+            generation_hold: Some(held.retention()),
+            identity: self.config.identity,
+        })
+    }
+
+    /// The installed package interface, written where the executor (its identity) reads it.
+    fn interface_file(
+        &self,
+        executor: &DeviceExecutor,
+        held: &HeldGeneration,
+    ) -> io::Result<PathBuf> {
+        let path = executor.root_path().join("package-interface.json");
+        fs::write(&path, serde_json::to_vec(&held.record.interface)?)?;
+        if let Some(identity) = self.config.identity {
+            identity.readable(&path)?;
+        }
+        Ok(path)
     }
     fn run(
         &self,
@@ -726,57 +957,45 @@ impl GpuPool {
             )?;
             self.memory
                 .with(|gpu| gpu.starting(&plan.id, gpu.spawn_need(&plan.id)));
-            let root = self.root.join(uuid::Uuid::new_v4().simple().to_string());
-            fs::create_dir(&root)?;
-            let directory = File::open(&root)?;
-            // Linux pathname limit is independent of the owned state directory length.
-            let socket = if self.config.identity.is_some() {
-                // Another UID cannot traverse this owner's /proc/fd magic link.
-                // A deliberately short owned state root is required for this operation.
-                let socket = root.join("executor");
-                use std::os::unix::ffi::OsStrExt;
-                if socket.as_os_str().as_bytes().len() > 107 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput,"configured identity needs a short owned executor socket path (Linux sun_path)"));
-                }
-                socket
-            } else {
-                PathBuf::from(format!(
-                    "/proc/{}/fd/{}/executor",
-                    std::process::id(),
-                    directory.as_raw_fd()
-                ))
+            let launched = Instant::now();
+            let (root, socket, directory) = self.executor_endpoint()?;
+            let config = self.executor_config(&held, root, socket)?;
+            let on_birth = |birth: &ProcessBirth, cancel: &Cancellation| {
+                self.memory.with(|gpu| gpu.spawned(&plan.id, birth.pid));
+                let cancel = cancel.clone();
+                let request = id.to_string();
+                engine.register_managed(
+                    id,
+                    birth.clone(),
+                    Arc::new(move || cancel.cancel(&request)),
+                )
             };
-            let mut seal = Seal::prepare(
-                &self.root,
-                self.config.identity,
-                &self.incarnation,
-                &held.record.identity,
-                &self.config.devices,
-            )?;
-            seal.alloc_conf = self.config.alloc_conf.clone();
-            seal.threads = self.config.threads;
-            let mut executor = DeviceExecutor::spawn_owned(
-                ExecutorConfig {
-                    python: held.record.python.clone(),
-                    root: root.clone(),
-                    socket,
-                    environment: self.config.environment.clone(),
-                    seal,
-                    generation_hold: Some(held.retention()),
-                    identity: self.config.identity,
-                },
-                &self.launcher,
-                |birth, cancel| {
-                    self.memory.with(|gpu| gpu.spawned(&plan.id, birth.pid));
-                    let cancel = cancel.clone();
-                    let request = id.to_string();
-                    engine.register_managed(
-                        id,
-                        birth.clone(),
-                        Arc::new(move || cancel.cancel(&request)),
-                    )
-                },
-            )?;
+            let (mut executor, mode) = match self.zygote(&held) {
+                Some((zygote, start)) => {
+                    if start {
+                        zygote.set(self.import_only(&held));
+                    }
+                    match zygote.fork(config, on_birth)? {
+                        Forked::Ready(executor) => (*executor, "fork"),
+                        Forked::Refused(config, reason) => {
+                            eprintln!("executor fork refused, spawning: {reason}");
+                            let spawned =
+                                DeviceExecutor::spawn_owned(*config, &self.launcher, on_birth)?;
+                            (spawned, "spawn")
+                        }
+                    }
+                }
+                None => (
+                    DeviceExecutor::spawn_owned(config, &self.launcher, on_birth)?,
+                    "spawn",
+                ),
+            };
+            let launch = Launch {
+                mode,
+                ms: launched.elapsed().as_secs_f64() * 1e3,
+                start_ms: 0.0,
+                start: vec![],
+            };
             executor.retain_until_exit(directory);
             executor.retain_until_exit(WakeOnExit(Arc::downgrade(engine)));
             // Weights from the machine's sealed tier when the executor adopts them; its header
@@ -830,6 +1049,7 @@ impl GpuPool {
                     sealed,
                     descriptors,
                     sharing: false,
+                    launch,
                 },
             );
         } else {
@@ -907,12 +1127,9 @@ impl GpuPool {
             spool: None,
         };
         if !session.loaded {
-            let interface_path = session.executor.root_path().join("package-interface.json");
-            fs::write(&interface_path, serde_json::to_vec(&held.record.interface)?)?;
-            if let Some(identity) = self.config.identity {
-                identity.readable(&interface_path)?;
-            }
-            command_ok(session.executor.command(
+            let interface_path = self.interface_file(&session.executor, held)?;
+            let starting = Instant::now();
+            let started = command_ok(session.executor.command(
                 &DeviceCommand::Start {
                     devices: self.config.devices.clone(),
                     application: held.record.application.clone(),
@@ -922,6 +1139,8 @@ impl GpuPool {
                 },
                 &mut callbacks,
             )?)?;
+            session.launch.start_ms = starting.elapsed().as_secs_f64() * 1e3;
+            session.launch.start = serde_json::from_value(started.stages).unwrap_or_default();
             let mut binding = plan.binding.clone();
             binding.package_interface = interface_path.to_string_lossy().into();
             binding.store = if session.descriptors {
@@ -970,6 +1189,7 @@ impl GpuPool {
                 started.elapsed(),
                 &loaded,
                 session.executor.birth.pid,
+                &session.launch,
             )?;
             if plane && !at_load {
                 command_ok(session.executor.command(
@@ -1314,6 +1534,21 @@ fn log_released(released: Vec<(HoldingKey, u64)>) {
 }
 
 /// Degree 2 stays off on a GPU that drives a display until qualified there. Unknown is "yes".
+/// Whether any entrypoint of an installed interface binds a model: its executors are GPU ones.
+fn binds_models(interface: &serde_json::Value) -> bool {
+    interface
+        .get("entrypoints")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry
+                    .get("models")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|models| !models.is_empty())
+            })
+        })
+}
+
 fn display_active(devices: &str) -> bool {
     let output = std::process::Command::new("nvidia-smi")
         .args([

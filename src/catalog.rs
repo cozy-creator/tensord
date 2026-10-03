@@ -30,6 +30,7 @@ pub struct Generation {
     #[serde(default)]
     pub cpu_bridge: String,
 }
+#[derive(Clone)]
 pub struct HeldGeneration {
     pub record: Generation,
     hold: Arc<File>,
@@ -93,6 +94,27 @@ impl Catalog {
     }
     pub fn root(&self) -> &Path {
         &self.root
+    }
+    /// Every published installation, the most recently installed first.
+    pub fn installed(&self) -> Vec<HeldGeneration> {
+        let mut found: Vec<_> = fs::read_dir(&self.root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                let installed = entry
+                    .path()
+                    .join("generation.json")
+                    .metadata()
+                    .ok()?
+                    .modified()
+                    .ok()?;
+                Some((installed, self.resolve(&name).ok()?))
+            })
+            .collect();
+        found.sort_by(|a, b| b.0.cmp(&a.0));
+        found.into_iter().map(|(_, held)| held).collect()
     }
 }
 impl HeldGeneration {

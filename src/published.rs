@@ -358,6 +358,9 @@ impl Publisher {
             &request.release,
         )?;
         let held = service.catalog.resolve(&identity).map_err(io_failure)?;
+        if let Some(gpu) = service.gpu() {
+            gpu.prespawn(held.clone()); // its imports overlap the model download
+        }
         service
             .engine
             .bind_installation(Installation {
