@@ -33,6 +33,8 @@ pub struct PackageSdk {
     pub find_links: Option<PathBuf>,
     /// The machine's CPU runner client, so a published CPU package can run here too.
     pub client_wheel: Option<PathBuf>,
+    /// An image's baked uv cache (expanded wheels, index records), linked rather than copied.
+    pub seed_cache: Option<PathBuf>,
 }
 
 pub struct Prepared {
@@ -523,8 +525,15 @@ impl Publisher {
         }
         command
             .env("HOME", self.root.join("home"))
-            .env("UV_CACHE_DIR", self.root.join("uv-cache"))
             .env("UV_PYTHON_INSTALL_DIR", self.root.join("python"));
+        // As the Python worker: an image's seeded cache, symlinked so overlayfs never copies
+        // the baked Torch payload into each environment; else this machine's own cache.
+        match &self.sdk.seed_cache {
+            Some(seed) => command
+                .env("UV_CACHE_DIR", seed)
+                .env("UV_LINK_MODE", "symlink"),
+            None => command.env("UV_CACHE_DIR", self.root.join("uv-cache")),
+        };
         let output = command.output().map_err(|e| {
             (
                 "package_installation_uv_absent",

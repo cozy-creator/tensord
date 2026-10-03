@@ -244,6 +244,10 @@ fn image_sdk(wheels: &std::path::Path) -> cozy_machine::published::PackageSdk {
         find_links: complete.then(|| wheels.to_path_buf()),
         requirements: if complete { pair } else { vec![] },
         client_wheel: None,
+        seed_cache: wheels
+            .parent()
+            .map(|opt| opt.join("dependency-seed/uv-cache"))
+            .filter(|seed| seed.is_dir()),
     }
 }
 
