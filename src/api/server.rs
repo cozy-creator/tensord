@@ -2,6 +2,7 @@ use super::{auth::Authority, backend::MachineBackend, pb, WIRE_MINIMUM, WIRE_MIN
 use crate::machine::receipt::{self, Readiness};
 use axum::{
     body::Bytes,
+    extract::Path,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response as HttpResponse},
     routing::get,
@@ -88,6 +89,7 @@ pub async fn serve<B: MachineBackend>(
         control_epoch: Arc::new(AtomicU64::new(0)),
     };
     let (post_access, delete_access) = (service.clone(), service.clone());
+    let (output, listed) = (service.clone(), service.clone());
     let mut routes = tonic::service::Routes::new(
         pb::pod_host_server::PodHostServer::new(service.clone())
             .max_decoding_message_size(16 << 20)
@@ -121,6 +123,25 @@ pub async fn serve<B: MachineBackend>(
                 let api = delete_access.clone();
                 async move { api.hub_access(headers, body, true).await }
             }),
+        )
+        .route(
+            "/v1/runs/{run}/outputs/{output}",
+            get(
+                move |headers: HeaderMap, Path((run, name)): Path<(String, String)>| {
+                    let api = output.clone();
+                    async move { api.output(headers, run, name, None).await }
+                },
+            ),
+        )
+        .route(
+            "/v1/runs/{run}/outputs/{output}/{index}",
+            get(
+                move |headers: HeaderMap,
+                      Path((run, name, index)): Path<(String, String, String)>| {
+                    let api = listed.clone();
+                    async move { api.output(headers, run, name, Some(index)).await }
+                },
+            ),
         )
         .route(
             "/v1/bootstrap/receipt",
@@ -287,6 +308,143 @@ impl<B: MachineBackend> Api<B> {
 impl<B: MachineBackend> Api<B> {
     /// The Go agent's scoped-access contract: an owner-signed `hub-access` capability,
     /// one JSON body, and typed refusals. Unknown body members are ignored.
+    /// One run output's current bytes for a `Cozy-Cap` holder: ETag `"r<rev>"`, a single
+    /// byte range, and `Repr-Digest` once the output is final.
+    async fn output(
+        &self,
+        headers: HeaderMap,
+        run: String,
+        name: String,
+        index: Option<String>,
+    ) -> HttpResponse {
+        let text = |status: StatusCode, message: String| {
+            (
+                status,
+                [("content-type", "text/plain; charset=utf-8")],
+                message,
+            )
+                .into_response()
+        };
+        let number = run.parse::<u64>().ok().filter(|n| *n > 0);
+        // A list item's index is 1-based; an unparsable one names no output.
+        let index = match index {
+            None => Some(None),
+            Some(text) => text.parse::<u32>().ok().filter(|i| *i > 0).map(Some),
+        };
+        let (Some(number), Some(index)) = (number, index) else {
+            return text(StatusCode::NOT_FOUND, "the path names no run output".into());
+        };
+        let token = headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Cozy-Cap "))
+            .unwrap_or_default();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs() as i64);
+        let authority = &self.identity.authority;
+        let keys = authority.keys.admitted();
+        let granted = super::capability::verify(token, &authority.worker_id, &keys, now, "")
+            .and_then(|grant| {
+                if grant.allows(&run, &name, index) {
+                    Ok(grant)
+                } else {
+                    Err(super::capability::Refusal::Scope)
+                }
+            });
+        if let Err(refusal) = granted {
+            return text(StatusCode::FORBIDDEN, refusal.to_string());
+        }
+        let backend = self.backend.clone();
+        let snapshot =
+            match tokio::task::spawn_blocking(move || backend.open_output(number, &name, index))
+                .await
+            {
+                Ok(Ok(snapshot)) => snapshot,
+                Ok(Err(status)) => {
+                    let code = match status.code() {
+                        tonic::Code::NotFound => StatusCode::NOT_FOUND,
+                        tonic::Code::Unimplemented => StatusCode::NOT_IMPLEMENTED,
+                        tonic::Code::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+                        _ => StatusCode::BAD_GATEWAY,
+                    };
+                    return text(code, status.message().into());
+                }
+                Err(_) => {
+                    return text(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "output read stopped".into(),
+                    )
+                }
+            };
+        let etag = format!("\"r{}\"", snapshot.rev);
+        let mut response = axum::http::Response::builder()
+            .header("etag", &etag)
+            .header("cache-control", "private, no-cache")
+            .header("accept-ranges", "bytes")
+            .header(
+                "content-type",
+                if snapshot.media_type.is_empty() {
+                    "application/octet-stream"
+                } else {
+                    &snapshot.media_type
+                },
+            );
+        if let Some(raw) = snapshot
+            .sha256
+            .as_deref()
+            .and_then(|digest| digest.strip_prefix("sha256:"))
+            .and_then(|hex| {
+                (0..hex.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+                    .collect::<Option<Vec<u8>>>()
+            })
+        {
+            use base64::{engine::general_purpose::STANDARD, Engine as _};
+            response =
+                response.header("repr-digest", format!("sha-256=:{}:", STANDARD.encode(raw)));
+        }
+        if headers
+            .get("if-none-match")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.split(',').any(|tag| tag.trim() == etag))
+        {
+            return response
+                .status(StatusCode::NOT_MODIFIED)
+                .body(axum::body::Body::empty())
+                .unwrap_or_default();
+        }
+        let length = snapshot.length;
+        let (status, start, count) = match headers
+            .get("range")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| byte_range(value, length))
+        {
+            None => (StatusCode::OK, 0, length),
+            Some(Some((start, end))) => {
+                response =
+                    response.header("content-range", format!("bytes {start}-{end}/{length}"));
+                (StatusCode::PARTIAL_CONTENT, start, end + 1 - start)
+            }
+            Some(None) => {
+                return response
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header("content-range", format!("bytes */{length}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap_or_default();
+            }
+        };
+        let (sender, receiver) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(4);
+        tokio::task::spawn_blocking(move || send_range(snapshot.parts, start, count, sender));
+        response
+            .status(status)
+            .header("content-length", count)
+            .body(axum::body::Body::from_stream(
+                tokio_stream::wrappers::ReceiverStream::new(receiver),
+            ))
+            .unwrap_or_default()
+    }
     async fn hub_access(&self, headers: HeaderMap, body: Bytes, forget: bool) -> HttpResponse {
         let refuse = |status: u16, code: &str, message: &str| {
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST);
@@ -796,6 +954,15 @@ impl<B: MachineBackend> pb::pod_host_server::PodHost for Api<B> {
         self.call(move |backend| backend.ack_collection(actor, request))
             .await
     }
+    async fn forget_package(
+        &self,
+        request: Request<pb::ForgetPackageCall>,
+    ) -> Result<Response<pb::ForgetPackageResult>, Status> {
+        let actor = self.auth(request.get_ref().claim.as_ref())?;
+        let request = request.into_inner();
+        self.call(move |backend| backend.forget_package(actor, request))
+            .await
+    }
     async fn read_machine_log(
         &self,
         request: Request<pb::MachineLogQuery>,
@@ -1003,4 +1170,63 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// One `bytes=` range of a `length`-byte body as inclusive (start, end); None when it cannot
+/// be satisfied. Several ranges are answered as the first.
+fn byte_range(header: &str, length: u64) -> Option<(u64, u64)> {
+    let spec = header.strip_prefix("bytes=")?.split(',').next()?.trim();
+    let (first, last) = spec.split_once('-')?;
+    let (start, end) = if first.is_empty() {
+        let suffix: u64 = last.parse().ok()?;
+        (
+            length.checked_sub(suffix.min(length))?,
+            length.checked_sub(1)?,
+        )
+    } else {
+        let start: u64 = first.parse().ok()?;
+        let end = if last.is_empty() {
+            length.checked_sub(1)?
+        } else {
+            last.parse::<u64>().ok()?.min(length.checked_sub(1)?)
+        };
+        (start, end)
+    };
+    (start <= end && end < length).then_some((start, end))
+}
+
+/// Reads `count` bytes from `start` across the snapshot's parts into the response stream.
+fn send_range(
+    parts: Vec<(std::fs::File, u64)>,
+    mut start: u64,
+    mut count: u64,
+    sender: tokio::sync::mpsc::Sender<std::io::Result<Bytes>>,
+) {
+    use std::os::unix::fs::FileExt;
+    let mut buffer = vec![0; 64 << 10];
+    for (file, length) in parts {
+        if start >= length {
+            start -= length;
+            continue;
+        }
+        while count > 0 && start < length {
+            let want = (buffer.len() as u64).min(count).min(length - start) as usize;
+            let read = match file.read_at(&mut buffer[..want], start) {
+                Ok(0) => Err(std::io::Error::other("output part ended early")),
+                Ok(read) => Ok(Bytes::copy_from_slice(&buffer[..read])),
+                Err(error) => Err(error),
+            };
+            let failed = read.is_err();
+            let read_len = read.as_ref().map_or(0, |bytes| bytes.len() as u64);
+            if sender.blocking_send(read).is_err() || failed {
+                return;
+            }
+            start += read_len;
+            count -= read_len;
+        }
+        if count == 0 {
+            return;
+        }
+        start = 0;
+    }
 }

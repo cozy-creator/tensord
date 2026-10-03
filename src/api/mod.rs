@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod backend;
+pub mod capability;
 pub mod identity;
 pub mod install;
 mod server;

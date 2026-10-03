@@ -618,6 +618,87 @@ impl MachineBackend for NativeBackend {
             ..Default::default()
         })
     }
+    fn open_output(
+        &self,
+        run: u64,
+        output: &str,
+        index: Option<u32>,
+    ) -> Result<crate::api::backend::OutputSnapshot, Status> {
+        let absent = || Status::not_found("this machine has no such run or output");
+        let record = match self.service.engine.get(&run.to_string()) {
+            Ok(record) if record.submission.is_some() => record,
+            Ok(_) => return Err(absent()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(absent()),
+            Err(error) => return Err(problem(error)),
+        };
+        let terminal = record.state.terminal();
+        let events = if terminal {
+            self.terminal(&record)?.events
+        } else {
+            self.product_events(&record)?
+        };
+        let (op, position) = match index {
+            Some(index) => (
+                pb::RunProductOp::Append,
+                index.checked_sub(1).ok_or_else(absent)?,
+            ),
+            None => (pb::RunProductOp::Set, 0),
+        };
+        let revisions: Vec<_> = events
+            .into_iter()
+            .filter_map(|event| event.product)
+            .filter(|p| p.output == output && p.op == op as i32 && p.index == position)
+            .collect();
+        let current = revisions.last().ok_or_else(absent)?;
+        let content = current
+            .content
+            .as_ref()
+            .ok_or_else(|| Status::data_loss("product content absent"))?;
+        let refs: Vec<&pb::Ref> = if current.parts.is_empty() {
+            vec![content]
+        } else {
+            current
+                .parts
+                .iter()
+                .filter_map(|p| p.content.as_ref())
+                .collect()
+        };
+        let parts = refs
+            .into_iter()
+            .map(|r| {
+                let file = self
+                    .store
+                    .open_verified(&sha256::hex(&r.digest))
+                    .map_err(storage)?
+                    .into_file();
+                Ok((file, r.length))
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+        Ok(crate::api::backend::OutputSnapshot {
+            parts,
+            length: content.length,
+            rev: revisions.len() as u64,
+            media_type: current.media_type.clone(),
+            sha256: terminal.then(|| format!("sha256:{}", sha256::hex(&content.digest))),
+        })
+    }
+    fn forget_package(
+        &self,
+        actor: VerifiedActor,
+        request: pb::ForgetPackageCall,
+    ) -> Result<pb::ForgetPackageResult, Status> {
+        let package = request.package.trim();
+        if package.is_empty() || package.len() > 256 || !package.contains('/') {
+            return Err(Status::invalid_argument("package must name org/name"));
+        }
+        // Held installations are keyed by their exact release; the owner's bindings are the
+        // model resolutions, read again on the next run.
+        self.service
+            .engine
+            .with_journal(|j| j.forget_resolutions(&actor_id(actor), package))
+            .map_err(problem)?;
+        Ok(pb::ForgetPackageResult {})
+    }
     fn read_machine_log(
         &self,
         _: VerifiedActor,

@@ -343,8 +343,11 @@ pub fn document(product: &pb::RunProduct) -> io::Result<Value> {
             .parts
             .iter()
             .map(|part| {
-                let mut value = json!({"content":reference(part.content.as_ref().ok_or_else(missing)?),
-                    "source":source(part.source.as_ref().ok_or_else(missing)?)?});
+                let mut value =
+                    json!({"content":reference(part.content.as_ref().ok_or_else(missing)?)});
+                if let Some(held) = &part.source {
+                    value["source"] = source(held)?;
+                }
                 if part.duration_us != 0 {
                     value["duration_us"] = json!(part.duration_us);
                 }

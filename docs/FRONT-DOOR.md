@@ -9,6 +9,12 @@ package uploads, installer and native inputs. The API owns no scheduler, journal
 - One TLS listener: gRPC `PodHost` and `WorkerControl` (same operations), 16 MiB message cap,
   plus HTTP `GET /v1/health` (204, or 401 if an `Authorization` header is sent) and
   `GET /v1/bootstrap/receipt`.
+- `GET /v1/runs/{run}/outputs/{output}[/{index}]` (`index` 1-based, a list item) for a
+  `Authorization: Cozy-Cap <token>` holder (`api/capability.rs`, the Go agent's token: an
+  authorized key's Ed25519 grant naming this worker, the run, optional outputs, expiry). Answers
+  the output's current bytes from the run's product log: `ETag: "r<rev>"`, `If-None-Match` 304,
+  one byte range (206/416), `Repr-Digest` once the run is terminal. Capability failures are 403,
+  an absent run or output 404.
 - Bindings are generated from `vendor/worker-protocol` (`SOURCE` names the commit).
 - `WIRE_MINOR = 72`, `WIRE_MINIMUM = 0`. Versions are reported, never used to refuse a peer.
   A missing operation returns `UNIMPLEMENTED` (`capability_unavailable: ...`) for that call only.
@@ -52,7 +58,8 @@ The bootstrap receipt is `{payload, hmac_sha256}`, where the HMAC covers
 is required. Hooks: `describe_runtime`, `list_packages`, `list_models`, `retain_bytes`,
 `release_bytes`, `begin_input_tree`, `workspace`, `submit`, `get`, `events[_observed]`,
 `control`, `list[_observed]`, `close_submission`, `collect`, `ack_collection`,
-`read_bytes`/`read_stream`, `uploads`, `prepare_local`, `read_machine_log`.
+`read_bytes`/`read_stream`, `uploads`, `prepare_local`, `read_machine_log`, `forget_package`,
+`open_output`.
 
 - `Observation` is set when the reader goes away. It only ends a wait. It has no run-control authority.
 - Event pages: default and max 256. Execution lists: default 64, max 256.
@@ -66,6 +73,8 @@ is required. Hooks: `describe_runtime`, `list_packages`, `list_models`, `retain_
   invocation digests itself. A callable that declares models needs the GPU pool, which prepares
   and binds a preparation. An empty `installation_id` resolves a published installation through
   the GPU pool.
+- `forget_package` (`org/name`) drops the calling owner's held model resolutions of that
+  package; installations are keyed by exact release and stay.
 - `read_machine_log` serves `MACHINE_LOG_TENSORFS_TRANSPORT`: the store's `logs/transport.log.1`
   then `transport.log`, optionally the newest `tail_bytes` from a line start, in 64 KiB chunks.
   Any other log is `NOT_FOUND`.

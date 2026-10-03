@@ -175,6 +175,24 @@ pub trait MachineBackend: Send + Sync + 'static {
     ) -> Result<Vec<pb::PrepareEvent>, Status> {
         unsupported()
     }
+    /// One run output's current bytes (`GET /v1/runs/{run}/outputs/{output}[/{index}]`).
+    /// `index` is a list item's 1-based index. The caller has verified a capability.
+    fn open_output(
+        &self,
+        _run: u64,
+        _output: &str,
+        _index: Option<u32>,
+    ) -> Result<OutputSnapshot, Status> {
+        unsupported()
+    }
+    /// The owner rebound or released `package`: drop what this machine read of it at its Hub.
+    fn forget_package(
+        &self,
+        _: VerifiedActor,
+        _: pb::ForgetPackageCall,
+    ) -> Result<pb::ForgetPackageResult, Status> {
+        unsupported()
+    }
     /// One kept log's bytes, oldest first (wire 72). A log not written yet is empty.
     fn read_machine_log(
         &self,
@@ -183,6 +201,16 @@ pub trait MachineBackend: Send + Sync + 'static {
     ) -> Result<Vec<u8>, Status> {
         unsupported()
     }
+}
+/// One consistent view of an output's current bytes: its parts in order.
+pub struct OutputSnapshot {
+    pub parts: Vec<(std::fs::File, u64)>,
+    pub length: u64,
+    /// The 1-based ordinal of this (output, index)'s products in the run's log.
+    pub rev: u64,
+    pub media_type: String,
+    /// `sha256:<hex>`, set once the run is terminal (the output is final).
+    pub sha256: Option<String>,
 }
 pub type NativeByteStream =
     Box<dyn Iterator<Item = Result<pb::NativeByteReadChunk, Status>> + Send>;
