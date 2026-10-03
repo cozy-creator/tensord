@@ -108,6 +108,7 @@ impl HeldGeneration {
             module: self.record.application.clone(),
             entrypoint: entrypoint.into(),
             input,
+            attention_kernel: String::new(),
         })
     }
     pub fn runner(&self) -> RunnerConfig {

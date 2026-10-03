@@ -43,6 +43,7 @@ fn run() -> io::Result<()> {
             let mut machine_config=None; let mut listen=None; let mut gpu_config=None;
             let mut installer_python=None; let mut client_wheel=None; let mut package_python="3.12".to_string();
             let mut budget=16*1024*1024; let mut ttl=300;
+            let mut sdk=cozy_machine::published::PackageSdk{uv:"uv".into(),..Default::default()};
             while let Some(arg)=args.next() {
                 match arg.as_str() {
                     "--state"=>root=args.next().map(PathBuf::from),
@@ -53,6 +54,9 @@ fn run() -> io::Result<()> {
                     "--installer-python"=>installer_python=args.next().map(PathBuf::from),
                     "--client-wheel"=>client_wheel=args.next().map(PathBuf::from),
                     "--package-python"=>package_python=args.next().ok_or_else(||io::Error::other("--package-python requires a Python version"))?,
+                    "--uv"=>sdk.uv=args.next().map(PathBuf::from).ok_or_else(||io::Error::other("--uv requires a path"))?,
+                    "--package-sdk"=>sdk.requirements.push(args.next().ok_or_else(||io::Error::other("--package-sdk requires a requirement or wheel"))?),
+                    "--package-find-links"=>sdk.find_links=args.next().map(PathBuf::from),
                     "--cpu-parallelism"=>parallelism=args.next().ok_or_else(||io::Error::other("--cpu-parallelism requires a count"))?.parse().map_err(io::Error::other)?,
                     "--host-bytes"=>budget=args.next().ok_or_else(||io::Error::other("--host-bytes requires bytes"))?.parse().map_err(io::Error::other)?,
                     "--cache-ttl-seconds"=>ttl=args.next().ok_or_else(||io::Error::other("--cache-ttl-seconds requires seconds"))?.parse().map_err(io::Error::other)?,
@@ -71,7 +75,8 @@ fn run() -> io::Result<()> {
             match (machine_config,listen) {
                 (Some(config),Some(listen))=>{
                     let identity=cozy_machine::api::MachineIdentity::retained(&cozy_machine::api::identity::MachineConfig::load(&config)?)?;
-                    start_api(&root,&generations,identity,std::net::TcpListener::bind(listen)?,&owner,&service,installer_python,client_wheel,package_python)?
+                    sdk.python=package_python.clone();
+                    start_api(&root,&generations,identity,std::net::TcpListener::bind(listen)?,&owner,&service,installer_python,client_wheel,package_python,sdk)?
                 }
                 (None,None)=>(),
                 _=>return Err(io::Error::other("--machine-config and --listen are required together")),
@@ -136,6 +141,7 @@ fn run_machine(mut grant: cozy_machine::machine::grant::Grant) -> io::Result<()>
         installer.0,
         installer.1,
         "3.12".into(),
+        cozy_machine::published::PackageSdk { uv: "uv".into(), python: "3.12".into(), ..Default::default() },
     )?;
     serve(owner, service, control)
 }
@@ -151,13 +157,15 @@ fn start_api(
     helper: Option<PathBuf>,
     wheel: Option<PathBuf>,
     python: String,
+    sdk: cozy_machine::published::PackageSdk,
 ) -> io::Result<()> {
     use cozy_machine::{api, machine_api::NativeBackend};
     let store = owner.lock().unwrap().store();
     let uploads = api::workspaces::WorkspaceUploads::open(&root.join("uploads"), store.clone())
         .map_err(io::Error::other)?;
     let mut backend =
-        NativeBackend::new(service.clone(), identity.authority.clone(), store, uploads);
+        NativeBackend::new(service.clone(), identity.authority.clone(), store.clone(), uploads);
+    backend.publisher = Some(cozy_machine::published::Publisher::new(&root.join("published"), sdk, store)?);
     backend.installer = match (helper, wheel) {
         (Some(helper_python), Some(client_wheel)) => Some(api::install::InstallerConfig {
             helper_python,

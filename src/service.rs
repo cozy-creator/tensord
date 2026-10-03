@@ -126,6 +126,7 @@ impl Service {
         generation: &str,
         entrypoint: &str,
         input: Value,
+        attention_kernel: &str,
         boot: &str,
     ) -> io::Result<Execution> {
         let stopped = self.stopped.lock().unwrap();
@@ -133,11 +134,9 @@ impl Service {
             return Err(io::Error::other("machine is stopping"));
         }
         let held = self.catalog.resolve(generation)?;
-        let record = self.engine.submit_public_on_boot(
-            context,
-            held.invocation(entrypoint, input)?,
-            boot,
-        )?;
+        let mut invocation = held.invocation(entrypoint, input)?;
+        invocation.attention_kernel = attention_kernel.into();
+        let record = self.engine.submit_public_on_boot(context, invocation, boot)?;
         self.retain(&record, held.retention());
         Ok(record)
     }

@@ -96,6 +96,7 @@ fn complete(journal: &mut Journal, n: usize, generation: &str, birth: ProcessBir
         .accept_public(
             context,
             Invocation {
+                attention_kernel: String::new(),
                 package: "fixture".into(),
                 generation: generation.into(),
                 module: "fixture:app".into(),

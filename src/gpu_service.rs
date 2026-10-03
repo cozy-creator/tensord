@@ -38,7 +38,7 @@ pub enum SourceMode {
     Descriptors,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ModelGrant {
     pub package: String,
     pub slot: String,
@@ -79,8 +79,10 @@ pub struct GpuConfig {
     pub memory: MemoryConfig,
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
-    /// Explicit authority for already verified cached catalog bytes. Hub download/grant
-    /// resolution is a separate operation; a cache hit alone grants no private model.
+    /// Explicit authority for already verified cached catalog bytes, for runs without a
+    /// Hub. Published runs resolve under the owner's Hub access instead; a cache hit alone
+    /// grants no private model.
+    #[serde(default)]
     pub models: Vec<ModelGrant>,
     #[serde(default)]
     pub packages: Vec<PublishedPackage>,
@@ -90,10 +92,10 @@ pub struct GpuConfig {
 impl GpuConfig {
     pub fn load(path: &Path) -> io::Result<Self> {
         let config: Self = serde_json::from_reader(File::open(path)?).map_err(io::Error::other)?;
-        if config.devices.is_empty() || config.devices.contains(',') || config.models.is_empty() {
+        if config.devices.is_empty() || config.devices.contains(',') {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "GPU scope requires one configured device and cached-model authority",
+                "GPU scope requires one configured device",
             ));
         }
         if config
@@ -280,14 +282,16 @@ impl GpuPool {
             .map(Some)
     }
 
-    /// Derive a binding from the installed SDK's real static interface and configured
-    /// cached byte authority. No model code executes during description/preparation.
+    /// Derive a binding from the installed SDK's real static interface and the model the
+    /// Hub resolved under the owner's access (or configured cached byte authority). No
+    /// model code executes during description/preparation.
     pub fn prepare_root(
         &self,
         actor: &str,
         installed: &crate::journal::Installation,
         entrypoint: &str,
         choices: &[crate::api::pb::ModelChoice],
+        resolved: Option<&ModelGrant>,
     ) -> io::Result<GpuPlan> {
         let interface: serde_json::Value =
             serde_json::from_slice(&installed.interface).map_err(io::Error::other)?;
@@ -358,10 +362,9 @@ impl GpuPool {
                 ));
             }
         }
-        let grants: Vec<_> = self
-            .config
-            .models
-            .iter()
+        let grants: Vec<_> = resolved
+            .into_iter()
+            .chain(self.config.models.iter().filter(|_| resolved.is_none()))
             .filter(|grant| {
                 grant.package == installed.package
                     && grant.slot == path
@@ -933,7 +936,7 @@ impl GpuPool {
                 entrypoint: plan.entrypoint,
                 spool: spool.clone(),
                 deadline_s: None,
-                attention_kernel: String::new(),
+                attention_kernel: record.invocation.attention_kernel.clone(),
                 plane_budget_bytes,
                 stages: false,
                 cap_bytes,

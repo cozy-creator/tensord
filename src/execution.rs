@@ -224,6 +224,10 @@ impl Engine {
     pub fn installations(&self, actor: &str) -> io::Result<Vec<crate::journal::Installation>> {
         self.journal.lock().unwrap().installations(actor)
     }
+    /// Short journal reads and writes that need no execution state transition.
+    pub fn with_journal<T>(&self, f: impl FnOnce(&mut Journal) -> io::Result<T>) -> io::Result<T> {
+        f(&mut self.journal.lock().unwrap())
+    }
     pub fn bind_installation(
         &self,
         record: crate::journal::Installation,

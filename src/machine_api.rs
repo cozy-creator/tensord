@@ -31,6 +31,7 @@ pub struct NativeBackend {
     pub store: Arc<Store>,
     pub uploads: Arc<WorkspaceUploads>,
     pub installer: Option<crate::api::install::InstallerConfig>,
+    pub publisher: Option<Arc<crate::published::Publisher>>,
     // Serialize native projection, not inference or observation. Only one result
     // projection may establish a given immutable output's native custody at once.
     projection: Mutex<()>,
@@ -49,6 +50,7 @@ impl NativeBackend {
             store,
             uploads,
             installer: None,
+            publisher: None,
             projection: Mutex::new(()),
             installation: Mutex::new(()),
         }
@@ -348,7 +350,62 @@ impl NativeBackend {
             .map_err(|_| Status::data_loss("durable event projection is corrupt"))
     }
 }
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+impl NativeBackend {
+    /// This owner's usable access at a Hub: present, bound to this leaf, unexpired.
+    fn hub_grant(&self, actor: &str, origin: &str) -> Result<crate::hub::Grant, Status> {
+        let key = crate::hub::origin_key(origin)
+            .filter(|_| crate::hub::valid_origin(origin))
+            .ok_or_else(|| Status::invalid_argument("release root names an invalid Hub origin"))?;
+        let grant = self
+            .service
+            .engine
+            .with_journal(|j| j.hub_grant(actor, &key))
+            .map_err(problem)?
+            .filter(|g| g.leaf == sha256::hex(&self.authority.leaf_digest))
+            .ok_or_else(|| refusal("hub_access_absent", &format!("this machine holds no execution access for {origin}; the next run from a signed-in CLI delivers it")))?;
+        if grant.expired(unix_now()) {
+            return Err(refusal("hub_access_expired", &format!("execution access for {origin} has expired; the next run from a signed-in CLI renews it")));
+        }
+        Ok(grant)
+    }
+}
 impl MachineBackend for NativeBackend {
+    fn hub_access(
+        &self,
+        actor: VerifiedActor,
+        mut access: crate::hub::Access,
+    ) -> Result<(String, i64), crate::api::backend::HubAccessRefusal> {
+        access.origin = access.origin.trim_end_matches('/').to_string();
+        crate::hub::validate(&access, unix_now()).map_err(|m| (400, "invalid_access", m.to_string()))?;
+        let key = crate::hub::origin_key(&access.origin).expect("validated origin");
+        let (origin, expires_at) = (access.origin.clone(), access.expires_at);
+        let grant = crate::hub::Grant {
+            principal: crate::hub::principal(&access.token),
+            leaf: sha256::hex(&self.authority.leaf_digest),
+            access,
+        };
+        match self.service.engine.with_journal(|j| j.put_hub_grant(&actor_id(actor), &key, &grant)) {
+            Ok(true) => Ok((origin, expires_at)),
+            Ok(false) => Err((409, "hub_access_principal_conflict", "this machine holds another account at this Hub; remove its access with DELETE /v1/hubs/access".into())),
+            Err(_) => Err((503, "hub_access_unavailable", "cannot retain the Hub access grant".into())),
+        }
+    }
+    fn forget_hub_access(&self, actor: VerifiedActor, origin: &str) -> Result<(), crate::api::backend::HubAccessRefusal> {
+        let key = crate::hub::origin_key(origin)
+            .filter(|_| crate::hub::valid_origin(origin))
+            .ok_or((400, "invalid_access", "send one valid Hub origin".to_string()))?;
+        // Accepted work needs no Hub: removal never waits on it.
+        self.service
+            .engine
+            .with_journal(|j| j.forget_hub_grant(&actor_id(actor), &key))
+            .map_err(|_| (503, "hub_access_unavailable", "cannot remove the Hub access grant".to_string()))
+    }
     fn begin_input_tree(
         &self,
         actor: VerifiedActor,
@@ -569,56 +626,32 @@ impl MachineBackend for NativeBackend {
         let root = request.release_root.as_ref().ok_or_else(|| {
             Status::unimplemented("captured offers are not qualified by this CPU build")
         })?;
-        if !root.hub.is_empty() || !request.hub.is_empty() {
-            return Err(Status::unimplemented(
-                "scoped Hub grant routing is not qualified by this build",
-            ));
+        let offer = request
+            .offer
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("request offer absent"))?;
+        let actor = actor_id(actor);
+        // A replay of accepted work needs nothing from the Hub, even after access expired.
+        if let Some(prior) = self
+            .service
+            .engine
+            .with_journal(|j| j.accepted_public(&actor, &offer.request_id, &request.submission_id))
+            .map_err(problem)?
+        {
+            if request.expected_execution_workspace_id != self.workspace_id() {
+                return Err(refusal("execution_workspace_changed", "the requested execution journal is not this workspace"));
+            }
+            return self.receipt(&prior);
         }
         if !root.inputs.is_empty()
             || !root.input_access.is_empty()
             || root.job
             || root.deadline_unix_ms != 0
-            || !root.attention_kernel.is_empty()
             || root.capture.is_some()
             || !request.publication_authorization_id.is_empty()
         {
             return Err(Status::unimplemented("this application slice supports callable roots without asset inputs, deadlines or publication"));
         }
-        let actor = actor_id(actor);
-        let installed = if root.installation_id.is_empty() {
-            self.service
-                .gpu()
-                .ok_or_else(|| {
-                    Status::unimplemented(
-                        "published cache-only GPU package execution is not configured",
-                    )
-                })?
-                .published_installation(&self.service, &actor, &root.package, &root.release)
-                .map_err(problem)?
-        } else {
-            self.service
-                .engine
-                .installation(&actor, &root.installation_id)
-                .map_err(problem)?
-        }
-        .ok_or_else(|| {
-            refusal(
-                "release_root_installation_absent",
-                "this owner has not prepared the named installation",
-            )
-        })?;
-        if (root.installation_id.is_empty() && root.release != installed.release)
-            || (!root.installation_id.is_empty() && !root.release.is_empty())
-            || (!root.package.is_empty() && root.package != installed.package)
-        {
-            return Err(Status::invalid_argument(
-                "release root differs from its held installation",
-            ));
-        }
-        let offer = request
-            .offer
-            .as_ref()
-            .ok_or_else(|| Status::invalid_argument("request offer absent"))?;
         if !request.capture_digest.is_empty()
             || !request.capture_canonical_bytes.is_empty()
             || request.prepared_state.is_some()
@@ -628,17 +661,81 @@ impl MachineBackend for NativeBackend {
                 "release root carries an independently prepared offer",
             ));
         }
+        let (installed, published_plan) = if !root.hub.is_empty() {
+            if !root.installation_id.is_empty() || root.package.is_empty() || root.release.is_empty() {
+                return Err(Status::invalid_argument("a published root names its package and release"));
+            }
+            let grant = self.hub_grant(&actor, &root.hub)?;
+            let publisher = self.publisher.as_ref().ok_or_else(|| {
+                Status::unimplemented("published package preparation is not configured on this machine")
+            })?;
+            let published = crate::published::Request {
+                grant,
+                package: root.package.clone(),
+                release: root.release.clone(),
+                entrypoint: root.entrypoint.clone(),
+                choices: root.models.clone(),
+            };
+            match publisher.prepare(&self.service, &actor, &request.submission_id, published) {
+                crate::published::Progress::Ready(prepared) => (prepared.installation.clone(), Some(prepared.plan.clone())),
+                crate::published::Progress::Failed(code, detail) => return Err(refusal(code, &format!("{code}: {detail}"))),
+                crate::published::Progress::Preparing { stage, moved, total } => {
+                    let mut status = Status::unavailable(stage);
+                    status.metadata_mut().insert("cozy-error-code", "release_root_preparing".parse().expect("ASCII"));
+                    if total > 0 {
+                        if let Ok(value) = format!("{moved} {total}").parse() {
+                            status.metadata_mut().insert("cozy-progress-bytes", value);
+                        }
+                    }
+                    return Err(status);
+                }
+            }
+        } else {
+            let installed = if root.installation_id.is_empty() {
+                self.service
+                    .gpu()
+                    .ok_or_else(|| {
+                        Status::unimplemented(
+                            "published cache-only GPU package execution is not configured",
+                        )
+                    })?
+                    .published_installation(&self.service, &actor, &root.package, &root.release)
+                    .map_err(problem)?
+            } else {
+                self.service
+                    .engine
+                    .installation(&actor, &root.installation_id)
+                    .map_err(problem)?
+            }
+            .ok_or_else(|| {
+                refusal(
+                    "release_root_installation_absent",
+                    "this owner has not prepared the named installation",
+                )
+            })?;
+            if (root.installation_id.is_empty() && root.release != installed.release)
+                || (!root.installation_id.is_empty() && !root.release.is_empty())
+                || (!root.package.is_empty() && root.package != installed.package)
+            {
+                return Err(Status::invalid_argument(
+                    "release root differs from its held installation",
+                ));
+            }
+            (installed, None)
+        };
         let interface: Value = serde_json::from_slice(&installed.interface)
             .map_err(|_| Status::data_loss("held installation interface is corrupt"))?;
         let entry = entrypoint(&interface, &root.entrypoint)?;
-        let gpu_plan = if entry
+        let gpu_plan = if let Some(plan) = published_plan {
+            plan
+        } else if entry
             .get("models")
             .and_then(Value::as_array)
             .is_some_and(|models| !models.is_empty())
         {
             let gpu = self.service.gpu().ok_or_else(|| Status::unimplemented("this installed callable needs the GPU execution operation; CPU peers remain usable"))?;
             let plan = gpu
-                .prepare_root(&actor, &installed, &root.entrypoint, &root.models)
+                .prepare_root(&actor, &installed, &root.entrypoint, &root.models, None)
                 .map_err(problem)?;
             self.service
                 .engine
@@ -661,10 +758,16 @@ impl MachineBackend for NativeBackend {
         };
         let input: Value = crate::boundary_json::parse(&request.payload_canonical_bytes)
             .map_err(|_| Status::invalid_argument("payload is invalid JSON"))?;
+        if !input.is_object() {
+            return Err(refusal("invalid_request", "the payload must be a JSON object of the function's parameters"));
+        }
         let canonical_input = canonical(&input)?;
         let payload_digest = format!("sha256:{}", sha256::hex(&sha256::digest(&canonical_input)));
         let binding = identity(entry)?;
         let mut spec = json!({"format":"cozy.worker.v1.InvocationSpec/1","installation_id":installed.alias,"payload_digest":payload_digest,"serving":{"entrypoint_binding_digest":binding,"attempt_binding_id":binding,"bindings_digest":binding}});
+        if !root.attention_kernel.is_empty() {
+            spec["attention_kernel"] = json!(root.attention_kernel);
+        }
         if let Some(plan) = &gpu_plan {
             spec["model_preparation"] = json!(plan.id);
         }
@@ -693,6 +796,7 @@ impl MachineBackend for NativeBackend {
                 &installed.generation,
                 &root.entrypoint,
                 input,
+                &root.attention_kernel,
                 &self.authority.boot_id,
             )
             .map_err(problem)?;

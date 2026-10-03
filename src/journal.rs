@@ -18,6 +18,9 @@ pub struct Invocation {
     pub module: String,
     pub entrypoint: String,
     pub input: Value,
+    /// The caller's attention-kernel pin, passed to the executor verbatim.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub attention_kernel: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -269,6 +272,8 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS public_terminals(execution INTEGER PRIMARY KEY REFERENCES executions(id),outcome BLOB NOT NULL,events BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS native_outputs(actor TEXT NOT NULL,owner TEXT NOT NULL,source BLOB NOT NULL,PRIMARY KEY(actor,owner));
             CREATE TABLE IF NOT EXISTS input_intakes(actor TEXT NOT NULL,retention TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,retention));
+            CREATE TABLE IF NOT EXISTS hub_access(actor TEXT NOT NULL,origin TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,origin));
+            CREATE TABLE IF NOT EXISTS resolutions(actor TEXT NOT NULL,key TEXT NOT NULL,package TEXT NOT NULL,preparation TEXT NOT NULL,PRIMARY KEY(actor,key));
             CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_request ON executions(actor,request_id) WHERE actor IS NOT NULL;
             CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_submission ON executions(actor,submission_id) WHERE actor IS NOT NULL;
             CREATE INDEX IF NOT EXISTS executions_actor_order ON executions(actor,id) WHERE actor IS NOT NULL;").map_err(db_error)?;
@@ -486,6 +491,58 @@ impl Journal {
         Ok(record)
     }
 
+    pub fn hub_grant(&self, actor: &str, origin: &str) -> io::Result<Option<crate::hub::Grant>> {
+        self.connection
+            .query_row("SELECT record FROM hub_access WHERE actor=?1 AND origin=?2", params![actor, origin], |r| r.get::<_, String>(0))
+            .optional()
+            .map_err(db_error)?
+            .map(|record| serde_json::from_str(&record).map_err(db_error))
+            .transpose()
+    }
+    /// Retains a grant unless this owner already holds another account at the origin.
+    pub fn put_hub_grant(&mut self, actor: &str, origin: &str, grant: &crate::hub::Grant) -> io::Result<bool> {
+        if self.hub_grant(actor, origin)?.is_some_and(|prior| prior.principal != grant.principal) {
+            return Ok(false);
+        }
+        self.connection
+            .execute("INSERT OR REPLACE INTO hub_access(actor,origin,record) VALUES(?1,?2,?3)", params![actor, origin, encoded(grant)?])
+            .map_err(db_error)?;
+        Ok(true)
+    }
+    pub fn forget_hub_grant(&mut self, actor: &str, origin: &str) -> io::Result<()> {
+        self.connection.execute("DELETE FROM hub_access WHERE actor=?1 AND origin=?2", params![actor, origin]).map_err(db_error)?;
+        Ok(())
+    }
+    pub fn resolution(&self, actor: &str, key: &str) -> io::Result<Option<String>> {
+        self.connection
+            .query_row("SELECT preparation FROM resolutions WHERE actor=?1 AND key=?2", params![actor, key], |r| r.get(0))
+            .optional()
+            .map_err(db_error)
+    }
+    pub fn bind_resolution(&mut self, actor: &str, key: &str, package: &str, preparation: &str) -> io::Result<()> {
+        self.connection
+            .execute("INSERT OR REPLACE INTO resolutions(actor,key,package,preparation) VALUES(?1,?2,?3,?4)", params![actor, key, package, preparation])
+            .map_err(db_error)?;
+        Ok(())
+    }
+    /// Drops cached model resolutions of a package: the next run reads its bindings again.
+    pub fn forget_resolutions(&mut self, actor: &str, package: &str) -> io::Result<()> {
+        self.connection.execute("DELETE FROM resolutions WHERE actor=?1 AND package=?2", params![actor, package]).map_err(db_error)?;
+        Ok(())
+    }
+    /// The accepted public execution a submission or request already names, if any.
+    pub fn accepted_public(&self, actor: &str, request_id: &str, submission_id: &str) -> io::Result<Option<Execution>> {
+        let record: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT record FROM executions WHERE actor=?1 AND (request_id=?2 OR submission_id=?3) LIMIT 1",
+                params![actor, request_id, submission_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        record.map(|r| serde_json::from_str(&r).map_err(db_error)).transpose()
+    }
     pub fn preparation(&self, actor: &str, id: &str) -> io::Result<Option<Preparation>> {
         self.connection
             .query_row(

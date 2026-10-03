@@ -1,7 +1,9 @@
 use super::{auth::Authority, backend::MachineBackend, pb, WIRE_MINIMUM, WIRE_MINOR};
 use crate::machine::receipt::{self, Readiness};
 use axum::{
+    body::Bytes,
     http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response as HttpResponse},
     routing::get,
 };
 use std::{
@@ -79,6 +81,7 @@ pub async fn serve<B: MachineBackend>(
         backend,
         control_epoch: Arc::new(AtomicU64::new(0)),
     };
+    let (post_access, delete_access) = (service.clone(), service.clone());
     let mut routes = tonic::service::Routes::new(
         pb::pod_host_server::PodHostServer::new(service.clone())
             .max_decoding_message_size(16 << 20)
@@ -100,6 +103,17 @@ pub async fn serve<B: MachineBackend>(
                 } else {
                     StatusCode::NO_CONTENT
                 }
+            }),
+        )
+        .route(
+            "/v1/hubs/access",
+            axum::routing::post(move |headers: HeaderMap, body: Bytes| {
+                let api = post_access.clone();
+                async move { api.hub_access(headers, body, false).await }
+            })
+            .delete(move |headers: HeaderMap, body: Bytes| {
+                let api = delete_access.clone();
+                async move { api.hub_access(headers, body, true).await }
             }),
         )
         .route(
@@ -222,6 +236,57 @@ impl<B: MachineBackend> Api<B> {
             .await
             .map_err(|_| Status::internal("machine backend operation stopped"))?
             .map(Response::new)
+    }
+}
+
+impl<B: MachineBackend> Api<B> {
+    /// The Go agent's scoped-access contract: an owner-signed `hub-access` capability,
+    /// one JSON body, and typed refusals. Unknown body members are ignored.
+    async fn hub_access(&self, headers: HeaderMap, body: Bytes, forget: bool) -> HttpResponse {
+        let refuse = |status: u16, code: &str, message: &str| {
+            let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST);
+            let body = serde_json::json!({"error":{"code":code,"message":message}});
+            (status, [("content-type", "application/json")], body.to_string()).into_response()
+        };
+        let token = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Cozy-Cap "))
+            .unwrap_or_default();
+        let authority = &self.identity.authority;
+        let Some(key) = crate::hub::verify_capability(token, &authority.worker_id, &authority.keys, now_ms() as i64 / 1000, crate::hub::ACTION) else {
+            return refuse(403, "capability_required", "a hub-access capability is required");
+        };
+        if body.len() > 64 << 10 {
+            return refuse(400, "invalid_access", "Hub access body exceeds 64 KiB");
+        }
+        let actor = super::auth::VerifiedActor { public_key: key.to_bytes() };
+        let backend = self.backend.clone();
+        let answer = tokio::task::spawn_blocking(move || {
+            if forget {
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Forget {
+                    origin: String,
+                }
+                let request: Forget = serde_json::from_slice(&body).map_err(|_| (400, "invalid_access", "send one valid Hub origin".to_string()))?;
+                backend.forget_hub_access(actor, &request.origin).map(|()| None)
+            } else {
+                let access: crate::hub::Access = serde_json::from_slice(&body).map_err(|_| (400, "invalid_access", "invalid Hub access grant".to_string()))?;
+                backend.hub_access(actor, access).map(Some)
+            }
+        })
+        .await;
+        match answer {
+            Ok(Ok(None)) => StatusCode::NO_CONTENT.into_response(),
+            Ok(Ok(Some((origin, expires_at)))) => (
+                [("content-type", "application/json")],
+                serde_json::json!({"origin":origin,"expires_at":expires_at}).to_string(),
+            )
+                .into_response(),
+            Ok(Err((status, code, message))) => refuse(status, code, &message),
+            Err(_) => refuse(503, "hub_access_unavailable", "Hub access operation stopped"),
+        }
     }
 }
 

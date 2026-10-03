@@ -10,7 +10,17 @@ use std::sync::{
 };
 use tonic::Status;
 
+/// An HTTP refusal of `/v1/hubs/access`: status, stable code, message.
+pub type HubAccessRefusal = (u16, &'static str, String);
+
 pub trait MachineBackend: Send + Sync + 'static {
+    /// Retains delegated Hub access for this owner key; answers the retained origin.
+    fn hub_access(&self, _: VerifiedActor, _: crate::hub::Access) -> Result<(String, i64), HubAccessRefusal> {
+        Err((404, "capability_unavailable", "this machine does not accept Hub access".into()))
+    }
+    fn forget_hub_access(&self, _: VerifiedActor, _: &str) -> Result<(), HubAccessRefusal> {
+        Err((404, "capability_unavailable", "this machine does not accept Hub access".into()))
+    }
     fn describe_runtime(&self, _: VerifiedActor) -> Result<pb::MachineRuntime, Status> {
         unsupported()
     }
