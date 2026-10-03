@@ -128,9 +128,12 @@ fn published_models_alternate_on_one_gpu_under_the_memory_policy() {
             .submit_public(
                 context,
                 &installed.generation,
-                &model.entrypoint,
-                input.clone(),
-                "",
+                cozy_machine::service::Call {
+                    entrypoint: model.entrypoint.clone(),
+                    input: input.clone(),
+                    attention_kernel: String::new(),
+                    inputs: vec![],
+                },
                 "",
             )
             .unwrap();
