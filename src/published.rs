@@ -57,16 +57,42 @@ pub struct Request {
     pub source: hub::Source,
     pub package: String,
     pub release: String,
+    /// Unpublished code this machine already holds, in place of the release.
+    pub installed: Option<Installation>,
+    /// The account an unpublished package's org-relative model names belong to.
+    pub owner: String,
+    /// The owner's binding revision the caller knows: a held resolution made under another
+    /// revision resolves again.
+    pub binding_revision: String,
     pub entrypoint: String,
     pub choices: Vec<pb::ModelChoice>,
 }
 
+/// Where a preparation's stage and bytes are reported as they change.
+pub type Observer = Box<dyn Fn(&str, u64, u64) + Send + Sync>;
+
+#[derive(Default)]
 struct Job {
     progress: Mutex<Progress>,
     changed: Condvar,
+    observer: Option<Observer>,
+}
+impl Default for Progress {
+    fn default() -> Self {
+        Progress::Preparing {
+            stage: String::new(),
+            moved: 0,
+            total: 0,
+        }
+    }
 }
 impl Job {
     fn set(&self, progress: Progress) {
+        if let (Some(observe), Progress::Preparing { stage, moved, total }) =
+            (&self.observer, &progress)
+        {
+            observe(stage, *moved, *total);
+        }
         *self.progress.lock().unwrap() = progress;
         self.changed.notify_all();
     }
@@ -79,10 +105,15 @@ impl Job {
     }
     fn bytes(&self, moved: u64, total: u64) {
         if let Progress::Preparing {
-            moved: m, total: t, ..
+            stage,
+            moved: m,
+            total: t,
         } = &mut *self.progress.lock().unwrap()
         {
             (*m, *t) = (moved, total);
+            if let Some(observe) = &self.observer {
+                observe(stage, moved, total);
+            }
         }
     }
 }
@@ -127,11 +158,14 @@ impl Publisher {
                 .or_insert_with(|| {
                     let job = Arc::new(Job {
                         progress: Mutex::new(Progress::Preparing {
-                            stage: format!("preparing {}@{}", request.package, request.release),
+                            stage: match &request.installed {
+                                Some(installed) => format!("preparing {}", installed.package),
+                                None => format!("preparing {}@{}", request.package, request.release),
+                            },
                             moved: 0,
                             total: 0,
                         }),
-                        changed: Condvar::new(),
+                        ..Default::default()
                     });
                     let (this, service, actor, worker) = (
                         self.clone(),
@@ -173,7 +207,29 @@ impl Publisher {
         answer
     }
 
+    /// One run's preparation on the calling thread, reported through `observe`: a held
+    /// installation and resolution answer at once.
+    pub fn prepare_now(
+        &self,
+        service: &Arc<Service>,
+        actor: &str,
+        request: &Request,
+        observe: Observer,
+    ) -> Result<Prepared, Failure> {
+        if let Ok(Some(prepared)) = self.held(service, actor, request) {
+            return Ok(prepared);
+        }
+        let job = Job {
+            observer: Some(observe),
+            ..Default::default()
+        };
+        self.work(service, actor, request, &job)
+    }
+
     fn alias(&self, request: &Request) -> String {
+        if let Some(installed) = &request.installed {
+            return installed.alias.clone();
+        }
         let origin = hub::origin_key(&request.source.origin).unwrap_or_default();
         let sdk = format!(
             "{:?}{:?}{:?}",
@@ -213,7 +269,8 @@ impl Publisher {
                 ])
             })
             .collect();
-        let key = json!({"installation":alias,"entrypoint":request.entrypoint,"choices":choices,"gpu":gpu});
+        let origin = hub::origin_key(&request.source.origin).unwrap_or_default();
+        let key = json!({"installation":alias,"hub":origin,"owner":request.owner,"bindings":request.binding_revision,"entrypoint":request.entrypoint,"choices":choices,"gpu":gpu});
         format!("hub-{}", sha256::hex_digest(key.to_string().as_bytes()))
     }
 
@@ -224,7 +281,11 @@ impl Publisher {
         actor: &str,
         request: &Request,
     ) -> io::Result<Option<Prepared>> {
-        let Some(installation) = service.engine.installation(actor, &self.alias(request))? else {
+        let held = match &request.installed {
+            Some(installed) => Some(installed.clone()),
+            None => service.engine.installation(actor, &self.alias(request))?,
+        };
+        let Some(installation) = held else {
             return Ok(None);
         };
         if service.catalog.resolve(&installation.generation).is_err() {
@@ -269,12 +330,21 @@ impl Publisher {
         job: &Job,
     ) -> Result<Prepared, Failure> {
         let catalog = Catalog::new(&request.source).map_err(|e| ("catalog_read_failed", e.0))?;
-        let installation = match service
-            .engine
-            .installation(actor, &self.alias(request))
-            .map_err(io_failure)?
-        {
+        let held = match &request.installed {
+            Some(installed) => Some(installed.clone()),
+            None => service
+                .engine
+                .installation(actor, &self.alias(request))
+                .map_err(io_failure)?,
+        };
+        let installation = match held {
             Some(held) if service.catalog.resolve(&held.generation).is_ok() => held,
+            _ if request.installed.is_some() => {
+                return Err((
+                    "release_root_installation_absent",
+                    "this owner has not prepared the named installation".into(),
+                ))
+            }
             _ => self.install(service, actor, request, &catalog, job)?,
         };
         if !declares_models(&installation, &request.entrypoint) {
@@ -616,7 +686,10 @@ impl Publisher {
             ))?;
         let gpu_model = gpu_name(&gpu.config().envelope()[0]);
         let width = gpu.width();
-        let (org, name) = request.package.split_once('/').unwrap_or_default();
+        let (org, name) = installation.package.split_once('/').unwrap_or_default();
+        // Unpublished code (local/) has no owner bindings; its org-relative names are its owner's.
+        let local = org == "local";
+        let account = if local { request.owner.as_str() } else { org };
         let mut bindings: Option<Value> = None;
         let mut grants = vec![];
         // The widest fitting rung's GPU count is the group's width (Runtime
@@ -653,7 +726,7 @@ impl Publisher {
                     false,
                 )
             } else {
-                if bindings.is_none() {
+                if bindings.is_none() && !local {
                     bindings = Some(
                         catalog
                             .json(&format!(
@@ -671,14 +744,20 @@ impl Publisher {
                     .and_then(|rows| rows.iter().find(|row| row.get("slot").and_then(Value::as_str) == Some(path.as_str())))
                     .cloned()
                     .or_else(|| authored(slot))
-                    .ok_or(("model_binding_absent", format!("{} binds no model to {path}; bind one with `cozy package bind`", request.package)))?;
+                    .ok_or(("model_binding_absent", format!("{} binds no model to {path}; bind one with `cozy package bind`", installation.package)))?;
                 let mut model = row
                     .get("model")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
                 if !model.contains('/') && !model.is_empty() {
-                    model = format!("{org}/{model}");
+                    if account.is_empty() {
+                        return Err((
+                            "model_binding_absent",
+                            format!("{path} names its owner's model and this run names no owner"),
+                        ));
+                    }
+                    model = format!("{account}/{model}");
                 }
                 let (lane, gpus) = rung(row.get("ladder"), &gpu_model, width).ok_or((
                     "model_binding_absent",
@@ -1063,7 +1142,7 @@ fn model_slots(interface: &Value, entrypoint: &str) -> Option<Vec<Value>> {
         .cloned()
 }
 
-fn declares_models(installation: &Installation, entrypoint: &str) -> bool {
+pub fn declares_models(installation: &Installation, entrypoint: &str) -> bool {
     serde_json::from_slice(&installation.interface)
         .ok()
         .and_then(|i: Value| model_slots(&i, entrypoint))

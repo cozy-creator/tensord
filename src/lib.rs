@@ -28,5 +28,6 @@ pub mod protocol;
 pub mod reclaim;
 pub mod published;
 pub mod resident_custody;
+pub mod runs;
 pub mod service;
 pub mod triage;

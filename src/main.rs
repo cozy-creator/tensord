@@ -320,7 +320,7 @@ fn start_api(
     backend.publisher = Some(cozy_machine::published::Publisher::new(
         &root.join("published"),
         sdk,
-        store,
+        store.clone(),
     )?);
     backend.installer = match (helper, wheel) {
         (Some(helper_python), Some(client_wheel)) => Some(api::install::InstallerConfig {
@@ -337,6 +337,24 @@ fn start_api(
             ))
         }
     };
+    let objects = Arc::new(cozy_machine::objects::Objects::new(
+        &root.join("writes"),
+        store.clone(),
+        service.engine.clone(),
+    )?);
+    backend.runs = Some(Arc::new(cozy_machine::runs::Runs {
+        service: service.clone(),
+        objects: objects.clone(),
+        publisher: backend.publisher.clone(),
+        local: backend.installer.clone().map(|installer| {
+            Arc::new(cozy_machine::local_source::LocalSources::new(
+                objects,
+                installer,
+                store.clone(),
+            ))
+        }),
+        own_hub: backend.own_hub.clone(),
+    }));
     listener.set_nonblocking(true)?;
     #[derive(serde::Serialize)]
     struct Ready<'a> {

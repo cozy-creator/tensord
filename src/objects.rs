@@ -88,9 +88,7 @@ impl Objects {
             sha256: hex.clone(),
             length,
         };
-        let dir = self
-            .root
-            .join(&sha256::hex_digest(actor.as_bytes())[..32]);
+        let dir = self.root.join(&sha256::hex_digest(actor.as_bytes())[..32]);
         let part = dir.join(format!("{hex}.part"));
         let mut writer = Writer {
             objects: self,
@@ -127,12 +125,9 @@ impl Objects {
                 format!("this machine holds {} bytes of the object", writer.held),
             ));
         }
-        self.store.admits(length - writer.held).map_err(|e| {
-            refused(
-                "machine_disk_full",
-                format!("no room for the object: {e}"),
-            )
-        })?;
+        self.store
+            .admits(length - writer.held)
+            .map_err(|e| refused("machine_disk_full", format!("no room for the object: {e}")))?;
         writer.file = Some(file);
         writer.skip = writer.held - offset;
         Ok(writer)
@@ -210,7 +205,8 @@ mod tests {
     #[test]
     fn a_write_resumes_verifies_and_belongs_to_its_signer() {
         let root = std::env::temp_dir().join(format!("cm-objects-{}", uuid::Uuid::new_v4()));
-        let service = crate::service::Service::open(&root.join("state"), &root.join("g"), 1).unwrap();
+        let service =
+            crate::service::Service::open(&root.join("state"), &root.join("g"), 1).unwrap();
         let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
         let objects = Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap();
         let bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
@@ -221,10 +217,21 @@ mod tests {
         let mut first = objects.begin("alice", &digest, length, 0).unwrap();
         first.append(&bytes[..100_000]).unwrap();
         assert_eq!(first.finish().unwrap(), 100_000);
-        assert_eq!(objects.begin("alice", &digest, length, 0).unwrap().finish().unwrap(), 100_000);
+        assert_eq!(
+            objects
+                .begin("alice", &digest, length, 0)
+                .unwrap()
+                .finish()
+                .unwrap(),
+            100_000
+        );
         assert!(objects.path("alice", &digest).unwrap().is_none());
         assert_eq!(
-            objects.begin("alice", &digest, length, 200_000).err().unwrap().code,
+            objects
+                .begin("alice", &digest, length, 200_000)
+                .err()
+                .unwrap()
+                .code,
             "object_offset_ahead"
         );
         // A resend overlapping the held prefix skips it; the rest completes the object.
@@ -233,7 +240,10 @@ mod tests {
         assert_eq!(second.finish().unwrap(), length);
         let (path, held) = objects.path("alice", &digest).unwrap().unwrap();
         assert_eq!((fs::read(path).unwrap(), held), (bytes.clone(), length));
-        assert_eq!(objects.begin("alice", &digest, length, 0).unwrap().held(), length);
+        assert_eq!(
+            objects.begin("alice", &digest, length, 0).unwrap().held(),
+            length
+        );
 
         // Another signer learns nothing of it and must send the bytes itself.
         assert!(objects.path("bob", &digest).unwrap().is_none());

@@ -75,7 +75,11 @@ impl LocalSources {
     ) -> Result<Installation, Refused> {
         let alias = format!(
             "local-{}",
-            digest.strip_prefix("sha256:").unwrap_or_default().get(..32).unwrap_or_default()
+            digest
+                .strip_prefix("sha256:")
+                .unwrap_or_default()
+                .get(..32)
+                .unwrap_or_default()
         );
         let _installing = self.installing.lock().unwrap();
         if let Some(held) = service.engine.installation(actor, &alias)? {
@@ -183,7 +187,9 @@ mod tests {
 
     fn write(objects: &Objects, actor: &str, bytes: &[u8]) -> Member {
         let digest = format!("sha256:{}", sha256::hex_digest(bytes));
-        let mut writer = objects.begin(actor, &digest, bytes.len() as u64, 0).unwrap();
+        let mut writer = objects
+            .begin(actor, &digest, bytes.len() as u64, 0)
+            .unwrap();
         writer.append(bytes).unwrap();
         writer.finish().unwrap();
         Member {
@@ -208,7 +214,15 @@ mod tests {
         assert!(built.status.success());
         let helper = Command::new("uv")
             .current_dir(repo)
-            .args(["run", "--locked", "--extra", "test", "python", "-c", "import sys; print(sys.executable)"])
+            .args([
+                "run",
+                "--locked",
+                "--extra",
+                "test",
+                "python",
+                "-c",
+                "import sys; print(sys.executable)",
+            ])
             .output()
             .unwrap();
         let helper = String::from_utf8(helper.stdout).unwrap().trim().to_string();
@@ -221,8 +235,9 @@ mod tests {
         let state = root.join("state");
         let service = Service::open(&state, &root.join("generations"), 1).unwrap();
         let store = Arc::new(Store::ensure(&state.join("tensorfs")).unwrap());
-        let objects =
-            Arc::new(Objects::new(&root.join("writes"), store.clone(), service.engine.clone()).unwrap());
+        let objects = Arc::new(
+            Objects::new(&root.join("writes"), store.clone(), service.engine.clone()).unwrap(),
+        );
         let sources = LocalSources::new(
             objects.clone(),
             InstallerConfig {
@@ -237,7 +252,9 @@ mod tests {
         let mut archive = tar::Builder::new(Vec::new());
         let fixture = repo.join("tests/fixtures/cpu_input");
         for name in ["pyproject.toml", "package.toml", "cpu_input/__init__.py"] {
-            archive.append_path_with_name(fixture.join(name), name).unwrap();
+            archive
+                .append_path_with_name(fixture.join(name), name)
+                .unwrap();
         }
         let source = write(&objects, "alice", &archive.into_inner().unwrap());
         let manifest = serde_json::json!({
@@ -249,14 +266,23 @@ mod tests {
         let manifest = write(&objects, "alice", manifest.to_string().as_bytes());
 
         // Another signer cannot install what it did not write.
-        let refused = sources.install(&service, "bob", &manifest.digest).err().unwrap();
+        let refused = sources
+            .install(&service, "bob", &manifest.digest)
+            .err()
+            .unwrap();
         assert_eq!(refused.code, "local_source_incomplete");
 
-        let installed = sources.install(&service, "alice", &manifest.digest).unwrap();
+        let installed = sources
+            .install(&service, "alice", &manifest.digest)
+            .unwrap();
         assert_eq!(installed.package, "local/cozy-machine-cpu-input");
         let interface: serde_json::Value = serde_json::from_slice(&installed.interface).unwrap();
-        assert!(interface["entrypoints"].as_array().is_some_and(|e| !e.is_empty()));
-        let again = sources.install(&service, "alice", &manifest.digest).unwrap();
+        assert!(interface["entrypoints"]
+            .as_array()
+            .is_some_and(|e| !e.is_empty()));
+        let again = sources
+            .install(&service, "alice", &manifest.digest)
+            .unwrap();
         assert_eq!(again.generation, installed.generation);
         let _ = fs::remove_dir_all(root);
     }

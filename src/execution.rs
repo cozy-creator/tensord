@@ -183,10 +183,12 @@ impl Engine {
         File::open(root)?.sync_all()?;
         let incarnation = uuid::Uuid::new_v4().simple().to_string();
         crate::launch_identity::remove_stale_jit(&root.join("seal"), &incarnation);
+        let mut journal = Journal::open(root)?;
+        journal.interrupt_preparations()?;
         Ok(Arc::new(Self {
             root: root.to_path_buf(),
             incarnation,
-            journal: Mutex::new(Journal::open(root)?),
+            journal: Mutex::new(journal),
             active: Mutex::new(HashMap::new()),
             owned: Mutex::new(HashSet::new()),
             progress: Mutex::new(HashMap::new()),
@@ -367,6 +369,58 @@ impl Engine {
         drop(owned);
         self.notify_activity();
         Ok(record)
+    }
+
+    /// A run accepted before its preparation; true when new. Its preparation's progress is
+    /// observed like a supervised attempt's until it is prepared or ends.
+    pub fn accept_run(
+        &self,
+        actor: &str,
+        id: &str,
+        digest: &str,
+        invocation: Invocation,
+    ) -> io::Result<(Execution, bool)> {
+        let mut owned = self.owned.lock().unwrap();
+        let (record, new) = self
+            .journal
+            .lock()
+            .unwrap()
+            .accept_run(actor, id, digest, invocation)?;
+        if new {
+            owned.insert(record.id.clone());
+        }
+        drop(owned);
+        self.notify_activity();
+        Ok((record, new))
+    }
+
+    /// The preparing run names its code and models and becomes dispatchable.
+    pub fn bind_prepared(
+        &self,
+        id: &str,
+        invocation: Invocation,
+        preparation: &str,
+    ) -> io::Result<Execution> {
+        let record = self
+            .journal
+            .lock()
+            .unwrap()
+            .bind_prepared(id, invocation, preparation);
+        self.end_observation(id);
+        record
+    }
+
+    /// The preparing run ends undispatched (warm success or preparation failure).
+    pub fn end_preparation(&self, id: &str, outcome: Outcome) -> io::Result<Execution> {
+        let record = self.journal.lock().unwrap().end_preparation(id, outcome);
+        self.end_observation(id);
+        record
+    }
+
+    fn end_observation(&self, id: &str) {
+        self.progress.lock().unwrap().remove(id);
+        self.owned.lock().unwrap().remove(id);
+        self.notify_activity();
     }
 
     pub fn get_public(&self, actor: &str, request_id: &str) -> io::Result<Execution> {
@@ -591,7 +645,7 @@ impl Engine {
         Ok(record)
     }
 
-    pub(crate) fn observe_progress(
+    pub fn observe_progress(
         &self,
         id: &str,
         completed_units: u64,

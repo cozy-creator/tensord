@@ -435,9 +435,17 @@ impl Journal {
             .map_err(db_error)?;
         Ok(state)
     }
-    pub fn intake(&self, actor: &str, retention: &str) -> io::Result<Option<crate::native_inputs::IntakeState>> {
+    pub fn intake(
+        &self,
+        actor: &str,
+        retention: &str,
+    ) -> io::Result<Option<crate::native_inputs::IntakeState>> {
         self.connection
-            .query_row("SELECT record FROM input_intakes WHERE actor=?1 AND retention=?2", params![actor, retention], |r| r.get::<_, String>(0))
+            .query_row(
+                "SELECT record FROM input_intakes WHERE actor=?1 AND retention=?2",
+                params![actor, retention],
+                |r| r.get::<_, String>(0),
+            )
             .optional()
             .map_err(db_error)?
             .map(|record| serde_json::from_str(&record).map_err(db_error))
@@ -669,7 +677,11 @@ impl Journal {
             .optional()
             .map_err(db_error)
     }
-    pub fn bind_object(&mut self, actor: &str, object: &tensorfs_core::ids::ObjectRef) -> io::Result<()> {
+    pub fn bind_object(
+        &mut self,
+        actor: &str,
+        object: &tensorfs_core::ids::ObjectRef,
+    ) -> io::Result<()> {
         self.connection
             .execute(
                 "INSERT OR REPLACE INTO objects(actor,sha256,length) VALUES(?1,?2,?3)",
@@ -691,7 +703,9 @@ impl Journal {
     pub fn triage(&self, id: &str) -> io::Result<Option<crate::triage::TriageRef>> {
         let record: Option<String> = self
             .connection
-            .query_row("SELECT record FROM triage WHERE execution=?1", [id], |r| r.get(0))
+            .query_row("SELECT record FROM triage WHERE execution=?1", [id], |r| {
+                r.get(0)
+            })
             .optional()
             .map_err(db_error)?;
         record
@@ -979,40 +993,196 @@ impl Journal {
                 return Err(admission(AdmissionError::SubmissionClosed));
             }
         }
-        tx.execute("INSERT INTO executions(idempotency_key,invocation,record,state,updated_ms,actor,request_id,submission_id) VALUES(?1,?2,'{}','queued',?3,?4,?5,?6)", params![key, encoded(&invocation)?, timestamp(),context.as_ref().map(|context|context.actor.as_str()),context.as_ref().map(|context|context.request_id.as_str()),context.as_ref().map(|context|context.submission_id.as_str())]).map_err(db_error)?;
-        let execution = Execution {
-            id: tx.last_insert_rowid().to_string(),
-            idempotency_key: key.into(),
-            invocation,
-            submission: context,
-            state: State::Queued,
-            revision: 1,
-            accepted_at_ms: timestamp().max(0) as u64,
-            finished_at_ms: 0,
-            acceptance_boot_id: boot.into(),
-            collected: false,
-            revision_ceiling: 1,
-            attempt: 0,
-            waiting_reason: None,
-            process: None,
-            cancel_actor: None,
-            completed_units: 0,
-            progress: None,
-            running_revision: 0,
-            started_at_ms: 0,
-            executor: None,
-            result: None,
-            failure: None,
-        };
-        tx.execute(
-            "UPDATE executions SET record=?1 WHERE id=?2",
-            params![encoded(&execution)?, execution.id],
-        )
-        .map_err(db_error)?;
+        let execution = insert(&tx, key, invocation, context, boot, None)?;
         tx.commit().map_err(db_error)?;
         Ok(execution)
     }
 
+    /// A run (`cozy.machine.v1` Run) accepted before its preparation: queued and waiting on
+    /// `PREPARING`, idempotent on (actor, id) by its spec digest. True when newly accepted.
+    pub fn accept_run(
+        &mut self,
+        actor: &str,
+        id: &str,
+        digest: &str,
+        invocation: Invocation,
+    ) -> io::Result<(Execution, bool)> {
+        validate_scope(actor, id, id)?;
+        let key = format!("run:{}", encoded(&(actor, id))?);
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        let prior: Option<String> = tx
+            .query_row(
+                "SELECT record FROM executions WHERE idempotency_key=?1",
+                [&key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        if let Some(prior) = prior {
+            let execution: Execution = serde_json::from_str(&prior).map_err(db_error)?;
+            if execution
+                .submission
+                .as_ref()
+                .map(|s| s.invocation_digest.as_str())
+                != Some(digest)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "this run id already names another run spec",
+                ));
+            }
+            return Ok((execution, false));
+        }
+        let context = SubmissionContext {
+            actor: actor.into(),
+            request_id: id.into(),
+            submission_id: id.into(),
+            expected_workspace_id: String::new(),
+            capture_digest: String::new(),
+            invocation_digest: digest.into(),
+            payload_digest: String::new(),
+            publication_authorization_id: String::new(),
+            preparation_id: String::new(),
+        };
+        let execution = insert(&tx, &key, invocation, Some(context), "", Some(PREPARING))?;
+        tx.commit().map_err(db_error)?;
+        Ok((execution, true))
+    }
+
+    /// A preparing run's code and models are ready: it names them and becomes dispatchable.
+    pub fn bind_prepared(
+        &mut self,
+        id: &str,
+        invocation: Invocation,
+        preparation: &str,
+    ) -> io::Result<Execution> {
+        let encoded_invocation = encoded(&invocation)?;
+        self.update_with(
+            id,
+            None,
+            |record| {
+                if record.state != State::Queued
+                    || record.waiting_reason.as_deref() != Some(PREPARING)
+                {
+                    return Ok(false);
+                }
+                record.invocation = invocation;
+                if let Some(submission) = record.submission.as_mut() {
+                    submission.preparation_id = preparation.into();
+                }
+                record.waiting_reason = None;
+                Ok(true)
+            },
+            |tx, record| {
+                tx.execute(
+                    "UPDATE executions SET invocation=?1 WHERE id=?2",
+                    params![encoded_invocation, record.id],
+                )
+                .map_err(db_error)?;
+                Ok(())
+            },
+        )
+    }
+
+    /// A preparing run ends without dispatch: a warm run's success or a preparation failure.
+    pub fn end_preparation(&mut self, id: &str, outcome: Outcome) -> io::Result<Execution> {
+        self.update(id, |record| {
+            if record.state != State::Queued || record.waiting_reason.as_deref() != Some(PREPARING)
+            {
+                return Ok(false);
+            }
+            match outcome {
+                Outcome::Completed(result) => {
+                    record.state = State::Completed;
+                    record.result = Some(result);
+                }
+                Outcome::Failed(reason) => {
+                    record.state = State::Failed;
+                    record.failure = Some(reason);
+                }
+                Outcome::Canceled => record.state = State::Canceled,
+            }
+            record.waiting_reason = None;
+            Ok(true)
+        })
+    }
+
+    /// A restarted machine holds no preparation and no run's Hub token: each preparing run
+    /// ends FAILED (nothing of it was started).
+    pub(crate) fn interrupt_preparations(&mut self) -> io::Result<()> {
+        let preparing: Vec<String> = {
+            let mut statement = self
+                .connection
+                .prepare("SELECT id FROM executions WHERE state='queued' AND json_extract(record,'$.waiting_reason')=?1")
+                .map_err(db_error)?;
+            let rows = statement
+                .query_map([PREPARING], |row| row.get::<_, i64>(0))
+                .map_err(db_error)?;
+            rows.map(|id| id.map(|id| id.to_string()))
+                .collect::<Result<_, _>>()
+                .map_err(db_error)?
+        };
+        for id in preparing {
+            let failure = Failure {
+                status: 3,
+                cause: 7,
+                origin: 3,
+                message: "preparation_interrupted: the machine restarted while this run was preparing; run it again".into(),
+            };
+            self.end_preparation(&id, Outcome::Failed(failure.encode()))?;
+        }
+        Ok(())
+    }
+}
+
+/// The waiting reason of a run accepted before its preparation completes.
+pub const PREPARING: &str = "preparing";
+
+fn insert(
+    tx: &rusqlite::Transaction<'_>,
+    key: &str,
+    invocation: Invocation,
+    context: Option<SubmissionContext>,
+    boot: &str,
+    waiting: Option<&str>,
+) -> io::Result<Execution> {
+    tx.execute("INSERT INTO executions(idempotency_key,invocation,record,state,updated_ms,actor,request_id,submission_id) VALUES(?1,?2,'{}','queued',?3,?4,?5,?6)", params![key, encoded(&invocation)?, timestamp(),context.as_ref().map(|context|context.actor.as_str()),context.as_ref().map(|context|context.request_id.as_str()),context.as_ref().map(|context|context.submission_id.as_str())]).map_err(db_error)?;
+    let execution = Execution {
+        id: tx.last_insert_rowid().to_string(),
+        idempotency_key: key.into(),
+        invocation,
+        submission: context,
+        state: State::Queued,
+        revision: 1,
+        accepted_at_ms: timestamp().max(0) as u64,
+        finished_at_ms: 0,
+        acceptance_boot_id: boot.into(),
+        collected: false,
+        revision_ceiling: 1,
+        attempt: 0,
+        waiting_reason: waiting.map(String::from),
+        process: None,
+        cancel_actor: None,
+        completed_units: 0,
+        progress: None,
+        running_revision: 0,
+        started_at_ms: 0,
+        executor: None,
+        result: None,
+        failure: None,
+    };
+    tx.execute(
+        "UPDATE executions SET record=?1 WHERE id=?2",
+        params![encoded(&execution)?, execution.id],
+    )
+    .map_err(db_error)?;
+    Ok(execution)
+}
+
+impl Journal {
     pub fn get(&self, id: &str) -> io::Result<Execution> {
         let value: Option<String> = self
             .connection

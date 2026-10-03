@@ -33,6 +33,8 @@ pub struct NativeBackend {
     pub publisher: Option<Arc<crate::published::Publisher>>,
     /// On a rental: its own Hub, read with the pod's worker capability.
     pub own_hub: Option<crate::hub::Source>,
+    /// `cozy.machine.v1` Run sources and Write.
+    pub runs: Option<Arc<crate::runs::Runs>>,
     // Serialize native projection, not inference or observation. Only one result
     // projection may establish a given immutable output's native custody at once.
     projection: Mutex<()>,
@@ -53,6 +55,7 @@ impl NativeBackend {
             installer: None,
             publisher: None,
             own_hub: None,
+            runs: None,
             projection: Mutex::new(()),
             installation: Mutex::new(()),
         }
@@ -124,6 +127,12 @@ impl NativeBackend {
                 State::Completed => "succeeded",
                 State::Failed => "failed",
                 State::Canceled => "canceled",
+                // Only Run (`cozy.machine.v1`) accepts a run before it is prepared.
+                State::Queued
+                    if record.waiting_reason.as_deref() == Some(crate::journal::PREPARING) =>
+                {
+                    "preparing"
+                }
                 State::Queued => "queued",
                 // The worker protocol has no "starting": an attempt is queued until it runs.
                 State::Starting => "queued",
@@ -989,6 +998,9 @@ impl MachineBackend for NativeBackend {
                 source,
                 package: root.package.clone(),
                 release: root.release.clone(),
+                installed: None,
+                owner: String::new(),
+                binding_revision: String::new(),
                 entrypoint: root.entrypoint.clone(),
                 choices: root.models.clone(),
             };
@@ -1215,7 +1227,10 @@ impl MachineBackend for NativeBackend {
             .after
             .max(if running { record.running_revision } else { 0 });
         if record.revision > floor && record.revision > published {
-            if let Some(progress) = record.progress.as_ref().filter(|_| running) {
+            // A run preparing inside itself (`runs`) shows its stage and bytes as progress.
+            let preparing = record.state == State::Queued
+                && record.waiting_reason.as_deref() == Some(crate::journal::PREPARING);
+            if let Some(progress) = record.progress.as_ref().filter(|_| running || preparing) {
                 let payload = serde_json::from_str::<Value>(progress)
                     .ok()
                     .filter(Value::is_object)

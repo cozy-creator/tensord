@@ -13,6 +13,7 @@ use std::{
 };
 use tonic::Status;
 
+#[derive(Clone)]
 pub struct InstallerConfig {
     pub helper_python: PathBuf,
     pub python: String,

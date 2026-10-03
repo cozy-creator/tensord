@@ -227,6 +227,22 @@ impl Service {
         self.retain(&record, held.retention());
         Ok(record)
     }
+    /// A run prepared inside itself (`runs`) names its generation, call and model plan.
+    pub fn bind_prepared(
+        &self,
+        id: &str,
+        generation: &str,
+        call: Call,
+        preparation: &str,
+    ) -> io::Result<Execution> {
+        let held = self.catalog.resolve(generation)?;
+        let mut invocation = held.invocation(&call.entrypoint, call.input)?;
+        invocation.attention_kernel = call.attention_kernel;
+        invocation.inputs = call.inputs;
+        let record = self.engine.bind_prepared(id, invocation, preparation)?;
+        self.retain(&record, held.retention());
+        Ok(record)
+    }
     fn retain(&self, record: &Execution, hold: Arc<File>) {
         if !record.state.terminal() {
             self.retained
