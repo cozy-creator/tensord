@@ -404,7 +404,7 @@ class Gate:
         self.request(arm, -1, "prime", "anima")
 
     def run(self) -> None:
-        samples = f"{POD_DIR}/samples-{self.m['salt']}.jsonl"
+        samples = f"{self.pod.dir}/samples-{self.m['salt']}.jsonl"
         sampler = self.pod.sh(f"nohup {self.pod.py} {POD_DIR}/pod.py sample {samples} >/dev/null 2>&1 & echo $!").strip()
         try:
             for arm in self.m.get("prime", []):
