@@ -146,6 +146,28 @@ fn run_machine(
     let generations = engine.join("generations");
     let owner = Owner::new(&engine, 16 * 1024 * 1024, Duration::from_secs(300))?;
     let service = cozy_machine::service::Service::open(&engine, &generations, 1)?;
+    // A machine with GPUs serves published GPU packages on all of them (the envelope, sorted
+    // by index; a degree-K plan uses the first K), with the executor environment the pod
+    // proofs used.
+    let gpus = receipt::gpus()?;
+    if !gpus.is_empty() {
+        let devices: Vec<String> = gpus.iter().map(|g| g.device_index.to_string()).collect();
+        let home = engine.join("executor-home");
+        std::fs::create_dir_all(&home)?;
+        let config: cozy_machine::gpu_service::GpuConfig = serde_json::from_value(serde_json::json!({
+            "devices": devices.join(","),
+            "authorized_device_limit_bytes": null,
+            "pinned_budget_bytes": 4i64 << 30,
+            "environment": {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": home, "COZY_HOME": home},
+        }))
+        .map_err(io::Error::other)?;
+        let store = owner.lock().unwrap().store();
+        service.configure_gpu(cozy_machine::gpu_service::GpuPool::new(
+            &engine.join("gpu"),
+            config,
+            store,
+        )?)?;
+    }
     if let Some(hub) = grant.hub.clone().filter(|_| rental) {
         identity.hubs = vec![(hub.origin.clone(), hub.worker_id.clone())];
         let hub = Arc::new(cozy_machine::machine::hub::Hub::new(hub)?);

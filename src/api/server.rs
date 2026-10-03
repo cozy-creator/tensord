@@ -236,6 +236,21 @@ impl<B: MachineBackend> Api<B> {
                 ..Default::default() }),
             runtime_absent: "CPU front door: package SDK measurements are supplied by the execution backend; full Runtime inventory is not implemented".into(), ..Default::default() }
     }
+    /// The accelerator facts this boot measured for its readiness receipt.
+    fn resources(&self) -> pb::WorkerResources {
+        let gpus = self.identity.readiness.gpus();
+        let first = gpus.first();
+        pb::WorkerResources {
+            platform: format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
+            backend: if gpus.is_empty() { "" } else { "cuda" }.into(),
+            memory_model: if gpus.is_empty() { "" } else { "discrete" }.into(),
+            device_count: gpus.len() as u32,
+            device_name: first.map(|g| g.device_name.clone()).unwrap_or_default(),
+            device_memory_total_bytes: first.map_or(0, |g| g.memory_bytes),
+            driver_version: first.map(|g| g.driver_version.clone()).unwrap_or_default(),
+            ..Default::default()
+        }
+    }
     fn phase(&self) -> &'static str {
         match &self.identity.lifecycle {
             Some(lifecycle) if lifecycle.released() => "releasing",
@@ -889,6 +904,9 @@ impl<B: MachineBackend> pb::worker_control_server::WorkerControl for Api<B> {
                 worker_id: self.identity.authority.worker_id.clone(),
                 worker_boot_id: self.identity.authority.boot_id.clone(),
                 wire_minor: WIRE_MINOR,
+                // One provisioned machine lifetime, as the Runtime names it: the boot id.
+                worker_instance_id: self.identity.authority.boot_id.clone(),
+                resources: Some(self.resources()),
                 ..Default::default()
             })),
         };

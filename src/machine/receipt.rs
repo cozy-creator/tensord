@@ -92,6 +92,21 @@ impl Readiness {
         self.state.lock().unwrap().sealed.clone()
     }
 
+    /// The GPUs this boot's sealed receipt names.
+    pub fn gpus(&self) -> Vec<Gpu> {
+        #[derive(serde::Deserialize)]
+        struct Gpus {
+            #[serde(default)]
+            runtime_gpus: Vec<Gpu>,
+        }
+        let sealed = self.state.lock().unwrap().sealed.clone();
+        sealed
+            .and_then(|raw| parse(&raw).ok())
+            .and_then(|e| serde_json::from_slice::<Gpus>(&e.payload).ok())
+            .map(|g| g.runtime_gpus)
+            .unwrap_or_default()
+    }
+
     /// The payload a retained envelope or this boot's seal attested.
     pub fn attested(&self) -> Option<Vec<u8>> {
         self.state.lock().unwrap().retained.clone()
