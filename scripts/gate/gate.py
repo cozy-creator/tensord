@@ -347,7 +347,8 @@ class Gate:
         if spec.get("cgroup"):
             self.pod.sh(f"({spec['cgroup']}) > {self.pod.dir}/cgroup")
         limits = self.pod.sh(spec["limits"]) if spec.get("limits") else None
-        self.record({"arm": arm, "cycle": cycle, "event": "restart", "scenario": scenario, "old_root": old, "limits": limits,
+        facts = self.pod.sh(spec["facts"], check=False) if spec.get("facts") else None
+        self.record({"arm": arm, "cycle": cycle, "event": "restart", "scenario": scenario, "old_root": old, "limits": limits, "facts": facts,
                      "new_root": new, "gpu_after_stop": now["gpu"], "stop_to_root_s": new["started"] - stop,
                      "cache": cache, "cache_done_before_root": cache["t_end"] <= new["started"]})
         self.request(arm, cycle, scenario, "sdxl", t0=new["started"])
@@ -431,6 +432,9 @@ class Gate:
                 self.kill_proof(self.m["kill_proof"]["arm"], self.m["kill_proof"]["n"])
         finally:
             self.pod.sh(f"kill {sampler}", check=False)   # the sampler PID this run started
+            if self.m.get("collect"):   # e.g. a tar of the machines' logs and learned facts
+                with (self.out / "collect.tgz").open("wb") as sink:
+                    subprocess.run(self.pod.ssh + [self.m["collect"]], stdout=sink, check=False)
             with (self.out / "samples.jsonl").open("w") as sink:
                 subprocess.run(self.pod.ssh + [f"cat {samples}"], stdout=sink, check=False)
 

@@ -73,6 +73,9 @@ leaves out the executor kill (fault injection stays on rentals). Disk reads fall
 processes' `/proc/<pid>/io` when its cgroup has no io controller. `xid_watch: true` follows `journalctl -kf`; any `NVRM: Xid` runs `on_xid` (stop both
 machines) and stops the harness at once.
 
+An arm's optional `facts` command is recorded at every restart; a manifest `collect` command's stdout
+(a tarball) is saved as `OUT/collect.tgz` at the end.
+
 ## Manifest
 
 `rental`, `hub`, `salt` (new per run), `targets`, `requests` (fixed fields; prompt and seed added per
