@@ -55,6 +55,14 @@ checked not flat (per-channel stddev > 2) and hashed.
   whole-tree equivalent and is the same instrument for both arms.
 - Disk reads: cgroup `io.stat` rbytes delta around each request (proves cold vs warm).
 
+## Local mode (the owner's laptop)
+
+Without `rental`, the machine runs on this computer: `work_dir` holds the helper, each arm may name
+`cli`, `run_args` and `show_args` (e.g. a pinned `--machine-endpoint-file`), `cgroup` (the arm's unit,
+followed by the sampler) and `limits` (recorded at each restart). `soak_s` adds equal GPU idle before
+each cycle. `xid_watch: true` follows `journalctl -kf`; any `NVRM: Xid` runs `on_xid` (stop both
+machines) and stops the harness at once.
+
 ## Manifest
 
 `rental`, `hub`, `salt` (new per run), `targets`, `requests` (fixed fields; prompt and seed added per

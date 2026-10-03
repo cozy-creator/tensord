@@ -19,6 +19,7 @@ import shlex
 import statistics
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -35,11 +36,14 @@ STYLES = ("at dawn, watercolor", "in fog, oil painting", "at noon, photograph", 
 # Pod side: stdlib only, observation plus page-cache control. It signals nothing.
 POD_HELPER = r'''
 import json, os, sys, time, subprocess
-CG = "/sys/fs/cgroup"
+HERE = os.path.dirname(os.path.abspath(__file__))
 def cg():   # cgroup v2, else v1 (v1 rss = anon without shmem; shmem sits inside cache)
+    try: CG = open(os.path.join(HERE, "cgroup")).read().strip()   # the measured arm's unit (local)
+    except OSError: CG = "/sys/fs/cgroup"                          # the whole container (rental)
     if os.path.exists(f"{CG}/memory.stat"):
         m = {l.split()[0]: int(l.split()[1]) for l in open(f"{CG}/memory.stat")}
-        r = sum(int(f.split("=")[1]) for l in open(f"{CG}/io.stat") for f in l.split() if f.startswith("rbytes="))
+        r = sum(int(f.split("=")[1]) for l in open(f"{CG}/io.stat") for f in l.split() if f.startswith("rbytes=")) \
+            if os.path.exists(f"{CG}/io.stat") else 0
         anon, shmem, mapped, file = m["anon"], m["shmem"], m["file_mapped"], m["file"]
     else:
         m = {l.split()[0]: int(l.split()[1]) for l in open(f"{CG}/memory/memory.stat")}
@@ -113,31 +117,35 @@ def log(*parts: object) -> None:
     print(time.strftime("%H:%M:%S"), *parts, file=sys.stderr, flush=True)
 
 
-class Pod:
-    """Root shell on the rental through the ordinary CLI's ssh-info; one multiplexed connection."""
+class Host:
+    """Where the machine runs: a rental (root ssh via the ordinary CLI's ssh-info) or this computer."""
 
-    def __init__(self, rental: str, hub: str):
-        info = json.loads(subprocess.check_output(["cozy", "rental", "ssh-info", rental, "--json", f"--tensorhub={hub}"]))
-        host, port = info["ssh_address"].rsplit(":", 1)
-        self.ssh = ["ssh", "-p", port, "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes",
-                    "-o", "ControlPath=/tmp/gate-ssh-%C", "-o", "ControlMaster=auto", "-o", "ControlPersist=900",
-                    f"root@{host}"]
-        self.sh(f"mkdir -p {POD_DIR}")
-        subprocess.run(self.ssh + [f"cat > {POD_DIR}/pod.py"], input=POD_HELPER, text=True, check=True)
+    def __init__(self, m: dict):
+        self.dir = m.get("work_dir", POD_DIR)
+        if m.get("rental"):
+            info = json.loads(subprocess.check_output(["cozy", "rental", "ssh-info", m["rental"], "--json", f"--tensorhub={m['hub']}"]))
+            host, port = info["ssh_address"].rsplit(":", 1)
+            self.ssh = ["ssh", "-p", port, "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes",
+                        "-o", "ControlPath=/tmp/gate-ssh-%C", "-o", "ControlMaster=auto", "-o", "ControlPersist=900",
+                        f"root@{host}"]
+        else:
+            self.ssh = ["bash", "-c"]
+        self.sh(f"mkdir -p {self.dir}")
+        subprocess.run(self.ssh + [f"cat > {self.dir}/pod.py"], input=POD_HELPER, text=True, check=True)
         self.py = self.sh("command -v python3").strip()
 
     def sh(self, command: str, check: bool = True) -> str:
         while True:   # sshd is the machine agent's child: it is briefly absent while an arm restarts
             done = subprocess.run(self.ssh + [command], capture_output=True, text=True)
-            if done.returncode != 255:
+            if done.returncode != 255 or self.ssh[0] != "ssh":
                 break
             time.sleep(0.2)
         if check and done.returncode:
-            raise RuntimeError(f"pod command failed ({done.returncode}): {command}\n{done.stderr}")
+            raise RuntimeError(f"host command failed ({done.returncode}): {command}\n{done.stderr}")
         return done.stdout
 
     def helper(self, *args: str) -> dict:
-        return json.loads(self.sh(" ".join([self.py, f"{POD_DIR}/pod.py", *map(shlex.quote, args)])))
+        return json.loads(self.sh(" ".join([self.py, f"{self.dir}/pod.py", *map(shlex.quote, args)])))
 
 
 def marks(events: str) -> dict:
@@ -176,9 +184,28 @@ class Gate:
         self.used = {r["prompt"] for r in rows if "prompt" in r} | {r["seed"] for r in rows if "seed" in r}
         self.index = len(rows)
         self.rng = random.Random(f"{self.m['salt']}-{self.index}")
-        self.pod = Pod(self.m["rental"], self.m["hub"])
+        self.pod = Host(self.m)
         self.offset = 0.0
-        self.cache = f"{POD_DIR}/cache-files"
+        self.cache = f"{self.pod.dir}/cache-files"
+        self.idle_since = 0.0
+        self.xid = threading.Event()
+        if self.m.get("xid_watch"):
+            threading.Thread(target=self.watch_xid, daemon=True).start()
+
+    def watch_xid(self) -> None:
+        """Any new NVRM Xid stops the test at once: both machines are stopped, the harness raises."""
+        watch = subprocess.Popen(["journalctl", "-kf", "-n0", "-o", "short-iso"], stdout=subprocess.PIPE, text=True)
+        for line in watch.stdout:
+            if "NVRM: Xid" in line:
+                self.xid.set()
+                log("NVRM Xid, stopping:", line.strip())
+                self.record({"event": "xid", "line": line.strip(), "t": time.time()})
+                self.pod.sh(self.m["on_xid"], check=False)
+                return
+
+    def check(self) -> None:
+        if self.xid.is_set():
+            raise RuntimeError("stopped on an NVRM Xid")
 
     def record(self, row: dict) -> None:
         with self.results.open("a") as sink:
@@ -205,8 +232,13 @@ class Gate:
     def cool(self) -> dict:
         """Equal thermal start: at or below the manifest's ceiling, or at the card's idle floor
         (no further cooling over 60 s; a card holding a CUDA context never cools past it)."""
+        soak = self.m.get("soak_s", 0) - (time.time() - self.idle_since)
+        if soak > 0:
+            log(f"equal soak: {soak:.0f} s of GPU idle")
+            time.sleep(soak)
         temps = []
         while True:
+            self.check()
             now = self.pod.helper("now")
             temps.append(now["gpu"]["temp_c"])
             if temps[-1] <= self.m["start_temp_c"] or (len(temps) >= 12 and min(temps[-6:]) >= min(temps[-12:-6])):
@@ -219,13 +251,18 @@ class Gate:
         root = self.out / "runs" / f"{self.index:03}-{arm}-{cycle}-{scenario}-{model}"
         root.mkdir(parents=True)
         (root / "input.json").write_text(json.dumps({**self.m["requests"][model], "prompt": prompt, "seed": seed}))
+        self.check()
+        spec = self.m["arms"][arm]
+        cli = spec.get("cli", "cozy")
+        place = spec.get("run_args", [f"--rental={self.m.get('rental')}", f"--tensorhub={self.m.get('hub')}"])
         before = self.pod.helper("now")
         submit = time.time()
-        done = subprocess.run(["cozy", "run", self.m["targets"][model], f"--input={root / 'input.json'}",
-                               f"--rental={self.m['rental']}", f"--tensorhub={self.m['hub']}", "--await", "--json",
-                               f"--out={root / 'out'}", f"--idempotency-key=gate-{self.m['salt']}-{self.index}"],
-                              capture_output=True, text=True)
+        done = subprocess.run([cli, "run", self.m["targets"][model], f"--input={root / 'input.json'}", *place,
+                               "--await", "--json", f"--out={root / 'out'}",
+                               f"--idempotency-key=gate-{self.m['salt']}-{self.index}"], capture_output=True, text=True)
         finished = time.time()
+        self.idle_since = finished
+        self.check()
         images = verify(root / "out", self.m["shapes"][model]) if (root / "out").is_dir() else []
         verified = time.time()
         after = self.pod.helper("now")
@@ -234,8 +271,8 @@ class Gate:
         run = images[0]["path"].rsplit("/", 1)[1].split("-")[0] if images else None
         show = {}
         if run:
-            shown = subprocess.run(["cozy", "run", "show", run, "--json", "--full", f"--tensorhub={self.m['hub']}"],
-                                   capture_output=True, text=True)
+            shown = subprocess.run([cli, "run", "show", run, "--json", "--full",
+                                    *spec.get("show_args", [f"--tensorhub={self.m.get('hub')}"])], capture_output=True, text=True)
             (root / "show.json").write_text(shown.stdout or shown.stderr)
             show = json.loads(shown.stdout) if shown.returncode == 0 else {}
         start = submit if t0 is None else t0 - self.offset   # t0 is a pod-clock process start time
@@ -280,14 +317,18 @@ class Gate:
         if scenario == "cold_first":
             cache = self.pod.helper("evict", self.cache)
         new = self.pod.helper("newroot", old, spec["root"])
-        self.record({"arm": arm, "cycle": cycle, "event": "restart", "scenario": scenario, "old_root": old,
+        if spec.get("cgroup"):
+            self.pod.sh(f"({spec['cgroup']}) > {self.pod.dir}/cgroup")
+        limits = self.pod.sh(spec["limits"]) if spec.get("limits") else None
+        self.record({"arm": arm, "cycle": cycle, "event": "restart", "scenario": scenario, "old_root": old, "limits": limits,
                      "new_root": new, "gpu_after_stop": now["gpu"], "stop_to_root_s": new["started"] - stop,
                      "cache": cache, "cache_done_before_root": cache["t_end"] <= new["started"]})
         self.request(arm, cycle, scenario, "sdxl", t0=new["started"])
 
     def cycle(self, arm: str, cycle: int) -> None:
-        subprocess.run(["cozy", "rental", "keepalive", self.m["rental"], f"--tensorhub={self.m['hub']}"],
-                       capture_output=True)
+        if self.m.get("rental"):
+            subprocess.run(["cozy", "rental", "keepalive", self.m["rental"], f"--tensorhub={self.m['hub']}"],
+                           capture_output=True)
         listed = self.pod.helper("list", json.dumps(self.m["cache_paths"]), self.cache)   # after any download
         self.record({"arm": arm, "cycle": cycle, "event": "begin", "clock": self.clock(), "cool": self.cool(),
                      "cache_files": listed["files"]})
