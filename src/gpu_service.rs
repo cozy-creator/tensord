@@ -13,7 +13,7 @@ use crate::{
     },
     launch_identity::Seal,
     memory::{
-        policy::{Facts, Holding, Step, MARGIN},
+        policy::{Facts, Holding, Step},
         GpuMemory, MemoryConfig,
     },
     model_sources::{ModelSources, SelectedManifest},
@@ -1607,10 +1607,9 @@ impl GpuPool {
         others: &mut BTreeMap<String, Session>,
         load_only: bool,
     ) -> io::Result<bool> {
-        let capped = session.executor.hello.offers("process_cap/1");
         // A group whose followers each read their own cap and cell; otherwise every rank
         // takes the smallest cap and only rank 0's GPU has a cell.
-        let ranked = plan.degree > 1 && capped && session.executor.hello.offers(RANK_CELLS);
+        let ranked = plan.degree > 1 && session.executor.hello.offers(RANK_CELLS);
         if !session.loaded {
             // Degree 2 keeps every component resident until revoked, and a running call never
             // revokes what it reads: only when the whole construction and its activations fit
@@ -1760,7 +1759,7 @@ impl GpuPool {
                     sealed_tiers: session.sealed,
                     pinned_bytes: at_load.then_some(pinned),
                     device_weights: sharing,
-                    cap_bytes: load_cap.filter(|_| capped),
+                    cap_bytes: load_cap,
                 },
                 &load_group,
                 &mut callbacks,
@@ -1873,19 +1872,9 @@ impl GpuPool {
         // A group's cap holds on every GPU of it (each rank caps its own process).
         let caps = self.decide(&plan.id, plan.degree, false, callbacks.others)?;
         let (cap, group) = rank_grant(&caps, ranked);
-        let first = &self.lane(plan.degree)?[0].memory;
-        let (plane_budget_bytes, cap_bytes) = match cap {
-            Some(cap) if capped => (-1, Some(cap)),
-            Some(cap) if session.executor.hello.offers("weight_plane/1") => {
-                let facts = first.with(|gpu| gpu.facts(&plan.id));
-                let context = facts
-                    .context
-                    .unwrap_or(first.with(|gpu| gpu.context_estimate()));
-                let plane = cap.saturating_sub(context + facts.activation.unwrap_or(0) + MARGIN);
-                (i64::try_from(plane).unwrap_or(i64::MAX), None)
-            }
-            _ => (-1, None),
-        };
+        // Every executor of the cohort caps its whole process (`process_cap/1`): the plane
+        // derives its budget inside the cap.
+        let (plane_budget_bytes, cap_bytes) = (-1, cap);
         if let Some(cap) = cap {
             // Each GPU's floor watchdog writes the cell of the process on that GPU. Without
             // per-rank cells only rank 0's GPU has one (a cell caps one process).

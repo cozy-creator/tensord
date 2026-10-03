@@ -327,8 +327,14 @@ impl GpuMemory {
         });
     }
 
+    /// A process's private host bytes (PSS less shared memory), kept across runs.
     pub fn learn_host(&self, plan: &str, bytes: u64) {
-        self.with(|gpu| gpu.learned.host(plan, bytes));
+        self.with(|gpu| {
+            gpu.learned.host(plan, bytes);
+            if let Err(error) = gpu.learned.save() {
+                note(serde_json::json!({"event": "learned_unsaved", "error": error.to_string()}));
+            }
+        });
     }
 
     pub fn observe(&self, plan: &str, facts: Facts, mapped: Option<bool>) {
