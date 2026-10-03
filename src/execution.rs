@@ -275,10 +275,16 @@ impl Engine {
         id: &str,
         events: Option<&[u8]>,
     ) -> io::Result<Execution> {
-        self.journal
+        let record = self
+            .journal
             .lock()
             .unwrap()
-            .acknowledge_collection_events(id, events)
+            .acknowledge_collection_events(id, events)?;
+        // Released by the client, and the store holds its products: the custody copy goes.
+        if events.is_some() && record.collected && self.public_terminal(id)?.is_some() {
+            drop(Spool(self.root.join("results").join(id)));
+        }
+        Ok(record)
     }
     pub fn native_output(&self, actor: &str, owner: &str) -> io::Result<Option<Vec<u8>>> {
         self.journal.lock().unwrap().native_output(actor, owner)
@@ -809,8 +815,11 @@ impl Engine {
             return Ok(());
         }
         let output_root = self.root.join("staging").join(id);
+        let _spool = Spool(output_root.clone());
+        let logs = self.root.join("logs");
         let launch = (|| {
             fs::create_dir_all(&output_root)?;
+            fs::create_dir_all(&logs)?;
             let seal = Seal::prepare(
                 &self.root.join("seal"),
                 None,
@@ -819,8 +828,8 @@ impl Engine {
                 "",
             )?;
             let (parent, runner) = UnixStream::pair()?;
-            let stdout = File::create(output_root.join("stdout.log"))?;
-            let stderr = File::create(output_root.join("stderr.log"))?;
+            let stdout = File::create(logs.join(format!("{id}.stdout.log")))?;
+            let stderr = File::create(logs.join(format!("{id}.stderr.log")))?;
             let child = spawn_runner(config, &seal, &runner, stdout, stderr)?;
             drop(runner);
             let exact = crate::process::Exact::open(&process_birth(child.id())?)?
@@ -894,7 +903,7 @@ impl Engine {
                     // Ended before authorization: no authored code ran; its exit is the reason.
                     Outcome::Failed(format!(
                         "runner ended before start ({status}): {error}; {}",
-                        crate::process::tail(&output_root.join("stderr.log"))
+                        crate::process::tail(&logs.join(format!("{id}.stderr.log")))
                     ))
                 } else {
                     Outcome::Failed(format!("executor ended {status}: {error}"))
@@ -1191,6 +1200,20 @@ fn spawn_runner(
 }
 
 pub use crate::process::{process_birth, process_ended};
+
+/// A run's spool: removed once the run is settled, whatever the outcome. Its outputs are in
+/// custody by then (results and the store), so the spool would be a third copy.
+pub(crate) struct Spool(pub PathBuf);
+impl Drop for Spool {
+    fn drop(&mut self) {
+        // remove_dir_all never follows a symlink the package planted inside.
+        if let Err(error) = fs::remove_dir_all(&self.0) {
+            if error.kind() != io::ErrorKind::NotFound {
+                eprintln!("spool {}: {error}", self.0.display());
+            }
+        }
+    }
+}
 
 /// Walk relative components using openat+NOFOLLOW: no symlink or parent escape races.
 pub(crate) fn open_artifact(root: &Path, path: &Path) -> io::Result<File> {

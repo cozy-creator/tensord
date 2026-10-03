@@ -131,7 +131,6 @@ pub fn ended(pidfd: &File) -> bool {
     unsafe { libc::poll(&mut poll, 1, 0) > 0 && poll.revents != 0 }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

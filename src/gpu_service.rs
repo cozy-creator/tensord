@@ -220,6 +220,7 @@ impl GpuPool {
             (!display_active(&config.devices)).then(|| Mutex::new(ResidentCustody::default()));
         let incarnation = uuid::Uuid::new_v4().simple().to_string();
         crate::launch_identity::remove_stale_jit(root, &incarnation);
+        remove_old_executor_roots(root);
         Ok(Arc::new(Self {
             launcher: crate::child_launcher::ChildLauncher::new()?,
             root: root.to_path_buf(),
@@ -982,6 +983,7 @@ impl GpuPool {
         } else {
             engine.staging(id)?
         };
+        let _spool = crate::execution::Spool(spool.clone());
         // A real grant for the whole call: one tenant needs no per-stage turns.
         let cap = self.memory.decide(
             &plan.id,
@@ -1269,7 +1271,35 @@ fn settle(engine: &Arc<Engine>, id: &str, error: &io::Error) -> io::Result<()> {
     engine.finish(id, outcome).map(drop)
 }
 
-pub(crate) fn output_bindings(bindings: Vec<device_executor::AssetBinding>) -> io::Result<Vec<AssetBinding>> {
+/// Executor roots keep each ended executor's logs for a day; every executor of an earlier
+/// machine run has ended before this pool exists.
+fn remove_old_executor_roots(root: &Path) {
+    const KEEP: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let executor = name.len() == 32
+            && name
+                .to_string_lossy()
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit());
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|modified| modified.elapsed().is_ok_and(|age| age > KEEP));
+        if executor && old {
+            if let Err(error) = fs::remove_dir_all(entry.path()) {
+                eprintln!("old executor root {}: {error}", entry.path().display());
+            }
+        }
+    }
+}
+
+pub(crate) fn output_bindings(
+    bindings: Vec<device_executor::AssetBinding>,
+) -> io::Result<Vec<AssetBinding>> {
     bindings
         .into_iter()
         .map(|binding| {
@@ -1434,7 +1464,9 @@ impl Services for Callbacks<'_> {
         if frame.kind == Kind::Publish {
             drop(descriptor);
             let answer = match &self.spool {
-                Some(spool) => crate::products::publish(self.store, self.engine, self.id, spool, frame),
+                Some(spool) => {
+                    crate::products::publish(self.store, self.engine, self.id, spool, frame)
+                }
                 None => Answer::unavailable(frame.seq),
             };
             return Ok((answer, None));

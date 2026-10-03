@@ -100,6 +100,9 @@ pub enum State {
     Completed,
     Failed,
     Canceled,
+    /// Written by a newer machine: listed, never dispatched, settled or overwritten.
+    #[serde(other)]
+    Unknown,
 }
 
 impl State {
@@ -114,6 +117,7 @@ impl State {
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Canceled => "canceled",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -223,6 +227,23 @@ pub struct Journal {
     workspace_id: String,
 }
 
+/// The record layout this machine writes. A newer journal still opens: unknown fields are
+/// ignored and rows it cannot read are skipped, never a refusal of the whole journal.
+pub const JOURNAL_FORMAT: u32 = 1;
+
+/// One unreadable row (written by a newer machine, or damaged) must not hide every other run.
+fn readable(rows: Vec<String>) -> Vec<Execution> {
+    rows.into_iter()
+        .filter_map(|row| match serde_json::from_str(&row) {
+            Ok(record) => Some(record),
+            Err(error) => {
+                eprintln!("journal: skipping an unreadable execution row: {error}");
+                None
+            }
+        })
+        .collect()
+}
+
 fn db_error(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
 }
@@ -304,6 +325,27 @@ impl Journal {
                     [uuid::Uuid::new_v4().to_string()],
                 )
                 .map_err(db_error)?;
+        }
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO machine_metadata(key,value) VALUES('journal_format',?1)",
+                [JOURNAL_FORMAT.to_string()],
+            )
+            .map_err(db_error)?;
+        let format: String = connection
+            .query_row(
+                "SELECT value FROM machine_metadata WHERE key='journal_format'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        if format
+            .parse::<u32>()
+            .map_or(true, |format| format > JOURNAL_FORMAT)
+        {
+            eprintln!(
+                "journal: format {format} is newer than {JOURNAL_FORMAT}; reading what it can"
+            );
         }
         let workspace_id = connection
             .query_row(
@@ -923,8 +965,9 @@ impl Journal {
             })
             .map_err(db_error)?;
         records
-            .map(|record| serde_json::from_str(&record.map_err(db_error)?).map_err(db_error))
-            .collect()
+            .map(|record| record.map_err(db_error))
+            .collect::<io::Result<Vec<_>>>()
+            .map(readable)
     }
 
     /// Closure is a durable acceptance tombstone, never implicit execution cancellation.
@@ -962,8 +1005,9 @@ impl Journal {
             )
             .map_err(db_error)?;
         records
-            .map(|record| serde_json::from_str(&record.map_err(db_error)?).map_err(db_error))
-            .collect()
+            .map(|record| record.map_err(db_error))
+            .collect::<io::Result<Vec<_>>>()
+            .map(readable)
     }
     pub fn actor_head(&self, actor: &str) -> io::Result<u64> {
         self.connection
@@ -1032,8 +1076,9 @@ impl Journal {
             .query_map([], |row| row.get::<_, String>(0))
             .map_err(db_error)?;
         records
-            .map(|record| serde_json::from_str(&record.map_err(db_error)?).map_err(db_error))
-            .collect()
+            .map(|record| record.map_err(db_error))
+            .collect::<io::Result<Vec<_>>>()
+            .map(readable)
     }
 
     pub fn nonterminal(&self, limit: usize) -> io::Result<Vec<Execution>> {
@@ -1060,8 +1105,9 @@ impl Journal {
             )
             .map_err(db_error)?;
         records
-            .map(|record| serde_json::from_str(&record.map_err(db_error)?).map_err(db_error))
-            .collect()
+            .map(|record| record.map_err(db_error))
+            .collect::<io::Result<Vec<_>>>()
+            .map(readable)
     }
 
     /// Includes terminal requests: their retained executor may still own a context.
@@ -1096,8 +1142,9 @@ impl Journal {
             })
             .map_err(db_error)?;
         records
-            .map(|record| serde_json::from_str(&record.map_err(db_error)?).map_err(db_error))
-            .collect()
+            .map(|record| record.map_err(db_error))
+            .collect::<io::Result<Vec<_>>>()
+            .map(readable)
     }
 
     fn update(
@@ -1141,6 +1188,12 @@ impl Journal {
                 io::Error::new(io::ErrorKind::NotFound, "execution does not exist")
             })?)
             .map_err(db_error)?;
+        if record.state == State::Unknown {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "execution state was written by a newer machine",
+            ));
+        }
         let was_terminal = record.state.terminal();
         let changed = change(&mut record)?;
         let observed =

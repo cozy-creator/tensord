@@ -124,6 +124,7 @@ impl NativeBackend {
                 State::Queued => "queued",
                 State::Starting => "starting",
                 State::Running => "running",
+                State::Unknown => "unknown",
             }
             .into(),
             sequence,

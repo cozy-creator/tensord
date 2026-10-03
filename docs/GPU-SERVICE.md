@@ -90,5 +90,5 @@ thread.
 - One Python post helper per request.
 - No separate cgroup scope; containment is the executor's process group.
 - Seal: `alloc_conf`/`threads` config fields; `<root>/home`, `<root>/kernels` (per UID) and
-  `<root>/jit/<run>/<generation>`. Earlier runs' JIT scopes are removed at pool start.
+  `<root>/jit/<run>/<generation>`. Earlier runs' JIT scopes, and executor roots (logs) older than a day, are removed at pool start.
 - `PDEATHSIG` retention after a UID drop is unverified.

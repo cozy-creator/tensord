@@ -44,7 +44,7 @@ let file = engine.open_result(&record.id, 0)?;  // re-verifies digest and length
   The runner holds its generation independently too.
 - `dispatch` launches through the Runtime trampoline like an executor (parent-death SIGKILL,
   no_new_privs, OOM order, own process group) with the sealed environment and no GPU, one
-  inherited socket (`--execution-fd`), null stdin, and stdout/stderr files in staging. A machine
+  inherited socket (`--execution-fd`), null stdin, and stdout/stderr in `logs/<id>.*.log`. A machine
   that dies takes its runners with it.
 - Scheduler hooks: `ready`, `active`, `nonterminal` (partial indexes). `activity_epoch()` +
   `wait_activity(epoch, wait)` is a process-local wake. The wait bounds observation only.
@@ -112,6 +112,14 @@ After `Result` and a zero exit, each declared file is opened with `openat(O_NOFO
 component (no absolute, `..` or symlink), checked as a regular file via `O_PATH`, copied to
 `results/<id>/`, SHA-256 hashed, fsynced, made 0400 and renamed. Every `asset_binding` must name
 one held artifact of equal length.
+
+Reclamation: the run's spool (`staging/<id>`, the executor's own output directory) is removed
+once the run is settled. `results/<id>` is removed when the client releases retention and the store
+holds the public products. Journal rows are durable records and stay.
+
+Journal: `machine_metadata.journal_format` records the layout (1). A newer journal still opens;
+a row this machine cannot decode is skipped (logged) instead of failing every list, and a state
+it does not know is `unknown`: listed, never dispatched, settled or overwritten.
 
 Not implemented: same-UID isolation (reads detect mutation), containment of descendants that
 leave the runner's process group, cleanup of orphan `*.pending` files, bounded log policy.

@@ -977,3 +977,71 @@ def infer(inputs, output_root, canceled, progress):
     else:(root/'prediction').write_text(','.join(map(str,prediction))+'\n')
     return {'prediction':prediction},['prediction']
 "#;
+
+#[test]
+fn a_settled_run_keeps_one_custody_copy_and_its_logs() {
+    let fixture = Fixture::new();
+    let id = fixture.submit("infer");
+    let done = fixture.wait(&id, |record| record.state.terminal());
+    assert_eq!(done.state, State::Completed, "{done:?}");
+    let state = fixture.root.join("state");
+    // The spool is gone; the verified custody copy and the runner's logs remain.
+    assert!(!state.join("staging").join(&id).exists());
+    let artifact = &done.result.unwrap().artifacts[0];
+    assert_eq!(
+        fs::read_to_string(state.join(&artifact.path)).unwrap(),
+        "17,39\n"
+    );
+    assert!(state.join("logs").join(format!("{id}.stderr.log")).exists());
+}
+
+#[test]
+fn a_newer_or_damaged_row_never_hides_the_rest_of_the_journal() {
+    let fixture = Fixture::new();
+    let kept = fixture
+        .engine
+        .submit("kept", fixture.invocation("infer"))
+        .unwrap();
+    let newer = fixture
+        .engine
+        .submit("newer", fixture.invocation("infer"))
+        .unwrap();
+    let damaged = fixture
+        .engine
+        .submit("damaged", fixture.invocation("infer"))
+        .unwrap();
+    let database =
+        rusqlite::Connection::open(fixture.root.join("state/executions.sqlite3")).unwrap();
+    database
+        .execute(
+            "UPDATE executions SET record=json_set(record,'$.state','paused_by_newer_machine'), state='paused_by_newer_machine' WHERE id=?1",
+            [&newer.id],
+        )
+        .unwrap();
+    database
+        .execute(
+            "UPDATE executions SET record=json_object('id',id,'layout','from a newer machine') WHERE id=?1",
+            [&damaged.id],
+        )
+        .unwrap();
+    let journal = Journal::open(&fixture.root.join("state")).unwrap();
+    let listed = journal.list().unwrap();
+    assert_eq!(listed.len(), 2, "{listed:?}");
+    assert!(listed
+        .iter()
+        .any(|r| r.id == kept.id && r.state == State::Queued));
+    let unknown = listed.iter().find(|r| r.id == newer.id).unwrap();
+    assert_eq!(unknown.state, State::Unknown);
+    assert!(!journal.ready(16).unwrap().iter().any(|r| r.id == newer.id));
+    // A newer machine's state is never overwritten by this one.
+    let mut journal = journal;
+    assert!(journal.cancel(&newer.id, "actor-a").is_err());
+    let format: String = database
+        .query_row(
+            "SELECT value FROM machine_metadata WHERE key='journal_format'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(format, journal::JOURNAL_FORMAT.to_string());
+}
