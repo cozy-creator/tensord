@@ -1766,12 +1766,19 @@ print(json.dumps({"identity": generation.identity}))
                             python: held.record.python.clone(),
                             root: executor_root.clone(),
                             socket: executor_root.join("e.sock"),
-                            // No device is visible: this package never imports torch.
-                            environment: BTreeMap::from([
-                                ("PATH".into(), "/usr/bin:/bin".into()),
-                                ("CUDA_VISIBLE_DEVICES".into(), String::new()),
-                                ("OMP_NUM_THREADS".into(), "1".into()),
-                            ]),
+                            environment: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
+                            // No device is visible (empty devices): this package never imports torch.
+                            seal: {
+                                let mut seal = crate::launch_identity::Seal::prepare(
+                                    &executor_root,
+                                    None,
+                                    "products",
+                                    &held.record.identity,
+                                    "",
+                                )?;
+                                seal.threads = 1;
+                                seal
+                            },
                             generation_hold: Some(held.retention()),
                             identity: None,
                         },
