@@ -1,10 +1,13 @@
 # Host tier (Degree 1)
 
-`host_tier.rs` (`HostTier`) keeps the machine's host weights. Each weight set's layout is filled
-once through TensorFS's verified read path (`tensorfs_plane::host::fill_sealed`: page-cache copies,
-O_DIRECT for the rest, N threads) into a memfd and sealed: nobody can write, resize or punch it.
-Executors adopt it read-only (`Plane.register_sealed`) and read no store, lease or object. The
-layout survives executor death and model switches. No CUDA or NVML.
+`host_tier.rs` (`HostTier`) keeps the machine's host weights. Each weight set's layout is a memfd
+sealed at creation (`tensorfs_plane::host::open_sealed`: nobody else can write, resize or punch
+it) and filled once through TensorFS's verified read path (page-cache copies, O_DIRECT for the
+rest, N threads) by one background filler, layouts in the order opened, each region marked Ready
+as its last byte lands. Executors adopt it read-only (`Plane.register_sealed`) at once and read no
+store, lease or object; the plane waits per region (pinned fills, device copies). A fill that
+fails or is abandoned marks the rest FAILED: adopters error, never read it. The layout survives
+executor death and model switches. No CUDA or NVML.
 
 ## Exchange
 
@@ -14,8 +17,10 @@ layout survives executor death and model switches. No CUDA or NVML.
   (manifest, traversal, window, components, regions, parts). The machine checks seals, length and
   SHA-256, that the manifest and components are the session's (`HostGrant`), and rebuilds the read
   plan and layout from its own header. Cache key: the TensorFS layout digest.
-- Answer `held: true` with a read-only reopen of the sealed memfd, or `held: false` (no room):
-  that weight set reads the store. A refused plan is an answer too, never a session failure.
+- Answer `held: true` with a read-only reopen of the sealed memfd, at once if the executor offers
+  `host_tiers.filling/1`, else once the layout is complete; or `held: false` (no room): that
+  weight set reads the store. A refused plan is an answer too, never a session failure.
+- `sealed_prefetch` carries all of a construction's plans: each is opened and queued at once.
 
 ## Size and release
 
@@ -23,9 +28,10 @@ layout survives executor death and model switches. No CUDA or NVML.
   `memory.high`/`memory.max` v2 or `limit_in_bytes` v1, minus non-reclaimable usage, and
   `MemAvailable`). `TierLimit` decides the most the tier may charge; until the memory policy
   module (B2) supplies one, `HalfOfHeadroom` = (available + charged) / 2.
-- To make room, unheld layouts are released oldest first; unheld layouts past `ttl` go anyway.
-  A layout is held while any executor it was granted to is alive (pidfd). Held layouts never go.
-- Charge = kernel `st_blocks` per memfd. A release records the charged bytes and the fall in
+- To make room, unheld, complete layouts are released oldest first; such layouts past `ttl` go
+  anyway. A layout is held while any executor it was granted to is alive (pidfd). Held or filling
+  layouts never go.
+- Charge = the layout's size while filling, then kernel `st_blocks` per memfd. A release records the charged bytes and the fall in
   shared memory; if memory did not come back, the bytes stay charged (`stranded_bytes`).
 - `release(want)` and `facts()` are the policy module's handles (see B1 `INTERFACE.md`).
 
@@ -33,20 +39,21 @@ layout survives executor death and model switches. No CUDA or NVML.
 
 A filled layout's verified plan is kept in `<gpu>/host-plans` (latest per manifest and
 components). When `GpuPool` spawns an executor that adopts sealed tiers, layouts of its model the
-tier no longer holds refill in the background while it imports (`prefill`); its asks then hit or
-wait for that fill. Only a model's first load ever has the fill on its Load path.
+tier no longer holds refill in the background while it imports (`prefill`); its asks then hit.
+Components without a plan get their memory reserved from the manifest at spawn.
 
 ## Bounds
 
 - One descriptor per layout, plus one pidfd per executor. A fill's read lease (one descriptor per
   object of that component) ends with the fill; `GpuPool` lifts the soft NOFILE limit to the hard one.
 - No lock across a fill: other asks, and other models' executors, proceed meanwhile; a second ask
-  for a layout being filled waits for that fill.
+  for a layout being filled gets the same layout.
 - `GpuPool` appends one line per Load to `<state>/gpu/loads.jsonl`: executor load facts and the
   host tier's facts (fills with ms, bytes by read mode and disk reads; hits; prefills;
   releases), and the machine's and executor's RSS/PSS.
 
-## Fallbacks
+## Fallbacks (removed after F's gate: hard cut, the sealed tier becomes the only source)
 
 Executor without `host_tiers.sealed/1`: descriptors (`model_sources.descriptors/1`), else legacy
-store reads. With sealed tiers the header and configs come from the store, not descriptors.
+store reads. Without `host_tiers.filling/1`: complete layouts only. With sealed tiers the header
+and configs come from the store, not descriptors.
