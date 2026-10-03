@@ -638,6 +638,40 @@ mod tests {
     }
 
     #[test]
+    fn a_learned_peak_for_the_shape_makes_room_before_the_call() {
+        let mut gpu = Gpu {
+            device: "GPU-1/580".into(),
+            ..Gpu::default()
+        };
+        loaded(&mut gpu, "sdxl", 10, 7 * GIB, GIB / 4);
+        gpu.active("sdxl", 15 * GIB);
+        gpu.idle("sdxl");
+        loaded(&mut gpu, "anima", 11, 6 * GIB, GIB / 4);
+        // Anima's 1536 shape was measured at 3 GiB in an earlier run; this run knows 256 MiB.
+        let methods = BTreeMap::from([("transformer".to_string(), 3 * GIB)]);
+        gpu.learned
+            .call("anima", "height=1536,width=1536", 3 * GIB, &methods);
+        gpu.learned.context("GPU-1/580", 300 * MIB);
+        gpu.set_shape("anima", "height=1536,width=1536");
+        assert_eq!(gpu.activation("anima"), Some(3 * GIB));
+        assert_eq!(gpu.seeds("anima"), methods);
+        assert_eq!(gpu.context_estimate(), 300 * MIB + MARGIN);
+        // SDXL idle holds 8 GiB of a 16 GiB card: 7.75 GiB of room is short of Anima's want.
+        let s = sample(16 * GIB, 7 * GIB + GIB / 2, &[(10, 8 * GIB), (11, GIB / 2)]);
+        let mut round = Round::default();
+        assert_eq!(
+            gpu.decide(
+                "anima",
+                gpu.want("anima"),
+                gpu.need("anima"),
+                &s,
+                &mut round
+            ),
+            Decision::Step(Step::Unmap("sdxl".into()))
+        );
+    }
+
+    #[test]
     fn nothing_left_to_free_grants_what_there_is() {
         let gpu = Gpu::default();
         let s = sample(4 * GIB, GIB, &[]);
