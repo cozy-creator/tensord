@@ -20,6 +20,8 @@ pub struct InstallerConfig {
     pub generations: PathBuf,
     pub client_wheel: PathBuf,
     pub staging_root: PathBuf,
+    /// The machine's own Runtime/TensorFS wheels: a local package runs this pair too.
+    pub sdk: Vec<PathBuf>,
 }
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 pub struct Dependency {
@@ -187,6 +189,12 @@ pub fn prepare_uploaded(
         .arg(&config.generations)
         .arg("--client-wheel")
         .arg(&config.client_wheel)
+        .args(
+            config
+                .sdk
+                .iter()
+                .flat_map(|wheel| [std::ffi::OsStr::new("--sdk-wheel"), wheel.as_os_str()]),
+        )
         .arg("--python")
         .arg(python)
         .arg("--distribution")

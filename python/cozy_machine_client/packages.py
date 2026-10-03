@@ -173,6 +173,7 @@ def main():
     captured.add_argument("--python-version", default="")
     captured.add_argument("--generations", type=Path, required=True)
     captured.add_argument("--client-wheel", type=Path, required=True)
+    captured.add_argument("--sdk-wheel", action="append", type=Path, default=[])
     captured.add_argument("--python", default=sys.executable)
     args = parser.parse_args()
     if args.command == "install-captured":
@@ -180,7 +181,8 @@ def main():
         try:
             result = install_captured(project=args.project, wheels=args.wheel, requirements=args.requirements,
                 distribution=args.distribution, release=args.release, python_requires=args.python_requires,
-                python_version=args.python_version, generations=args.generations, client_wheel=args.client_wheel, python=args.python)
+                python_version=args.python_version, generations=args.generations, client_wheel=args.client_wheel, python=args.python,
+                sdk=args.sdk_wheel)
         except PackageError as exc:
             print(msgspec.json.encode(InstallFailed(exc.code, str(exc))).decode())
             raise SystemExit(1)

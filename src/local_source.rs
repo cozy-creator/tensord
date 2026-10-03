@@ -238,17 +238,15 @@ mod tests {
         let objects = Arc::new(
             Objects::new(&root.join("writes"), store.clone(), service.engine.clone()).unwrap(),
         );
-        let sources = LocalSources::new(
-            objects.clone(),
-            InstallerConfig {
-                helper_python: helper.into(),
-                python: "3.12".into(),
-                generations: root.join("generations"),
-                client_wheel: client,
-                staging_root: root.join("staging"),
-            },
-            store,
-        );
+        let installer = InstallerConfig {
+            helper_python: helper.into(),
+            python: "3.12".into(),
+            generations: root.join("generations"),
+            client_wheel: client,
+            staging_root: root.join("staging"),
+            sdk: vec![],
+        };
+        let sources = LocalSources::new(objects.clone(), installer.clone(), store.clone());
         let mut archive = tar::Builder::new(Vec::new());
         let fixture = repo.join("tests/fixtures/cpu_input");
         for name in ["pyproject.toml", "package.toml", "cpu_input/__init__.py"] {
@@ -284,6 +282,60 @@ mod tests {
             .install(&service, "alice", &manifest.digest)
             .unwrap();
         assert_eq!(again.generation, installed.generation);
+
+        // With the machine's own SDK pair, a local package runs that pair, not PyPI's newest.
+        let sdk = root.join("sdk");
+        fs::create_dir_all(&sdk).unwrap();
+        let mut pair = vec![];
+        for (name, url) in SDK_PAIR {
+            let path = sdk.join(name);
+            assert!(Command::new("curl")
+                .args(["-sfL", "-o"])
+                .arg(&path)
+                .arg(url)
+                .status()
+                .unwrap()
+                .success());
+            pair.push(path);
+        }
+        let pinned = LocalSources::new(
+            objects.clone(),
+            InstallerConfig {
+                sdk: pair,
+                ..installer
+            },
+            store,
+        );
+        let other = serde_json::json!({
+            "package": "local/cozy-machine-cpu-input",
+            "release": "0.1.0",
+            "python_version": "3.12",
+            "python_requires": ">=3.12",
+            "source": {"digest": source.digest, "length": source.length},
+        });
+        let other = write(&objects, "alice", other.to_string().as_bytes());
+        let installed = pinned.install(&service, "alice", &other.digest).unwrap();
+        let python = service
+            .catalog
+            .resolve(&installed.generation)
+            .unwrap()
+            .record
+            .python
+            .clone();
+        let version = Command::new(python)
+            .args(["-c", "import importlib.metadata as m; print(m.version('cozy-runtime'), m.version('tensorfs'))"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(version.stdout).unwrap().trim(),
+            "0.18.101 0.3.92"
+        );
         let _ = fs::remove_dir_all(root);
     }
+
+    /// A Runtime/TensorFS pair other than PyPI's newest, standing in for the machine's own.
+    const SDK_PAIR: [(&str, &str); 2] = [
+        ("cozy_runtime-0.18.101-cp312-abi3-manylinux_2_28_x86_64.whl", "https://files.pythonhosted.org/packages/23/be/107c41ae8c978de51c315ba0c18152625454cd3767fb584683420b799d6b/cozy_runtime-0.18.101-cp312-abi3-manylinux_2_28_x86_64.whl"),
+        ("tensorfs-0.3.92-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", "https://files.pythonhosted.org/packages/f4/fc/8bc1e8fd0927b08257663e0b599da5e503a09adc8ee1db9cc183e78a73eb/tensorfs-0.3.92-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"),
+    ];
 }

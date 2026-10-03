@@ -628,6 +628,7 @@ mod tests {
                 generations: root.join("generations"),
                 client_wheel: client,
                 staging_root: root.join("staging"),
+                sdk: vec![],
             },
             store,
         );

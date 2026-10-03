@@ -90,6 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             generations: output.join("generations"),
             client_wheel: client.ok_or("--client-wheel is required")?,
             staging_root: output.join("staging"),
+            sdk: vec![],
         },
         &uploaded,
     )?;

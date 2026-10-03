@@ -58,7 +58,7 @@ def inventory(interpreter: Path) -> list[Dependency]:
 
 def install_captured(*, project: Path | None, wheels: list[Path], requirements: Path | None,
                      distribution: str, release: str, python_requires: str, python_version: str,
-                     generations: Path, client_wheel: Path, python: str):
+                     generations: Path, client_wheel: Path, python: str, sdk: list[Path] = ()):
     python = subprocess.check_output(["uv", "python", "find", "--no-project", "--no-python-downloads", python]).decode().strip()
     version = Version(subprocess.check_output([python, "-I", "-S", "-c", "import platform;print(platform.python_version())"]).decode().strip())
     if python_requires and version not in SpecifierSet(python_requires):
@@ -113,6 +113,15 @@ def install_captured(*, project: Path | None, wheels: list[Path], requirements: 
                 subprocess.run(["uv", "pip", "install", "--python", str(interpreter), str(project), *map(str,wheels)], check=True)
             else:
                 subprocess.run(["uv", "pip", "install", "--python", str(interpreter), *map(str,wheels)], check=True)
+        if sdk:
+            # The machine's own Runtime/TensorFS pair replaces what the capture resolved; every
+            # other locked version stays, and uv reports a conflict with declared bounds.
+            pair = {canonicalize_name(wheel.name.split("-")[0]) for wheel in sdk}
+            kept = root / "sdk-constraints.txt"
+            kept.write_text("".join(f"{row.name}=={row.version}\n" for row in inventory(interpreter)
+                                    if canonicalize_name(row.name) not in pair))
+            subprocess.run(["uv", "pip", "install", "--python", str(interpreter), "-c", str(kept),
+                            *map(str, sdk)], check=True)
         locked = inventory(interpreter)
         constraints = root / "captured-constraints.txt"
         constraints.write_text("".join(f"{row.name}=={row.version}\n" for row in locked))
