@@ -76,6 +76,12 @@ machines) and stops the harness at once.
 An arm's optional `facts` command is recorded at every restart; a manifest `collect` command's stdout
 (a tarball) is saved as `OUT/collect.tgz` at the end.
 
+`cells` (name → models, e.g. `grouped: [sdxl, sdxl, sdxl, anima, anima, anima]`) with `cell_order`
+([arm, cell] pairs) runs the 2026-10-01 rebench's six-request cells before the cycles: equal soak and
+thermal start, a freshly started ready machine (`ready` command), then each request as its own
+`cozy run --await`, the next submitted once the previous one holds the GPU. Total = first submit to last
+saved output.
+
 ## Manifest
 
 `rental`, `hub`, `salt` (new per run), `targets`, `requests` (fixed fields; prompt and seed added per

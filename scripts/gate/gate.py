@@ -430,12 +430,79 @@ class Gate:
         self.record({"arm": arm, "event": "kill_proof", "cycles": n, "failed": failed})
         log(f"kill proof on {arm}: {n} cycles, {failed} failed")
 
+    def cell(self, arm: str, name: str, models: list[str]) -> None:
+        """A rebench cell: a freshly started, ready machine, then the requests in order with at most one
+        successor waiting behind a predecessor that holds the GPU. Total = first submit to last saved output."""
+        spec = self.m["arms"][arm]
+        cycle = 2000 + self.index
+        self.record({"arm": arm, "cell": name, "event": "cell_begin", "clock": self.clock(), "cool": self.cool()})
+        old = (self.pod.sh(spec["root"]).split() or ["none"])[0]
+        self.pod.sh(spec["restart"])
+        if spec.get("start"):
+            while self.pod.helper("now")["executors"]:
+                time.sleep(0.2)
+            self.pod.sh(spec["start"])
+        new = self.pod.helper("newroot", old, spec["root"])
+        if spec.get("after_start"):
+            self.pod.sh(spec["after_start"])
+        if spec.get("ready"):   # e.g. the owner's machine reports phase ready
+            self.pod.sh(spec["ready"])
+        if spec.get("cgroup"):
+            self.pod.sh(f"({spec['cgroup']}) > {self.pod.dir}/cgroup")
+        limits = self.pod.sh(spec["limits"]) if spec.get("limits") else None
+        cli = spec.get("cli", "cozy")
+        place = spec.get("run_args", [f"--rental={self.m.get('rental')}", f"--tensorhub={self.m.get('hub')}"])
+        on_gpu = ("machine.gpu.grant", "machine.executor", "run.in_progress", "machine.stage.turn")
+        procs, before = [], self.pod.helper("now")
+        first = None
+        for k, model in enumerate(models):
+            if procs:   # wait until the previous request holds the GPU (or has already finished)
+                while procs[-1]["proc"].poll() is None and not any(f'"type":"{t}"' in procs[-1]["err"].read_text() for t in on_gpu):
+                    time.sleep(0.1)
+            prompt, seed = self.unique()
+            root = self.out / "runs" / f"{self.index:03}-{arm}-{name}-{k}-{model}"
+            root.mkdir(parents=True)
+            (root / "input.json").write_text(json.dumps({**self.m["requests"][model], "prompt": prompt, "seed": seed}))
+            submit = time.time()
+            first = first or submit
+            err = root / "events.jsonl"
+            proc = subprocess.Popen([cli, "run", self.m["targets"][model], f"--input={root / 'input.json'}", *place,
+                                     "--await", "--json", f"--out={root / 'out'}", f"--idempotency-key=gate-{self.m['salt']}-{self.index}"],
+                                    stdout=(root / "stdout.json").open("w"), stderr=err.open("w"))
+            procs.append({"proc": proc, "err": err, "root": root, "model": model, "prompt": prompt, "seed": seed, "submit": submit})
+            self.index += 1
+        for p in procs:
+            p["proc"].wait()
+            p["done"] = time.time()
+        end = max(p["done"] for p in procs)
+        after = self.pod.helper("now")
+        rows = []
+        for p in procs:
+            images = verify(p["root"] / "out", self.m["shapes"][p["model"]]) if (p["root"] / "out").is_dir() else []
+            seen = marks(p["err"].read_text())
+            rows.append({"model": p["model"], "prompt": p["prompt"], "seed": p["seed"], "exit": p["proc"].returncode,
+                         "dir": str(p["root"]), "submit": p["submit"], "done": p["done"], "images": images,
+                         "machine_s": (seen["machine.outcome"] - seen["request.machine_accepted"])
+                         if "machine.outcome" in seen and "request.machine_accepted" in seen else None,
+                         "ok": p["proc"].returncode == 0 and len(images) == 1 and images[0]["ok"]})
+        ok = all(r["ok"] for r in rows)
+        self.record({"arm": arm, "cell": name, "event": "cell", "total_s": end - first, "t_first": first, "t_end": end,
+                     "offset": self.offset, "new_root": new, "limits": limits, "ok": ok, "requests": rows,
+                     "disk_read_bytes": after["cg"]["read_bytes"] - before["cg"]["read_bytes"],
+                     "controller_load": os.getloadavg()[0]})
+        self.idle_since = end
+        log(f"{arm} cell {name}: {end - first:.1f} s", "ok" if ok else "FAILED")
+        if not ok:
+            raise RuntimeError(f"cell {name} on {arm} failed")
+
     def run(self) -> None:
         samples = f"{self.pod.dir}/samples-{self.m['salt']}.jsonl"
         sampler = self.pod.sh(f"nohup {self.pod.py} {POD_DIR}/pod.py sample {samples} >/dev/null 2>&1 & echo $!").strip()
         try:
             for arm in self.m.get("prime", []):
                 self.prime(arm)
+            for arm, name in self.m.get("cell_order", []):
+                self.cell(arm, name, self.m["cells"][name])
             for cycle, arm in enumerate(self.m["order"]):
                 self.cycle(arm, cycle)
             if self.m.get("kill_proof"):
@@ -496,6 +563,19 @@ def report(out: Path) -> dict:
         cell["gpu_peak_gib"] = spread(gpu)
         cell["busy_sm_mhz"] = spread(clocks)
         summary["arms"][arm] = cell
+    cells = [r for r in rows if r.get("event") == "cell"]
+    summary["cells"] = {}
+    for r in cells:
+        window = [x for x in samples if r["t_first"] + r["offset"] <= x["t"] <= r["t_end"] + r["offset"]
+                  and (rental or x["cg"].get("path") != "/sys/fs/cgroup")]
+        cell = summary["cells"].setdefault(r["arm"], {}).setdefault(r["cell"], {"total_s": [], "host_peak_gib": [], "gpu_peak_gib": [],
+                                                                               "disk_read_gib": [], "ok": []})
+        cell["total_s"].append(round(r["total_s"], 2))
+        cell["ok"].append(r["ok"])
+        cell["disk_read_gib"].append(round(r["disk_read_bytes"] / 2**30, 2))
+        if window:
+            cell["host_peak_gib"].append(round(max(x["cg"]["host"] for x in window) / 2**30, 2))
+            cell["gpu_peak_gib"].append(round(max(x["gpu"]["mem_mib"] or 0 for x in window) / 1024, 2))
     old, new = summary["arms"].get("old"), summary["arms"].get("rust")
     if old and new:
         def gain(key: str) -> float | None:
