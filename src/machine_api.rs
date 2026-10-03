@@ -125,7 +125,8 @@ impl NativeBackend {
                 State::Failed => "failed",
                 State::Canceled => "canceled",
                 State::Queued => "queued",
-                State::Starting => "starting",
+                // The worker protocol has no "starting": an attempt is queued until it runs.
+                State::Starting => "queued",
                 State::Running => "running",
                 State::Unknown => "unknown",
             }
