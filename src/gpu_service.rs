@@ -86,7 +86,6 @@ pub struct GpuConfig {
     pub devices: String,
     /// Load's device limit where NVML cannot read the device total.
     pub authorized_device_limit_bytes: Option<u64>,
-    pub pinned_budget_bytes: i64,
     #[serde(default)]
     pub memory: MemoryConfig,
     /// Explicitly configured locations; the executor seal is imposed on top of them.
@@ -924,6 +923,12 @@ impl GpuPool {
             // The pinned budget comes with the Load, so no fill pins past it; an executor
             // without `load_pinned/1` gets it after, as before.
             let at_load = plane && session.executor.hello.offers("load_pinned/1");
+            // Its share of the machine's pinned total, ahead of every other tenant.
+            let pinned = self
+                .memory
+                .pinned_budgets(&plan.id)
+                .and_then(|split| split.get(&plan.id).copied())
+                .map_or(-1, |share| i64::try_from(share).unwrap_or(i64::MAX));
             let started = std::time::Instant::now();
             let loaded = command_ok(session.executor.command(
                 &DeviceCommand::Load {
@@ -940,7 +945,7 @@ impl GpuPool {
                     stages: false,
                     descriptor_sources: session.descriptors,
                     sealed_tiers: session.sealed,
-                    pinned_bytes: at_load.then_some(self.config.pinned_budget_bytes),
+                    pinned_bytes: at_load.then_some(pinned),
                     device_weights: sharing,
                     cap_bytes: load_cap.filter(|_| capped),
                 },
@@ -959,7 +964,7 @@ impl GpuPool {
                 command_ok(session.executor.command(
                     &DeviceCommand::Budget {
                         vram_bytes: -1,
-                        pinned_bytes: self.config.pinned_budget_bytes,
+                        pinned_bytes: pinned,
                         cap_bytes: None,
                     },
                     &mut callbacks,
@@ -1025,6 +1030,7 @@ impl GpuPool {
             &spool,
             &record.invocation.inputs,
         )?;
+        self.shed(&plan.id, callbacks.others);
         // A real grant for the whole call: one tenant needs no per-stage turns.
         let cap = self.memory.decide(
             &plan.id,
@@ -1148,6 +1154,44 @@ impl GpuPool {
         Ok(true)
     }
 
+    /// Idle tenants pinning more than their share of the host's pinned total give it back
+    /// (their planes punch the least recently used regions; page cache and disk stay beneath)
+    /// before `plan` runs. An idle executor's pinned tier is optional: a failure is noted.
+    fn shed(&self, plan: &str, others: &mut BTreeMap<String, Session>) {
+        let Some(split) = self.memory.pinned_budgets(plan) else {
+            return;
+        };
+        for (other, session) in others.iter_mut() {
+            let budget = self.memory.with(|gpu| gpu.facts(other).pinned_budget);
+            let Some(share) = split.get(other).copied() else {
+                continue;
+            };
+            if !session.executor.hello.offers("weight_plane/1")
+                || budget.is_none_or(|budget| share >= budget)
+            {
+                continue;
+            }
+            let reply = session.executor.command(
+                &DeviceCommand::Budget {
+                    vram_bytes: -1,
+                    pinned_bytes: i64::try_from(share).unwrap_or(i64::MAX),
+                    cap_bytes: None,
+                },
+                &mut device_executor::Baseline,
+            );
+            match reply {
+                Ok(reply) if reply.ok => {
+                    self.memory
+                        .observe(other, plane_facts(reply.plane.as_ref()), None);
+                    crate::memory::note(serde_json::json!({"event": "shed", "plan": other,
+                        "pinned_budget": share, "for": plan}));
+                }
+                other_reply => crate::memory::note(serde_json::json!({"event": "shed_failed",
+                    "plan": other, "detail": format!("{:?}", other_reply.map(|r| r.code))})),
+            }
+        }
+    }
+
     /// An executor's out-of-memory retry asks for `free_bytes` from the other tenants: idle
     /// weights leave first, then idle processes; its cap rises into what they gave.
     fn room_for(
@@ -1178,6 +1222,8 @@ fn plane_facts(plane: Option<&device_executor::PlaneFacts>) -> Facts {
         context: known(plane.context_bytes),
         process: known(plane.process_bytes),
         activation: known(plane.activation_peak_bytes).filter(|v| *v > 0),
+        pinned: known(plane.pinned_bytes),
+        pinned_budget: known(plane.pinned_budget_bytes),
         ..Facts::default()
     })
 }

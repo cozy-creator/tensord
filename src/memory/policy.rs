@@ -32,6 +32,9 @@ pub struct Facts {
     pub weights: Option<u64>,
     pub weights_floor: Option<u64>,
     pub activation: Option<u64>,
+    /// Host bytes its pinned tier holds, and the budget that bounds it.
+    pub pinned: Option<u64>,
+    pub pinned_budget: Option<u64>,
 }
 impl Facts {
     /// Newer facts replace older ones field by field; an absent field keeps what was known.
@@ -40,6 +43,8 @@ impl Facts {
         self.process = newer.process.or(self.process);
         self.weights = newer.weights.or(self.weights);
         self.weights_floor = newer.weights_floor.or(self.weights_floor);
+        self.pinned = newer.pinned.or(self.pinned);
+        self.pinned_budget = newer.pinned_budget.or(self.pinned_budget);
         self.activation = match (self.activation, newer.activation) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => b.or(a),
@@ -386,6 +391,29 @@ impl Gpu {
         Decision::Go(room)
     }
 
+    /// Every live tenant as `(plan, weights, pinned now)`, `first` ahead and then most
+    /// recently used first: the order host pinned budgets are shared in.
+    pub fn pinned_order(&self, first: &str) -> Vec<(String, u64, u64)> {
+        let mut rows: Vec<_> = self.tenants.iter().collect();
+        rows.sort_by_key(|(plan, t)| (plan.as_str() != first, std::cmp::Reverse(t.last_used)));
+        let mut order: Vec<_> = rows
+            .into_iter()
+            .map(|(plan, _)| {
+                let facts = self.facts(plan);
+                (
+                    plan.clone(),
+                    facts.weights.unwrap_or(0),
+                    facts.pinned.unwrap_or(0),
+                )
+            })
+            .collect();
+        if !self.tenants.contains_key(first) {
+            let facts = self.facts(first);
+            order.insert(0, (first.into(), facts.weights.unwrap_or(0), 0));
+        }
+        order
+    }
+
     /// A sample below the floor during a call: the running tenant's lowered cap, never below
     /// its lowest rung. None while the floor holds or nobody runs.
     pub fn below_floor(&self, sample: &Sample) -> Option<(String, u64)> {
@@ -433,6 +461,7 @@ mod tests {
                 weights: Some(weights),
                 weights_floor: Some(weights / 8),
                 activation: Some(activation),
+                ..Facts::default()
             },
             Some(false),
         );

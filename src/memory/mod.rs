@@ -1,6 +1,7 @@
 //! The one owner of every GPU memory decision (PLAN decision 3, design rust-machine.md §2.1–2.2).
 //! `policy` decides from samples and executor facts; `nvml` samples on its own thread; this
 //! module joins them and keeps the floor while a call runs.
+pub mod host;
 pub mod nvml;
 pub mod policy;
 
@@ -246,6 +247,14 @@ impl GpuMemory {
                 }
             }
         }
+    }
+
+    /// Host pinned budgets, `first` ahead and then most recently used first, from the live
+    /// host (cgroup path and `MemAvailable`). None: the host is unreadable.
+    pub fn pinned_budgets(&self, first: &str) -> Option<std::collections::BTreeMap<String, u64>> {
+        let order = self.with(|gpu| gpu.pinned_order(first));
+        let memory = crate::host_memory::read();
+        host::pinned_split(memory.available, memory.shmem, &order)
     }
 
     pub fn observe(&self, plan: &str, facts: Facts, mapped: Option<bool>) {
