@@ -64,8 +64,17 @@ pub struct Request {
     /// The owner's binding revision the caller knows: a held resolution made under another
     /// revision resolves again.
     pub binding_revision: String,
+    /// Provider tokens for source models (memory only).
+    pub providers: Providers,
     pub entrypoint: String,
     pub choices: Vec<pb::ModelChoice>,
+}
+
+/// The caller's provider tokens; empty reads public sources anonymously.
+#[derive(Clone, Debug, Default)]
+pub struct Providers {
+    pub huggingface: String,
+    pub civitai: String,
 }
 
 /// Where a preparation's stage and bytes are reported as they change.
@@ -248,6 +257,86 @@ impl Publisher {
         self.work(service, actor, request, &job)
     }
 
+    /// A slot's model made from its provider source (TensorFS `source_model`), kept as the
+    /// local repository named by the source and its profiles.
+    fn source_grant(
+        &self,
+        installation: &Installation,
+        path: &str,
+        choice: &pb::ModelChoice,
+        providers: &Providers,
+        job: &Job,
+    ) -> Result<ModelGrant, Failure> {
+        if !choice.repository.is_empty() || choice.manifest.is_some() {
+            return Err((
+                "model_override_invalid",
+                format!("{path} names a source and a catalog checkpoint"),
+            ));
+        }
+        let mut profiles = choice.profiles.clone();
+        profiles.sort();
+        let identity = serde_json_canonicalizer::to_vec(&json!([
+            "cozy.machine-source-model/1",
+            choice.source,
+            profiles
+        ]))
+        .map_err(|e| io_failure(io::Error::other(e)))?;
+        let name = format!("source-{}", &sha256::hex_digest(&identity)[..40]);
+        let token = if choice.source.starts_with("civitai://") {
+            &providers.civitai
+        } else {
+            &providers.huggingface
+        };
+        let access = tensorfs_core::source_model::Access {
+            credential: if token.is_empty() {
+                String::new()
+            } else {
+                format!("bearer {token}")
+            },
+            endpoints: Default::default(),
+        };
+        let progress = |stage: &str, moved: u64, total: u64| {
+            job.set(Progress::Preparing {
+                stage: format!("{stage} for {path}"),
+                moved,
+                total,
+            })
+        };
+        let made = tensorfs_core::source_model::make(
+            &self.store,
+            &tensorfs_core::source_model::Request {
+                source: &choice.source,
+                profiles: &choice.profiles,
+                name: &name,
+                access: &access,
+                registry: None,
+                progress: &progress,
+                cancellation: None,
+            },
+        )
+        .map_err(|e| ("model_source_failed", e.to_string()))?;
+        let manifest = self
+            .store
+            .read_manifest(&made.manifest)
+            .map_err(|e| ("model_source_failed", e.to_string()))?;
+        let header = manifest
+            .header()
+            .map(|reference| tensorfs_core::checkpoint::load_header(&self.store, reference))
+            .transpose()
+            .map_err(|e| ("model_source_failed", e.to_string()))?;
+        Ok(ModelGrant {
+            package: installation.package.clone(),
+            slot: path.to_string(),
+            repository: made.repository,
+            release: String::new(),
+            lane: String::new(),
+            manifest: format!("sha256:{}", made.manifest.sha256),
+            components: header
+                .map(|h| h.components.into_iter().map(|(name, _)| name).collect())
+                .unwrap_or_default(),
+        })
+    }
+
     fn fetch(&self, manifests: Vec<String>) -> Fetching<'_> {
         let mut fetching = self.fetching.lock().unwrap();
         for manifest in &manifests {
@@ -311,6 +400,8 @@ impl Publisher {
                     c.manifest
                         .as_ref()
                         .map(|m| (sha256::hex(&m.digest), m.length)),
+                    c.source,
+                    c.profiles,
                     // Adapter order and scale are part of what the slot runs.
                     c.adapters
                         .iter()
@@ -768,6 +859,10 @@ impl Publisher {
                 .find(|c| c.parameter == path || c.parameter == parameter)
                 .cloned()
                 .unwrap_or_default();
+            if !choice.source.is_empty() {
+                grants.push(self.source_grant(installation, &path, &choice, &request.providers, job)?);
+                continue;
+            }
             let (model, release, lane, manifest) = if let Some(reference) =
                 choice.manifest.as_ref().filter(|m| m.digest.len() == 32)
             {
@@ -894,8 +989,8 @@ impl Publisher {
         let keep = self.protected(service, gpu);
         let mut fetched = std::collections::BTreeSet::new();
         for grant in &grants {
-            if !fetched.insert(grant.manifest.clone()) {
-                continue; // two slots of one checkpoint download it once
+            if !fetched.insert(grant.manifest.clone()) || grant.repository.starts_with("local/") {
+                continue; // one download per checkpoint; a source model is already here
             }
             job.stage(format!(
                 "downloading {}@{} {}",
@@ -1416,5 +1511,40 @@ mod tests {
         let slot = json!({"default_ladder":[{"gpu":"*","lane":"cozy/sdxl@1/plain"}]});
         assert_eq!(authored(&slot).unwrap()["model"], "cozy/sdxl");
         assert_eq!(authored(&json!({})), None);
+    }
+
+    /// A source choice becomes the slot's grant through TensorFS `source_model`, as a local
+    /// repository named by the source; a second choice of it is held. Real huggingface.co.
+    #[test]
+    #[ignore = "real network: huggingface.co"]
+    fn a_source_choice_is_made_into_a_local_grant() {
+        let root = std::env::temp_dir().join(format!("cm-source-{}", uuid::Uuid::new_v4()));
+        let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
+        let publisher = Publisher::new(&root.join("published"), Default::default(), store).unwrap();
+        let installation = Installation {
+            actor: "alice".into(),
+            alias: "x".into(),
+            generation: String::new(),
+            package: "org/sdxl".into(),
+            release: "1".into(),
+            interface: vec![],
+        };
+        let choice = pb::ModelChoice {
+            parameter: "unet".into(),
+            source: "hf://hf-internal-testing/tiny-sdxl-pipe@20594cbc343cfcfe447af5c87cdaf6c436b453f2/unet/diffusion_pytorch_model.safetensors".into(),
+            ..Default::default()
+        };
+        let job = Job::default();
+        let grant = publisher
+            .source_grant(&installation, "generate.models.unet", &choice, &Providers::default(), &job)
+            .unwrap();
+        assert!(grant.repository.starts_with("local/source-"), "{grant:?}");
+        assert!(grant.manifest.starts_with("sha256:"));
+        assert!(!grant.components.is_empty());
+        let again = publisher
+            .source_grant(&installation, "generate.models.unet", &choice, &Providers::default(), &job)
+            .unwrap();
+        assert_eq!(again.manifest, grant.manifest);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

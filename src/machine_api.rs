@@ -1022,6 +1022,7 @@ impl MachineBackend for NativeBackend {
                 installed: None,
                 owner: String::new(),
                 binding_revision: String::new(),
+                providers: Default::default(),
                 entrypoint: root.entrypoint.clone(),
                 choices: root.models.clone(),
             };

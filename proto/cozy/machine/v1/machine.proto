@@ -47,6 +47,13 @@ message RunSpec {
   string weights_destination = 13;  // model://… for a job's weights outputs
   HubAccess hub = 14;               // held in memory for this run's preparation only
   string owner = 15;                // the account that org-relative references of local code name
+  ProviderAccess providers = 16;    // provider tokens for source models, memory only like hub
+}
+
+// The caller's provider tokens, for models a run makes from a provider source.
+message ProviderAccess {
+  string huggingface = 1;
+  string civitai = 2;
 }
 
 message Release {
@@ -75,6 +82,11 @@ message ModelChoice {
   string manifest = 5;   // sha256:<hex>, optional exact checkpoint
   uint64 manifest_length = 6;
   repeated Adapter adapters = 7;
+  // A provider source (hf://<org>/<repo>@<rev>[/member], civitai://<version>[/file]) the
+  // machine makes the slot's model from, under these reviewed profiles (none: the one its
+  // headers select); never with repository or manifest.
+  string source = 8;
+  repeated string profiles = 9;
 }
 message Adapter {
   string component = 1;

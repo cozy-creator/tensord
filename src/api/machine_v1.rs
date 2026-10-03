@@ -139,6 +139,7 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
         }
     };
     let hub = spec.hub.take();
+    let providers = spec.providers.take();
     let identity_digest = {
         let mut identity = spec.clone();
         identity.hub = hub.clone().map(|hub| v1::HubAccess {
@@ -202,6 +203,8 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
                         length: choice.manifest_length,
                     })
                 },
+                source: choice.source,
+                profiles: choice.profiles,
                 adapters: choice
                     .adapters
                     .into_iter()
@@ -215,7 +218,6 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
                         ..Default::default()
                     })
                     .collect(),
-                ..Default::default()
             })
         })
         .collect::<Result<_, _>>()?;
@@ -240,6 +242,12 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
         binding_revision: spec.binding_revision,
         attention_kernel: spec.attention_kernel,
         hub,
+        providers: providers
+            .map(|p| crate::published::Providers {
+                huggingface: p.huggingface,
+                civitai: p.civitai,
+            })
+            .unwrap_or_default(),
         owner: spec.owner,
         digest: identity_digest,
     })

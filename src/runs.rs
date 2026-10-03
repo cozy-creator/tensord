@@ -8,7 +8,7 @@ use crate::{
     journal::{Execution, Failure, InputFile, Installation, Outcome, Preparation, ResultRecord},
     local_source::LocalSources,
     objects::{Objects, Refused},
-    published::{declares_models, Publisher, Request},
+    published::{declares_models, Providers, Publisher, Request},
     service::{Call, Service},
 };
 use serde_json::{json, Value};
@@ -36,6 +36,8 @@ pub struct Spec {
     pub attention_kernel: String,
     /// The run's Hub access, held in memory for this preparation only.
     pub hub: Option<hub::Source>,
+    /// Provider tokens for source models, held the same way.
+    pub providers: Providers,
     pub owner: String,
     /// The spec's identity (its token excluded): a resubmitted id must carry the same.
     pub digest: String,
@@ -197,6 +199,7 @@ impl Runs {
                     installed: held,
                     owner: spec.owner.clone(),
                     binding_revision: spec.binding_revision.clone(),
+                    providers: spec.providers.clone(),
                     entrypoint: spec.entrypoint.clone(),
                     choices: spec.models.clone(),
                 };
@@ -333,6 +336,7 @@ mod tests {
             binding_revision: String::new(),
             attention_kernel: String::new(),
             hub: None,
+            providers: Default::default(),
             owner: "alice".into(),
             digest: digest.into(),
         }

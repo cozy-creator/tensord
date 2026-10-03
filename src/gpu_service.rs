@@ -735,13 +735,12 @@ impl GpuPool {
             }
             // Hub-resolved grants already carry a slot's adapters (as its adapter view);
             // configured cached authority has no resolution step to apply them.
-            if !choice.source.is_empty()
-                || !choice.profiles.is_empty()
-                || (!choice.adapters.is_empty() && resolved.is_empty())
+            if (!choice.source.is_empty() || !choice.profiles.is_empty() || !choice.adapters.is_empty())
+                && resolved.is_empty()
             {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "provider sources (and adapters without Hub resolution) are not taken by this machine yet",
+                    "provider sources and adapters need the run's preparation (configured grants take neither)",
                 ));
             }
         }
