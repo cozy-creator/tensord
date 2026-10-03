@@ -51,7 +51,7 @@ fn now_ms() -> u128 {
         .unwrap_or(0)
 }
 
-fn note(event: serde_json::Value) {
+pub(crate) fn note(event: serde_json::Value) {
     eprintln!("memory: {event}");
 }
 

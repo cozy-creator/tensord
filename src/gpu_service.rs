@@ -1073,6 +1073,15 @@ impl GpuPool {
                 .and_then(|v| u64::try_from(v).ok())
         });
         self.memory.observe(&plan.id, facts, Some(true));
+        if let Some(plane) = &reply.plane {
+            crate::memory::note(
+                serde_json::json!({"event": "call", "plan": plan.id, "id": id,
+                "cap": cap, "cap_bytes": plane.cap_bytes, "process": plane.process_bytes,
+                "context": plane.context_bytes, "committed": plane.committed_bytes,
+                "activation": plane.activation_peak_bytes, "oom_retries": plane.oom_retries,
+                "evictions": plane.evictions, "h2d_bytes": plane.h2d_bytes}),
+            );
+        }
         if !reply.quiescent || !reply.poisoned.is_empty() {
             // The run ends once the executor is gone; its own reason travels with it.
             let reason = reply
