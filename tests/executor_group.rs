@@ -56,6 +56,7 @@ fn launch(devices: &str, group: bool) -> (DeviceExecutor, PathBuf, Generation) {
         seal,
         generation_hold: Some(Arc::new(hold)),
         identity: None,
+        cgroup_namespace: Some("group".into()),
     })
     .unwrap();
     executor.liveness = Liveness {
@@ -97,6 +98,7 @@ fn environ(pid: u32) -> BTreeMap<String, String> {
 }
 
 #[test]
+#[ignore = "needs installed cpu_group generations"]
 fn a_group_start_spawns_sealed_followers_and_teardown_leaves_none() {
     let (mut executor, root, generation) = launch("0,1", true);
     let sealed = &executor.hello.sealed;
@@ -169,6 +171,7 @@ fn a_group_start_spawns_sealed_followers_and_teardown_leaves_none() {
 }
 
 #[test]
+#[ignore = "needs installed cpu_group generations"]
 fn a_degree_the_seal_does_not_name_is_refused_before_any_follower() {
     let (mut executor, root, generation) = launch("0,1", true);
     let reply = executor

@@ -677,7 +677,8 @@ mod tests {
         let liveness = Liveness {
             sample: Duration::from_millis(50),
         };
-        let (status, killed) = reap_group(&exact, Some(&mut child), liveness).unwrap();
+        let reaped = reap_group(&exact, Some(&mut child), liveness).unwrap();
+        let (status, killed) = (reaped.status, reaped.killed);
         assert_eq!(status.signal(), Some(libc::SIGKILL));
         // A sleeping member shows no progress: it is ended on that measurement, then waited.
         let killed = killed.expect("still members are ended on their measurement");
