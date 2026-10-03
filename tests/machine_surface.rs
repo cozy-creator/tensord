@@ -1397,4 +1397,151 @@ mod v1_api {
         assert_eq!(outcome(&child).status, "canceled", "{child:?}");
         let _ = fs::remove_dir_all(tools);
     }
+
+    /// H3 long-form's failure contract on CPU: a segment that fails in authored code fails its
+    /// child run with that reason, the job fails with `segment_failed` naming the segment, and
+    /// the film it published before the failure stays readable.
+    #[tokio::test]
+    async fn a_failed_segment_fails_the_job_and_keeps_the_film_so_far() {
+        let (machine, tools) = installing_machine().await;
+        let mut client = client(&machine).await;
+        let all = cap(Grant {
+            action: MACHINE.into(),
+            ..Default::default()
+        });
+        let manifest = write_package(
+            &mut client,
+            &all,
+            "cpu_longform",
+            "local/cozy-machine-cpu-longform",
+        )
+        .await;
+        let mut reference = vec![];
+        {
+            let mut encoder = png::Encoder::new(&mut reference, 2, 2);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&[9; 12])
+                .unwrap();
+        }
+        let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&reference));
+        let length = reference.len() as u64;
+        write(&mut client, &all, &digest, length, 0, &reference)
+            .await
+            .unwrap();
+        let segments = ["a dawn", "a storm", "a calm"];
+        let spec = v1::RunSpec {
+            kind: v1::RunKind::Job as i32,
+            source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
+            entrypoint: "long_form".into(),
+            payload: serde_json::to_vec(
+                &serde_json::json!({"reference": digest, "segments": segments, "fail_at": 1}),
+            )
+            .unwrap(),
+            inputs: vec![v1::InputFile {
+                field: "reference".into(),
+                digest: digest.clone(),
+                length,
+                media_type: "image/png".into(),
+                order: 0,
+            }],
+            owner: "alice".into(),
+            ..Default::default()
+        };
+        let events = collect(
+            client
+                .run(authorized(
+                    v1::RunRequest {
+                        id: "broken".into(),
+                        after: 0,
+                        spec: Some(spec),
+                    },
+                    &all,
+                ))
+                .await
+                .unwrap()
+                .into_inner(),
+        )
+        .await
+        .unwrap();
+        let done = outcome(&events);
+        assert_eq!(done.status, "failed", "{done:?}");
+        let reason = done.reason.clone().unwrap_or_default();
+        assert!(
+            reason.code.contains("segment_failed") || reason.message.contains("segment_failed"),
+            "{reason:?}"
+        );
+        assert!(reason.message.contains("segment 2 of 3"), "{reason:?}");
+        // The child that failed is a failed run with the authored reason; the one before it
+        // succeeded; no third segment ran.
+        let watch = |id: &str| v1::RunRequest {
+            id: id.into(),
+            after: 0,
+            spec: None,
+        };
+        let first = collect(
+            client
+                .run(authorized(watch("broken/0"), &all))
+                .await
+                .unwrap()
+                .into_inner(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome(&first).status, "succeeded", "{first:?}");
+        let second = collect(
+            client
+                .run(authorized(watch("broken/1"), &all))
+                .await
+                .unwrap()
+                .into_inner(),
+        )
+        .await
+        .unwrap();
+        let failed = outcome(&second);
+        assert_eq!(failed.status, "failed", "{second:?}");
+        assert!(
+            format!("{:?}", failed.reason).contains("cannot be rendered"),
+            "{failed:?}"
+        );
+        // No third segment ran.
+        match client.run(authorized(watch("broken/2"), &all)).await {
+            Err(_) => {}
+            Ok(stream) => assert!(collect(stream.into_inner()).await.is_err()),
+        }
+        // The film through the first segment was published and stays readable.
+        let labels: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.event {
+                Some(v1::run_event::Event::Product(p)) if p.output == "video" => {
+                    Some(p.label.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels, ["Video (segments 1-1)"], "{events:?}");
+        let seen = tensorfs_core::sha256::hex_digest(&reference);
+        let (meta, bytes) = read(
+            &mut client,
+            &all,
+            v1::ReadRequest {
+                target: Some(v1::read_request::Target::Output(v1::OutputTarget {
+                    run: "broken".into(),
+                    output: "video".into(),
+                    index: 0,
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            format!("0|a dawn|{seen}|\n"),
+            "{meta:?}"
+        );
+        let _ = fs::remove_dir_all(tools);
+    }
 }

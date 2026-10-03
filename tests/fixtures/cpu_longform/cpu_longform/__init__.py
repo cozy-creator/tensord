@@ -12,9 +12,11 @@ import msgspec
 from cozy_runtime.author import (
     App,
     AssetBound,
+    ChildCallError,
     Context,
     FileAsset,
     ImageAsset,
+    OutputError,
     Outputs,
     Telemetry,
     invocable,
@@ -33,6 +35,8 @@ class SegmentInput(msgspec.Struct):
     context: str = ""
     #: Seconds a segment takes (a cancel test holds one running).
     hold: float = 0.0
+    #: This segment fails in authored code (a failure test); -1: none does.
+    fail_at: int = -1
 
 
 class SegmentOutput(msgspec.Struct):
@@ -44,6 +48,8 @@ class SegmentOutput(msgspec.Struct):
 async def render_segment(ctx: Context, *, payload: SegmentInput, out: Outputs) -> SegmentOutput:
     """One segment: its bytes name the reference it saw and the context it continued."""
     ctx.raise_if_cancelled()
+    if payload.index == payload.fail_at:
+        raise ValueError(f"segment {payload.index} cannot be rendered")
     for _ in range(int(payload.hold * 20)):
         await asyncio.sleep(0.05)
         ctx.raise_if_cancelled()
@@ -59,6 +65,7 @@ class LongFormInput(msgspec.Struct):
     reference: Reference
     segments: list[str]
     hold: float = 0.0
+    fail_at: int = -1
 
 
 class LongFormOutput(msgspec.Struct):
@@ -73,9 +80,20 @@ async def long_form(
     film, context = b"", ""
     for index, prompt in enumerate(payload.segments):
         ctx.raise_if_cancelled()
-        result = await render_segment(
-            payload=SegmentInput(index, prompt, payload.reference, context, payload.hold)
-        )
+        try:
+            result = await render_segment(
+                payload=SegmentInput(
+                    index, prompt, payload.reference, context, payload.hold, payload.fail_at
+                )
+            )
+        except ChildCallError as failure:
+            # H3's long_form: the film published so far stays; the run fails with the segment.
+            ctx.raise_if_cancelled()
+            raise OutputError(
+                f"segment {index + 1} of {len(payload.segments)} failed ({failure.code}): "
+                f"{str(failure)[:512]}",
+                code="segment_failed",
+            ) from failure
         film += result.video.read_bytes()
         context = result.context
         revision = out.save_bytes(film, media_type="video/mp4")
