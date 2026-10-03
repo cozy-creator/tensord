@@ -233,7 +233,8 @@ async fn status_answers_identity_to_anyone_and_the_machine_to_its_owner() {
     std::fs::remove_dir_all(&root).unwrap();
 }
 
-/// A persistent machine (this computer's) never releases itself: Status names no deadline.
+/// A persistent machine (this computer's) never releases itself: Status names no deadline. It
+/// makes its installer helper from the client it embeds.
 #[tokio::test]
 async fn a_persistent_machine_reports_no_idle_deadline() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -246,8 +247,25 @@ async fn a_persistent_machine_reports_no_idle_deadline() {
         .local_addr()
         .unwrap()
         .port();
+    // The root's own uv, as an image or a local install provides it: the machine makes its
+    // installer helper with it from the client it embeds.
+    let uv = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|dir| dir.join("uv"))
+        .find(|path| path.is_file())
+        .expect("uv is required");
+    std::fs::create_dir_all(root.join("usr/local/bin")).unwrap();
+    std::os::unix::fs::symlink(&uv, root.join("usr/local/bin/uv")).unwrap();
     let mut machine = boot(&root, port, "persistent");
     receipt(&mut machine, &root, port);
+    let helper = root.join("var/lib/cozy/rust-machine/helper/bin/python");
+    let imported = Command::new(&helper)
+        .args(["-c", "import cozy_machine_client.packages, packaging"])
+        .status()
+        .unwrap();
+    assert!(
+        imported.success(),
+        "the installer helper holds the embedded client"
+    );
     let pem = std::fs::read(root.join("run/cozy/bootstrap/tls.crt")).unwrap();
     let channel = Endpoint::from_shared(format!("https://127.0.0.1:{port}"))
         .unwrap()

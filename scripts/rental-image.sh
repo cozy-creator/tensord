@@ -15,12 +15,6 @@ nice -n 19 docker run --rm --runtime=runc --user "$(id -u):$(id -g)" -e CARGO_HO
   rust:1.91-bookworm cargo build --release --locked --offline -j 2 --bin cozy-machine
 install -m 0755 "$target/release/cozy-machine" "$stage/opt/cozy/machine/cozy-machine"
 
-# The installer helper: its own environment over the image's interpreter, holding the client wheel.
-# Both kinds share python:3.12.12-slim-bookworm at /opt/cozy/python, so the cpu image builds it.
-uv build -q --wheel --out-dir "$stage/opt/cozy/machine" "$repo"
-docker run --rm --runtime=runc --entrypoint sh -v "$stage/opt/cozy/machine:/opt/cozy/machine" "tensorhub/worker@$(crane digest tensorhub/worker:cpu-linux-x86)" -c \
-  'w=$(ls /opt/cozy/machine/*.whl) && uv venv -q --python /opt/cozy/python/bin/python3 /opt/cozy/machine/helper && uv pip install -q --python /opt/cozy/machine/helper/bin/python "$w[installer]" && chown -R '"$(id -u):$(id -g)"' /opt/cozy/machine'
-
 # Optional: this machine's own executor SDK (Runtime/TensorFS wheels), apart from the Go agent's pair.
 if [ -n "$own_wheels" ]; then mkdir -p "$stage/opt/cozy/machine/wheels" && cp "$own_wheels"/*.whl "$stage/opt/cozy/machine/wheels/"; fi
 if [ "$kind" = cuda ]; then

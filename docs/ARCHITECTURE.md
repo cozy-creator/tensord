@@ -59,7 +59,7 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 | `runs.rs` | Run sources and preparation inside a run: accepted at once, install/resolve/download as its progress, Hub token in memory only | `Runs`, `Spec`, `Source` | D1 |
 | `objects.rs` | Write: resumable content-addressed objects into the store, recorded per signer | `Objects`, `Writer` | D1 |
 | `local_source.rs` | A run's local source: install written unpublished code once per manifest | `LocalSources`, `Manifest` | D1 |
-| `machine/` | Launch grant, lifetime identity, readiness receipt, rental lifecycle, supervision, SSH, runtime update | `Grant`, `Readiness`, `Lifecycle` | D2 |
+| `machine/` | Launch grant, lifetime identity, readiness receipt, rental lifecycle, supervision, SSH, runtime update, the embedded Python client and installer helper (`client.rs`) | `Grant`, `Readiness`, `Lifecycle` | D2 |
 | `native_inputs.rs` | Native input custody into TensorFS + journal | `SourceIntake`, `IntakeJournal` | D1 |
 | `catalog.rs` | Immutable package environment generations and their holds | `Catalog`, `Generation`, `HeldGeneration` | D1 |
 | `service.rs` | Sole dispatch policy (CPU parallelism, one GPU slot, startup GPU fences) | `Service` | B2 |

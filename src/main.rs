@@ -228,17 +228,17 @@ fn run_machine(
     if let Some(port) = grant.media_port {
         identity.media = Some(std::net::TcpListener::bind((grant.listen_host, port))?);
     }
-    // The image's installer helper: an environment over its interpreter with the client wheel.
-    let python = layout.root.join("opt/cozy/machine/helper/bin/python");
-    let wheel = std::fs::read_dir(layout.root.join("opt/cozy/machine"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|entry| entry.path())
-        .find(|path| path.extension().is_some_and(|e| e == "whl"));
-    let installer = match (python.exists(), wheel) {
-        (true, Some(wheel)) => (Some(python), Some(wheel)),
-        _ => (None, None),
+    // The client this binary embeds, and the installer helper over it (made once per client).
+    let uv = cozy_machine::machine::client::uv(&layout.root);
+    let wheel = cozy_machine::machine::client::wheel(&engine)?;
+    let helper = match cozy_machine::machine::client::helper(&engine, &uv, &wheel) {
+        Ok(python) => Some(python),
+        Err(error) => {
+            eprintln!(
+                "cozy-machine: no installer helper, so local packages cannot install: {error}"
+            );
+            None
+        }
     };
     start_api(
         &engine,
@@ -247,10 +247,10 @@ fn run_machine(
         api,
         &owner,
         &service,
-        installer.0,
-        installer.1,
+        helper,
+        Some(wheel),
         "3.12".into(),
-        image_sdk(&paths.sdk()),
+        image_sdk(&paths.sdk(), &layout.root, uv),
         // A run naming no Hub reads this rental's own Hub as the pod (Go agent parity).
         grant.hub.clone().filter(|_| rental).map(|hub| {
             cozy_machine::hub::Source::pod(
@@ -265,9 +265,13 @@ fn run_machine(
     serve(owner, service, control)
 }
 
-/// Executors on an image use its own Runtime/TensorFS pair (the wheels it ships), so they speak
-/// this image's protocol; elsewhere each release's locked SDK.
-fn image_sdk(wheels: &std::path::Path) -> cozy_machine::published::PackageSdk {
+/// Executors use the machine's own Runtime/TensorFS pair (the wheels its root ships), so they
+/// speak its protocol; without a pair, each release's locked SDK.
+fn image_sdk(
+    wheels: &std::path::Path,
+    root: &std::path::Path,
+    uv: PathBuf,
+) -> cozy_machine::published::PackageSdk {
     let mut pair: Vec<String> = std::fs::read_dir(wheels)
         .into_iter()
         .flatten()
@@ -279,16 +283,14 @@ fn image_sdk(wheels: &std::path::Path) -> cozy_machine::published::PackageSdk {
     pair.sort();
     let complete = pair.iter().any(|w| w.contains("/cozy_runtime-"))
         && pair.iter().any(|w| w.contains("/tensorfs-"));
+    let seed = root.join("opt/cozy/dependency-seed/uv-cache");
     cozy_machine::published::PackageSdk {
-        uv: "uv".into(),
+        uv,
         python: "3.12".into(),
         find_links: complete.then(|| wheels.to_path_buf()),
         requirements: if complete { pair } else { vec![] },
         client_wheel: None,
-        seed_cache: wheels
-            .parent()
-            .map(|opt| opt.join("dependency-seed/uv-cache"))
-            .filter(|seed| seed.is_dir()),
+        seed_cache: seed.is_dir().then_some(seed),
     }
 }
 
@@ -323,6 +325,7 @@ fn start_api(
         sdk,
         store.clone(),
     )?);
+    // Local packages install only with the helper; package environments get the client either way.
     backend.installer = match (helper, wheel) {
         (Some(helper_python), Some(client_wheel)) => Some(api::install::InstallerConfig {
             helper_python,
@@ -331,12 +334,12 @@ fn start_api(
             generations: generations.to_path_buf(),
             staging_root: root.join("package-staging"),
         }),
-        (None, None) => None,
-        _ => {
+        (Some(_), None) => {
             return Err(io::Error::other(
-                "--installer-python and --client-wheel are required together",
+                "--installer-python requires --client-wheel",
             ))
         }
+        _ => None,
     };
     let objects = Arc::new(cozy_machine::objects::Objects::new(
         &root.join("writes"),
