@@ -197,6 +197,7 @@ class Service:
             stdout=subprocess.PIPE, stderr=self.log,
         )
         self.socket = str(state / "machine.sock")
+        self.admin = str(state / "admin.sock")
         ready = self.process.stdout.readline()
         if not ready.startswith(b"READY"):
             self.process.wait()
@@ -225,7 +226,7 @@ class Service:
         try:
             if self.process.poll() is None:
                 try:
-                    with Client(self.socket) as client:
+                    with Client(self.admin) as client:
                         client.hello()
                         assert client.stats().active_leases == 0
                         client.exchange(Shutdown(client.next_sequence()), ShutdownReply)

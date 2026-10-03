@@ -50,7 +50,10 @@ pub struct Owner {
     ttl: Duration,
     stopping: bool,
     pub incarnation: String,
+    /// Weight peers: hello, import, attach, release, stats.
     pub socket: PathBuf,
+    /// The owner's administration: submit, executions, cancel, results, shutdown.
+    pub admin: PathBuf,
 }
 fn failure(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
@@ -96,7 +99,8 @@ impl Owner {
             ttl,
             stopping: false,
             incarnation,
-            socket: control_socket(root)?,
+            socket: control_socket(root, "machine")?,
+            admin: control_socket(root, "admin")?,
         })))
     }
     fn id(&mut self) -> u64 {
@@ -326,8 +330,8 @@ impl Owner {
         true
     }
 }
-fn control_socket(root: &Path) -> io::Result<PathBuf> {
-    let path = root.join("machine.sock");
+fn control_socket(root: &Path, name: &str) -> io::Result<PathBuf> {
+    let path = root.join(format!("{name}.sock"));
     if std::os::unix::net::SocketAddr::from_pathname(&path).is_ok() {
         return Ok(path);
     }
@@ -352,7 +356,7 @@ fn control_socket(root: &Path) -> io::Result<PathBuf> {
     let identity = tensorfs_core::sha256::hex(&tensorfs_core::sha256::digest(
         canonical.as_os_str().as_encoded_bytes(),
     ));
-    let path = directory.join(format!("{}.sock", &identity[..24]));
+    let path = directory.join(format!("{}.{name}.sock", &identity[..24]));
     std::os::unix::net::SocketAddr::from_pathname(&path)?;
     Ok(path)
 }

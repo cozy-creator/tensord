@@ -299,27 +299,82 @@ fn start_api(
         })?;
     Ok(())
 }
-fn bind_control(owner: &Shared) -> io::Result<UnixListener> {
-    let path = owner.lock().unwrap().socket.clone();
+fn bind_control(owner: &Shared) -> io::Result<(UnixListener, UnixListener)> {
+    let (weights, admin) = {
+        let owner = owner.lock().unwrap();
+        (owner.socket.clone(), owner.admin.clone())
+    };
+    Ok((bind_private(&weights)?, bind_private(&admin)?))
+}
+fn bind_private(path: &std::path::Path) -> io::Result<UnixListener> {
     // Only the singleton owner can remove a stale socket; no active peer store is touched.
-    match std::fs::remove_file(&path) {
+    match std::fs::remove_file(path) {
         Ok(()) => (),
         Err(e) if e.kind() == io::ErrorKind::NotFound => (),
         Err(e) => return Err(e),
     }
-    let listener = UnixListener::bind(&path)?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    let listener = UnixListener::bind(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok(listener)
 }
 fn serve(
     owner: Shared,
     service: Arc<cozy_machine::service::Service>,
-    listener: UnixListener,
+    (listener, admin): (UnixListener, UnixListener),
 ) -> io::Result<()> {
-    let path = owner.lock().unwrap().socket.clone();
+    let paths = {
+        let owner = owner.lock().unwrap();
+        Arc::new([owner.socket.clone(), owner.admin.clone()])
+    };
     let stopped = Arc::new(AtomicBool::new(false));
-    println!("READY {}", path.display());
+    println!("READY {}", paths[0].display());
+    println!("ADMIN {}", paths[1].display());
     io::stdout().flush()?;
+    {
+        let (owner, stopped, paths, service) = (
+            owner.clone(),
+            stopped.clone(),
+            paths.clone(),
+            service.clone(),
+        );
+        std::thread::Builder::new()
+            .name("machine-admin".into())
+            .spawn(move || {
+                for stream in admin.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    if stopped.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if !matches!(os_peer_outside(&stream), Ok(true)) {
+                        let _ = protocol::write(
+                            &mut stream,
+                            &Reply {
+                                seq: 0,
+                                body: Body::Error {
+                                    code: "connection_unavailable",
+                                    detail: "administration is refused to the machine's own \
+                                             descendants"
+                                        .into(),
+                                },
+                            },
+                        );
+                        continue;
+                    }
+                    let (owner, stopped, paths, service) = (
+                        owner.clone(),
+                        stopped.clone(),
+                        paths.clone(),
+                        service.clone(),
+                    );
+                    std::thread::spawn(move || {
+                        if let Err(error) = client(stream, None, &owner, &stopped, &paths, &service)
+                        {
+                            eprintln!("admin peer: {error}");
+                        }
+                    });
+                }
+            })?;
+    }
     for stream in listener.incoming() {
         let stream = stream?;
         if stopped.load(Ordering::Acquire) {
@@ -342,29 +397,35 @@ fn serve(
                 continue;
             }
         };
-        let (owner, stopped, path, service) = (
+        let (owner, stopped, paths, service) = (
             owner.clone(),
             stopped.clone(),
-            path.clone(),
+            paths.clone(),
             service.clone(),
         );
         std::thread::spawn(move || {
-            let result = client(stream, peer, &owner, &stopped, &path, &service);
+            let result = client(stream, Some(peer), &owner, &stopped, &paths, &service);
             owner.lock().unwrap().disconnect(peer);
             if let Err(error) = result {
                 eprintln!("peer {peer}: {error}");
             }
         });
     }
-    std::fs::remove_file(path)?;
+    for path in paths.iter() {
+        std::fs::remove_file(path)?;
+    }
     Ok(())
 }
+fn os_peer_outside(stream: &UnixStream) -> io::Result<bool> {
+    cozy_machine::os::peer_descends_from_machine(stream).map(|inside| !inside)
+}
+/// `peer` is a registered weight peer; `None` is the owner's admin connection.
 fn client(
     mut stream: UnixStream,
-    peer: u64,
+    peer: Option<u64>,
     owner: &Shared,
     stopped: &AtomicBool,
-    path: &PathBuf,
+    paths: &[PathBuf; 2],
     service: &Arc<cozy_machine::service::Service>,
 ) -> io::Result<()> {
     let mut capabilities = HashSet::new();
@@ -429,6 +490,36 @@ fn client(
             | Command::ReadResult { .. } => Some("execution.cpu/1"),
             _ => None,
         };
+        let admin = peer.is_none();
+        let wrong = match &request.command {
+            Command::Import { .. } | Command::Attach { .. } | Command::Release { .. } => {
+                admin.then_some("weight operations use the machine socket")
+            }
+            Command::Submit { .. }
+            | Command::Execution { .. }
+            | Command::Executions
+            | Command::Cancel { .. }
+            | Command::ReadResult { .. }
+            | Command::Shutdown => (!admin).then_some("administration uses the admin socket"),
+            _ => None,
+        };
+        if let Some(detail) = wrong {
+            if matches!(request.command, Command::Import { .. }) {
+                drop(protocol::recv_fd(&stream)?);
+            }
+            protocol::write(
+                &mut stream,
+                &Reply {
+                    seq,
+                    body: Body::Error {
+                        code: "wrong_socket",
+                        detail: detail.into(),
+                    },
+                },
+            )?;
+            continue;
+        }
+        let peer = peer.unwrap_or(0); // only weight operations, never reached by admin, use it
         if let Some(cap) = required {
             if !capabilities.contains(cap) {
                 if matches!(request.command, Command::Import { .. }) {
@@ -537,7 +628,9 @@ fn client(
                         },
                     );
                     stopped.store(true, Ordering::Release);
-                    let _ = UnixStream::connect(path);
+                    for path in paths {
+                        let _ = UnixStream::connect(path);
+                    }
                     return acknowledgement;
                 }
             }

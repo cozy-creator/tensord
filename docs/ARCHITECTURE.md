@@ -13,7 +13,7 @@ Plan of record and workstream IDs (A–F):
 ```
 cozy CLI ──TLS/gRPC (ClaimProof)──> api::server ─> machine_api::NativeBackend
                                                         │
-private control socket (owner protocol) ─> main.rs      ▼
+machine.sock (weight peers) / admin.sock ─> main.rs ▼
                                           service::Service (dispatch policy)
                                            │ journal + supervision: execution::Engine / journal::Journal
                          CPU ──────────────┤
@@ -30,11 +30,16 @@ its immutable generation (`catalog`) and starts it: CPU work through the runner,
 the single retained executor slot in `GpuPool`. Progress, outputs and terminal state are written
 by `Engine`; outputs are kept in native custody until the client acknowledges collection.
 
+Local sockets, both 0600 and announced on start as `READY <machine.sock>` then
+`ADMIN <admin.sock>`: `machine.sock` serves weight peers (hello, import, attach, release, stats);
+`admin.sock` serves the owner (submit, executions, cancel, results, shutdown) and refuses any peer
+that descends from the machine. Same-UID package code is still not sandboxed.
+
 ## Module map
 
 | Module | Owns | Main types | Owner |
 |---|---|---|---|
-| `main.rs` | `serve`/`version` commands, private control socket, wiring | — | E (admin socket split), D2 (rental config) |
+| `main.rs` | `serve`/`version` commands, weight-peer socket and owner-only admin socket, wiring | — | E (admin socket split), D2 (rental config) |
 | `api/server.rs` | TLS/gRPC front door (worker.proto from `vendor/worker-protocol`) | `MachineIdentity`, `serve` | D1 |
 | `api/auth.rs` | ClaimProof/1 verification per request | `Authority`, `VerifiedActor` | D1 |
 | `api/identity.rs` | Persistent P-256 TLS identity, typed machine config, readiness secret | `MachineConfig`, `AuthorizedKeys`, `ReadinessSecret` | D2 |
@@ -50,9 +55,10 @@ by `Engine`; outputs are kept in native custody until the client acknowledges co
 | `gpu_service.rs` | GPU pool: published package/model mapping, executor retention, request callbacks | `GpuPool`, `GpuConfig`, `GpuPlan`, `ModelGrant` | B2 (admission, grants), E (spawn/fencing), D1 (published mapping) |
 | `memory/` | Per-GPU ledger and decisions (`policy`), NVML sampler thread (`nvml`), floor watchdog | `GpuMemory`, `policy::Gpu`, `Step`, `Decision` | B2 |
 | `device_executor.rs` | Typed control seam to the Runtime device executor, per-request output encoding | `DeviceExecutor`, `ExecutorConfig`, `DeviceCommand`, `Frame`, `Answer` | E |
-| `launch_identity.rs` | Runtime trampoline command, optional sealed UID/GID | `LaunchIdentity`, `trampoline` | E |
+| `launch_identity.rs` | Runtime trampoline command, the executor environment seal, optional UID/GID | `LaunchIdentity`, `Seal`, `trampoline` | E |
+| `process.rs` | Exact process births, group kill, the progress meter and watch, reaping | `Exact`, `Pace`, `Watching` | E |
 | `child_launcher.rs` | Pool-owned spawn thread (PDEATHSIG follows the creating thread) | `ChildLauncher` | E |
-| `os.rs` | memfd, seals, `SO_PEERPIDFD`, pidfd exit | — | E |
+| `os.rs` | memfd, seals, peer credentials (`SO_PEERPIDFD`, `pidfd_open` fallback), pidfd exit | — | E |
 | `owner.rs` | TensorFS store owner: import, sealed memfd cache (LRU/TTL), leases per pidfd | `Owner` | B1 |
 | `protocol.rs` | Private control-socket protocol (length-prefixed JSON + `SCM_RIGHTS`) | `Request`, `Command`, `Reply` | E |
 | `host_tier.rs` | Degree 1 host tier: machine-filled sealed layouts, adopted read-only, sized by live headroom | `HostTier`, `HostGrant`, `TierLimit`, `HostTierFacts` | B1 |
@@ -84,7 +90,7 @@ The host ledger (pinned tier, RSS/PSS, cgroup headroom) is not in `memory/` yet 
 | `src/bin/front-door.rs`, `tests/*_client`, `tests/creator_*` | Isolated front-door fixture and Go consumer gates | D1 |
 | `scripts/gate/` | Matched old-stack vs Rust-machine gate through ordinary `cozy run` | F |
 | `scripts/benchmarks/permission_probe.py` | CPU executor permission probe | E |
-| `scripts/service_cpu_gate.py` | CPU service end-to-end gate over the control socket | E |
+| `scripts/service_cpu_gate.py` | CPU service end-to-end gate over the admin socket, including machine kill and restart | E |
 
 ## Contracts
 
