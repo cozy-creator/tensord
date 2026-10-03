@@ -323,7 +323,7 @@ impl Journal {
                     .map_err(db_error)?;
             }
         }
-        connection.execute_batch("CREATE TABLE IF NOT EXISTS machine_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+        connection.execute_batch("BEGIN; CREATE TABLE IF NOT EXISTS machine_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS submission_closures(actor TEXT NOT NULL,submission_id TEXT NOT NULL,request_id TEXT NOT NULL,workspace_id TEXT NOT NULL,closed_ms INTEGER NOT NULL,PRIMARY KEY(actor,submission_id));
             CREATE TABLE IF NOT EXISTS installations(actor TEXT NOT NULL,alias TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,alias));
             CREATE TABLE IF NOT EXISTS preparations(actor TEXT NOT NULL,id TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,id));
@@ -337,7 +337,7 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS objects(actor TEXT NOT NULL,sha256 TEXT NOT NULL,length INTEGER NOT NULL,PRIMARY KEY(actor,sha256));
             CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_request ON executions(actor,request_id) WHERE actor IS NOT NULL;
             CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_submission ON executions(actor,submission_id) WHERE actor IS NOT NULL;
-            CREATE INDEX IF NOT EXISTS executions_actor_order ON executions(actor,id) WHERE actor IS NOT NULL;").map_err(db_error)?;
+            CREATE INDEX IF NOT EXISTS executions_actor_order ON executions(actor,id) WHERE actor IS NOT NULL; COMMIT;").map_err(db_error)?;
         let existing: Option<String> = connection
             .query_row(
                 "SELECT value FROM machine_metadata WHERE key='workspace_id'",
