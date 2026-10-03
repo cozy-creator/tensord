@@ -36,6 +36,9 @@ its package install and model download.
 5. `to_anima`, then `to_sdxl`: the model switch and back.
 6. `kill_next`: SIGKILL every executor (exact PIDs, listed in the row), then SDXL.
 
+With `first_images: "alternate"` a cycle has one restart (cold first image in cycles 0–1, 4–5, …,
+warm in 2–3, 6–7, …), so with alternating arms every restart is a switch to the other arm.
+
 Every request has a never-used prompt and seed. Each image is decoded, checked for the declared size,
 checked not flat (per-channel stddev > 2) and hashed.
 

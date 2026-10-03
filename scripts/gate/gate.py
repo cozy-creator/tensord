@@ -341,8 +341,11 @@ class Gate:
         listed = self.pod.helper("list", json.dumps(self.m["cache_paths"]), self.cache)   # after any download
         self.record({"arm": arm, "cycle": cycle, "event": "begin", "clock": self.clock(), "cool": self.cool(),
                      "cache_files": listed["files"]})
-        self.first(arm, cycle, "cold_first")
-        self.first(arm, cycle, "warm_first")
+        if self.m.get("first_images") == "alternate":   # one restart per cycle: a cross-arm switch
+            self.first(arm, cycle, "cold_first" if cycle // 2 % 2 == 0 else "warm_first")
+        else:
+            self.first(arm, cycle, "cold_first")
+            self.first(arm, cycle, "warm_first")
         for _ in range(self.m["warm"]):
             self.request(arm, cycle, "warm", "sdxl")
         self.request(arm, cycle, "to_anima", "anima")
@@ -363,9 +366,12 @@ class Gate:
     def prime(self, arm: str) -> None:
         """Unmeasured: switch to the arm and pay its package install and model download once."""
         spec = self.m["arms"][arm]
-        old = (self.pod.sh(spec["root"]).split() or ["none"])[0]
-        self.pod.sh(spec["restart"])
-        self.record({"arm": arm, "cycle": -1, "event": "prime", "root": self.pod.helper("newroot", old, spec["root"])})
+        live = self.pod.sh(spec["root"]).split()
+        if live:   # already this arm's machine: no same-arm restart
+            self.record({"arm": arm, "cycle": -1, "event": "prime", "root": {"pid": int(live[0]), "already": True}})
+        else:
+            self.pod.sh(spec["restart"])
+            self.record({"arm": arm, "cycle": -1, "event": "prime", "root": self.pod.helper("newroot", "none", spec["root"])})
         self.request(arm, -1, "prime", "sdxl")
         self.request(arm, -1, "prime", "anima")
 
