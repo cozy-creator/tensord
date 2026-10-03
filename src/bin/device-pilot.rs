@@ -1,5 +1,8 @@
 //! Explicit isolated hardware pilot; validate never launches Python or initializes a device.
+//! `run A.json B.json ...` runs each config's executor in turn in one process: with
+//! `host_tier`, their weights come from one machine host tier that outlives each executor.
 use cozy_machine::device_executor;
+use cozy_machine::host_tier::{HalfOfHeadroom, HostGrant, HostTier, HostTierConfig, SealedRequest};
 use cozy_machine::model_sources::{ModelSources, SelectedManifest};
 
 use device_executor::{
@@ -36,6 +39,9 @@ struct Pilot {
     /// Auto negotiates existing stage policy; false is a fixed-allowance single-executor experiment.
     #[serde(default)]
     stages: Option<bool>,
+    /// Weights from the machine's sealed host tier (`host_tiers.sealed/1`) when offered.
+    #[serde(default)]
+    host_tier: bool,
     payloads: Vec<Value>,
 }
 
@@ -70,6 +76,8 @@ struct Turns {
     phase: String,
     sources: Option<Arc<Mutex<ModelSources>>>,
     source_evidence: SourceEvidence,
+    /// The host tier, this executor in it, and what it may adopt.
+    host: Option<(Arc<HostTier>, u64, Vec<HostGrant>)>,
 }
 impl Turns {
     fn sample_source_fds(&mut self) -> io::Result<()> {
@@ -92,6 +100,27 @@ impl Services for Turns {
         descriptor: Option<File>,
     ) -> io::Result<(Answer, Option<File>)> {
         let mut answer = Answer::unavailable(frame.seq);
+        if let (Kind::SealedTier, Some((tier, peer, grants))) = (frame.kind, &self.host) {
+            let plan = descriptor.ok_or_else(|| io::Error::other("sealed tier omitted its plan"))?;
+            let started = Instant::now();
+            let request = SealedRequest { sha256: &frame.sha256, length: frame.length };
+            let granted = match tier.seal(*peer, grants, request, plan) {
+                Ok(granted) => granted,
+                Err(error) => {
+                    answer.code = "sealed_tier_refused".into();
+                    answer.detail = error.to_string();
+                    None
+                }
+            };
+            if answer.code != "sealed_tier_refused" {
+                (answer.ok, answer.held) = (true, granted.is_some());
+                answer.code.clear();
+                answer.detail.clear();
+            }
+            let row = serde_json::json!({"phase":self.phase,"exchange":"SealedTier","held":answer.held,"code":answer.code,"detail":answer.detail,"ms":started.elapsed().as_secs_f64()*1e3});
+            writeln!(self.events, "{row}")?;
+            return Ok((answer, granted));
+        }
         if frame.kind == Kind::ModelSourceRead {
             drop(descriptor);
             let Some(sources) = &self.sources else {
@@ -163,16 +192,28 @@ fn main() {
     }
 }
 fn run() -> io::Result<()> {
-    let total_started = Instant::now();
     let mut args = std::env::args().skip(1);
     let action = args
         .next()
-        .ok_or_else(|| io::Error::other("usage: device-pilot validate|run CONFIG.json"))?;
-    let path = PathBuf::from(
-        args.next()
-            .ok_or_else(|| io::Error::other("config path required"))?,
-    );
-    let config: Pilot = serde_json::from_slice(&fs::read(&path)?)?;
+        .ok_or_else(|| io::Error::other("usage: device-pilot validate|run CONFIG.json..."))?;
+    let paths: Vec<PathBuf> = args.map(PathBuf::from).collect();
+    if paths.is_empty() {
+        return Err(io::Error::other("config path required"));
+    }
+    let mut tier: Option<Arc<HostTier>> = None;
+    for path in paths {
+        let config: Pilot = serde_json::from_slice(&fs::read(&path)?)?;
+        if config.host_tier && tier.is_none() {
+            let store = Arc::new(tensorfs_core::store::Store::open(std::path::Path::new(&config.binding.store)).map_err(io::Error::other)?);
+            tier = Some(HostTier::new(store, HostTierConfig::default(), Box::new(HalfOfHeadroom))?);
+        }
+        pilot(&action, config, tier.as_ref())?;
+    }
+    Ok(())
+}
+
+fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Result<()> {
+    let total_started = Instant::now();
     if !config.python.is_file()
         || !config.package_interface.is_file()
         || config.binding.model_class.is_empty()
@@ -246,6 +287,8 @@ fn run() -> io::Result<()> {
     let plane = executor.hello.offers("weight_plane/1");
     let descriptors = matches!(config.model_sources, SourceMode::Descriptors)
         && executor.hello.offers("model_sources.descriptors/1");
+    let sealed = config.host_tier && plane && executor.hello.offers("host_tiers.sealed/1");
+    let at_load = plane && executor.hello.offers("load_pinned/1");
     fs::write(
         config.root.join("negotiation.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
@@ -258,6 +301,8 @@ fn run() -> io::Result<()> {
             "legacy_residency":!plane,
             "requested_model_sources":config.model_sources,
             "descriptor_sources":descriptors,
+            "sealed_tiers":sealed,
+            "pinned_at_load":at_load,
             "executor_store_path":if descriptors { "" } else { &config.binding.store }
         }))?,
     )?;
@@ -268,7 +313,24 @@ fn run() -> io::Result<()> {
         phase: "start".into(),
         sources: None,
         source_evidence: SourceEvidence::default(),
+        host: None,
     };
+    if let (true, Some(tier)) = (sealed, tier) {
+        let selections = selected_sources(&config.binding)?;
+        let sources = ModelSources::open(&PathBuf::from(&config.binding.store), &selections)?;
+        let grants = selections
+            .iter()
+            .map(|s| {
+                Ok(HostGrant {
+                    manifest: s.manifest.clone(),
+                    header: sources.authorized_header(&s.manifest)?,
+                    components: s.components.iter().cloned().collect(),
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        turns.host = Some((tier.clone(), tier.register_peer(executor.observer_pidfd()?), grants));
+    }
+    let disk_before = disk_read_bytes();
     let mut timings = BTreeMap::new();
     timings.insert("spawn_ms", spawn_ms);
     if descriptors {
@@ -337,12 +399,20 @@ fn run() -> io::Result<()> {
             descriptor_sources: descriptors,
             device_weights: false,
             cap_bytes: None,
-            sealed_tiers: false,
-            pinned_bytes: None,
+            sealed_tiers: sealed,
+            pinned_bytes: at_load.then_some(config.pinned_budget_bytes),
         },
         &mut turns,
     )?;
     timings.insert("load_ms", start.elapsed().as_secs_f64() * 1000.);
+    let machine = serde_json::json!({
+        "host_tier": tier.map(|t| t.facts()),
+        "machine": cozy_machine::host_memory::process(std::process::id()).ok(),
+        "executor": cozy_machine::host_memory::process(executor.birth.pid).ok(),
+        "host": cozy_machine::host_memory::read(),
+        "machine_disk_read_bytes": disk_read_bytes() - disk_before,
+    });
+    fs::write(config.root.join("load-machine.json"), serde_json::to_vec_pretty(&machine)?)?;
     if !loaded.ok {
         return Err(io::Error::other(format!(
             "load: {} {}",
@@ -358,7 +428,7 @@ fn run() -> io::Result<()> {
         let budget = executor.command(
             &DeviceCommand::Budget {
                 vram_bytes: config.plane_budget_bytes,
-                pinned_bytes: config.pinned_budget_bytes,
+                pinned_bytes: if at_load { -1 } else { config.pinned_budget_bytes },
                 cap_bytes: None,
             },
             &mut turns,
@@ -464,10 +534,17 @@ fn run() -> io::Result<()> {
     fs::write(
         config.root.join("results.json"),
         serde_json::to_vec_pretty(
-            &serde_json::json!({"qualification":"stock executor pilot; machine host/GPU ownership/full machine API unqualified","stage_turns":stages,"weight_plane":plane,"descriptor_sources":descriptors,"timings":timings,"sources":turns.source_evidence,"runs":results}),
+            &serde_json::json!({"qualification":"stock executor pilot; machine host/GPU ownership/full machine API unqualified","stage_turns":stages,"weight_plane":plane,"descriptor_sources":descriptors,"sealed_tiers":sealed,"timings":timings,"sources":turns.source_evidence,"runs":results,"host_tier":tier.map(|t| t.facts())}),
         )?,
     )?;
     Ok(())
+}
+
+fn disk_read_bytes() -> u64 {
+    fs::read_to_string("/proc/self/io")
+        .ok()
+        .and_then(|s| s.lines().find_map(|l| l.strip_prefix("read_bytes: ")?.trim().parse().ok()))
+        .unwrap_or(0)
 }
 
 fn fd_count() -> io::Result<usize> {
