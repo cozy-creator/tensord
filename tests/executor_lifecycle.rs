@@ -59,6 +59,7 @@ fn launch(generation: &Generation, hold: &File) -> (DeviceExecutor, PathBuf, Sea
         seal: seal.clone(),
         generation_hold: Some(Arc::new(hold.try_clone().unwrap())),
         identity: None,
+        cgroup_namespace: Some("lifecycle".into()),
     })
     .unwrap();
     // Shorter sampling keeps the measured-wedge tests quick; the rule is unchanged.
@@ -294,6 +295,37 @@ fn executor_killed_mid_request_returns_and_is_reaped() {
 }
 
 #[test]
+#[ignore = "needs installed cpu_lifecycle generations"]
+fn a_setsid_descendant_is_killed_with_its_executor_cgroup() {
+    for (generation, hold) in generations() {
+        let (mut executor, root, _) = launch(&generation, &hold);
+        let member = fs::read_to_string(format!("/proc/{}/cgroup", executor.birth.pid)).unwrap();
+        if !member.contains("cozy-executor-") {
+            eprintln!("no delegated cgroup here: process-group containment applies");
+            executor.shutdown().unwrap();
+            return;
+        }
+        let reply = invoke(&mut executor, &root, "daemon", "daemon", json!({})).unwrap();
+        assert_eq!(terminal(&reply), "succeeded", "{reply:?}");
+        let spool = root.join("daemon");
+        let pid = cozy_machine::device_executor::read_result(&spool, &reply).unwrap()["pid"]
+            .as_u64()
+            .unwrap() as u32;
+        let daemon = cozy_machine::process::process_birth(pid).unwrap();
+        // Its own session: a process-group kill would miss it.
+        let session = |pid: u32| {
+            fs::read_to_string(format!("/proc/{pid}/stat")).unwrap().rsplit_once(") ").unwrap().1
+                .split_whitespace().nth(3).unwrap().to_string()
+        };
+        assert_ne!(session(pid), session(executor.birth.pid));
+        let ended = executor.terminate().unwrap();
+        assert_eq!(ended.stragglers, 1);
+        assert!(process_ended(&daemon).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn pre_start_exit_is_a_typed_failure_with_its_stderr() {
     // An interpreter without cozy-runtime: the trampoline cannot even import.
     let root = std::env::temp_dir().join(format!("machine-prestart-{}", uuid::Uuid::new_v4()));
@@ -307,6 +339,7 @@ fn pre_start_exit_is_a_typed_failure_with_its_stderr() {
         seal,
         generation_hold: None,
         identity: None,
+        cgroup_namespace: Some("lifecycle".into()),
     })
     .err()
     .unwrap();
@@ -371,6 +404,7 @@ fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
         seal,
         generation_hold: Some(Arc::new(hold.try_clone().unwrap())),
         identity: Some(identity),
+        cgroup_namespace: Some("lifecycle".into()),
     })
     .unwrap();
     let status = fs::read_to_string(format!("/proc/{}/status", executor.birth.pid)).unwrap();

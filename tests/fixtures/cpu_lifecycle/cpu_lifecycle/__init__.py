@@ -96,3 +96,17 @@ def probe(payload: Probe, ctx: Context) -> Reach:
     ctypes.CDLL(None).prctl(2, ctypes.byref(signal), 0, 0, 0)  # PR_GET_PDEATHSIG
     return Reach(os.getuid(), os.getgid(), sorted(os.getgroups()), reach, writable, sorted(fds),
                  signal.value)
+
+
+class Daemon(msgspec.Struct):
+    pid: int
+
+
+@app.entrypoint
+def daemon(payload: Steps, ctx: Context) -> Daemon:
+    """Leaves a process in its own session: outside the process group, inside the cgroup."""
+    import subprocess
+    child = subprocess.Popen(["sleep", "1000"], start_new_session=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+    return Daemon(child.pid)

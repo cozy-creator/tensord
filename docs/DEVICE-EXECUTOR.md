@@ -106,14 +106,25 @@ longer than eight times the longest pause it has shown, and at least six samples
   measured wedge, then reaps it and every member left in its process group (a group's followers),
   and frees `retain_until_exit` resources. `shutdown()` asks first.
   `Drop` does the same before returning, so a slot or reservation is released only after the exit. If exit cannot be observed, resources are leaked, not released.
+- Containment: with `cgroup_namespace`, each executor gets its own cgroup-v2 scope below the
+  machine's when the host delegates one (a writable unified hierarchy); the trampoline joins it
+  before importing anything and Hello must show the executor inside it. A kill writes
+  `cgroup.kill`, which reaches descendants that called `setsid` or double-forked; after the
+  executor exits, whatever is still in the scope is killed, counted (`Ended.stragglers`) and the
+  scope removed. Without delegation (most containers) the process group is the containment.
+- No copy drain before a kill: a kill only follows a measured wedge, so the executor is not
+  cooperating and could not drain. Nothing it was copying is shared yet: Degree 2 regions are
+  offered to custody only by `Share` after a synchronized, completed call; host-tier layouts are
+  sealed read-only memfds the machine filled; outputs are taken into custody only from a
+  quiescent reply. Sources it read stay retained until its exit is observed.
 
 ## Known gaps
 
 - The legacy output-path resolver is imported from the SDK worker module. An executor
   `output_bindings` capability would remove it.
 - Encoders read whole raw buffers. There is no streaming post-processing.
-- Containment is the process group: a descendant that calls `setsid` escapes kills. Same-UID
-  package code can reopen store paths.
+- Without a delegated cgroup a descendant that calls `setsid` escapes kills. Same-UID package
+  code can reopen store paths, and can write a delegated ancestor's `cgroup.procs`.
 - Descriptor sources still use native TensorFS plane, header and read-plan code inside the executor.
 - Degree > 1 reads the store or the sealed tier (rank 0 shares it with followers); descriptor
   sources are world-one.

@@ -552,6 +552,19 @@ impl Journal {
             .map(|record| serde_json::from_str(&record).map_err(db_error))
             .transpose()
     }
+    /// Every generation an installation names: never evicted while named.
+    pub fn bound_generations(&self) -> io::Result<std::collections::HashSet<String>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT DISTINCT json_extract(record,'$.generation') FROM installations")
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, Option<String>>(0))
+            .map_err(db_error)?;
+        rows.filter_map(|row| row.map_err(db_error).transpose())
+            .collect()
+    }
+
     pub fn installations(&self, actor: &str) -> io::Result<Vec<Installation>> {
         let mut statement = self
             .connection

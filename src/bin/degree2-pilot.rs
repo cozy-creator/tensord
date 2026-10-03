@@ -185,6 +185,7 @@ fn exec(
         seal,
         generation_hold: None,
         identity: None,
+        cgroup_namespace: None,
     })?;
     let spawn_ms = began.elapsed().as_secs_f64() * 1000.;
     let mut executor = executor;

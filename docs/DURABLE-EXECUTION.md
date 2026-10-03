@@ -114,12 +114,20 @@ component (no absolute, `..` or symlink), checked as a regular file via `O_PATH`
 one held artifact of equal length.
 
 Reclamation: the run's spool (`staging/<id>`, the executor's own output directory) is removed
-once the run is settled. `results/<id>` is removed when the client releases retention and the store
-holds the public products. Journal rows are durable records and stay.
+before the run's terminal state is written. `results/<id>` is removed when the client releases
+retention and the store holds the public products. The caches manage themselves (`reclaim.rs`, at
+start and every 10 minutes; no purge verb): crash-leftover spools of settled runs go at once;
+logs, collected results and generations go after a 7-day TTL (a generation's last use is its
+`.hold` mtime) or, least recently used first, under the host's storage pressure (below 1/10 of
+the filesystem free, until above 1/5: TensorFS's thresholds). Never evicted: uncollected results,
+journal rows, a generation any run or executor holds (its `.hold` lock) or an installation or
+configured package names. Below the reserve, max(1 GiB, 1/50), an executor's compiled kernels go
+to its run-scoped JIT directory instead of the persistent store.
 
 Journal: `machine_metadata.journal_format` records the layout (1). A newer journal still opens;
 a row this machine cannot decode is skipped (logged) instead of failing every list, and a state
 it does not know is `unknown`: listed, never dispatched, settled or overwritten.
 
-Not implemented: same-UID isolation (reads detect mutation), containment of descendants that
-leave the runner's process group, cleanup of orphan `*.pending` files, bounded log policy.
+Runners get the same cgroup scope as executors (see device executor) when the host delegates one.
+
+Not implemented: same-UID isolation (reads detect mutation), cleanup of orphan `*.pending` files.

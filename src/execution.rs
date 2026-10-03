@@ -232,6 +232,9 @@ impl Engine {
             .unwrap()
             .installation_for_generation(actor, generation)
     }
+    pub fn bound_generations(&self) -> io::Result<std::collections::HashSet<String>> {
+        self.journal.lock().unwrap().bound_generations()
+    }
     pub fn installations(&self, actor: &str) -> io::Result<Vec<crate::journal::Installation>> {
         self.journal.lock().unwrap().installations(actor)
     }
@@ -668,11 +671,16 @@ impl Engine {
         let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, birth.pid, 0) } as i32;
         if raw < 0 {
             let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ESRCH) {
-                self.notify_activity();
-                return Ok(());
-            }
-            return Err(error);
+            return match error.raw_os_error() {
+                Some(libc::ESRCH) => {
+                    self.notify_activity();
+                    Ok(())
+                }
+                // A leader whose exit is still tearing down (a large GPU context) has no
+                // pidfd yet: observe that exit by sampling instead, then wake dispatch.
+                Some(libc::EINVAL) => self.watch_by_sampling(birth),
+                _ => Err(error),
+            };
         }
         let pidfd = unsafe { File::from_raw_fd(raw) };
         if process_ended(&birth)? {
@@ -700,6 +708,20 @@ impl Engine {
                         return;
                     }
                 }
+            })?;
+        Ok(())
+    }
+
+    fn watch_by_sampling(self: &Arc<Self>, birth: ProcessBirth) -> io::Result<()> {
+        let engine = self.clone();
+        std::thread::Builder::new()
+            .name(format!("exiting-{}", birth.pid))
+            .spawn(move || {
+                // The sample period is how often the exit is looked for, never a deadline.
+                while !process_ended(&birth).unwrap_or(true) {
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+                engine.notify_activity();
             })?;
         Ok(())
     }
@@ -865,10 +887,24 @@ impl Engine {
             let (parent, runner) = UnixStream::pair()?;
             let stdout = File::create(logs.join(format!("{id}.stdout.log")))?;
             let stderr = File::create(logs.join(format!("{id}.stderr.log")))?;
-            let child = spawn_runner(config, &seal, &runner, stdout, stderr)?;
+            let scope = crate::cgroup::CgroupScope::create(&crate::cgroup::namespace(
+                self.root.parent().unwrap_or(&self.root),
+            ))?
+            .map(Arc::new);
+            let child = spawn_runner(config, &seal, scope.as_deref(), &runner, stdout, stderr);
+            let child = match child {
+                Ok(child) => child,
+                Err(error) => {
+                    if let Some(scope) = &scope {
+                        let _ = scope.end();
+                    }
+                    return Err(error);
+                }
+            };
             drop(runner);
             let exact = crate::process::Exact::open(&process_birth(child.id())?)?
-                .ok_or_else(|| io::Error::other("launched runner has no exact birth"))?;
+                .ok_or_else(|| io::Error::other("launched runner has no exact birth"))?
+                .with_cgroup(scope);
             Ok::<_, io::Error>((child, parent, exact))
         })();
         let (mut child, mut reader, exact) = match launch {
@@ -896,7 +932,7 @@ impl Engine {
         self.active.lock().unwrap().remove(id);
         let _ = reader.shutdown(std::net::Shutdown::Both);
         drop(reader);
-        let (status, _) = crate::process::reap(&exact, Some(&mut child), Liveness::default())?;
+        let status = crate::process::reap(&exact, Some(&mut child), Liveness::default())?.status;
         let outcome = match supervised {
             Ok(terminal) => match terminal {
                 RunnerEvent::Result {
@@ -1191,6 +1227,7 @@ fn overlay_observation(
 fn spawn_runner(
     config: RunnerConfig,
     seal: &Seal,
+    scope: Option<&crate::cgroup::CgroupScope>,
     socket: &UnixStream,
     stdout: File,
     stderr: File,
@@ -1207,7 +1244,7 @@ fn spawn_runner(
                 .into_owned(),
         );
     }
-    let mut command = crate::launch_identity::trampoline(&config.python, None)?;
+    let mut command = crate::launch_identity::trampoline(&config.python, None, scope)?;
     command
         .arg("-m")
         .arg(config.module)

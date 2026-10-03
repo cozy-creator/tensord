@@ -1066,3 +1066,58 @@ fn a_newer_or_damaged_row_never_hides_the_rest_of_the_journal() {
         .unwrap();
     assert_eq!(format, journal::JOURNAL_FORMAT.to_string());
 }
+
+fn age(path: &std::path::Path, days: u64) {
+    let when = std::time::SystemTime::now() - Duration::from_secs(days * 24 * 60 * 60);
+    fs::File::open(path).unwrap().set_modified(when).unwrap();
+}
+
+#[test]
+fn caches_expire_but_held_named_and_uncollected_work_stays() {
+    use cozy_machine::{catalog::Catalog, reclaim};
+    let fixture = Fixture::new();
+    // Two completed runs: one collected by its client, one not.
+    let collected = fixture.submit("infer");
+    fixture.wait(&collected, |record| record.state.terminal());
+    let owed = fixture.engine.submit("owed", fixture.invocation("infer")).unwrap().id;
+    assert!(fixture.engine.dispatch(&owed, fixture.config()).unwrap());
+    fixture.wait(&owed, |record| record.state.terminal());
+    fixture.engine.acknowledge_collection(&collected).unwrap();
+    let state = fixture.root.join("state");
+    for id in [&collected, &owed] {
+        age(&state.join("results").join(id), 8);
+    }
+    // A crash leftover spool of a settled run, and one of a queued run.
+    let queued = fixture.engine.submit("queued", fixture.invocation("infer")).unwrap().id;
+    for id in [&collected, &queued] {
+        fs::create_dir_all(state.join("staging").join(id)).unwrap();
+    }
+    // Generations: unused for 8 days (unbound, held, named) and one used today.
+    let generations = fixture.root.join("generations");
+    let catalog = Catalog::new(&generations).unwrap();
+    let make = |name: &str, days: u64| {
+        let directory = generations.join(name);
+        fs::create_dir_all(directory.join("env")).unwrap();
+        fs::write(directory.join(".hold"), b"").unwrap();
+        age(&directory.join(".hold"), days);
+        directory
+    };
+    let unused = make(&"a".repeat(32), 8);
+    let held = make(&"b".repeat(32), 8);
+    let named = make(&"c".repeat(32), 8);
+    let recent = make(&"d".repeat(32), 0);
+    let lease = fs::File::open(held.join(".hold")).unwrap();
+    fs2::FileExt::lock_shared(&lease).unwrap(); // a run or executor holding it
+    let bound = std::collections::HashSet::from(["c".repeat(32)]);
+    let swept = reclaim::sweep(&fixture.engine, &catalog, &bound).unwrap();
+    assert_eq!((swept.staging, swept.results, swept.generations), (1, 1, 1), "{swept:?}");
+    assert!(!state.join("staging").join(&collected).exists());
+    assert!(state.join("staging").join(&queued).exists());
+    assert!(!state.join("results").join(&collected).exists());
+    assert!(state.join("results").join(&owed).exists()); // a durable output still owed
+    assert!(!unused.exists());
+    assert!(held.exists() && named.exists() && recent.exists());
+    drop(lease);
+    // The journal keeps every row.
+    assert_eq!(fixture.engine.list().unwrap().len(), 3);
+}

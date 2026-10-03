@@ -15,7 +15,7 @@ fn optional_same_uid_sdk_launch_seals_process_and_preserves_default_identity() {
         gid: unsafe { libc::getegid() },
     };
     for selected in [None, Some(identity)] {
-        let output = trampoline(&python,selected).unwrap()
+        let output = trampoline(&python, selected, None).unwrap()
             .args(["-I","-c",r#"import os,json,ctypes,pathlib
 status=pathlib.Path('/proc/self/status').read_text()
 libc=ctypes.CDLL(None);death=ctypes.c_int();assert libc.prctl(2,ctypes.byref(death),0,0,0)==0
@@ -54,7 +54,7 @@ fn retained_child_is_killed_when_the_temporary_creator_thread_exits() {
     };
     let python = PathBuf::from(std::env::var("COZY_MACHINE_CPU_TEST_PYTHON").unwrap());
     let mut child = std::thread::spawn(move || {
-        let mut child = trampoline(&python, None)
+        let mut child = trampoline(&python, None, None)
             .unwrap()
             .args([
                 "-I",
@@ -104,7 +104,7 @@ fn pool_launcher_keeps_retained_child_usable_after_requesting_thread_exits() {
     let launcher = Arc::new(cozy_machine::child_launcher::ChildLauncher::new().unwrap());
     let owner = launcher.clone();
     let (mut child,mut stdout)=std::thread::spawn(move || {
-        let mut command=trampoline(&python,None).unwrap();
+        let mut command=trampoline(&python, None, None).unwrap();
         command.args(["-I","-c","import sys;print('armed',flush=True)\nfor line in sys.stdin: print(line.strip(),flush=True)"])
             .env_clear().env("PATH","/usr/bin:/bin").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped());
         let mut child=owner.spawn(command).unwrap();

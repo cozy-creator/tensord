@@ -55,6 +55,7 @@ fn prepared(version: &str, generation_path: &str) -> (DeviceExecutor, PathBuf) {
         seal,
         generation_hold: Some(Arc::new(hold)),
         identity: None,
+        cgroup_namespace: None,
     };
     let mut executor = DeviceExecutor::spawn(config).unwrap();
     assert_eq!(executor.hello.runtime_version, version); // fixture provenance, not admission

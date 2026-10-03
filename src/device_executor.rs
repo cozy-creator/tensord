@@ -41,6 +41,8 @@ pub struct ExecutorConfig {
     pub seal: Seal,
     pub generation_hold: Option<Arc<File>>,
     pub identity: Option<LaunchIdentity>,
+    /// Give the executor its own cgroup in this namespace when the host delegates one.
+    pub cgroup_namespace: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -765,12 +767,8 @@ impl std::fmt::Display for EndedBeforeStart {
 }
 impl std::error::Error for EndedBeforeStart {}
 
-/// How an executor ended: its reaped status and the measurement behind a kill, if any.
-#[derive(Debug)]
-pub struct Ended {
-    pub status: ExitStatus,
-    pub killed: Option<String>,
-}
+/// How an executor ended: status, a kill's measurement, descendants killed after it.
+pub type Ended = crate::process::Reaped;
 
 #[derive(Clone)]
 pub struct CodecConfig {
@@ -1112,7 +1110,12 @@ impl DeviceExecutor {
         on_birth: impl FnOnce(&ProcessBirth, &Cancellation) -> io::Result<()>,
     ) -> io::Result<Self> {
         let (listener, environment) = endpoint(&config)?;
-        let mut command = crate::launch_identity::trampoline(&config.python, config.identity)?;
+        let scope = match &config.cgroup_namespace {
+            Some(namespace) => crate::cgroup::CgroupScope::create(namespace)?.map(Arc::new),
+            None => None,
+        };
+        let mut command =
+            crate::launch_identity::trampoline(&config.python, config.identity, scope.as_deref())?;
         command
             .args(["-I", "-m", "cozy_runtime.internal.executor", "--socket"])
             .arg(&config.socket)
@@ -1146,6 +1149,7 @@ impl DeviceExecutor {
             child: Some(child),
             exact: None,
             birth: None,
+            scope,
         };
         Self::connect(config, listener, environment, launched, on_birth)
     }
@@ -1179,13 +1183,22 @@ impl DeviceExecutor {
                 return Ok(Forked::Refused(Box::new(config), reason));
             }
         };
-        let launched = Unready {
+        let mut launched = Unready {
             pid,
             parent: self.birth.pid,
             child: None,
             exact: None,
             birth: None,
+            scope: None,
         };
+        // A fork starts in its parent's cgroup: move it into its own before it dials, so
+        // ending it never touches the import-only parent.
+        if let Some(namespace) = &config.cgroup_namespace {
+            if let Some(scope) = crate::cgroup::CgroupScope::create(namespace)? {
+                scope.adopt(pid)?;
+                launched.scope = Some(Arc::new(scope));
+            }
+        }
         Self::connect(config, listener, environment, launched, on_birth)
             .map(|executor| Forked::Ready(Box::new(executor)))
     }
@@ -1211,7 +1224,8 @@ impl DeviceExecutor {
         let pid = unready.pid;
         let birth = process_birth(pid)?;
         let exact = Exact::open(&birth)?
-            .ok_or_else(|| io::Error::other("launched executor has no exact birth"))?;
+            .ok_or_else(|| io::Error::other("launched executor has no exact birth"))?
+            .with_cgroup(unready.scope.clone());
         unready.exact = Some(exact.try_clone()?);
         unready.birth = Some(birth.clone());
         if unready.child.is_none() && parent_of(pid)? != unready.parent {
@@ -1324,6 +1338,12 @@ impl DeviceExecutor {
                  (pid {}, parent {}, group {}; differing sealed names {mismatched:?})",
                 hello.hello.pid, hello.hello.ppid, hello.hello.pgid
             )));
+        }
+        if let Some(scope) = unready.scope.as_deref() {
+            let member = fs::read_to_string(format!("/proc/{}/cgroup", executor.birth.pid))?;
+            if !member.lines().any(|line| line == format!("0::{}", scope.relative)) {
+                return Err(io::Error::other("executor is outside its own cgroup"));
+            }
         }
         // Proven: the executor now owns the child; the launch guard no longer kills it.
         executor.child = unready.child.take();
@@ -1626,6 +1646,8 @@ struct Unready {
     child: Option<Child>,
     exact: Option<Exact>,
     birth: Option<ProcessBirth>,
+    /// Its own cgroup, ended with it if it never becomes an executor.
+    scope: Option<Arc<crate::cgroup::CgroupScope>>,
 }
 impl Unready {
     /// Its exit status, once the process is seen to have exited.
@@ -1657,6 +1679,9 @@ impl Drop for Unready {
             let _ = child.kill();
             let _ = child.wait();
         }
+        if let Some(scope) = self.scope.take() {
+            let _ = scope.end();
+        }
     }
 }
 
@@ -1682,7 +1707,7 @@ impl Ending {
             }
         };
         // Followers (degree > 1) stay in the leader's group and are waited for too.
-        let (mut status, killed) = match reap_group(exact, self.child.as_mut(), self.liveness) {
+        let mut ended = match reap_group(exact, self.child.as_mut(), self.liveness) {
             Ok(ended) => ended,
             Err(error) => {
                 std::mem::forget(std::mem::take(&mut self.retained));
@@ -1690,13 +1715,13 @@ impl Ending {
             }
         };
         if self.forked {
-            status = zombie_status(&exact.birth).unwrap_or(status);
+            ended.status = zombie_status(&exact.birth).unwrap_or(ended.status);
         }
         if !self.socket.as_os_str().is_empty() {
             let _ = fs::remove_file(&self.socket);
         }
         drop(std::mem::take(&mut self.retained));
-        Ok(Ended { status, killed })
+        Ok(ended)
     }
 }
 

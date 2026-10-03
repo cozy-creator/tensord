@@ -72,6 +72,9 @@ impl Catalog {
             .custom_flags(libc::O_NOFOLLOW)
             .open(directory.join(".hold"))?;
         FileExt::lock_shared(&hold)?;
+        // Last use, for least-recently-used eviction of unheld generations.
+        // SAFETY: a live descriptor; a null time sets both times to now.
+        unsafe { libc::futimens(std::os::fd::AsRawFd::as_raw_fd(&hold), std::ptr::null()) };
         let manifest = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)

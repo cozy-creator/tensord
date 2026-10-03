@@ -69,6 +69,8 @@ fn process_stat(pid: u32) -> io::Result<Stat> {
 pub struct Exact {
     pidfd: File,
     pub birth: ProcessBirth,
+    /// The executor's own cgroup, when the host delegates one: kills reach every descendant.
+    cgroup: Option<Arc<crate::cgroup::CgroupScope>>,
 }
 
 impl Exact {
@@ -81,7 +83,8 @@ impl Exact {
         if raw < 0 {
             let error = io::Error::last_os_error();
             return match error.raw_os_error() {
-                Some(libc::ESRCH) => Ok(None),
+                // ESRCH: reaped. EINVAL: a leader already exiting (its threads tearing down).
+                Some(libc::ESRCH | libc::EINVAL) => Ok(None),
                 _ => Err(error),
             };
         }
@@ -92,6 +95,7 @@ impl Exact {
             Ok(stat) if stat.start_ticks == birth.start_ticks => Ok(Some(Self {
                 pidfd,
                 birth: birth.clone(),
+                cgroup: None,
             })),
             Ok(_) => Ok(None),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -103,7 +107,13 @@ impl Exact {
         Ok(Self {
             pidfd: self.pidfd.try_clone()?,
             birth: self.birth.clone(),
+            cgroup: self.cgroup.clone(),
         })
+    }
+
+    pub fn with_cgroup(mut self, cgroup: Option<Arc<crate::cgroup::CgroupScope>>) -> Self {
+        self.cgroup = cgroup;
+        self
     }
 
     pub fn as_file(&self) -> &File {
@@ -114,9 +124,13 @@ impl Exact {
         self.pidfd
     }
 
-    /// SIGKILL this birth and, while it still anchors its own process group, every member.
-    /// A group outlives its leader's number while members remain, so it cannot be reused.
+    /// SIGKILL this birth and everything it started: its cgroup when it has one, else the
+    /// process group it still anchors (a group outlives its leader's number while members
+    /// remain, so it cannot be reused).
     pub fn kill(&self) -> io::Result<()> {
+        if let Some(cgroup) = &self.cgroup {
+            cgroup.kill()?;
+        }
         let leads_group = process_stat(self.birth.pid).is_ok_and(|stat| {
             stat.start_ticks == self.birth.start_ticks && stat.pgrp as u32 == self.birth.pid
         });
@@ -464,11 +478,13 @@ impl Drop for Watching {
 
 /// After its channel closed: wait for this exact process to exit, killing it only on a
 /// measured wedge, then reap it. The sample period is the meter's cadence, not a deadline.
+/// Then its cgroup: whatever outlived it (a `setsid` daemon) is killed and counted, and the
+/// scope is removed.
 pub fn reap(
     exact: &Exact,
     child: Option<&mut Child>,
     liveness: Liveness,
-) -> io::Result<(ExitStatus, Option<String>)> {
+) -> io::Result<Reaped> {
     let floor = liveness.floor();
     let mut pace = Pace::default();
     let mut killed = None;
@@ -493,7 +509,24 @@ pub fn reap(
         Some(child) => child.wait()?,
         None => ExitStatus::from_raw(0),
     };
-    Ok((status, killed))
+    let stragglers = match &exact.cgroup {
+        Some(cgroup) => cgroup.end()?,
+        None => 0,
+    };
+    Ok(Reaped {
+        status,
+        killed,
+        stragglers,
+    })
+}
+
+/// How a process ended: its status, the measurement behind a kill, and how many of its
+/// descendants were still alive in its cgroup and were killed after it.
+#[derive(Debug)]
+pub struct Reaped {
+    pub status: ExitStatus,
+    pub killed: Option<String>,
+    pub stragglers: usize,
 }
 
 /// `reap` the leader, then every member left in its group (followers die with their leader
@@ -502,21 +535,21 @@ pub fn reap_group(
     exact: &Exact,
     child: Option<&mut Child>,
     liveness: Liveness,
-) -> io::Result<(ExitStatus, Option<String>)> {
-    let (status, mut killed) = reap(exact, child, liveness)?;
+) -> io::Result<Reaped> {
+    // With a cgroup the leader's reap already ended its followers (they share its scope).
+    let mut reaped = reap(exact, child, liveness)?;
     for member in group_members(&exact.birth) {
         let Some(member) = Exact::open(&member)? else {
             continue;
         };
-        let (_, member_killed) = reap(&member, None, liveness)?;
-        if let Some(verdict) = member_killed {
-            killed = Some(match killed {
+        if let Some(verdict) = reap(&member, None, liveness)?.killed {
+            reaped.killed = Some(match reaped.killed.take() {
                 Some(first) => format!("{first}; process {}: {verdict}", member.birth.pid),
                 None => format!("process {}: {verdict}", member.birth.pid),
             });
         }
     }
-    Ok((status, killed))
+    Ok(reaped)
 }
 
 fn readable_within(file: &File, period: Duration) -> io::Result<bool> {

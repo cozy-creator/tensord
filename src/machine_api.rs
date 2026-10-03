@@ -2095,6 +2095,7 @@ print(json.dumps({"identity": generation.identity}))
             },
             generation_hold: Some(held_generation.retention()),
             identity: None,
+            cgroup_namespace: None,
         })
         .unwrap();
         let interface = executor_root.join("package-interface.json");
@@ -2300,6 +2301,7 @@ print(json.dumps({"identity": generation.identity}))
                             },
                             generation_hold: Some(held.retention()),
                             identity: None,
+                            cgroup_namespace: None,
                         },
                         |birth, cancel| {
                             let (cancel, request) = (cancel.clone(), id.clone());

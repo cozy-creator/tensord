@@ -1167,6 +1167,9 @@ impl GpuPool {
             seal,
             generation_hold: Some(held.retention()),
             identity: self.config.identity,
+            cgroup_namespace: Some(crate::cgroup::namespace(
+                self.root.parent().unwrap_or(&self.root),
+            )),
         })
     }
 

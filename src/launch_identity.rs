@@ -111,7 +111,11 @@ impl LaunchIdentity {
 /// Reuse Runtime's pre-CUDA seal: expected parent, parent-death SIGKILL, no_new_privs,
 /// OOM score and the optional identity. Every child gets its own process group, so a kill
 /// reaches the descendants that stayed in it and a terminal signal to the machine does not.
-pub fn trampoline(python: &Path, identity: Option<LaunchIdentity>) -> io::Result<Command> {
+pub fn trampoline(
+    python: &Path,
+    identity: Option<LaunchIdentity>,
+    scope: Option<&crate::cgroup::CgroupScope>,
+) -> io::Result<Command> {
     let mut command = Command::new(python);
     command
         .args([
@@ -121,7 +125,13 @@ pub fn trampoline(python: &Path, identity: Option<LaunchIdentity>) -> io::Result
             "--expect-parent",
         ])
         .arg(std::process::id().to_string())
-        .args(["--oom-adj", "1000", "--scope-backend", "inherit"]);
+        .args(["--oom-adj", "1000"]);
+    // The trampoline joins the executor's own cgroup before anything is imported; without
+    // one the process group (set below) is the containment.
+    match scope {
+        Some(scope) => command.args(scope.trampoline_args()),
+        None => command.args(["--scope-backend", "inherit"]),
+    };
     if let Some(identity) = identity {
         identity.validate()?;
         command.args([
@@ -240,9 +250,15 @@ impl Seal {
             boundary_directory(&root.join(boundary))?;
         }
         boundary_directory(&root.join("jit").join(incarnation))?;
-        let kernels = owned(root.join("kernels").join(&namespace))?;
-        owned(kernels.join(format!("torch-kernels.{generation}")))?;
         let jit = owned(root.join("jit").join(incarnation).join(generation))?;
+        // Below the disk reserve the persistent kernel store is an optional write: compiled
+        // kernels then live in this run's JIT scope, removed with it.
+        let kernels = if crate::reclaim::Disk::measure(root)?.below_reserve() {
+            owned(jit.join("kernels"))?
+        } else {
+            owned(root.join("kernels").join(&namespace))?
+        };
+        owned(kernels.join(format!("torch-kernels.{generation}")))?;
         Ok(Self {
             devices: devices.into(),
             alloc_conf: DEFAULT_ALLOC_CONF.into(),

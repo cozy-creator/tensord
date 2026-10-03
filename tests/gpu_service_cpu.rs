@@ -128,3 +128,34 @@ fn complete(journal: &mut Journal, n: usize, generation: &str, birth: ProcessBir
         )
         .unwrap();
 }
+
+#[test]
+fn restart_ends_processes_left_in_earlier_executor_cgroups() {
+    use cozy_machine::cgroup::{namespace, CgroupScope};
+    use std::io::Write;
+    let root = std::env::temp_dir().join(format!("machine-cgroup-sweep-{}", uuid::Uuid::new_v4()));
+    let state = root.join("state");
+    fs::create_dir_all(&state).unwrap();
+    let Some(scope) = CgroupScope::create(&namespace(&state)).unwrap() else {
+        eprintln!("no delegated cgroup-v2 here; process-group containment applies");
+        return;
+    };
+    // A daemon an earlier executor left behind, in its own session inside its scope.
+    let mut leader = Command::new("/bin/sh")
+        .args(["-c", "read go; setsid sleep 1000 </dev/null >/dev/null 2>&1 &"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fs::write(
+        format!("/sys/fs/cgroup{}/cgroup.procs", scope.relative),
+        leader.id().to_string(),
+    )
+    .unwrap();
+    leader.stdin.take().unwrap().write_all(b"go\n").unwrap();
+    assert!(leader.wait().unwrap().success());
+    assert_eq!(scope.processes().unwrap(), 1);
+    let service = Service::open(&state, &root.join("generations"), 1).unwrap();
+    assert!(!std::path::Path::new(&format!("/sys/fs/cgroup{}", scope.relative)).exists());
+    assert!(service.stop().unwrap());
+    fs::remove_dir_all(root).unwrap();
+}

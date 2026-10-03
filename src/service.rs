@@ -34,6 +34,7 @@ pub struct Service {
     /// This machine's birth: a fenced leader's group members born before it are its
     /// previous incarnation's followers.
     started_ticks: u64,
+    swept: Mutex<std::time::Instant>,
 }
 /// Held while one preparation runs; the machine is not idle meanwhile.
 pub struct Preparing(Arc<Service>);
@@ -45,6 +46,8 @@ impl Drop for Preparing {
         self.0.engine.notify_activity();
     }
 }
+
+const SWEEP_EVERY: std::time::Duration = crate::reclaim::IDLE;
 impl Service {
     pub fn open(root: &Path, generations: &Path, parallelism: usize) -> io::Result<Arc<Self>> {
         if parallelism == 0 {
@@ -86,6 +89,13 @@ impl Service {
                 }
             }
         }
+        // Descendants of those executors (a setsid daemon, a compile worker) live on in the
+        // executors' own cgroups; every such scope of this machine is ended now.
+        match crate::cgroup::CgroupScope::sweep(&crate::cgroup::namespace(root)) {
+            Ok(0) => (),
+            Ok(held) => eprintln!("ended {held} process(es) left in earlier executor cgroups"),
+            Err(error) => eprintln!("earlier executor cgroups remain: {error}"),
+        }
         let service = Arc::new(Self {
             engine,
             catalog: Catalog::new(generations)?,
@@ -96,8 +106,10 @@ impl Service {
             startup_gpu_births: Mutex::new(startup_gpu_births),
             preparing: std::sync::atomic::AtomicUsize::new(0),
             started_ticks,
+            swept: Mutex::new(std::time::Instant::now()),
         });
         service.engine.reconcile()?;
+        service.reclaim();
         // Keep queued generations alive, including accepted work from a prior boot.
         for record in service.engine.nonterminal(usize::MAX)? {
             if let Ok(held) = service.catalog.resolve(&record.invocation.generation) {
@@ -269,7 +281,33 @@ impl Service {
             if let Err(error) = self.dispatch_ready() {
                 eprintln!("dispatch observation: {error}");
             }
-            self.engine.wait_activity(epoch, None);
+            if self.swept.lock().unwrap().elapsed() >= SWEEP_EVERY {
+                self.reclaim();
+            }
+            // The wait bounds only how long caches go unswept; it ends nothing.
+            self.engine.wait_activity(epoch, Some(SWEEP_EVERY));
+        }
+    }
+    /// Caches manage themselves (`reclaim`): TTL and storage pressure, never a purge verb.
+    pub fn reclaim(&self) -> crate::reclaim::Swept {
+        *self.swept.lock().unwrap() = std::time::Instant::now();
+        let bound = self.engine.bound_generations().map(|mut bound| {
+            if let Some(gpu) = self.gpu() {
+                bound.extend(gpu.config().packages.iter().map(|p| p.generation.clone()));
+            }
+            bound
+        });
+        match bound.and_then(|bound| crate::reclaim::sweep(&self.engine, &self.catalog, &bound)) {
+            Ok(swept) => {
+                if swept != crate::reclaim::Swept::default() {
+                    eprintln!("reclaimed {swept:?}");
+                }
+                swept
+            }
+            Err(error) => {
+                eprintln!("reclaim: {error}");
+                crate::reclaim::Swept::default()
+            }
         }
     }
     fn dispatch_ready(&self) -> io::Result<()> {

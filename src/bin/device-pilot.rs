@@ -290,6 +290,7 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
         seal,
         generation_hold: hold,
         identity: None,
+        cgroup_namespace: None,
     })?;
     let spawn_ms = spawn_started.elapsed().as_secs_f64() * 1000.;
     let devices = executor
