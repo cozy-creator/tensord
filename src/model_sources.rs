@@ -13,8 +13,8 @@ use std::{
 use tensorfs_core::{
     header::Header,
     ids::ObjectRef,
-    meta::Meta,
-    read::{self, ReadLease, Source},
+    meta::{Hold, Meta},
+    read::{self, Source},
     sha256,
     store::Store,
 };
@@ -56,7 +56,8 @@ struct Selection {
     header: Header,
     allowed_objects: BTreeMap<String, ObjectRef>,
     retained_objects: Vec<ObjectRef>,
-    lease: Option<ReadLease>,
+    /// The GC hold while the executor reads: two descriptors, never one per object.
+    hold: Option<Hold>,
     components: Vec<String>,
     encoded_bytes: u64,
     manifest_length: u64,
@@ -172,7 +173,7 @@ impl ModelSources {
                         header,
                         allowed_objects,
                         retained_objects: retained_objects.into_values().collect(),
-                        lease: None,
+                        hold: None,
                         components,
                         encoded_bytes,
                         manifest_length: length,
@@ -252,7 +253,8 @@ impl ModelSources {
         }
         let bytes = objects.values().map(|object| object.length).sum();
         for (manifest, selection) in &mut self.selected {
-            if selection.lease.is_none() {
+            if selection.hold.is_none() {
+                // Verify every object once; keep only the hold, not a descriptor per object.
                 let (lease, _) = read::acquire(
                     &self.store,
                     &self.meta,
@@ -260,7 +262,8 @@ impl ModelSources {
                     selection.retained_objects.clone(),
                 )
                 .map_err(failure)?;
-                selection.lease = Some(lease);
+                selection.hold = Some(self.meta.acquire_hold("read").map_err(failure)?);
+                lease.release(&self.meta).map_err(failure)?;
             }
         }
         Ok((objects.len(), bytes))
@@ -322,15 +325,8 @@ impl ModelSources {
             }
             None
         };
-        if selection.lease.is_none() {
-            let (lease, _) = read::acquire(
-                &self.store,
-                &self.meta,
-                manifest,
-                selection.retained_objects.clone(),
-            )
-            .map_err(failure)?;
-            selection.lease = Some(lease);
+        if selection.hold.is_none() {
+            selection.hold = Some(self.meta.acquire_hold("read").map_err(failure)?);
         }
         if let Some(object) = object {
             let file = self
@@ -350,13 +346,12 @@ impl ModelSources {
             .iter()
             .find(|(name, _)| name == &request.name)
             .unwrap();
-        let bytes = read::read_asset(
-            selection.lease.as_ref().unwrap(),
-            &request.name,
-            &asset.1,
-            asset.1.logical_length,
-        )
-        .map_err(failure)?;
+        // A lease over this asset's own segments, for this read only.
+        let (lease, _) = read::acquire(&self.store, &self.meta, manifest, asset.1.segments.clone())
+            .map_err(failure)?;
+        let bytes = read::read_asset(&lease, &request.name, &asset.1, asset.1.logical_length);
+        lease.release(&self.meta).map_err(failure)?;
+        let bytes = bytes.map_err(failure)?;
         let mut writable = os::memfd()?;
         writable.write_all(&bytes)?;
         os::seal(&writable)?;
@@ -372,8 +367,8 @@ impl ModelSources {
 impl Drop for ModelSources {
     fn drop(&mut self) {
         for selection in self.selected.values_mut() {
-            if let Some(lease) = selection.lease.take() {
-                if let Err(error) = lease.release(&self.meta) {
+            if let Some(hold) = selection.hold.take() {
+                if let Err(error) = hold.release(&self.meta) {
                     eprintln!("model source hold release: {error}");
                 }
             }

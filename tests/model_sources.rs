@@ -320,3 +320,89 @@ fn readonly_source_fd_can_outlive_owner_broker() {
     drop(grant);
     fs::remove_dir_all(root).unwrap();
 }
+
+/// Audit M1: the owner kept one descriptor per object for the session (2,618 for SDXL). It now
+/// keeps a GC hold; each object's read-only descriptor goes to the executor and closes here.
+#[test]
+fn the_owner_holds_a_bounded_number_of_descriptors_however_many_objects_it_serves() {
+    let root = std::env::temp_dir().join(format!(
+        "machine-source-fds-{}-{}",
+        std::process::id(),
+        tensorfs_core::meta::now_nanos_unique()
+    ));
+    let store = Store::init(&root).unwrap();
+    let plain = registry::seeds()
+        .into_iter()
+        .find(|s| s.alias == "plain/1")
+        .unwrap()
+        .spec;
+    let mut tensors = Vec::new();
+    let mut objects = Vec::new();
+    for n in 0..300u32 {
+        let data: Vec<u8> = (0..70_000u32)
+            .map(|i| (i.wrapping_mul(31).wrapping_add(n)) as u8)
+            .collect();
+        let part = Part::plan(Dtype::U8, vec![data.len() as u64], &data);
+        let object = ObjectRef::of(&data);
+        store
+            .put_stream(&mut data.as_slice(), Some(&object), &Fault::default())
+            .unwrap();
+        objects.push(object);
+        tensors.push((
+            format!("w{n}"),
+            Tensor {
+                dtype: Dtype::U8,
+                shape: vec![data.len() as u64],
+                encoding: plain.object_id(),
+                parts: vec![("value".into(), part)],
+            },
+        ));
+    }
+    let header = Header {
+        configs: vec![],
+        assets: vec![],
+        encodings: vec![plain],
+        components: vec![("many".into(), tensors)],
+    };
+    let bytes = header.canonical_bytes().unwrap();
+    let header_ref = ObjectRef::of(&bytes);
+    store
+        .put_stream(&mut bytes.as_slice(), Some(&header_ref), &Fault::default())
+        .unwrap();
+    let manifest = Draft {
+        entries: vec![("model".into(), Entry::CozyTensors(header_ref))],
+    }
+    .seal()
+    .unwrap();
+    store.put_manifest(&manifest).unwrap();
+    let fds = || fs::read_dir("/proc/self/fd").unwrap().count();
+    let mut broker = ModelSources::open(
+        &root,
+        &[SelectedManifest {
+            manifest: manifest.manifest_id(),
+            components: vec!["many".into()],
+        }],
+    )
+    .unwrap();
+    let before = fds();
+    let mut peak = before;
+    for object in &objects {
+        let grant = broker
+            .read(&SourceRequest {
+                manifest: manifest.manifest_id(),
+                role: SourceRole::Object,
+                name: object.sha256.clone(),
+                length: object.length,
+            })
+            .unwrap();
+        assert_eq!(grant.length, object.length);
+        peak = peak.max(fds());
+        drop(grant); // sent to the executor, then closed here
+    }
+    assert!(
+        peak <= before + 4,
+        "owner descriptors grew from {before} to {peak} over 300 objects"
+    );
+    drop(broker);
+    fs::remove_dir_all(root).unwrap();
+}

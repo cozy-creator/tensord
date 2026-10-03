@@ -411,6 +411,7 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
         "executor": cozy_machine::host_memory::process(executor.birth.pid).ok(),
         "host": cozy_machine::host_memory::read(),
         "machine_disk_read_bytes": disk_read_bytes() - disk_before,
+        "machine_fds": fd_count()?,
     });
     fs::write(config.root.join("load-machine.json"), serde_json::to_vec_pretty(&machine)?)?;
     if !loaded.ok {
