@@ -334,6 +334,7 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS hub_access(actor TEXT NOT NULL,origin TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,origin));
             CREATE TABLE IF NOT EXISTS triage(execution INTEGER PRIMARY KEY REFERENCES executions(id),record TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS resolutions(actor TEXT NOT NULL,key TEXT NOT NULL,package TEXT NOT NULL,preparation TEXT NOT NULL,PRIMARY KEY(actor,key));
+            CREATE TABLE IF NOT EXISTS objects(actor TEXT NOT NULL,sha256 TEXT NOT NULL,length INTEGER NOT NULL,PRIMARY KEY(actor,sha256));
             CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_request ON executions(actor,request_id) WHERE actor IS NOT NULL;
             CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_submission ON executions(actor,submission_id) WHERE actor IS NOT NULL;
             CREATE INDEX IF NOT EXISTS executions_actor_order ON executions(actor,id) WHERE actor IS NOT NULL;").map_err(db_error)?;
@@ -654,6 +655,26 @@ impl Journal {
     ) -> io::Result<()> {
         self.connection
             .execute("INSERT OR REPLACE INTO resolutions(actor,key,package,preparation) VALUES(?1,?2,?3,?4)", params![actor, key, package, preparation])
+            .map_err(db_error)?;
+        Ok(())
+    }
+    /// The length of an object this signer wrote (`objects`), or None.
+    pub fn object(&self, actor: &str, sha256: &str) -> io::Result<Option<u64>> {
+        self.connection
+            .query_row(
+                "SELECT length FROM objects WHERE actor=?1 AND sha256=?2",
+                params![actor, sha256],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_error)
+    }
+    pub fn bind_object(&mut self, actor: &str, object: &tensorfs_core::ids::ObjectRef) -> io::Result<()> {
+        self.connection
+            .execute(
+                "INSERT OR REPLACE INTO objects(actor,sha256,length) VALUES(?1,?2,?3)",
+                params![actor, object.sha256, object.length],
+            )
             .map_err(db_error)?;
         Ok(())
     }
