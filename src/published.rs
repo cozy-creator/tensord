@@ -416,18 +416,31 @@ impl Publisher {
             &env.to_string_lossy(),
         ])?;
         let requirements = dir.join("requirements.txt").to_string_lossy().to_string();
+        // The last install compiles the whole environment's bytecode: executors run `-I` from
+        // an environment they may not write, so uncompiled modules compile again in every
+        // executor (SDXL's imports: 10.7 s uncompiled, 4.5 s compiled; J/BREAKDOWN.md).
+        let sdk = !self.sdk.requirements.is_empty();
+        let client = self.sdk.client_wheel.is_some();
+        let compile = |last: bool| {
+            if last {
+                "--compile-bytecode"
+            } else {
+                "--no-compile-bytecode"
+            }
+        };
         self.uv(&[
             "pip",
             "install",
             "--no-config",
             "--python",
             &py,
+            compile(!sdk && !client),
             "--require-hashes",
             "--no-deps",
             "--requirements",
             &requirements,
         ])?;
-        if !self.sdk.requirements.is_empty() {
+        if sdk {
             let constraints = dir.join("constraints.txt").to_string_lossy().to_string();
             let mut args = vec![
                 "pip",
@@ -435,6 +448,7 @@ impl Publisher {
                 "--no-config",
                 "--python",
                 &py,
+                compile(!client),
                 "--constraints",
                 &constraints,
             ];
@@ -468,6 +482,7 @@ impl Publisher {
                     "--no-config",
                     "--python",
                     &py,
+                    compile(!client),
                     "--require-hashes",
                     "--no-deps",
                     "--requirements",
@@ -485,6 +500,7 @@ impl Publisher {
                 "--no-config",
                 "--python",
                 &py,
+                compile(true),
                 "--constraints",
                 &constraints,
                 &wheel,
