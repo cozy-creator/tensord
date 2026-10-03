@@ -207,7 +207,10 @@ impl GpuPool {
             store.clone(),
             HostTierConfig {
                 fill_threads: config.host.fill_threads.unwrap_or(defaults.fill_threads),
-                ttl: config.host.ttl_seconds.map_or(defaults.ttl, std::time::Duration::from_secs),
+                ttl: config
+                    .host
+                    .ttl_seconds
+                    .map_or(defaults.ttl, std::time::Duration::from_secs),
             },
             Box::new(HalfOfHeadroom),
         )?;
@@ -542,7 +545,14 @@ impl GpuPool {
     }
     /// One line per Load in `loads.jsonl`: the executor's load facts, the host tier's, and
     /// the machine's and executor's RSS/PSS.
-    fn record_load(&self, plan: &str, sealed: bool, took: std::time::Duration, loaded: &Frame, executor: u32) -> io::Result<()> {
+    fn record_load(
+        &self,
+        plan: &str,
+        sealed: bool,
+        took: std::time::Duration,
+        loaded: &Frame,
+        executor: u32,
+    ) -> io::Result<()> {
         use crate::host_memory::{process, ProcessMemory};
         #[derive(Serialize)]
         struct Line<'a> {
@@ -565,7 +575,11 @@ impl GpuPool {
         };
         let mut bytes = serde_json::to_vec(&line)?;
         bytes.push(b'\n');
-        fs::OpenOptions::new().create(true).append(true).open(self.root.join("loads.jsonl"))?.write_all(&bytes)
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root.join("loads.jsonl"))?
+            .write_all(&bytes)
     }
     pub fn stop(&self) -> io::Result<()> {
         let sessions = std::mem::take(&mut *self.sessions.lock().unwrap());
@@ -789,7 +803,10 @@ impl GpuPool {
             let peer = self.host.register_peer(executor.observer_pidfd()?);
             let grants = vec![HostGrant {
                 manifest: plan.binding.snapshot.clone(),
-                header: sources.lock().unwrap().authorized_header(&plan.binding.snapshot)?,
+                header: sources
+                    .lock()
+                    .unwrap()
+                    .authorized_header(&plan.binding.snapshot)?,
                 components: plan.binding.components.iter().cloned().collect(),
             }];
             sessions.insert(
@@ -917,7 +934,13 @@ impl GpuPool {
             )?)?;
             self.memory
                 .observe(&plan.id, load_facts(loaded.facts.as_ref()), Some(false));
-            self.record_load(&plan.id, session.sealed, started.elapsed(), &loaded, session.executor.birth.pid)?;
+            self.record_load(
+                &plan.id,
+                session.sealed,
+                started.elapsed(),
+                &loaded,
+                session.executor.birth.pid,
+            )?;
             if plane && !at_load {
                 command_ok(session.executor.command(
                     &DeviceCommand::Budget {
@@ -1238,7 +1261,9 @@ fn settle(engine: &Arc<Engine>, id: &str, error: &io::Error) -> io::Result<()> {
     let outcome = if record.cancel_actor.is_some() {
         Outcome::Canceled
     } else if record.state == State::Starting {
-        Outcome::Failed(Failure::abandoned(&format!("device executor did not start: {error}")).encode())
+        Outcome::Failed(
+            Failure::abandoned(&format!("device executor did not start: {error}")).encode(),
+        )
     } else {
         Outcome::Failed(Failure::abandoned(&format!("device executor ended: {error}")).encode())
     };
@@ -1398,8 +1423,12 @@ impl Services for Callbacks<'_> {
     ) -> io::Result<(Answer, Option<File>)> {
         if frame.kind == Kind::SealedTier {
             let mut answer = Answer::unavailable(frame.seq);
-            let plan = descriptor.ok_or_else(|| io::Error::other("sealed tier request omitted its plan"))?;
-            let request = SealedRequest { sha256: &frame.sha256, length: frame.length };
+            let plan = descriptor
+                .ok_or_else(|| io::Error::other("sealed tier request omitted its plan"))?;
+            let request = SealedRequest {
+                sha256: &frame.sha256,
+                length: frame.length,
+            };
             // A refusal is an answer: that weight set reads the store, the session goes on.
             match self.host.seal(self.peer, self.grants, request, plan) {
                 Ok(granted) => {
