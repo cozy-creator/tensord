@@ -153,8 +153,16 @@ impl Gpu {
         self.tenants.get(plan)
     }
 
+    /// `plan`'s facts as measured this run; before its first load here, its weights as an
+    /// earlier run's load measured them.
     pub fn facts(&self, plan: &str) -> Facts {
-        self.facts.get(plan).copied().unwrap_or_default()
+        let mut facts = self.facts.get(plan).copied().unwrap_or_default();
+        if let Some(learned) = self.learned.plans.get(plan) {
+            let known = |bytes: u64| (bytes > 0).then_some(bytes);
+            facts.weights = facts.weights.or(known(learned.weights));
+            facts.weights_floor = facts.weights_floor.or(known(learned.weights_floor));
+        }
+        facts
     }
 
     /// A spawn admitted: charged `reserved` until it reports.
@@ -301,14 +309,22 @@ impl Gpu {
         self.shapes.insert(plan.into(), shape.into());
     }
 
-    /// `plan`'s activation growth for its next shape as learned, else its largest this run.
+    /// `plan`'s activation growth for its next shape as learned; before its shape is known
+    /// (a load) or for a shape never measured, the largest any of its shapes measured, here
+    /// or in an earlier run.
     pub fn activation(&self, plan: &str) -> Option<u64> {
-        self.shapes
+        let shaped = self
+            .shapes
             .get(plan)
             .and_then(|shape| self.learned.shape(plan, shape))
             .map(|measured| measured.peak)
-            .filter(|peak| *peak > 0)
-            .or(self.facts(plan).activation)
+            .filter(|peak| *peak > 0);
+        shaped.or_else(|| {
+            [self.facts(plan).activation, self.learned.peak(plan)]
+                .into_iter()
+                .flatten()
+                .max()
+        })
     }
 
     /// Per-method activation growth learned for `plan`'s next shape: the executor's seeds.
@@ -320,22 +336,39 @@ impl Gpu {
             .unwrap_or_default()
     }
 
-    /// Everything resident: context, every weight byte, activations. None: not known yet.
+    /// Holdings `plan`'s executor maps (Degree 2): weights already on the GPU, counted once
+    /// among the resident allocations, never again in what it asks for.
+    fn attached(&self, plan: &str) -> u64 {
+        let Some(pid) = self.tenant(plan).map(|t| t.pid).filter(|pid| *pid != 0) else {
+            return 0;
+        };
+        self.holdings
+            .iter()
+            .filter(|h| h.readers.contains(&pid))
+            .map(|h| h.bytes)
+            .sum()
+    }
+
+    /// Everything resident beside what it already maps: context, every weight byte,
+    /// activations. None: not known yet.
     pub fn want(&self, plan: &str) -> Option<u64> {
         let facts = self.facts(plan);
         Some(
             facts.context.unwrap_or(self.context_estimate())
-                + facts.weights?
+                + facts.weights?.saturating_sub(self.attached(plan))
                 + self.activation(plan)?
                 + MARGIN,
         )
     }
 
-    /// The lowest rung: context, the weights' floor, activations.
+    /// The lowest rung: context, the weights' floor beside what it maps, activations.
     pub fn need(&self, plan: &str) -> u64 {
         let facts = self.facts(plan);
         facts.context.unwrap_or(self.context_estimate())
-            + facts.weights_floor.unwrap_or(0)
+            + facts
+                .weights_floor
+                .unwrap_or(0)
+                .saturating_sub(self.attached(plan))
             + self.activation(plan).unwrap_or(0)
             + MARGIN
     }
@@ -638,6 +671,45 @@ mod tests {
     }
 
     #[test]
+    fn weights_a_plan_already_maps_are_counted_once() {
+        // 24 GiB card, Degree 2: SDXL (7 GiB) and Anima (6 GiB) both kept by custody, each
+        // read by its own idle executor (0.5 GiB of process each).
+        let mut gpu = Gpu::default();
+        loaded(&mut gpu, "sdxl", 10, 7 * GIB, GIB / 2);
+        loaded(&mut gpu, "anima", 11, 6 * GIB, 3 * GIB);
+        let held = |id: &str, bytes, reader| Holding {
+            id: id.into(),
+            bytes,
+            readers: vec![reader],
+            idle_ms: 1_000,
+            revoking: false,
+        };
+        gpu.holdings = vec![held("sdxl#1", 7 * GIB, 10), held("anima#1", 6 * GIB, 11)];
+        let s = sample(
+            24 * GIB,
+            24 * GIB - 14 * GIB,
+            &[(10, GIB / 2), (11, GIB / 2)],
+        );
+        // Anima asks for its context and activations only: its weights are resident.
+        assert_eq!(gpu.want("anima"), Some(GIB / 2 + 3 * GIB + MARGIN));
+        let mut round = Round::default();
+        let room = gpu.room("anima", &s);
+        assert_eq!(
+            gpu.decide(
+                "anima",
+                gpu.want("anima"),
+                gpu.need("anima"),
+                &s,
+                &mut round
+            ),
+            Decision::Go(room),
+            "nothing of SDXL's is touched"
+        );
+        // Its cap still leaves every holding in place: room counts them all.
+        assert_eq!(room, 24 * GIB - HEADLESS_FLOOR - GIB / 2 - 13 * GIB);
+    }
+
+    #[test]
     fn a_learned_peak_for_the_shape_makes_room_before_the_call() {
         let mut gpu = Gpu {
             device: "GPU-1/580".into(),
@@ -669,6 +741,35 @@ mod tests {
             ),
             Decision::Step(Step::Unmap("sdxl".into()))
         );
+    }
+
+    #[test]
+    fn a_restarted_machine_knows_a_plans_whole_want_before_its_first_load() {
+        let mut gpu = Gpu {
+            device: "GPU-1/580".into(),
+            ..Gpu::default()
+        };
+        assert_eq!(gpu.want("sdxl"), None);
+        // An earlier run loaded SDXL (7 GiB) and ran two shapes; no shape is known at a load.
+        gpu.learned.load("sdxl", 7 * GIB, 2 * GIB);
+        let methods = BTreeMap::new();
+        gpu.learned
+            .call("sdxl", "height=1024,width=1024", GIB / 2, &methods);
+        gpu.learned
+            .call("sdxl", "height=512,width=512", GIB / 4, &methods);
+        gpu.learned.context("GPU-1/580", 300 * MIB);
+        assert_eq!(gpu.activation("sdxl"), Some(GIB / 2));
+        assert_eq!(
+            gpu.want("sdxl"),
+            Some(300 * MIB + MARGIN + 7 * GIB + GIB / 2 + MARGIN)
+        );
+        assert_eq!(
+            gpu.need("sdxl"),
+            300 * MIB + MARGIN + 2 * GIB + GIB / 2 + MARGIN
+        );
+        // The next shape, once known, takes its own measurement.
+        gpu.set_shape("sdxl", "height=512,width=512");
+        assert_eq!(gpu.activation("sdxl"), Some(GIB / 4));
     }
 
     #[test]

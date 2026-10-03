@@ -27,6 +27,9 @@ pub struct Plan {
     pub shapes: BTreeMap<String, Shape>,
     /// The executor's private host bytes (PSS less shared memory) after a call.
     pub host_bytes: u64,
+    /// Its weights as stages count them at load (decoded copies included) and their floor.
+    pub weights: u64,
+    pub weights_floor: u64,
     pub used_ms: u64,
 }
 
@@ -109,6 +112,23 @@ impl Learned {
         }
     }
 
+    /// `plan`'s weights at its last load: what the next load plans before it starts.
+    pub fn load(&mut self, plan: &str, weights: u64, floor: u64) {
+        let row = self.plans.entry(plan.into()).or_default();
+        row.used_ms = now_ms();
+        (row.weights, row.weights_floor) = (weights, floor);
+    }
+
+    /// The largest activation growth any shape of `plan` measured.
+    pub fn peak(&self, plan: &str) -> Option<u64> {
+        let plan = self.plans.get(plan)?;
+        plan.shapes
+            .values()
+            .map(|shape| shape.peak)
+            .max()
+            .filter(|peak| *peak > 0)
+    }
+
     pub fn host(&mut self, plan: &str, bytes: u64) {
         let row = self.plans.entry(plan.into()).or_default();
         row.host_bytes = row.host_bytes.max(bytes);
@@ -149,8 +169,12 @@ mod tests {
         learned.call("anima", "height=1536,width=1536", 3 << 30, &methods);
         learned.call("anima", "height=2048,width=2048", 5 << 30, &methods);
         learned.context("GPU-1/580", 220 << 20);
+        learned.load("anima", 6 << 30, 2 << 30);
         learned.save().unwrap();
         let learned = Learned::open(&path);
+        let anima = &learned.plans["anima"];
+        assert_eq!((anima.weights, anima.weights_floor), (6 << 30, 2 << 30));
+        assert_eq!(learned.peak("anima"), Some(5 << 30));
         assert_eq!(
             learned
                 .shape("anima", "height=1024,width=1024")

@@ -1695,16 +1695,7 @@ impl GpuPool {
         // Every rank of a group reads its own GPU's cap and cell (`rank_cells/1`).
         let ranked = plan.degree > 1;
         if !session.loaded {
-            // Degree 2 keeps every component resident until revoked, and a running call never
-            // revokes what it reads: only when the whole construction and its activations fit
-            // beside the other tenants. Unmeasured: off (Degree 1 lets stages evict each other).
-            // World-one only: the executor shares nothing from a group.
-            session.sharing = self.custody.is_some()
-                && plan.degree == 1
-                && session.executor.hello.offers("weights.attach/1")
-                && self.lane(1)?[0]
-                    .memory
-                    .fits_resident(&plan.id, || self.holdings());
+            session.sharing = self.degree2(&plan.id, plan.degree, &session.executor)?;
         }
         let sharing = session.sharing;
         let lane = self.lane_devices(plan.degree)?;
@@ -1842,13 +1833,18 @@ impl GpuPool {
                 &load_group,
                 &mut callbacks,
             )?)?;
-            self.observe(
+            let facts = self.observe(
                 &plan.id,
                 plan.degree,
                 load_facts(loaded.facts.as_ref()),
                 &loaded.rank_planes,
                 Some(false),
             );
+            for device in self.lane(plan.degree)? {
+                device
+                    .memory
+                    .learn_load(&plan.id, facts.weights, facts.weights_floor);
+            }
             self.record_load(
                 &plan.id,
                 started.elapsed(),
@@ -2090,6 +2086,12 @@ impl GpuPool {
                 )?;
             }
         }
+        // Degree 2 once this call measured that the construction fits: an executor loaded
+        // without it (its plan never ran here) offers everything it holds at this boundary.
+        if !session.sharing && self.degree2(&plan.id, plan.degree, &session.executor)? {
+            session.sharing = true;
+            callbacks.custody = self.custody.as_ref();
+        }
         if let Some(custody) = callbacks.custody {
             // The call is over: the GPU regions it filled outlive this executor, and
             // generations revoked meanwhile are let go at this idle boundary.
@@ -2103,6 +2105,20 @@ impl GpuPool {
             }
         }
         Ok(true)
+    }
+
+    /// Degree 2 for `plan`'s executor: GPU weights the machine keeps across executors. It
+    /// keeps every component resident until revoked, and a running call never revokes what
+    /// it reads, so only when the whole construction and its activations fit beside the other
+    /// tenants, as measured here or in an earlier run (unmeasured: Degree 1, where stages
+    /// evict each other). World-one only: a group shares nothing.
+    fn degree2(&self, plan: &str, degree: u32, executor: &DeviceExecutor) -> io::Result<bool> {
+        Ok(self.custody.is_some()
+            && degree == 1
+            && executor.hello.offers("weights.attach/1")
+            && self.lane(1)?[0]
+                .memory
+                .fits_resident(plan, || self.holdings()))
     }
 
     /// Before a spawn: the host has room for the executor's private bytes as measured in

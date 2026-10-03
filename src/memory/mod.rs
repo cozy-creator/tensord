@@ -327,6 +327,19 @@ impl GpuMemory {
         });
     }
 
+    /// A load's weights (as stages count them) and their floor, kept for the next load.
+    pub fn learn_load(&self, plan: &str, weights: Option<u64>, floor: Option<u64>) {
+        let Some(weights) = weights.filter(|w| *w > 0) else {
+            return;
+        };
+        self.with(|gpu| {
+            gpu.learned.load(plan, weights, floor.unwrap_or(0));
+            if let Err(error) = gpu.learned.save() {
+                note(serde_json::json!({"event": "learned_unsaved", "error": error.to_string()}));
+            }
+        });
+    }
+
     /// A process's private host bytes (PSS less shared memory), kept across runs.
     pub fn learn_host(&self, plan: &str, bytes: u64) {
         self.with(|gpu| {
