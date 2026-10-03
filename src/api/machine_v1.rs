@@ -125,91 +125,140 @@ pub(super) fn state(id: &str, state: &pb::MachineExecutionState) -> v1::RunState
     }
 }
 
-fn submission(
-    id: &str,
-    spec: v1::RunSpec,
-    workspace: String,
-) -> Result<pb::MachineExecutionSubmit, Status> {
-    if spec.kind != v1::RunKind::Call as i32 {
-        return Err(Status::unimplemented(
-            "this machine runs calls; jobs, warm-up and updates come next",
-        ));
-    }
-    if !spec.inputs.is_empty() {
-        return Err(Status::unimplemented("file inputs arrive with Write"));
-    }
-    if spec.hub.as_ref().is_some_and(|hub| !hub.token.is_empty()) {
-        return Err(Status::unimplemented(
-            "a run-held Hub token arrives with preparation in runs",
-        ));
-    }
-    let mut root = pb::ReleaseRoot {
-        entrypoint: spec.entrypoint,
-        attention_kernel: spec.attention_kernel,
-        owner: spec.owner,
-        hub: spec.hub.map(|hub| hub.origin).unwrap_or_default(),
-        models: spec
-            .models
-            .into_iter()
-            .map(|choice| -> Result<pb::ModelChoice, Status> {
-                Ok(pb::ModelChoice {
-                    parameter: choice.parameter,
-                    repository: choice.repository,
-                    release: choice.release,
-                    lane: choice.lane,
-                    manifest: if choice.manifest.is_empty() {
-                        None
-                    } else {
-                        Some(pb::Ref {
-                            digest: digest(&choice.manifest)?,
-                            length: choice.manifest_length,
-                        })
-                    },
-                    adapters: choice
-                        .adapters
-                        .into_iter()
-                        .map(|a| pb::DownloadAdapterRef {
-                            component: a.component,
-                            model: a.model,
-                            release: a.release,
-                            lane: a.lane,
-                            manifest: a.manifest,
-                            scale: a.scale,
-                            ..Default::default()
-                        })
-                        .collect(),
-                    ..Default::default()
-                })
-            })
-            .collect::<Result<_, _>>()?,
-        ..Default::default()
-    };
-    match spec.source {
-        Some(v1::run_spec::Source::Release(release)) => {
-            root.package = release.package;
-            root.release = release.release;
-        }
-        Some(v1::run_spec::Source::Installation(installation)) => {
-            root.installation_id = installation;
-        }
-        Some(_) => {
+/// A Run spec as this machine's run sources (`runs`). Its digest (the token cleared) makes the
+/// id idempotent: the same id with another spec is refused.
+fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
+    let warm = match v1::RunKind::try_from(spec.kind) {
+        Ok(v1::RunKind::Call) => false,
+        Ok(v1::RunKind::Warm) => true,
+        _ => {
             return Err(Status::unimplemented(
-                "local and private sources arrive with Write",
+                "Run takes calls, warm-ups and updates; jobs come next",
             ))
         }
+    };
+    let hub = spec.hub.take();
+    let identity_digest = {
+        let mut identity = spec.clone();
+        identity.hub = hub.clone().map(|hub| v1::HubAccess {
+            token: String::new(),
+            ..hub
+        });
+        format!(
+            "sha256:{}",
+            tensorfs_core::sha256::hex_digest(&prost::Message::encode_to_vec(&identity))
+        )
+    };
+    let hub = match hub.filter(|hub| !hub.token.is_empty()) {
+        None => None,
+        Some(hub) => {
+            if !crate::hub::valid_origin(&hub.origin) {
+                return Err(Status::invalid_argument("the run's Hub origin is invalid"));
+            }
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs() as i64);
+            if hub.expires_at != 0 && hub.expires_at <= now {
+                return Err(refused("hub_access_expired", "the run's Hub access has expired"));
+            }
+            Some(crate::hub::Source {
+                origin: hub.origin.trim_end_matches('/').to_string(),
+                credential: format!("bearer {}", hub.token),
+                ca_der: (!hub.ca_der.is_empty()).then_some(hub.ca_der),
+                object_hosts: hub.object_hosts,
+            })
+        }
+    };
+    let source = match spec.source {
+        Some(v1::run_spec::Source::Release(release)) => crate::runs::Source::Release {
+            package: release.package,
+            release: release.release,
+        },
+        Some(v1::run_spec::Source::Installation(alias)) => crate::runs::Source::Installation(alias),
+        Some(v1::run_spec::Source::Local(local)) => crate::runs::Source::Local(local.manifest),
         None => return Err(Status::invalid_argument("a run spec names its source")),
-    }
-    Ok(pb::MachineExecutionSubmit {
-        offer: Some(pb::AttemptOffer {
-            request_id: id.into(),
-            ..Default::default()
-        }),
-        submission_id: id.into(),
-        expected_execution_workspace_id: workspace,
-        payload_canonical_bytes: spec.payload,
-        release_root: Some(root),
-        ..Default::default()
+    };
+    let input: Value = if spec.payload.is_empty() {
+        serde_json::json!({})
+    } else {
+        crate::boundary_json::parse(&spec.payload)
+            .map_err(|_| Status::invalid_argument("the payload is not JSON"))?
+    };
+    let models = spec
+        .models
+        .into_iter()
+        .map(|choice| -> Result<pb::ModelChoice, Status> {
+            Ok(pb::ModelChoice {
+                parameter: choice.parameter,
+                repository: choice.repository,
+                release: choice.release,
+                lane: choice.lane,
+                manifest: if choice.manifest.is_empty() {
+                    None
+                } else {
+                    Some(pb::Ref {
+                        digest: digest(&choice.manifest)?,
+                        length: choice.manifest_length,
+                    })
+                },
+                adapters: choice
+                    .adapters
+                    .into_iter()
+                    .map(|a| pb::DownloadAdapterRef {
+                        component: a.component,
+                        model: a.model,
+                        release: a.release,
+                        lane: a.lane,
+                        manifest: a.manifest,
+                        scale: a.scale,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(crate::runs::Spec {
+        warm,
+        source,
+        entrypoint: spec.entrypoint,
+        input,
+        inputs: spec
+            .inputs
+            .into_iter()
+            .map(|file| crate::journal::InputFile {
+                input_id: file.field,
+                digest: file.digest,
+                length: file.length,
+                media_type: file.media_type,
+                order: file.order,
+            })
+            .collect(),
+        models,
+        binding_revision: spec.binding_revision,
+        attention_kernel: spec.attention_kernel,
+        hub,
+        owner: spec.owner,
+        digest: identity_digest,
     })
+}
+
+/// A typed refusal: the status carries its code as `cozy-error-code`, its message as text.
+fn refused(code: &str, message: &str) -> Status {
+    let status = match code {
+        "run_id_conflict" => Status::already_exists(format!("{code}: {message}")),
+        c if c.starts_with("invalid") => Status::invalid_argument(format!("{code}: {message}")),
+        "object_storage_failed" => Status::unavailable(format!("{code}: {message}")),
+        _ => Status::failed_precondition(format!("{code}: {message}")),
+    };
+    let mut status = status;
+    if let Ok(value) = code.parse() {
+        status.metadata_mut().insert("cozy-error-code", value);
+    }
+    status
+}
+fn refusal(refused_: crate::objects::Refused) -> Status {
+    refused(refused_.code, &refused_.message)
 }
 
 fn digest(text: &str) -> Result<Vec<u8>, Status> {
@@ -288,7 +337,8 @@ impl Log {
                     fraction: payload["overall_fraction"].as_f64().unwrap_or(-1.0),
                     completed: payload["position"].as_u64().unwrap_or(0),
                     total: payload["total"].as_u64().unwrap_or(0),
-                    ..Default::default()
+                    bytes_done: payload["bytes_done"].as_u64().unwrap_or(0),
+                    bytes_total: payload["bytes_total"].as_u64().unwrap_or(0),
                 })
             }
             "product" => {
@@ -402,6 +452,54 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
         Ok(Response::new(Box::pin(
             tokio_stream::wrappers::ReceiverStream::new(receiver),
         )))
+    }
+
+    /// One object's bytes from the frame's offset; a header-only stream answers what is held.
+    async fn write(
+        &self,
+        request: Request<tonic::Streaming<v1::WriteFrame>>,
+    ) -> Result<Response<v1::WriteResult>, Status> {
+        let caller = self.caller(request.metadata())?;
+        caller.machine()?;
+        let runs = self
+            .backend
+            .runs()
+            .ok_or_else(|| Status::unimplemented("this machine takes no writes"))?;
+        let actor = crate::machine_api::actor_id(caller.actor);
+        let mut frames = request.into_inner();
+        let first = frames
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("a write names its object first"))?;
+        let (digest, length, offset) = (first.digest.clone(), first.length, first.offset);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let object = digest.clone();
+        let writer = tokio::task::spawn_blocking(move || -> Result<u64, Status> {
+            let mut writer = runs
+                .objects
+                .begin(&actor, &object, length, offset)
+                .map_err(refusal)?;
+            while let Some(data) = receiver.blocking_recv() {
+                writer.append(&data).map_err(refusal)?;
+            }
+            writer.finish().map_err(refusal)
+        });
+        let mut data = first.data;
+        loop {
+            // A refused writer drops its receiver; its refusal is the answer.
+            if !data.is_empty() && sender.send(data).await.is_err() {
+                break;
+            }
+            match frames.message().await? {
+                Some(frame) => data = frame.data,
+                None => break,
+            }
+        }
+        drop(sender);
+        let held = writer
+            .await
+            .map_err(|_| Status::internal("machine operation stopped"))??;
+        Ok(Response::new(v1::WriteResult { digest, held }))
     }
 
     async fn control(
@@ -573,51 +671,16 @@ async fn stream_run<B: MachineBackend>(
 ) -> Result<(), Status> {
     let id = request.id.clone();
     if let Some(spec) = request.spec {
-        loop {
-            let (submit_backend, id, spec) = (backend.clone(), id.clone(), spec.clone());
-            let submitted = tokio::task::spawn_blocking(move || {
-                let workspace = submit_backend
-                    .workspace(actor, pb::MachineExecutionWorkspaceQuery::default())?
-                    .execution_workspace_id;
-                submit_backend.submit(actor, submission(&id, spec, workspace)?)
-            })
-            .await
-            .map_err(|_| Status::internal("machine operation stopped"))?;
-            match submitted {
-                Ok(_) => break,
-                // Preparation before acceptance: its stage is the progress (D1 moves it into runs).
-                Err(status)
-                    if status
-                        .metadata()
-                        .get("cozy-error-code")
-                        .and_then(|v| v.to_str().ok())
-                        == Some("release_root_preparing") =>
-                {
-                    let (done, total) = status
-                        .metadata()
-                        .get("cozy-progress-bytes")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|v| v.split_once(' '))
-                        .map(|(d, t)| (d.parse().unwrap_or(0), t.parse().unwrap_or(0)))
-                        .unwrap_or((0, 0));
-                    let event = v1::RunEvent {
-                        sequence: 0,
-                        at_ms: 0,
-                        event: Some(v1::run_event::Event::Progress(v1::Progress {
-                            stage: status.message().into(),
-                            fraction: -1.0,
-                            bytes_done: done,
-                            bytes_total: total,
-                            ..Default::default()
-                        })),
-                    };
-                    if sender.send(Ok(event)).await.is_err() {
-                        return Ok(());
-                    }
-                }
-                Err(status) => return Err(status),
-            }
-        }
+        let runs = backend
+            .runs()
+            .ok_or_else(|| Status::unimplemented("this machine takes no runs"))?;
+        let (id, spec) = (id.clone(), spec_of(spec)?);
+        tokio::task::spawn_blocking(move || {
+            runs.submit(&crate::machine_api::actor_id(actor), &id, spec)
+        })
+        .await
+        .map_err(|_| Status::internal("machine operation stopped"))?
+        .map_err(refusal)?;
     }
     let mut log = Log::default();
     let mut after = request.after;

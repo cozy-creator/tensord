@@ -33,6 +33,10 @@ impl Machine {
     }
     /// `prepare` sees the state root and the test actor's journal id before the machine starts.
     async fn start_with(prepare: impl FnOnce(&Path, &str)) -> Self {
+        Self::start_args(prepare, &[]).await
+    }
+    /// As `start_with`, with more `serve` arguments.
+    async fn start_args(prepare: impl FnOnce(&Path, &str), extra: &[std::ffi::OsString]) -> Self {
         let root = std::env::temp_dir().join(format!("cm-surface-{}", uuid::Uuid::new_v4()));
         let config = root.join("config");
         fs::create_dir_all(&config).unwrap();
@@ -57,7 +61,7 @@ impl Machine {
                 "authorized_keys_file":"keys.json","readiness_hmac_key_file":"readiness.json"}),
         );
         prepare(&root.join("state"), &actor());
-        let (child, client, claim, address) = launch(&root).await;
+        let (child, client, claim, address) = launch(&root, extra).await;
         Self {
             child,
             root,
@@ -156,6 +160,7 @@ fn actor() -> String {
 
 async fn launch(
     root: &Path,
+    extra: &[std::ffi::OsString],
 ) -> (
     Child,
     pb::pod_host_client::PodHostClient<Channel>,
@@ -164,12 +169,13 @@ async fn launch(
 ) {
     let state = root.join("state");
     let _ = fs::remove_file(state.join("api-ready.json"));
-    let child = Command::new(env!("CARGO_BIN_EXE_cozy-machine"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cozy-machine"))
         .args(["serve", "--state"])
         .arg(&state)
         .arg("--machine-config")
         .arg(root.join("config/machine.json"))
         .args(["--listen", "127.0.0.1:0", "--host-bytes", "0"])
+        .args(extra)
         .stdout(Stdio::null())
         .spawn()
         .unwrap();
@@ -179,10 +185,10 @@ async fn launch(
         if let Ok(bytes) = fs::read(state.join("api-ready.json")) {
             break serde_json::from_slice::<serde_json::Value>(&bytes).unwrap();
         }
-        assert!(
-            Instant::now() < until,
-            "machine did not publish api-ready.json"
-        );
+        if Instant::now() >= until {
+            let _ = child.kill(); // never leave a started machine behind
+            panic!("machine did not publish api-ready.json");
+        }
         std::thread::sleep(Duration::from_millis(50));
     };
     let pem = ready["cert_pem"].as_str().unwrap().to_owned();
@@ -925,5 +931,151 @@ mod v1_api {
                 break;
             }
         }
+    }
+
+    async fn write(
+        client: &mut v1::machine_client::MachineClient<Channel>,
+        cap: &str,
+        digest: &str,
+        length: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<u64, tonic::Status> {
+        let mut frames = vec![v1::WriteFrame {
+            digest: digest.into(),
+            length,
+            offset,
+            data: vec![],
+        }];
+        frames.extend(data.chunks(64 << 10).map(|chunk| v1::WriteFrame {
+            data: chunk.to_vec(),
+            ..Default::default()
+        }));
+        let request = authorized(tokio_stream::iter(frames), cap);
+        Ok(client.write(request).await?.into_inner().held)
+    }
+
+    /// Write and run sources on the real serve process: an object resumes from what is held,
+    /// and unpublished code written with Write prepares inside its run (warm, then a call).
+    #[tokio::test]
+    async fn written_local_code_prepares_inside_its_run() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let tools = std::env::temp_dir().join(format!("cm-tools-{}", uuid::Uuid::new_v4()));
+        assert!(Command::new("uv")
+            .current_dir(repo)
+            .args(["build", "--wheel", "--out-dir"])
+            .arg(&tools)
+            .status()
+            .unwrap()
+            .success());
+        let wheel = fs::read_dir(&tools)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|e| e == "whl"))
+            .unwrap();
+        let helper = Command::new("uv")
+            .current_dir(repo)
+            .args(["run", "--locked", "--extra", "test", "python", "-c", "import sys; print(sys.executable)"])
+            .output()
+            .unwrap();
+        let helper = String::from_utf8(helper.stdout).unwrap().trim().to_string();
+        let machine = Machine::start_args(
+            |_, _| (),
+            &["--installer-python".into(), helper.into(), "--client-wheel".into(), wheel.into()],
+        )
+        .await;
+        let mut client = client(&machine).await;
+        let all = cap(Grant {
+            action: MACHINE.into(),
+            ..Default::default()
+        });
+
+        let mut archive = tar::Builder::new(Vec::new());
+        let fixture = repo.join("tests/fixtures/cpu_lifecycle");
+        for name in ["pyproject.toml", "package.toml", "cpu_lifecycle/__init__.py"] {
+            archive.append_path_with_name(fixture.join(name), name).unwrap();
+        }
+        let source = archive.into_inner().unwrap();
+        let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&source));
+        let length = source.len() as u64;
+        // A probe holds nothing; half, then the rest from the held offset.
+        assert_eq!(write(&mut client, &all, &digest, length, 0, &[]).await.unwrap(), 0);
+        let half = length / 2;
+        assert_eq!(
+            write(&mut client, &all, &digest, length, 0, &source[..half as usize]).await.unwrap(),
+            half
+        );
+        let ahead = write(&mut client, &all, &digest, length, half + 1, b"x").await.unwrap_err();
+        assert_eq!(ahead.metadata().get("cozy-error-code").unwrap(), "object_offset_ahead");
+        assert_eq!(
+            write(&mut client, &all, &digest, length, half, &source[half as usize..]).await.unwrap(),
+            length
+        );
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "package": "local/cozy-machine-cpu-lifecycle", "release": "0.1.0",
+            "python_version": "3.12", "source": {"digest": digest, "length": length}}))
+        .unwrap();
+        let manifest_digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&manifest));
+        let size = manifest.len() as u64;
+        assert_eq!(
+            write(&mut client, &all, &manifest_digest, size, 0, &manifest).await.unwrap(),
+            size
+        );
+
+        let local = |kind: v1::RunKind| v1::RunSpec {
+            kind: kind as i32,
+            source: Some(v1::run_spec::Source::Local(v1::LocalSource {
+                manifest: manifest_digest.clone(),
+            })),
+            entrypoint: "steps".into(),
+            payload: br#"{"steps":2,"seconds":0.01}"#.to_vec(),
+            owner: "alice".into(),
+            ..Default::default()
+        };
+        let run = |id: &str, spec: v1::RunSpec| v1::RunRequest {
+            id: id.into(),
+            after: 0,
+            spec: Some(spec),
+        };
+        let outcome = |events: &[v1::RunEvent]| match &events.last().unwrap().event {
+            Some(v1::run_event::Event::Outcome(outcome)) => outcome.clone(),
+            _ => panic!("{events:?}"),
+        };
+        let warm = collect(
+            client
+                .run(authorized(run("warm-1", local(v1::RunKind::Warm)), &all))
+                .await
+                .unwrap()
+                .into_inner(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome(&warm).status, "succeeded", "{warm:?}");
+        let called = collect(
+            client
+                .run(authorized(run("call-1", local(v1::RunKind::Call)), &all))
+                .await
+                .unwrap()
+                .into_inner(),
+        )
+        .await
+        .unwrap();
+        let done = outcome(&called);
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        assert_eq!(result["steps"], 2);
+        // The id names that spec: another spec under it is refused.
+        let mut other = local(v1::RunKind::Call);
+        other.payload = br#"{"steps":3}"#.to_vec();
+        let conflict = client
+            .run(authorized(run("call-1", other), &all))
+            .await
+            .unwrap()
+            .into_inner()
+            .message()
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
+        let _ = fs::remove_dir_all(tools);
     }
 }

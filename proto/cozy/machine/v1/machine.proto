@@ -36,7 +36,6 @@ message RunSpec {
     Release release = 2;
     string installation = 3;  // one this machine already holds for the signer
     LocalSource local = 4;
-    PrivateSource private = 5;
   }
   string entrypoint = 6;
   bytes payload = 7;              // canonical JSON object of the function's parameters
@@ -54,11 +53,12 @@ message Release {
   string package = 1;  // org/name
   string release = 2;
 }
+// The manifest is a JSON object written with Write: {package: "local/<dist>", release,
+// python_requires, python_version, source: {digest, length} (a tar of the project),
+// wheels: [{name, digest, length}], requirements: {digest, length}}. Its members are objects
+// the same signer wrote.
 message LocalSource {
-  string manifest = 1;  // sha256:<hex> of the uploaded source tree manifest
-}
-message PrivateSource {
-  string placement = 1;
+  string manifest = 1;  // sha256:<hex> of the manifest object
 }
 message InputFile {
   string field = 1;   // the payload field path, list index included
@@ -94,6 +94,7 @@ message HubAccess {
   string token = 2;
   int64 expires_at = 3;  // unix seconds
   bytes ca_der = 4;      // an origin's private CA, when it has one
+  repeated string object_hosts = 5;  // the Hub's object-storage hosts downloads may follow
 }
 
 message RunEvent {

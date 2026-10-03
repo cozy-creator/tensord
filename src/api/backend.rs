@@ -14,6 +14,10 @@ use tonic::Status;
 pub type HubAccessRefusal = (u16, &'static str, String);
 
 pub trait MachineBackend: Send + Sync + 'static {
+    /// `cozy.machine.v1` Run sources and Write (`runs`).
+    fn runs(&self) -> Option<std::sync::Arc<crate::runs::Runs>> {
+        None
+    }
     /// Retains delegated Hub access for this owner key; answers the retained origin.
     fn hub_access(
         &self,

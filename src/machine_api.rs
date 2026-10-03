@@ -202,7 +202,12 @@ impl NativeBackend {
         let mut value = record.result.as_ref().map(|r| r.value.clone());
         let mut products = vec![];
         let mut schema_digest = None;
-        if let Some(result) = &record.result {
+        // A warm run's result describes its preparation; no callable produced it.
+        if let Some(result) = record
+            .result
+            .as_ref()
+            .filter(|_| !record.invocation.generation.is_empty())
+        {
             let held = self
                 .service
                 .engine
@@ -564,6 +569,9 @@ impl NativeBackend {
     }
 }
 impl MachineBackend for NativeBackend {
+    fn runs(&self) -> Option<Arc<crate::runs::Runs>> {
+        self.runs.clone()
+    }
     fn hub_access(
         &self,
         actor: VerifiedActor,
@@ -1640,7 +1648,7 @@ impl Iterator for ByteReader {
         Some(Ok(pb::NativeByteReadChunk { offset, data }))
     }
 }
-fn actor_id(actor: VerifiedActor) -> String {
+pub fn actor_id(actor: VerifiedActor) -> String {
     sha256::hex(&actor.public_key)
 }
 fn verify_checksum(
