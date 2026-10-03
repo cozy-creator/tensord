@@ -1702,6 +1702,20 @@ mod v1_api {
             labels,
             ["Video (segments 1-1)", "Video (segments 1-2)", "Video (segments 1-3)"]
         );
+        // Nor do its list items: each segment is one item of `parts`, in order.
+        let parts: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.event {
+                Some(v1::run_event::Event::Product(p)) if p.output == "parts" => {
+                    Some((p.index, p.label.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            parts,
+            [(1, "Segment 1".into()), (2, "Segment 2".into()), (3, "Segment 3".into())]
+        );
         let again = client.control(control(v1::Action::Resume, "film")).await;
         assert_eq!(again.err().and_then(code).as_deref(), Some("run_not_paused"));
 

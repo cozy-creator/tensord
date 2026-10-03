@@ -80,6 +80,8 @@ class LongFormInput(msgspec.Struct):
 class LongFormOutput(msgspec.Struct):
     video: Video
     segments: int
+    #: Each segment's file, published (appended) as it lands.
+    parts: list[Video]
     #: This run's attempts so far, counted in its scratch (a resume adds one).
     attempts: int = 1
     #: Segment checkpoints an earlier attempt had already declared.
@@ -99,7 +101,7 @@ async def long_form(
     counted = state / "attempts"
     attempts = int(counted.read_text()) + 1 if counted.exists() else 1
     counted.write_text(str(attempts))
-    film, context, replayed = b"", "", 0
+    film, context, replayed, parts = b"", "", 0, []
     for index, prompt in enumerate(payload.segments):
         ctx.raise_if_cancelled()
         try:
@@ -124,6 +126,8 @@ async def long_form(
             ) from failure
         film += result.video.read_bytes()
         context = result.context
+        parts.append(out.save_bytes(result.video.read_bytes(), media_type="video/mp4"))
+        out.publish("parts", parts[-1], label=f"Segment {index + 1}")
         kept = state / f"film-{index}"
         kept.write_bytes(film)
         replayed += checkpoints.declare(f"film-{index}", kept).replayed
@@ -133,6 +137,7 @@ async def long_form(
     return LongFormOutput(
         video=out.save_bytes(film, media_type="video/mp4"),
         segments=len(payload.segments),
+        parts=parts,
         attempts=attempts,
         replayed=replayed,
     )

@@ -279,6 +279,7 @@ impl Jobs {
             completed: 0,
             publish: true,
             job: Some((self, &parent)),
+            appended: HashMap::new(),
         };
         let reply = executor.command(
             &DeviceCommand::RunJob {
@@ -320,6 +321,7 @@ impl Jobs {
             completed: 0,
             publish: false,
             job: None,
+            appended: HashMap::new(),
         };
         let application = held.record.application.clone();
         command_ok(executor.command(
@@ -825,6 +827,8 @@ struct Seam<'a> {
     /// A job's products show to its owner; a child's do not (its parent publishes).
     publish: bool,
     job: Option<(&'a Arc<Jobs>, &'a Arc<Parent>)>,
+    /// This attempt's list items per output: a resumed job's replay adds no duplicates.
+    appended: HashMap<String, usize>,
 }
 impl Services for Seam<'_> {
     fn progress(&mut self, frame: &Frame) {
@@ -855,7 +859,14 @@ impl Services for Seam<'_> {
         drop(descriptor);
         match (frame.kind, self.job) {
             (Kind::Publish, _) if self.publish => Ok((
-                crate::products::publish(self.store, self.engine, self.id, self.spool, frame),
+                crate::products::publish_replayed(
+                    self.store,
+                    self.engine,
+                    self.id,
+                    self.spool,
+                    frame,
+                    &mut self.appended,
+                ),
                 None,
             )),
             // A child call's product shows nothing (`sequence` 0): its parent decides.

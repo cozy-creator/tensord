@@ -178,8 +178,33 @@ pub fn decode(stored: &StoredProduct) -> io::Result<pb::RunProduct> {
 
 /// The SDK's `publish` request during a running attempt: answers `Published`.
 pub fn publish(store: &Store, engine: &Engine, id: &str, spool: &Path, frame: &Frame) -> Answer {
+    publish_in(store, engine, id, spool, frame, None)
+}
+
+/// `publish` for an attempt that may replay an earlier one's (a resumed job): `appended` counts
+/// this attempt's list items per output, and an item an earlier attempt already published at
+/// that position, with the same bytes, adds nothing.
+pub fn publish_replayed(
+    store: &Store,
+    engine: &Engine,
+    id: &str,
+    spool: &Path,
+    frame: &Frame,
+    appended: &mut std::collections::HashMap<String, usize>,
+) -> Answer {
+    publish_in(store, engine, id, spool, frame, Some(appended))
+}
+
+fn publish_in(
+    store: &Store,
+    engine: &Engine,
+    id: &str,
+    spool: &Path,
+    frame: &Frame,
+    appended: Option<&mut std::collections::HashMap<String, usize>>,
+) -> Answer {
     let mut answer = Answer::unavailable(frame.seq);
-    match commit(store, engine, id, spool, frame) {
+    match commit(store, engine, id, spool, frame, appended) {
         Ok((content, sequence)) => {
             answer.ok = true;
             answer.code.clear();
@@ -206,6 +231,7 @@ fn commit(
     id: &str,
     spool: &Path,
     frame: &Frame,
+    appended: Option<&mut std::collections::HashMap<String, usize>>,
 ) -> io::Result<(pb::Ref, u64)> {
     let record = engine.get(id)?;
     let context = record
@@ -303,10 +329,21 @@ fn commit(
     let sequence = engine.append_product(id, |prior| {
         let prior = prior.iter().map(decode).collect::<io::Result<Vec<_>>>()?;
         if op == pb::RunProductOp::Append {
-            product.index = prior
+            let items: Vec<_> = prior
                 .iter()
                 .filter(|p| p.output == product.output && p.op == op as i32)
-                .count() as u32;
+                .collect();
+            if let Some(appended) = appended {
+                let position = appended.entry(product.output.clone()).or_default();
+                let replayed = items
+                    .get(*position)
+                    .is_some_and(|item| item.content == product.content);
+                *position += 1;
+                if replayed {
+                    return Ok(None);
+                }
+            }
+            product.index = items.len() as u32;
         } else if prior
             .iter()
             .rev()
