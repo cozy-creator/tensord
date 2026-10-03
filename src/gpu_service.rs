@@ -1400,9 +1400,9 @@ impl GpuPool {
         let launched = Instant::now();
         let (root, socket, directory) = self.executor_endpoint()?;
         let config = self.executor_config(held, root, socket, plan.degree)?;
-        // The import-only parent is sealed to one GPU: a group is always spawned.
-        let zygote = (plan.degree == 1).then(|| self.zygote(held)).flatten();
-        let (mut executor, mode) = match zygote {
+        // A forked child takes its lane and seal with its environment, so a group forks from
+        // the same import-only parent (sealed to the first GPU) as a single GPU does.
+        let (mut executor, mode) = match self.zygote(held) {
             Some((zygote, start)) => {
                 if start {
                     zygote.set(self.import_only(held));

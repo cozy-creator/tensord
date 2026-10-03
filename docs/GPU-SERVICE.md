@@ -51,7 +51,9 @@ executor per plan; `memory::GpuMemory` decides every device byte. Acceptance, jo
   Teardown waits for every group member's exit. Startup fences GPU dispatch until a previous
   machine's leaders and their followers are gone. A refusal or poisoned group call fails the run
   with the executor's own code (a group's first fault names its GPU). Descriptor sources and
-  Degree 2 custody stay world-one.
+  Degree 2 custody stay world-one. A group forks from the generation's import-only parent like a
+  single GPU does: the child takes the lane and NCCL seal with its environment; followers are spawned
+  by rank 0.
 - A cold session is admitted first: its context estimate (twice the largest measured here, else
   1 GiB) and known first working set are reserved, making room by the ladder below. It is spawned by
   the pool's `ChildLauncher`, which journals the birth, then sent Start, Load (with that cap),
