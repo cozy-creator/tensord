@@ -123,6 +123,7 @@ fn invoke(
             construction: "lifecycle".into(),
             entrypoint: entrypoint.into(),
             payload,
+            attention_kernel: String::new(),
         },
         &mut Baseline,
     )?;

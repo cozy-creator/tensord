@@ -398,6 +398,7 @@ fn run() -> io::Result<()> {
                 construction: "pilot-model".into(),
                 entrypoint: "generate".into(),
                 payload,
+                attention_kernel: String::new(),
             },
             &mut turns,
         )?;

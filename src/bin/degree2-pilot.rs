@@ -269,6 +269,7 @@ fn exec(
                 construction: "pilot".into(),
                 entrypoint: config.entrypoint.clone(),
                 payload: (*payload).clone(),
+                attention_kernel: String::new(),
             },
             &mut pilot,
         )?;

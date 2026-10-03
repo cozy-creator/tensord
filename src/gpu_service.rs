@@ -969,9 +969,27 @@ impl GpuPool {
                 construction: plan.id.clone(),
                 entrypoint: plan.entrypoint.clone(),
                 payload: record.invocation.input,
+                attention_kernel: record.invocation.attention_kernel.clone(),
             },
             &mut callbacks,
         )?;
+        if !prepared.ok
+            && !matches!(
+                prepared.code.as_str(),
+                "executor_not_ready" | "poisoned_generation"
+            )
+        {
+            // A pre-entry refusal leaves the executor Ready; the run ends with its reason.
+            let terminal = if prepared.terminal.is_empty() {
+                "refused"
+            } else {
+                &prepared.terminal
+            };
+            let failure =
+                Failure::executor(terminal, &prepared.origin, &prepared.code, &prepared.detail);
+            engine.finish(id, Outcome::Failed(failure.encode()))?;
+            return Ok(true);
+        }
         command_ok(prepared)?;
         let spool = if let Some(identity) = self.config.identity {
             // Keep Journal/results/admin paths private to the core. A separate peer-owned
@@ -1032,7 +1050,15 @@ impl GpuPool {
         });
         self.memory.observe(&plan.id, facts, Some(true));
         if !reply.quiescent || !reply.poisoned.is_empty() {
-            return Err(io::Error::other("device reply lacks quiescence; wait for exact executor exit before releasing reservation"));
+            // The run ends once the executor is gone; its own reason travels with it.
+            let reason = reply
+                .outcome
+                .as_ref()
+                .map(|o| format!("{}: {}; ", o.code, o.message))
+                .unwrap_or_default();
+            return Err(io::Error::other(format!(
+                "{reason}the executor did not settle quiescent"
+            )));
         }
         let outcome = reply
             .outcome

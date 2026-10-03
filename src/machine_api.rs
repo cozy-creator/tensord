@@ -1842,6 +1842,7 @@ print(json.dumps({"identity": generation.identity}))
                             construction: "fixture".into(),
                             entrypoint: "make".into(),
                             payload: record.invocation.input,
+                            attention_kernel: String::new(),
                         },
                     )?;
                     let spool = engine.staging(&id)?;

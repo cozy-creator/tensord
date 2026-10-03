@@ -201,6 +201,9 @@ pub enum DeviceCommand {
         construction: String,
         entrypoint: String,
         payload: Value,
+        /// Checked before entry, so a bad pin is the request's refusal, not a fault.
+        #[serde(skip_serializing_if = "String::is_empty")]
+        attention_kernel: String,
     },
     Invoke {
         request_id: String,
@@ -439,6 +442,9 @@ pub struct Frame {
     pub ok: bool,
     pub code: String,
     pub detail: String,
+    /// A refusal's own terminal (`refused`/`failed`) and origin (`request`/`author`/`runtime`).
+    pub terminal: String,
+    pub origin: String,
     #[serde(flatten)]
     pub hello: Hello,
     pub outcome: Option<Outcome>,
