@@ -204,6 +204,9 @@ pub enum DeviceCommand {
         /// Checked before entry, so a bad pin is the request's refusal, not a fault.
         #[serde(skip_serializing_if = "String::is_empty")]
         attention_kernel: String,
+        /// File inputs by field path (identity only; the bytes arrive with Invoke).
+        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+        input_metadata: BTreeMap<String, Value>,
     },
     Invoke {
         request_id: String,
@@ -217,6 +220,9 @@ pub enum DeviceCommand {
         stages: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         cap_bytes: Option<u64>,
+        /// File inputs by field path: read-only copies in this call's spool.
+        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+        inputs: BTreeMap<String, Value>,
     },
     Budget {
         vram_bytes: i64,

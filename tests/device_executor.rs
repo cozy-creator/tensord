@@ -130,7 +130,7 @@ fn invoke(
 ) -> Frame {
     let spool = root.join(id);
     fs::create_dir(&spool).unwrap();
-    let prepared=executor.command(&DeviceCommand::PrepareRequest{attention_kernel:String::new(),request_id:id.into(),construction:"classifier".into(),entrypoint:"classify".into(),payload:json!({"samples":[[5.1,3.5,1.4,0.2],[6.,2.7,5.1,1.6],[6.7,3.1,4.7,1.5]],"iterations":iterations,"seed":19})},&mut Baseline).unwrap();
+    let prepared=executor.command(&DeviceCommand::PrepareRequest{attention_kernel:String::new(),input_metadata:Default::default(),request_id:id.into(),construction:"classifier".into(),entrypoint:"classify".into(),payload:json!({"samples":[[5.1,3.5,1.4,0.2],[6.,2.7,5.1,1.6],[6.7,3.1,4.7,1.5]],"iterations":iterations,"seed":19})},&mut Baseline).unwrap();
     assert!(prepared.ok, "{prepared:?}");
     executor
         .command(
@@ -144,6 +144,7 @@ fn invoke(
                 plane_budget_bytes: -1,
                 stages: false,
                 cap_bytes: None,
+                inputs: Default::default(),
             },
             services,
         )
@@ -221,6 +222,7 @@ fn credential_refusal_and_result_mutation_are_operation_local() {
         .command(
             &DeviceCommand::PrepareRequest {
                 attention_kernel: String::new(),
+                input_metadata: Default::default(),
                 request_id: "rejected".into(),
                 construction: "classifier".into(),
                 entrypoint: "classify".into(),
@@ -263,6 +265,7 @@ fn stock_executor_deferred_webp_reuses_sdk_encoder_and_exact_asset_binding() {
         .command(
             &DeviceCommand::PrepareRequest {
                 attention_kernel: String::new(),
+                input_metadata: Default::default(),
                 request_id: "image".into(),
                 construction: "classifier".into(),
                 entrypoint: "render".into(),
@@ -284,6 +287,7 @@ fn stock_executor_deferred_webp_reuses_sdk_encoder_and_exact_asset_binding() {
                 plane_budget_bytes: -1,
                 stages: false,
                 cap_bytes: None,
+                inputs: Default::default(),
             },
             &mut Baseline,
         )

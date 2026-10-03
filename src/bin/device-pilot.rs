@@ -472,6 +472,7 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
                 entrypoint: "generate".into(),
                 payload,
                 attention_kernel: String::new(),
+                input_metadata: Default::default(),
             },
             &mut turns,
         )?;
@@ -494,6 +495,7 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
                 plane_budget_bytes: config.plane_budget_bytes,
                 stages,
                 cap_bytes: None,
+                inputs: Default::default(),
             },
             &mut turns,
         )?;

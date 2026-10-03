@@ -109,6 +109,7 @@ impl HeldGeneration {
             entrypoint: entrypoint.into(),
             input,
             attention_kernel: String::new(),
+            inputs: vec![],
         })
     }
     pub fn runner(&self) -> RunnerConfig {

@@ -21,6 +21,20 @@ pub struct Invocation {
     /// The caller's attention-kernel pin, passed to the executor verbatim.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub attention_kernel: String,
+    /// File inputs the caller imported, verified at acceptance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<InputFile>,
+}
+
+/// One file input: the declared field path, its exact bytes (sha256 and length, held in the
+/// store by the caller's retention) and media type, in the caller's order.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct InputFile {
+    pub input_id: String,
+    pub digest: String,
+    pub length: u64,
+    pub media_type: String,
+    pub order: u32,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -418,6 +432,14 @@ impl Journal {
             )
             .map_err(db_error)?;
         Ok(state)
+    }
+    pub fn intake(&self, actor: &str, retention: &str) -> io::Result<Option<crate::native_inputs::IntakeState>> {
+        self.connection
+            .query_row("SELECT record FROM input_intakes WHERE actor=?1 AND retention=?2", params![actor, retention], |r| r.get::<_, String>(0))
+            .optional()
+            .map_err(db_error)?
+            .map(|record| serde_json::from_str(&record).map_err(db_error))
+            .transpose()
     }
     pub fn settle_intake(
         &mut self,

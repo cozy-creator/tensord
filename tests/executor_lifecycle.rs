@@ -124,6 +124,7 @@ fn invoke(
             entrypoint: entrypoint.into(),
             payload,
             attention_kernel: String::new(),
+            input_metadata: Default::default(),
         },
         &mut Baseline,
     )?;
@@ -139,6 +140,7 @@ fn invoke(
             plane_budget_bytes: -1,
             stages: false,
             cap_bytes: None,
+            inputs: Default::default(),
         },
         &mut Baseline,
     )

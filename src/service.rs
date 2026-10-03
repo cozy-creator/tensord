@@ -13,6 +13,14 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+/// What one public submission calls on its generation.
+pub struct Call {
+    pub entrypoint: String,
+    pub input: Value,
+    pub attention_kernel: String,
+    pub inputs: Vec<crate::journal::InputFile>,
+}
+
 pub struct Service {
     pub engine: Arc<Engine>,
     pub catalog: Catalog,
@@ -125,9 +133,7 @@ impl Service {
         &self,
         context: SubmissionContext,
         generation: &str,
-        entrypoint: &str,
-        input: Value,
-        attention_kernel: &str,
+        call: Call,
         boot: &str,
     ) -> io::Result<Execution> {
         let stopped = self.stopped.lock().unwrap();
@@ -135,8 +141,9 @@ impl Service {
             return Err(io::Error::other("machine is stopping"));
         }
         let held = self.catalog.resolve(generation)?;
-        let mut invocation = held.invocation(entrypoint, input)?;
-        invocation.attention_kernel = attention_kernel.into();
+        let mut invocation = held.invocation(&call.entrypoint, call.input)?;
+        invocation.attention_kernel = call.attention_kernel;
+        invocation.inputs = call.inputs;
         let record = self
             .engine
             .submit_public_on_boot(context, invocation, boot)?;

@@ -270,6 +270,7 @@ fn exec(
                 entrypoint: config.entrypoint.clone(),
                 payload: (*payload).clone(),
                 attention_kernel: String::new(),
+                input_metadata: Default::default(),
             },
             &mut pilot,
         )?;
@@ -288,6 +289,7 @@ fn exec(
                 plane_budget_bytes: config.plane_budget_bytes,
                 stages: false,
                 cap_bytes: None,
+                inputs: Default::default(),
             },
             &mut pilot,
         )?;

@@ -92,6 +92,7 @@ fn complete(journal: &mut Journal, n: usize, generation: &str, birth: ProcessBir
             context,
             Invocation {
                 attention_kernel: String::new(),
+                inputs: vec![],
                 package: "fixture".into(),
                 generation: generation.into(),
                 module: "fixture:app".into(),

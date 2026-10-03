@@ -47,6 +47,7 @@ impl Fixture {
     fn invocation(&self, mode: &str) -> Invocation {
         Invocation {
             attention_kernel: String::new(),
+            inputs: vec![],
             package: "fixture-cpu".into(),
             generation: "installed-cpu-v1".into(),
             module: "cpu_package".into(),

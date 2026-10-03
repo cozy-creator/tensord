@@ -278,7 +278,11 @@ impl NativeBackend {
         // The Python worker's run facts: which Runtime executed it, and for how long.
         let attempt = record.attempt.max(1) as u64;
         let mut facts = vec![];
-        if let Some(executor) = record.executor.as_ref().filter(|e| !e.runtime_version.is_empty()) {
+        if let Some(executor) = record
+            .executor
+            .as_ref()
+            .filter(|e| !e.runtime_version.is_empty())
+        {
             facts.push(("executor", json!({"request":context.request_id,"attempt":attempt,"pid":executor.pid,"runtime_version":executor.runtime_version,"tensorfs_version":executor.tensorfs_version})));
         }
         let mut timing = json!({"attempt":attempt,"terminal":true});
@@ -401,6 +405,111 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 impl NativeBackend {
+    /// The root's file inputs, each the committed import of this request and field: one
+    /// `payload` file whose bytes the binding names. Trees are not taken yet.
+    fn file_inputs(
+        &self,
+        actor: &str,
+        request_id: &str,
+        root: &pb::ReleaseRoot,
+    ) -> Result<Vec<crate::journal::InputFile>, Status> {
+        const FILE_BYTES: u64 = 64 << 20;
+        const TOTAL_BYTES: u64 = 256 << 20;
+        let unprepared = |id: &str| {
+            refusal(
+                "input_unprepared",
+                &format!("input {id} was not imported for this request"),
+            )
+        };
+        if root.inputs.len() != root.input_access.len() {
+            return Err(Status::invalid_argument(
+                "every input binding needs exactly one access",
+            ));
+        }
+        let mut files = vec![];
+        let mut total = 0;
+        for binding in &root.inputs {
+            let access: Vec<_> = root
+                .input_access
+                .iter()
+                .filter(|a| a.input_id == binding.input_id)
+                .collect();
+            let [access] = access.as_slice() else {
+                return Err(Status::invalid_argument(
+                    "every input binding needs exactly one access",
+                ));
+            };
+            let tree = access
+                .native_tree
+                .as_ref()
+                .ok_or_else(|| Status::unimplemented("only imported (native) inputs are taken"))?;
+            let state = self
+                .service
+                .engine
+                .with_journal(|j| j.intake(actor, &tree.retention_id))
+                .map_err(problem)?
+                .ok_or_else(|| unprepared(&binding.input_id))?;
+            if state.released
+                || state.spec.request_id != request_id
+                || state.spec.input_id != binding.input_id
+            {
+                return Err(unprepared(&binding.input_id));
+            }
+            let receipt = state.receipt.ok_or_else(|| unprepared(&binding.input_id))?;
+            let committed = pb::NativeByteRetentionResult::decode(receipt.as_slice())
+                .map_err(|_| Status::data_loss("input receipt corrupt"))?;
+            let source = tree
+                .source
+                .as_ref()
+                .filter(|s| committed.source.as_ref() == Some(*s))
+                .ok_or_else(|| unprepared(&binding.input_id))?;
+            let manifest = source
+                .manifest
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("input tree names no manifest"))?;
+            let manifest = self
+                .store
+                .read_manifest(&ObjectRef {
+                    sha256: sha256::hex(&manifest.digest),
+                    length: manifest.length,
+                })
+                .map_err(storage)?;
+            let object = match manifest.entries() {
+                [(name, tensorfs_core::manifest::Entry::File(object))] if name == "payload" => {
+                    object.clone()
+                }
+                _ => {
+                    return Err(Status::unimplemented(
+                        "directory (tree) inputs are not taken yet",
+                    ))
+                }
+            };
+            if format!("sha256:{}", object.sha256) != binding.digest
+                || object.length != binding.length
+            {
+                return Err(Status::invalid_argument(format!(
+                    "input {} differs from its imported bytes",
+                    binding.input_id
+                )));
+            }
+            total += object.length;
+            if object.length > FILE_BYTES || total > TOTAL_BYTES {
+                return Err(refusal(
+                    "input_too_large",
+                    "file inputs are limited to 64 MiB each and 256 MiB in all",
+                ));
+            }
+            files.push(crate::journal::InputFile {
+                input_id: binding.input_id.clone(),
+                digest: binding.digest.clone(),
+                length: object.length,
+                media_type: binding.kind_mime.clone(),
+                order: binding.order,
+            });
+        }
+        files.sort_by(|a, b| a.input_id.cmp(&b.input_id));
+        Ok(files)
+    }
     /// This owner's usable access at a Hub: present, bound to this leaf, unexpired.
     fn hub_grant(&self, actor: &str, origin: &str) -> Result<crate::hub::Grant, Status> {
         let key = crate::hub::origin_key(origin)
@@ -705,14 +814,14 @@ impl MachineBackend for NativeBackend {
             }
             return self.receipt(&prior);
         }
-        if !root.inputs.is_empty()
-            || !root.input_access.is_empty()
-            || root.job
+        if root.job
             || root.deadline_unix_ms != 0
             || root.capture.is_some()
             || !request.publication_authorization_id.is_empty()
         {
-            return Err(Status::unimplemented("this application slice supports callable roots without asset inputs, deadlines or publication"));
+            return Err(Status::unimplemented(
+                "this machine runs callable roots without deadlines or publication",
+            ));
         }
         if !request.capture_digest.is_empty()
             || !request.capture_canonical_bytes.is_empty()
@@ -854,6 +963,14 @@ impl MachineBackend for NativeBackend {
         if let Some(plan) = &gpu_plan {
             spec["model_preparation"] = json!(plan.id);
         }
+        let inputs = self.file_inputs(&actor, &offer.request_id, root)?;
+        if !inputs.is_empty() {
+            if gpu_plan.is_none() {
+                return Err(Status::unimplemented("file inputs reach device executors only; this CPU callable cannot take them yet"));
+            }
+            spec["inputs"] = serde_json::to_value(&inputs)
+                .map_err(|_| Status::internal("input encoding failed"))?;
+        }
         let mut capture = json!({"installation":installed.alias,"generation":installed.generation,"entrypoint":root.entrypoint,"owner":root.owner,"hub":root.hub});
         if let Some(plan) = &gpu_plan {
             capture["model_preparation"] = json!(plan.id);
@@ -877,9 +994,12 @@ impl MachineBackend for NativeBackend {
             .submit_public(
                 context,
                 &installed.generation,
-                &root.entrypoint,
-                input,
-                &root.attention_kernel,
+                crate::service::Call {
+                    entrypoint: root.entrypoint.clone(),
+                    input,
+                    attention_kernel: root.attention_kernel.clone(),
+                    inputs,
+                },
                 &self.authority.boot_id,
             )
             .map_err(problem)?;
@@ -1621,6 +1741,7 @@ mod product_log_tests {
         path::{Path, PathBuf},
         process::Command,
     };
+    use tensorfs_core::manifest::{Draft, Entry};
 
     const INSTALL: &str = r#"
 import json, subprocess, sys
@@ -1632,15 +1753,18 @@ generation = install(fixture, out / "generations", next((out / "client").glob("*
 print(json.dumps({"identity": generation.identity}))
 "#;
 
-    /// A real uv-installed generation of `tests/fixtures/cpu_publish` (released cozy-runtime).
+    /// A real uv-installed generation of `tests/fixtures/<name>` (released cozy-runtime).
     fn install_fixture(root: &Path) -> String {
+        install_named(root, "cpu_publish")
+    }
+    fn install_named(root: &Path, name: &str) -> String {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
         let output = Command::new("uv")
             .current_dir(repo)
             .args([
                 "run", "--locked", "--extra", "test", "python", "-c", INSTALL,
             ])
-            .arg(repo.join("tests/fixtures/cpu_publish"))
+            .arg(repo.join("tests/fixtures").join(name))
             .arg(root)
             .output()
             .expect("uv runs the repository's installer");
@@ -1701,6 +1825,226 @@ print(json.dumps({"identity": generation.identity}))
                 ))
             })
             .collect()
+    }
+
+    #[test]
+    fn imported_file_inputs_are_verified_at_submit_and_granted_to_the_executor() {
+        let root = std::env::temp_dir().join(format!("cm-inputs-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let identity = install_named(&root, "cpu_input");
+        let state = root.join("state");
+        let service = Service::open(&state, &root.join("generations"), 1).unwrap();
+        assert!(service.stop().unwrap());
+        let store = Arc::new(Store::ensure(&state.join("tensorfs")).unwrap());
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[43; 32]);
+        let machine =
+            MachineIdentity::ephemeral("inputs".into(), vec![signer.verifying_key()], vec![7; 32])
+                .unwrap();
+        let actor = VerifiedActor {
+            public_key: signer.verifying_key().to_bytes(),
+        };
+        let backend = NativeBackend::new(
+            service.clone(),
+            machine.authority.clone(),
+            store.clone(),
+            WorkspaceUploads::open(&state.join("uploads"), store.clone()).unwrap(),
+        );
+        // The CLI's import: a one-file tree whose member is `payload`.
+        let bytes = b"%PDF-1.4 a document the package reads".to_vec();
+        let object = ObjectRef::of(&bytes);
+        let tree = Draft {
+            entries: vec![("payload".into(), Entry::File(object.clone()))],
+        }
+        .seal()
+        .unwrap();
+        let manifest = tree.object_ref().unwrap();
+        let reference = |o: &ObjectRef| pb::Ref {
+            digest: digest_bytes(&format!("sha256:{}", o.sha256)).unwrap(),
+            length: o.length,
+        };
+        let import = |request: &str| {
+            let mut receiver = backend
+                .begin_input_tree(
+                    actor,
+                    pb::InputTreeImportHeader {
+                        request_id: request.into(),
+                        input_id: "document".into(),
+                        manifest: Some(reference(&manifest)),
+                        manifest_canonical_bytes: StoredDoc::canonical_bytes(&tree).unwrap(),
+                        content_bytes: object.length,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            receiver
+                .blob(pb::InputTreeImportBlob {
+                    object: Some(reference(&object)),
+                    offset: 0,
+                    data: bytes.clone(),
+                })
+                .unwrap();
+            receiver
+                .commit(pb::InputTreeImportCommit { abort: false })
+                .unwrap()
+        };
+        let held = import("request-1");
+        let release_root = |digest: String| pb::ReleaseRoot {
+            inputs: vec![pb::InputBinding {
+                input_id: "document".into(),
+                digest,
+                length: object.length,
+                kind_mime: "application/pdf".into(),
+                order: 0,
+            }],
+            input_access: vec![pb::InputAccess {
+                input_id: "document".into(),
+                native_tree: Some(pb::NativeByteRetentionRequest {
+                    source: held.source.clone(),
+                    retention_id: held.retention_id.clone(),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let actor_key = actor_id(actor);
+        let inputs = backend
+            .file_inputs(
+                &actor_key,
+                "request-1",
+                &release_root(format!("sha256:{}", object.sha256)),
+            )
+            .unwrap();
+        assert_eq!(inputs.len(), 1);
+        // Another request cannot borrow this import, and the binding must name its bytes.
+        let other = backend
+            .file_inputs(
+                &actor_key,
+                "request-2",
+                &release_root(format!("sha256:{}", object.sha256)),
+            )
+            .unwrap_err();
+        assert_eq!(
+            other.metadata().get("cozy-error-code").unwrap(),
+            "input_unprepared"
+        );
+        assert!(backend
+            .file_inputs(
+                &actor_key,
+                "request-1",
+                &release_root(format!("sha256:{}", "b".repeat(64)))
+            )
+            .is_err());
+
+        let held_generation = service.catalog.resolve(&identity).unwrap();
+        let executor_root = root.join("executor");
+        std::fs::create_dir(&executor_root).unwrap();
+        let mut executor = DeviceExecutor::spawn(ExecutorConfig {
+            python: held_generation.record.python.clone(),
+            root: executor_root.clone(),
+            socket: executor_root.join("e.sock"),
+            environment: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
+            seal: {
+                let mut seal = crate::launch_identity::Seal::prepare(
+                    &executor_root,
+                    None,
+                    "inputs",
+                    &identity,
+                    "",
+                )
+                .unwrap();
+                seal.threads = 1;
+                seal
+            },
+            generation_hold: Some(held_generation.retention()),
+            identity: None,
+        })
+        .unwrap();
+        let interface = executor_root.join("package-interface.json");
+        std::fs::write(
+            &interface,
+            serde_json::to_vec(&held_generation.record.interface).unwrap(),
+        )
+        .unwrap();
+        let application = held_generation.record.application.clone();
+        command(
+            &mut executor,
+            &DeviceCommand::Start {
+                devices: String::new(),
+                application: application.clone(),
+                package_interface: interface.clone(),
+                sequence_parallel_degree: 1,
+                import_only: false,
+            },
+        )
+        .unwrap();
+        command(
+            &mut executor,
+            &DeviceCommand::Load {
+                construction: "inputs".into(),
+                devices: String::new(),
+                sequence_parallel_degree: 1,
+                binding: Box::new(Binding {
+                    application,
+                    package_interface: interface.display().to_string(),
+                    ..Binding::default()
+                }),
+                budgets: Budgets::default(),
+                authorized_device_limit_bytes: None,
+                attention_pin: String::new(),
+                stages: false,
+                descriptor_sources: false,
+                device_weights: false,
+                cap_bytes: None,
+                sealed_tiers: false,
+                pinned_bytes: None,
+            },
+        )
+        .unwrap();
+        command(
+            &mut executor,
+            &DeviceCommand::Activate {
+                construction: "inputs".into(),
+            },
+        )
+        .unwrap();
+        let payload = json!({"document": format!("sha256:{}", object.sha256)});
+        command(&mut executor, &DeviceCommand::PrepareRequest {
+            request_id: "run-1".into(),
+            construction: "inputs".into(),
+            entrypoint: "measure".into(),
+            payload,
+            attention_kernel: String::new(),
+            input_metadata: inputs.iter().map(|i| (i.input_id.clone(), json!({"input_id":i.input_id,"media_type":i.media_type,"digest":i.digest,"length":i.length,"order":i.order}))).collect(),
+        })
+        .unwrap();
+        let spool = root.join("spool");
+        std::fs::create_dir(&spool).unwrap();
+        let granted = crate::gpu_service::stage_inputs(&store, None, &spool, &inputs).unwrap();
+        let reply = executor
+            .command(
+                &DeviceCommand::Invoke {
+                    request_id: "run-1".into(),
+                    construction: "inputs".into(),
+                    entrypoint: "measure".into(),
+                    spool: spool.clone(),
+                    deadline_s: None,
+                    attention_kernel: String::new(),
+                    plane_budget_bytes: -1,
+                    stages: false,
+                    cap_bytes: None,
+                    inputs: granted,
+                },
+                &mut Baseline,
+            )
+            .unwrap();
+        let result = device_executor::read_result(&spool, &reply)
+            .unwrap_or_else(|e| panic!("{e}: {:?}", reply.outcome));
+        assert_eq!(
+            result,
+            json!({"length": bytes.len(), "sha256": object.sha256, "media_type": "application/pdf"})
+        );
+        executor.shutdown().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1772,6 +2116,7 @@ print(json.dumps({"identity": generation.identity}))
                     entrypoint: "make".into(),
                     input: json!({"gate": gate}),
                     attention_kernel: String::new(),
+                    inputs: vec![],
                 },
             )
             .unwrap();
@@ -1864,6 +2209,7 @@ print(json.dumps({"identity": generation.identity}))
                             entrypoint: "make".into(),
                             payload: record.invocation.input,
                             attention_kernel: String::new(),
+                            input_metadata: Default::default(),
                         },
                     )?;
                     let spool = engine.staging(&id)?;
@@ -1878,6 +2224,7 @@ print(json.dumps({"identity": generation.identity}))
                             plane_budget_bytes: -1,
                             stages: false,
                             cap_bytes: None,
+                            inputs: Default::default(),
                         },
                         &mut Publisher {
                             store: &task_store,
@@ -1988,9 +2335,16 @@ print(json.dumps({"identity": generation.identity}))
             .all(|w| w[0].sequence < w[1].sequence));
         assert_eq!(page.events.last().unwrap().kind, "outcome");
         // `cozy run show` reads the execution time from the terminal run.timing event.
-        let timing = page.events.iter().find(|e| e.kind == "run.timing").expect("run.timing event");
+        let timing = page
+            .events
+            .iter()
+            .find(|e| e.kind == "run.timing")
+            .expect("run.timing event");
         let timing: Value = serde_json::from_slice(&timing.body_canonical_bytes).unwrap();
-        assert_eq!((timing["attempt"].as_u64(), timing["terminal"].as_bool()), (Some(1), Some(true)));
+        assert_eq!(
+            (timing["attempt"].as_u64(), timing["terminal"].as_bool()),
+            (Some(1), Some(true))
+        );
         assert!(timing["execution_ms"].as_f64().is_some_and(|ms| ms >= 0.0));
         // Every product's bytes are fetchable with the actor's own Claim.
         let bytes: Vec<Vec<u8>> = page

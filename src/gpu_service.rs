@@ -981,6 +981,12 @@ impl GpuPool {
                 entrypoint: plan.entrypoint.clone(),
                 payload: record.invocation.input,
                 attention_kernel: record.invocation.attention_kernel.clone(),
+                input_metadata: record
+                    .invocation
+                    .inputs
+                    .iter()
+                    .map(|i| (i.input_id.clone(), serde_json::json!({"input_id":i.input_id,"media_type":i.media_type,"digest":i.digest,"length":i.length,"order":i.order})))
+                    .collect(),
             },
             &mut callbacks,
         )?;
@@ -1013,6 +1019,12 @@ impl GpuPool {
             engine.staging(id)?
         };
         let _spool = crate::execution::Spool(spool.clone());
+        let inputs = stage_inputs(
+            &self.store,
+            self.config.identity,
+            &spool,
+            &record.invocation.inputs,
+        )?;
         // A real grant for the whole call: one tenant needs no per-stage turns.
         let cap = self.memory.decide(
             &plan.id,
@@ -1048,6 +1060,7 @@ impl GpuPool {
                 plane_budget_bytes,
                 stages: false,
                 cap_bytes,
+                inputs,
             },
             &mut callbacks,
         )?;
@@ -1332,6 +1345,68 @@ fn remove_old_executor_roots(root: &Path) {
             }
         }
     }
+}
+
+/// Read-only copies of the run's file inputs in its spool (`inputs/NNN-<field>`), from
+/// the bytes the caller's import holds in the store; the executor binds them by field.
+pub(crate) fn stage_inputs(
+    store: &Store,
+    identity: Option<crate::launch_identity::LaunchIdentity>,
+    spool: &Path,
+    inputs: &[crate::journal::InputFile],
+) -> io::Result<BTreeMap<String, serde_json::Value>> {
+    let mut granted = BTreeMap::new();
+    if inputs.is_empty() {
+        return Ok(granted);
+    }
+    let directory = spool.join("inputs");
+    fs::create_dir(&directory)?;
+    for (position, input) in inputs.iter().enumerate() {
+        let field: String = input
+            .input_id
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .take(96)
+            .collect();
+        let local = directory.join(format!("{position:03}-{field}"));
+        let sha = input
+            .digest
+            .strip_prefix("sha256:")
+            .unwrap_or(&input.digest);
+        let mut source = store
+            .open_verified(sha)
+            .map_err(io::Error::other)?
+            .into_file();
+        let mut copy = std::os::unix::fs::OpenOptionsExt::mode(
+            fs::OpenOptions::new().write(true).create_new(true),
+            0o444,
+        )
+        .open(&local)?;
+        if std::io::copy(&mut source, &mut copy)? != input.length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "an input's held bytes changed length",
+            ));
+        }
+        copy.sync_all()?;
+        if let Some(identity) = identity {
+            identity.readable(&local)?;
+        }
+        granted.insert(
+            input.input_id.clone(),
+            serde_json::json!({"local":local,"media_type":input.media_type,"digest":input.digest,"length":input.length,"order":input.order,"file_state":null}),
+        );
+    }
+    if let Some(identity) = identity {
+        identity.readable(&directory)?;
+    }
+    Ok(granted)
 }
 
 pub(crate) fn output_bindings(
