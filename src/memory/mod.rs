@@ -115,7 +115,7 @@ impl GpuMemory {
                         Ok(_) => {
                             ledger.set_cap(&plan, cap);
                             note(serde_json::json!({"event":"floor","plan":plan,"cap":cap,
-                                "free":sample.free,"floor":ledger.floor(sample)}));
+                                "gpu":ledger.device,"free":sample.free,"floor":ledger.floor(sample)}));
                         }
                         Err(error) => note(serde_json::json!({"event":"floor_cell_failed",
                             "plan":plan,"error":error.to_string()})),
