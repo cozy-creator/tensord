@@ -123,6 +123,13 @@ impl State {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ExecutorFacts {
+    pub pid: u32,
+    pub runtime_version: String,
+    pub tensorfs_version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ProcessBirth {
     pub pid: u32,
     pub boot_id: String,
@@ -190,6 +197,11 @@ pub struct Execution {
     /// The cursor at which the attempt started running: its `running` event.
     #[serde(default)]
     pub running_revision: u64,
+    /// When the attempt started running (wall clock), and on which executor.
+    #[serde(default)]
+    pub started_at_ms: u64,
+    #[serde(default)]
+    pub executor: Option<ExecutorFacts>,
     pub result: Option<ResultRecord>,
     pub failure: Option<String>,
 }
@@ -910,6 +922,8 @@ impl Journal {
             completed_units: 0,
             progress: None,
             running_revision: 0,
+            started_at_ms: 0,
+            executor: None,
             result: None,
             failure: None,
         };
@@ -1340,7 +1354,7 @@ impl Journal {
         })
     }
 
-    pub fn running(&mut self, id: &str) -> io::Result<Execution> {
+    pub fn running(&mut self, id: &str, executor: Option<ExecutorFacts>) -> io::Result<Execution> {
         self.update(id, |record| {
             if record.state != State::Starting || record.process.is_none() {
                 return Err(db_error("attempt has no registered executor"));
@@ -1353,6 +1367,8 @@ impl Journal {
             }
             record.state = State::Running;
             record.running_revision = record.revision.max(record.revision_ceiling) + 1;
+            record.started_at_ms = timestamp().max(0) as u64;
+            record.executor = executor;
             Ok(true)
         })
     }

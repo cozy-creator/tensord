@@ -596,7 +596,7 @@ pub struct DeviceExecutor {
     root: PathBuf,
     socket: PathBuf,
     _generation_hold: Option<Arc<File>>,
-    codec: CodecConfig,
+    codec: Arc<Codec>,
     retained: Vec<Box<dyn Send>>,
     identity: Option<LaunchIdentity>,
     watched: Watched,
@@ -670,6 +670,133 @@ pub struct CodecConfig {
     pub generation_hold: Option<Arc<File>>,
 }
 
+/// The selected SDK's encoder for codecs this machine does not encode itself (audio,
+/// video): one helper process per executor, started at its first such output and ended
+/// with the executor (or when the machine dies: it exits on stdin EOF).
+pub struct Codec {
+    config: CodecConfig,
+    log: PathBuf,
+    helper: Mutex<Option<CodecHelper>>,
+}
+struct CodecHelper {
+    child: Child,
+    input: std::process::ChildStdin,
+    output: std::io::BufReader<std::process::ChildStdout>,
+}
+impl Drop for CodecHelper {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+impl Codec {
+    pub fn python(&self) -> &Path {
+        &self.config.python
+    }
+    pub fn new(config: CodecConfig, log: PathBuf) -> Self {
+        Self {
+            config,
+            log,
+            helper: Mutex::new(None),
+        }
+    }
+    fn spawn(&self) -> io::Result<CodecHelper> {
+        let hold = self
+            .config
+            .generation_hold
+            .as_ref()
+            .map(|hold| hold.as_raw_fd());
+        let mut command = Command::new(&self.config.python);
+        command
+            .args([
+                "-I",
+                "-c",
+                include_str!("../python/cozy_machine_client/device_codec.py"),
+            ])
+            .env_clear()
+            .envs(&self.config.environment)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .mode(0o600)
+                    .open(&self.log)?,
+            );
+        // SAFETY: only async-signal-safe fcntl on the retained generation hold.
+        unsafe {
+            command.pre_exec(move || {
+                if let Some(descriptor) = hold {
+                    if libc::fcntl(descriptor, libc::F_SETFD, 0) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn()?;
+        let input = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("codec stdin missing"))?;
+        let output = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("codec stdout missing"))?;
+        Ok(CodecHelper {
+            child,
+            input,
+            output: std::io::BufReader::new(output),
+        })
+    }
+    fn encode(&self, spool: &Path, reply: &Frame) -> io::Result<PostReply> {
+        use std::io::BufRead;
+        let mut helper = self.helper.lock().unwrap();
+        if helper.is_none() {
+            *helper = Some(self.spawn()?);
+        }
+        let request = PostRequest {
+            spool,
+            frames: &reply.frames,
+            outputs: &reply.outputs,
+            max_output_bytes: reply.max_output_bytes,
+        };
+        let mut line = serde_json::to_vec(&request)?;
+        line.push(b'\n');
+        let mut answer = String::new();
+        let exchanged = (|| {
+            let current = helper.as_mut().expect("spawned codec helper");
+            current.input.write_all(&line)?;
+            current.input.flush()?;
+            current.output.read_line(&mut answer)
+        })();
+        match exchanged {
+            Ok(n) if n > 0 => {}
+            Ok(_) | Err(_) => {
+                helper.take(); // the next output starts a fresh helper
+                return Err(io::Error::other(format!(
+                    "selected SDK encoder stopped; see {}",
+                    self.log.display()
+                )));
+            }
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Answer {
+            Done(PostReply),
+            Refused { error: String },
+        }
+        match serde_json::from_str::<Answer>(&answer).map_err(io::Error::other)? {
+            Answer::Done(post) => Ok(post),
+            Answer::Refused { error } => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("selected SDK encoder refused: {error}"),
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AssetBinding {
     pub output_id: String,
@@ -687,13 +814,14 @@ struct PostReply {
 }
 #[derive(Serialize)]
 struct PostRequest<'a> {
+    spool: &'a Path,
     frames: &'a [HostFrame],
     outputs: &'a [Output],
     max_output_bytes: Option<u64>,
 }
 
 pub fn postprocess(
-    config: &CodecConfig,
+    codec: &Codec,
     spool: &Path,
     reply: &Frame,
 ) -> io::Result<(Value, Vec<AssetBinding>)> {
@@ -701,7 +829,7 @@ pub fn postprocess(
     let directory = File::open(spool)?;
     let post = match encode_native(spool, reply)? {
         Some(bindings) => PostReply { bindings },
-        None => encode_with_sdk(config, spool, reply)?,
+        None => codec.encode(spool, reply)?,
     };
     for binding in &post.bindings {
         let mut file = open_artifact(spool, Path::new(&binding.name))?;
@@ -728,65 +856,6 @@ pub fn postprocess(
     directory.sync_all()?;
     Ok((result, post.bindings))
 }
-/// The selected SDK's post helper, one process per request: only for codecs this
-/// machine does not encode itself (audio, video).
-fn encode_with_sdk(config: &CodecConfig, spool: &Path, reply: &Frame) -> io::Result<PostReply> {
-    let directory = File::open(spool)?;
-    let fd = directory.as_raw_fd();
-    let hold = config.generation_hold.as_ref().map(|hold| hold.as_raw_fd());
-    let mut command = Command::new(&config.python);
-    let log_name = format!("codec-{}.stderr.log", uuid::Uuid::new_v4());
-    command
-        .args([
-            "-I",
-            "-c",
-            include_str!("../python/cozy_machine_client/device_codec.py"),
-            "--spool-fd",
-        ])
-        .arg(fd.to_string())
-        .env_clear()
-        .envs(&config.environment)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(spool.join(&log_name))?,
-        );
-    // SAFETY: only async-signal-safe fcntl on retained directory/generation fds.
-    unsafe {
-        command.pre_exec(move || {
-            for descriptor in std::iter::once(fd).chain(hold) {
-                if libc::fcntl(descriptor, libc::F_SETFD, 0) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-            }
-            Ok(())
-        });
-    }
-    let mut child = command.spawn()?;
-    let request = PostRequest {
-        frames: &reply.frames,
-        outputs: &reply.outputs,
-        max_output_bytes: reply.max_output_bytes,
-    };
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::other("codec stdin missing"))?
-        .write_all(&serde_json::to_vec(&request)?)?;
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        return Err(io::Error::other(format!(
-            "selected SDK post helper failed: {}; see {log_name}",
-            output.status
-        )));
-    }
-    serde_json::from_slice(&output.stdout).map_err(io::Error::other)
-}
-
 /// Encodes registered PNG/WebP frames in this process exactly as the SDK's post thread
 /// does (lossless RGB; PNG at zlib's fastest level, WebP lossless) and binds every output
 /// to its spool file. None when a frame needs a codec only the SDK has.
@@ -934,11 +1003,14 @@ impl DeviceExecutor {
         on_birth: impl FnOnce(&ProcessBirth, &Cancellation) -> io::Result<()>,
     ) -> io::Result<Self> {
         let environment = config.seal.environment(&config.environment);
-        let codec = CodecConfig {
-            python: config.python.clone(),
-            environment: environment.clone(),
-            generation_hold: config.generation_hold.clone(),
-        };
+        let codec = Arc::new(Codec::new(
+            CodecConfig {
+                python: config.python.clone(),
+                environment: environment.clone(),
+                generation_hold: config.generation_hold.clone(),
+            },
+            config.root.join("codec.stderr.log"),
+        ));
         fs::create_dir_all(&config.root)?;
         fs::set_permissions(&config.root, fs::Permissions::from_mode(0o700))?;
         if let Some(identity) = config.identity {
@@ -1092,7 +1164,7 @@ impl DeviceExecutor {
         executor.hello = hello.hello;
         Ok(executor)
     }
-    pub fn codec(&self) -> CodecConfig {
+    pub fn codec(&self) -> Arc<Codec> {
         self.codec.clone()
     }
     pub fn root_path(&self) -> &Path {
@@ -1513,4 +1585,84 @@ fn scan(value: &Value) -> io::Result<()> {
         _ => (),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod codec_tests {
+    use super::*;
+
+    fn pid(codec: &Codec) -> Option<u32> {
+        codec.helper.lock().unwrap().as_ref().map(|h| h.child.id())
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly configured installed SDK interpreter; no GPU imports"]
+    fn one_sdk_encoder_serves_every_output_of_an_executor() {
+        let python = PathBuf::from(std::env::var("COZY_MACHINE_CPU_TEST_PYTHON").unwrap());
+        let root = std::env::temp_dir().join(format!("codec-{}", uuid::Uuid::new_v4().simple()));
+        let spool = root.join("spool");
+        fs::create_dir_all(&spool).unwrap();
+        let codec = Codec::new(
+            CodecConfig {
+                python,
+                environment: BTreeMap::new(),
+                generation_hold: None,
+            },
+            root.join("codec.log"),
+        );
+        let reply = |index: usize, raw_bytes: u64| {
+            let name = format!("image-{index:04}");
+            fs::write(
+                spool.join(format!("{name}.raw")),
+                vec![index as u8 * 40; 4 * 2 * 3],
+            )
+            .unwrap();
+            Frame {
+                frames: vec![HostFrame {
+                    handle: format!("asset/image/{index:04}"),
+                    codec: "png".into(),
+                    raw: format!("{name}.raw"),
+                    raw_bytes,
+                    media_type: "image/png".into(),
+                    facts: BTreeMap::from([
+                        ("width".into(), 4.into()),
+                        ("height".into(), 2.into()),
+                    ]),
+                }],
+                outputs: vec![Output {
+                    output_id: format!("out-{index}"),
+                    asset_ref: format!("asset/image/{index:04}"),
+                    kind: "image".into(),
+                    media_type: "image/png".into(),
+                    size_bytes: None,
+                    digest: String::new(),
+                }],
+                ..Default::default()
+            }
+        };
+        let first = codec.encode(&spool, &reply(1, 24)).unwrap();
+        let helper = pid(&codec);
+        let second = codec.encode(&spool, &reply(2, 24)).unwrap();
+        assert_eq!(
+            pid(&codec),
+            helper,
+            "one encoder process serves the executor's outputs"
+        );
+        for (post, name) in [(first, "image-0001"), (second, "image-0002")] {
+            let bytes = fs::read(spool.join(name)).unwrap();
+            assert_eq!(post.bindings[0].name, name);
+            assert_eq!(post.bindings[0].media_type, "image/png");
+            assert_eq!(
+                post.bindings[0].sha256,
+                tensorfs_core::sha256::hex_digest(&bytes)
+            );
+            assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        }
+        // A refused output is that output's failure; the encoder keeps serving.
+        assert!(codec.encode(&spool, &reply(3, 25)).is_err());
+        assert_eq!(pid(&codec), helper);
+        codec.encode(&spool, &reply(4, 24)).unwrap();
+        drop(codec);
+        fs::remove_dir_all(root).unwrap();
+    }
 }

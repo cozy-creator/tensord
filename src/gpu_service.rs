@@ -840,7 +840,13 @@ impl GpuPool {
                 Arc::new(move || cancel.cancel(&request)),
             )?;
         }
-        if !engine.authorize_managed(id)? {
+        let executor = &sessions[&plan.id].executor;
+        let facts = crate::journal::ExecutorFacts {
+            pid: executor.birth.pid,
+            runtime_version: executor.hello.runtime_version.clone(),
+            tensorfs_version: executor.hello.tensorfs_version.clone(),
+        };
+        if !engine.authorize_managed(id, Some(facts))? {
             engine.finish(id, Outcome::Canceled)?;
             return Ok(());
         }

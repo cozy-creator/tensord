@@ -31,6 +31,8 @@ pub struct PackageSdk {
     pub python: String,
     pub requirements: Vec<String>,
     pub find_links: Option<PathBuf>,
+    /// The machine's CPU runner client, so a published CPU package can run here too.
+    pub client_wheel: Option<PathBuf>,
 }
 
 pub struct Prepared {
@@ -169,7 +171,10 @@ impl Publisher {
 
     fn alias(&self, request: &Request) -> String {
         let origin = hub::origin_key(&request.grant.access.origin).unwrap_or_default();
-        let sdk = format!("{:?}{:?}", self.sdk.requirements, self.sdk.find_links);
+        let sdk = format!(
+            "{:?}{:?}{:?}",
+            self.sdk.requirements, self.sdk.find_links, self.sdk.client_wheel
+        );
         let key = format!("{origin}\0{}\0{}\0{sdk}", request.package, request.release);
         format!("hub-{}", &sha256::hex_digest(key.as_bytes())[..32])
     }
@@ -340,7 +345,7 @@ impl Publisher {
             &request.release,
             !self.sdk.requirements.is_empty(),
         )?;
-        let identity = sha256::hex_digest(json!({"lock":lock,"python":python,"sdk":self.sdk.requirements,"links":self.sdk.find_links}).to_string().as_bytes())[..32].to_string();
+        let identity = sha256::hex_digest(json!({"lock":lock,"python":python,"sdk":self.sdk.requirements,"links":self.sdk.find_links,"client":self.sdk.client_wheel}).to_string().as_bytes())[..32].to_string();
         self.generation(
             service.catalog.root(),
             &identity,
@@ -435,6 +440,20 @@ impl Publisher {
             }
             args.extend(self.sdk.requirements.iter().map(String::as_str));
             self.uv(&args)?;
+        }
+        if let Some(wheel) = &self.sdk.client_wheel {
+            let constraints = dir.join("constraints.txt").to_string_lossy().to_string();
+            let wheel = wheel.to_string_lossy().to_string();
+            self.uv(&[
+                "pip",
+                "install",
+                "--no-config",
+                "--python",
+                &py,
+                "--constraints",
+                &constraints,
+                &wheel,
+            ])?;
         }
         let application = interface
             .get("application")

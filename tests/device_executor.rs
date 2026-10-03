@@ -301,7 +301,7 @@ fn stock_executor_deferred_webp_reuses_sdk_encoder_and_exact_asset_binding() {
     let bytes = fs::read(&path).unwrap();
     assert_eq!(&bytes[..4], b"RIFF");
     assert_eq!(&bytes[8..12], b"WEBP");
-    let decoded=std::process::Command::new(&executor.codec().python).args(["-I","-c","import json,sys;from PIL import Image;i=Image.open(sys.argv[1]).convert('RGB');print(json.dumps({'size':i.size,'pixels':[i.getpixel((x,16))for x in(2,15,29)]}))"]).arg(path).output().unwrap();
+    let decoded=std::process::Command::new(executor.codec().python()).args(["-I","-c","import json,sys;from PIL import Image;i=Image.open(sys.argv[1]).convert('RGB');print(json.dumps({'size':i.size,'pixels':[i.getpixel((x,16))for x in(2,15,29)]}))"]).arg(path).output().unwrap();
     assert!(decoded.status.success());
     let decoded: Value = serde_json::from_slice(&decoded.stdout).unwrap();
     assert_eq!(decoded["size"], json!([32, 32]));

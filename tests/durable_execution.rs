@@ -596,7 +596,7 @@ fn cursor_reservation_renewal_never_reuses_old_cursors_and_accepts_older_records
     journal
         .register_process(&id, process_birth(child.id()).unwrap())
         .unwrap();
-    let first = journal.running(&id).unwrap();
+    let first = journal.running(&id, None).unwrap();
     let old_edge = first.revision_ceiling;
     // Exercise the allocator's boundary directly, without publishing billions of frames.
     let snapshot = journal::ProgressSnapshot {
@@ -709,7 +709,7 @@ fn restart_settlement_waits_for_exact_process_birth_without_adoption() {
     journal
         .register_process(&id, process_birth(child.id()).unwrap())
         .unwrap();
-    journal.running(&id).unwrap();
+    journal.running(&id, None).unwrap();
     drop(journal);
     let reopened = Engine::open(&journal_root).unwrap();
     reopened.reconcile().unwrap();

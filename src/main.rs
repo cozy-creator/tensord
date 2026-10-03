@@ -217,6 +217,7 @@ fn image_sdk(wheels: &std::path::Path) -> cozy_machine::published::PackageSdk {
         python: "3.12".into(),
         find_links: complete.then(|| wheels.to_path_buf()),
         requirements: if complete { pair } else { vec![] },
+        client_wheel: None,
     }
 }
 
@@ -231,9 +232,10 @@ fn start_api(
     helper: Option<PathBuf>,
     wheel: Option<PathBuf>,
     python: String,
-    sdk: cozy_machine::published::PackageSdk,
+    mut sdk: cozy_machine::published::PackageSdk,
 ) -> io::Result<()> {
     use cozy_machine::{api, machine_api::NativeBackend};
+    sdk.client_wheel = wheel.clone();
     let store = owner.lock().unwrap().store();
     let uploads = api::workspaces::WorkspaceUploads::open(&root.join("uploads"), store.clone())
         .map_err(io::Error::other)?;

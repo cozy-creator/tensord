@@ -275,6 +275,27 @@ impl NativeBackend {
                 ..Default::default()
             });
         }
+        // The Python worker's run facts: which Runtime executed it, and for how long.
+        let attempt = record.attempt.max(1) as u64;
+        let mut facts = vec![];
+        if let Some(executor) = record.executor.as_ref().filter(|e| !e.runtime_version.is_empty()) {
+            facts.push(("executor", json!({"request":context.request_id,"attempt":attempt,"pid":executor.pid,"runtime_version":executor.runtime_version,"tensorfs_version":executor.tensorfs_version})));
+        }
+        let mut timing = json!({"attempt":attempt,"terminal":true});
+        if record.started_at_ms > 0 && record.finished_at_ms >= record.started_at_ms {
+            timing["execution_ms"] = json!((record.finished_at_ms - record.started_at_ms) as f64);
+        }
+        facts.push(("run.timing", timing));
+        for (kind, body) in facts {
+            events.push(pb::MachineExecutionEvent {
+                sequence: first_sequence + events.len() as u64,
+                attempt_ordinal: attempt,
+                at_ms: record.finished_at_ms,
+                kind: kind.into(),
+                body_canonical_bytes: canonical(&body)?,
+                ..Default::default()
+            });
+        }
         let mut body = json!({"format":"cozy.worker.v1.AttemptOutcomeBody/1", "request_id":context.request_id, "attempt_ordinal":record.attempt.max(1), "invocation_spec_digest":context.invocation_digest});
         if record.process.is_some() {
             body["execution_started"] = json!(true);
@@ -1793,7 +1814,7 @@ print(json.dumps({"identity": generation.identity}))
                         },
                     )?;
                     assert!(!executor.hello.torch_loaded);
-                    assert!(engine.authorize_managed(&id)?);
+                    assert!(engine.authorize_managed(&id, None)?);
                     let interface = executor_root.join("package-interface.json");
                     std::fs::write(&interface, serde_json::to_vec(&held.record.interface)?)?;
                     command(
@@ -1966,6 +1987,11 @@ print(json.dumps({"identity": generation.identity}))
             .windows(2)
             .all(|w| w[0].sequence < w[1].sequence));
         assert_eq!(page.events.last().unwrap().kind, "outcome");
+        // `cozy run show` reads the execution time from the terminal run.timing event.
+        let timing = page.events.iter().find(|e| e.kind == "run.timing").expect("run.timing event");
+        let timing: Value = serde_json::from_slice(&timing.body_canonical_bytes).unwrap();
+        assert_eq!((timing["attempt"].as_u64(), timing["terminal"].as_bool()), (Some(1), Some(true)));
+        assert!(timing["execution_ms"].as_f64().is_some_and(|ms| ms >= 0.0));
         // Every product's bytes are fetchable with the actor's own Claim.
         let bytes: Vec<Vec<u8>> = page
             .events

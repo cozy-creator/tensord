@@ -102,7 +102,7 @@ fn complete(journal: &mut Journal, n: usize, generation: &str, birth: ProcessBir
         .unwrap();
     assert!(journal.claim(&record.id).unwrap());
     journal.register_process(&record.id, birth).unwrap();
-    journal.running(&record.id).unwrap();
+    journal.running(&record.id, None).unwrap();
     journal
         .finish(
             &record.id,

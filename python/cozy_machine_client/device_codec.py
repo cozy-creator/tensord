@@ -1,8 +1,9 @@
-"""Trusted post helper for the stock Executor's registered frames and output bindings.
+"""The selected SDK's encoder for one executor's audio/video frames.
 
-Embedded by Rust; imports the selected installed SDK. No model/codec implementation is copied.
+Embedded by Rust and started once per executor: one JSON request per stdin line, one JSON
+answer per stdout line; it ends on stdin EOF. It imports the selected installed SDK; no
+model or codec implementation is copied.
 """
-import argparse
 import hashlib
 import json
 import os
@@ -29,19 +30,12 @@ def read_regular(directory, name):
         os.close(handle)
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--spool-fd", type=int, required=True)
-    args = parser.parse_args()
-    request = json.load(sys.stdin)
-    directory = args.spool_fd
+def encode(request, directory):
     spool = Path(f"/proc/self/fd/{directory}")
     for frame in request["frames"]:
         raw = read_regular(directory, frame["raw"])
         if len(raw) != frame["raw_bytes"]:
             raise ValueError("registered raw frame length changed")
-        # This resolver belongs to the actual selected SDK. It is a legacy dependency,
-        # removed once an additive Executor output_bindings capability is qualified.
         destination = AttemptEngine._blob_path(spool, frame["handle"])
         if destination is None:
             raise ValueError("SDK frame has no owned output binding")
@@ -77,7 +71,22 @@ def main():
                          "name": destination.name, "kind": output["kind"], "media_type": media,
                          "length": len(encoded), "producer_digest": producer,
                          "sha256": hashlib.sha256(encoded).hexdigest()})
-    json.dump({"bindings": bindings}, sys.stdout, separators=(",", ":"))
+    return {"bindings": bindings}
+
+
+def main():
+    for line in sys.stdin:
+        try:
+            request = json.loads(line)
+            directory = os.open(request["spool"], os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            try:
+                answer = encode(request, directory)
+            finally:
+                os.close(directory)
+        except Exception as exc:  # one refused output never ends the executor's encoder
+            answer = {"error": f"{type(exc).__name__}: {exc}"[:2000]}
+        sys.stdout.write(json.dumps(answer, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
 
 
 if __name__ == "__main__":

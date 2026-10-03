@@ -726,8 +726,12 @@ impl Engine {
         Ok(())
     }
 
-    pub(crate) fn authorize_managed(&self, id: &str) -> io::Result<bool> {
-        match self.journal.lock().unwrap().running(id) {
+    pub(crate) fn authorize_managed(
+        &self,
+        id: &str,
+        executor: Option<crate::journal::ExecutorFacts>,
+    ) -> io::Result<bool> {
+        match self.journal.lock().unwrap().running(id, executor) {
             Ok(_) => {
                 self.notify_activity();
                 Ok(true)
@@ -954,7 +958,7 @@ impl Engine {
         {
             let mut stream = writer.lock().unwrap();
             // Running means authorization may have arrived, including a lost write ack.
-            self.journal.lock().unwrap().running(id)?;
+            self.journal.lock().unwrap().running(id, None)?;
             self.notify_activity();
             write_command(
                 &mut stream,
