@@ -180,8 +180,8 @@ pub enum DeviceCommand {
         sequence_parallel_degree: u32,
         binding: Box<Binding>,
         budgets: Budgets,
-        /// Several model slots in one construction; the executor loads these instead of
-        /// `binding` (which then names the first, for executors before many-model loads).
+        /// Several model slots in one construction (H3 turbo: base + LoRA); when set, the
+        /// executor loads these and ignores `binding`/`budgets`.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         models: Vec<ModelLoad>,
         #[serde(skip_serializing_if = "Option::is_none")]
