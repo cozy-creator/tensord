@@ -998,6 +998,53 @@ impl GpuPool {
         }
     }
 
+    /// A running parent's hint that it will call `plan` next (`model_prefetch`, H3 long-form's
+    /// `prefetch(motion_segment)`): load it in the background where it fits beside the tenants
+    /// already there, as a prewarm does, but without waiting for the parent's own run to end.
+    /// It takes the GPU's call slot like any call, so a child call in flight finishes first.
+    pub fn prefetch(self: &Arc<Self>, engine: &Arc<Engine>, held: HeldGeneration, plan: GpuPlan) {
+        if !self.config.prewarm {
+            return;
+        }
+        let (pool, engine) = (self.clone(), engine.clone());
+        let started = std::thread::Builder::new()
+            .name("executor-prefetch".into())
+            .spawn(move || {
+                let asked = Instant::now();
+                if let Some((zygote, start)) = pool.zygote(&held) {
+                    if start {
+                        zygote.set(pool.import_only(&held));
+                    }
+                    zygote.wait_started();
+                }
+                while pool
+                    .reserved
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                let _permit = Permit {
+                    pool: pool.clone(),
+                    engine: Arc::downgrade(&engine),
+                };
+                let key = plan.id.clone();
+                let waited = asked.elapsed();
+                let mut sessions = pool.sessions.lock().unwrap();
+                let result = pool.prewarm_locked(&engine, &held, plan, &mut sessions);
+                for device in &pool.devices {
+                    device.memory.finished(&key);
+                }
+                if !sessions.contains_key(&key) {
+                    pool.ended(&key);
+                }
+                pool.note_prewarm(&key, waited, asked.elapsed() - waited, &result);
+            });
+        if let Err(error) = started {
+            eprintln!("executor prefetch: {error}");
+        }
+    }
+
     /// One line per prewarm in `prewarm.jsonl`: what it did and how long it waited first.
     fn note_prewarm(
         &self,
