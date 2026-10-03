@@ -97,8 +97,12 @@ act = sys.argv[1]
 if act == "sample":
     with open(sys.argv[2], "a") as out:
         while True:
-            t = time.time(); ex = executors()
-            out.write(json.dumps({"t": t, "gpu": gpu(), "cg": cg(), "load": load(), "executors": len(ex)}) + "\n"); out.flush()
+            t = time.time()
+            try:   # a unit can vanish mid-read while an arm restarts: skip that tick, never die
+                ex = executors()
+                out.write(json.dumps({"t": t, "gpu": gpu(), "cg": cg(), "load": load(), "executors": len(ex)}) + "\n"); out.flush()
+            except (OSError, ValueError, KeyError):
+                pass
             time.sleep(max(0.0, 1.0 - (time.time() - t)))
 elif act == "now":
     print(json.dumps({"t": time.time(), "cg": cg(), "gpu": gpu(), "load": load(), "executors": executors()}))
