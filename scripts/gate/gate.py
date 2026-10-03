@@ -246,7 +246,8 @@ class Gate:
             log("waiting for the GPU to cool", now["gpu"])
             time.sleep(5)
 
-    def request(self, arm: str, cycle: int, scenario: str, model: str, t0: float | None = None) -> dict:
+    def request(self, arm: str, cycle: int, scenario: str, model: str, t0: float | None = None,
+                start: float | None = None, allow_fail: bool = False) -> dict:
         prompt, seed = self.unique()
         root = self.out / "runs" / f"{self.index:03}-{arm}-{cycle}-{scenario}-{model}"
         root.mkdir(parents=True)
@@ -275,7 +276,8 @@ class Gate:
                                     *spec.get("show_args", [f"--tensorhub={self.m.get('hub')}"])], capture_output=True, text=True)
             (root / "show.json").write_text(shown.stdout or shown.stderr)
             show = json.loads(shown.stdout) if shown.returncode == 0 else {}
-        start = submit if t0 is None else t0 - self.offset   # t0 is a pod-clock process start time
+        if start is None:   # t0 is a pod-clock process birth; start a controller-clock event (the kill)
+            start = submit if t0 is None else t0 - self.offset
         seen = marks(done.stderr)
         accepted, outcome = seen.get("request.machine_accepted"), seen.get("machine.outcome")
         row = {"arm": arm, "cycle": cycle, "scenario": scenario, "model": model, "prompt": prompt, "seed": seed,
@@ -296,7 +298,14 @@ class Gate:
         log(f"{arm} c{cycle} {scenario:10} {model:5} {row['wall_s']:7.2f}s  disk {row['disk_read_bytes'] / 2**30:5.2f} GiB",
             "ok" if row["ok"] else "FAILED", run)
         if not row["ok"]:
-            raise RuntimeError(f"request failed; evidence in {root}")
+            try:
+                row["error"] = json.loads(done.stdout)["error"]["message"]
+            except (json.JSONDecodeError, KeyError, TypeError):
+                row["error"] = done.stdout[-500:] or done.stderr[-500:]
+            self.record({"arm": arm, "cycle": cycle, "event": "failed", "scenario": scenario, "run": run,
+                         "error": row["error"], "dir": str(root)})
+            if not allow_fail:
+                raise RuntimeError(f"request failed; evidence in {root}")
         return row
 
     def first(self, arm: str, cycle: int, scenario: str) -> None:
@@ -342,8 +351,13 @@ class Gate:
         if not victims:
             raise RuntimeError("no idle executor to kill; the kill scenario cannot be measured")
         self.record({"arm": arm, "cycle": cycle, "event": "kill", "executors": victims})
+        killed = time.time()
         self.pod.sh("kill -9 " + " ".join(str(v["pid"]) for v in victims))   # exact PIDs listed above
-        self.request(arm, cycle, "kill_next", "sdxl")
+        for _ in range(3):   # a failed attempt is a finding; the time runs from the kill to the first image
+            if self.request(arm, cycle, "kill_next", "sdxl", start=killed, allow_fail=True)["ok"]:
+                break
+        else:
+            raise RuntimeError("three requests after an executor kill failed")
         self.record({"arm": arm, "cycle": cycle, "event": "end", "now": self.pod.helper("now")})
 
     def prime(self, arm: str) -> None:
@@ -380,7 +394,8 @@ def report(out: Path) -> dict:
     rows = [json.loads(line) for line in (out / "results.jsonl").read_text().splitlines()]
     samples = [json.loads(line) for line in (out / "samples.jsonl").read_text().splitlines() if line.strip()]
     requests = [r for r in rows if "wall_s" in r]
-    summary: dict = {"failed": [r["dir"] for r in requests if not r["ok"]], "arms": {}}
+    summary: dict = {"failed": {a: [(r["scenario"], r["run"], r.get("error")) for r in requests if r["arm"] == a and not r["ok"]]
+                                for a in sorted({r["arm"] for r in requests})}, "arms": {}}
     for arm in sorted({r["arm"] for r in requests}):
         mine = [r for r in requests if r["arm"] == arm and r["ok"]]
         cycles = sorted({r["cycle"] for r in mine if r["cycle"] >= 0})
@@ -420,7 +435,7 @@ def report(out: Path) -> dict:
         v["warm_regression"] = -v["warm_gain"] if v["warm_gain"] is not None else None
         benefit = (v["first_image_gain"] or 0) >= .20 or (v["switch_gain"] or 0) >= .20 or (v["host_peak_gain"] or 0) >= .25
         v["pass"] = bool(benefit and v["warm_regression"] is not None and v["warm_regression"] <= .02
-                         and not summary["failed"])
+                         and not summary["failed"].get("rust"))
         summary["verdict"] = v
     (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     return summary
