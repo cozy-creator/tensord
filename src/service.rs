@@ -143,8 +143,32 @@ impl Service {
         for held in self.catalog.installed() {
             gpu.prespawn(held);
         }
+        // A previous run's executors still exiting fence it, as they fence requests.
+        let fence = self.startup_gpu_births.lock().unwrap().clone();
+        gpu.prewarm(&self.engine, self.recent_gpu_plans(&gpu), fence);
         self.changed_environment()
     }
+    /// Each installed GPU generation's most recently used construction, newest first.
+    fn recent_gpu_plans(
+        &self,
+        gpu: &crate::gpu_service::GpuPool,
+    ) -> Vec<(crate::catalog::HeldGeneration, crate::gpu_service::GpuPlan)> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut plans = vec![];
+        for preparation in self.engine.recent_preparations(64).unwrap_or_default() {
+            let Ok(plan) = gpu.plan(&preparation) else {
+                continue;
+            };
+            if !seen.insert(plan.generation.clone()) {
+                continue;
+            }
+            if let Ok(held) = self.catalog.resolve(&plan.generation) {
+                plans.push((held, plan));
+            }
+        }
+        plans
+    }
+
     pub fn submit(
         &self,
         key: &str,

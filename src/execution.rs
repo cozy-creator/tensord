@@ -254,6 +254,13 @@ impl Engine {
         self.journal.lock().unwrap().preparation(actor, id)
     }
 
+    pub fn recent_preparations(
+        &self,
+        limit: usize,
+    ) -> io::Result<Vec<crate::journal::Preparation>> {
+        self.journal.lock().unwrap().recent_preparations(limit)
+    }
+
     pub fn bind_preparation(
         &self,
         record: crate::journal::Preparation,

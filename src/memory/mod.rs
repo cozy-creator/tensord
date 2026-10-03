@@ -229,6 +229,20 @@ impl GpuMemory {
         fits
     }
 
+    /// Whether `plan`'s executor and first working set fit in the room there is now, with no
+    /// step on another tenant (a prewarm never makes room). True without NVML: nothing is
+    /// decided here then.
+    pub fn admits(&self, plan: &str, holdings: impl Fn() -> Vec<Holding>) -> bool {
+        let Some(sample) = self.sample() else {
+            return true;
+        };
+        let held = holdings();
+        self.with(|gpu| {
+            gpu.holdings = held;
+            gpu.room(plan, &sample) >= gpu.spawn_need(plan)
+        })
+    }
+
     /// Idle tenants give room until `free_bytes` are free beside the floor (weights first, then
     /// processes); then `plan`'s cap rises into what is there. None: no NVML.
     pub fn make_room(

@@ -1168,6 +1168,23 @@ impl Journal {
     }
 
     /// Includes terminal requests: their retained executor may still own a context.
+    /// The GPU preparations recent executions used, the most recently used first.
+    pub fn recent_preparations(&self, limit: usize) -> io::Result<Vec<Preparation>> {
+        let mut statement = self.connection.prepare("SELECT json_extract(record,'$.submission.actor') AS actor,json_extract(record,'$.submission.preparation_id') AS preparation,MAX(id) AS last FROM executions WHERE preparation IS NOT NULL AND preparation!='' AND actor IS NOT NULL GROUP BY actor,preparation ORDER BY last DESC LIMIT ?1").map_err(db_error)?;
+        let keys = statement
+            .query_map(params![limit.min(i64::MAX as usize) as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(db_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_error)?;
+        let mut found = vec![];
+        for (actor, id) in keys {
+            found.extend(self.preparation(&actor, &id)?);
+        }
+        Ok(found)
+    }
+
     /// Read only birth metadata in bounded pages, never materialize old results.
     pub fn gpu_births_after(
         &self,

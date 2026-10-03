@@ -116,6 +116,12 @@ pub struct GpuConfig {
     /// host memory (no device memory); false spawns every executor, which imports again.
     #[serde(default = "yes")]
     pub prespawn: bool,
+    /// At machine start, load each installed GPU generation's most recently used
+    /// construction where it fits beside the tenants already there (it never makes room).
+    /// They stay as idle tenants the memory policy evicts least recently used first.
+    /// Off until proven on a rental (J/INTERFACE.md).
+    #[serde(default)]
+    pub prewarm: bool,
 }
 impl GpuConfig {
     pub fn load(path: &Path) -> io::Result<Self> {
@@ -251,6 +257,8 @@ struct Session {
     /// Its weights stay on the GPU under custody (Degree 2), decided once at its load.
     sharing: bool,
     launch: Launch,
+    /// It has served a call: its next one is not its first.
+    invoked: bool,
 }
 
 /// How a session's executor came to exist, for the load record.
@@ -287,6 +295,13 @@ impl Zygote {
         }
         *self.state.lock().unwrap() = state;
         self.changed.notify_all();
+    }
+    /// Wait while the parent imports.
+    fn wait_started(&self) {
+        let mut state = self.state.lock().unwrap();
+        while matches!(*state, ZygoteState::Starting) {
+            state = self.changed.wait(state).unwrap();
+        }
     }
     /// Fork an executor, waiting while the parent imports. A refusal or an ended parent
     /// gives the configuration back for a spawn.
@@ -841,6 +856,168 @@ impl GpuPool {
             .open(self.root.join("loads.jsonl"))?
             .write_all(&bytes)
     }
+    /// One line per call in `invokes.jsonl`: wall time, whether it was the executor's first,
+    /// and the executor's weight-movement facts and metrics.
+    fn record_invoke(&self, plan: &str, first: bool, took: std::time::Duration, reply: &Frame) {
+        let line = serde_json::json!({
+            "plan": plan,
+            "first": first,
+            "invoke_ms": took.as_secs_f64() * 1e3,
+            "plane": reply.plane,
+            "metrics": reply.metrics,
+        });
+        let written = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root.join("invokes.jsonl"))
+            .and_then(|mut file| writeln!(file, "{line}"));
+        if let Err(error) = written {
+            eprintln!("invokes.jsonl: {error}");
+        }
+    }
+
+    /// Load the given constructions in the background, each only where it fits beside the
+    /// tenants already there (a prewarm never makes room), most recent first. Each waits for
+    /// the GPU's call slot, so a request already running finishes first.
+    /// `fence`: a previous run's executors; new GPU work waits until each has exited.
+    pub fn prewarm(
+        self: &Arc<Self>,
+        engine: &Arc<Engine>,
+        plans: Vec<(HeldGeneration, GpuPlan)>,
+        fence: Vec<ProcessBirth>,
+    ) {
+        if !self.config.prewarm || plans.is_empty() {
+            return;
+        }
+        let (pool, engine) = (self.clone(), engine.clone());
+        let started = std::thread::Builder::new()
+            .name("executor-prewarm".into())
+            .spawn(move || {
+                while !fence
+                    .iter()
+                    .all(|birth| process_ended(birth).unwrap_or(true))
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                for (held, plan) in plans {
+                    let asked = Instant::now();
+                    // Its parent imports first, off the call slot; a request in flight or
+                    // queued always goes ahead of a prewarm.
+                    if let Some((zygote, start)) = pool.zygote(&held) {
+                        if start {
+                            zygote.set(pool.import_only(&held));
+                        }
+                        zygote.wait_started();
+                    }
+                    while !engine.nonterminal(1).is_ok_and(|work| work.is_empty())
+                        || pool
+                            .reserved
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                            .is_err()
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    let _permit = Permit {
+                        pool: pool.clone(),
+                        engine: Arc::downgrade(&engine),
+                    };
+                    let key = plan.id.clone();
+                    let waited = asked.elapsed();
+                    let mut sessions = pool.sessions.lock().unwrap();
+                    let result = pool.prewarm_locked(&engine, &held, plan, &mut sessions);
+                    for device in &pool.devices {
+                        device.memory.finished(&key);
+                    }
+                    if !sessions.contains_key(&key) {
+                        pool.ended(&key);
+                    }
+                    pool.note_prewarm(&key, waited, asked.elapsed() - waited, &result);
+                }
+            });
+        if let Err(error) = started {
+            eprintln!("executor prewarm: {error}");
+        }
+    }
+
+    /// One line per prewarm in `prewarm.jsonl`: what it did and how long it waited first.
+    fn note_prewarm(
+        &self,
+        plan: &str,
+        waited: std::time::Duration,
+        took: std::time::Duration,
+        result: &io::Result<&'static str>,
+    ) {
+        let line = serde_json::json!({
+            "plan": plan,
+            "outcome": result.as_ref().map_or_else(|e| format!("failed: {e}"), |o| o.to_string()),
+            "waited_ms": waited.as_secs_f64() * 1e3,
+            "took_ms": took.as_secs_f64() * 1e3,
+        });
+        let written = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root.join("prewarm.jsonl"))
+            .and_then(|mut file| writeln!(file, "{line}"));
+        if let Err(error) = written {
+            eprintln!("prewarm.jsonl: {error}");
+        }
+    }
+
+    fn prewarm_locked(
+        &self,
+        engine: &Arc<Engine>,
+        held: &HeldGeneration,
+        plan: GpuPlan,
+        sessions: &mut BTreeMap<String, Session>,
+    ) -> io::Result<&'static str> {
+        if sessions.contains_key(&plan.id) {
+            return Ok("already loaded");
+        }
+        let lane = self.lane(plan.degree)?;
+        let fits = lane.iter().enumerate().all(|(index, device)| {
+            device.memory.admits(
+                &plan.id,
+                || {
+                    if index == 0 {
+                        self.holdings()
+                    } else {
+                        vec![]
+                    }
+                },
+            )
+        });
+        if !fits {
+            return Ok("no room beside the other tenants");
+        }
+        self.host_room(&plan.id, sessions);
+        let load_caps = self.decide(&plan.id, plan.degree, true, sessions)?;
+        for device in lane {
+            device
+                .memory
+                .with(|gpu| gpu.starting(&plan.id, gpu.spawn_need(&plan.id)));
+        }
+        let mut session = self.new_session(engine, held, &plan, |birth, _| {
+            self.first().with(|gpu| gpu.spawned(&plan.id, birth.pid));
+            Ok(())
+        })?;
+        match self.call(
+            engine,
+            "",
+            held,
+            plan,
+            &load_caps,
+            &mut session,
+            sessions,
+            true,
+        ) {
+            Ok(_) => {
+                sessions.insert(session.plan.clone(), session);
+                Ok("loaded")
+            }
+            Err(error) => Err(ended_with(error, session.executor)),
+        }
+    }
+
     pub fn stop(&self) -> io::Result<()> {
         let sessions = std::mem::take(&mut *self.sessions.lock().unwrap());
         for (plan, session) in sessions {
@@ -1144,9 +1321,6 @@ impl GpuPool {
                     .memory
                     .with(|gpu| gpu.starting(&plan.id, gpu.spawn_need(&plan.id)));
             }
-            let launched = Instant::now();
-            let (root, socket, directory) = self.executor_endpoint()?;
-            let config = self.executor_config(&held, root, socket, plan.degree)?;
             let on_birth = |birth: &ProcessBirth, cancel: &Cancellation| {
                 // Rank 0 drives the first GPU; followers are named after Start.
                 self.first().with(|gpu| gpu.spawned(&plan.id, birth.pid));
@@ -1158,105 +1332,14 @@ impl GpuPool {
                     Arc::new(move || cancel.cancel(&request)),
                 )
             };
-            // The import-only parent is sealed to one GPU: a group is always spawned.
-            let zygote = (plan.degree == 1).then(|| self.zygote(&held)).flatten();
-            let (mut executor, mode) = match zygote {
-                Some((zygote, start)) => {
-                    if start {
-                        zygote.set(self.import_only(&held));
-                    }
-                    match zygote.fork(config, on_birth)? {
-                        Forked::Ready(executor) => (*executor, "fork"),
-                        Forked::Refused(config, reason) => {
-                            eprintln!("executor fork refused, spawning: {reason}");
-                            let spawned =
-                                DeviceExecutor::spawn_owned(*config, &self.launcher, on_birth)?;
-                            (spawned, "spawn")
-                        }
-                    }
-                }
-                None => (
-                    DeviceExecutor::spawn_owned(config, &self.launcher, on_birth)?,
-                    "spawn",
-                ),
-            };
-            let launch = Launch {
-                mode,
-                ms: launched.elapsed().as_secs_f64() * 1e3,
-                start_ms: 0.0,
-                start: vec![],
-            };
-            executor.retain_until_exit(directory);
-            executor.retain_until_exit(WakeOnExit(Arc::downgrade(engine)));
-            // Weights from the machine's sealed tier when the executor adopts them; its header
-            // and configs then come from the store (descriptors would lease every object).
-            let sealed = executor.hello.offers("weight_plane/1")
-                && executor.hello.offers("host_tiers.sealed/1");
-            let descriptors = match self.config.source_mode {
-                SourceMode::Legacy => false,
-                // Descriptor sources are world-one; a group reads the store or the sealed tier.
-                SourceMode::Auto => {
-                    !sealed
-                        && plan.degree == 1
-                        && executor.hello.offers("model_sources.descriptors/1")
-                }
-                SourceMode::Descriptors
-                    if plan.degree == 1 && executor.hello.offers("model_sources.descriptors/1") =>
-                {
-                    true
-                }
-                SourceMode::Descriptors => {
-                    executor.shutdown()?;
-                    engine.finish(id, Outcome::Failed("requested descriptor-source operation is unavailable; automatic or legacy mode remains available".into()))?;
+            let session = match self.new_session(engine, &held, &plan, on_birth) {
+                Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                    engine.finish(id, Outcome::Failed(error.to_string()))?;
                     return Ok(());
                 }
+                session => session?,
             };
-            let selections = plan.selections();
-            let sources = Arc::new(Mutex::new(ModelSources::open_shared(
-                self.store.clone(),
-                &selections,
-            )?));
-            executor.retain_until_exit(sources.clone());
-            let peer = self.host.register_peer(
-                executor.observer_pidfd()?,
-                executor.hello.offers("host_tiers.filling/1"),
-            );
-            let grants = selections
-                .iter()
-                .map(|selected| {
-                    Ok(HostGrant {
-                        manifest: selected.manifest.clone(),
-                        header: sources
-                            .lock()
-                            .unwrap()
-                            .authorized_header(&selected.manifest)?,
-                        components: selected.components.iter().cloned().collect(),
-                    })
-                })
-                .collect::<io::Result<Vec<_>>>()?;
-            // Start on this model's layouts while the executor imports and constructs.
-            if sealed {
-                self.host.prepare(grants.clone());
-            }
-            sessions.insert(
-                plan.id.clone(),
-                Session {
-                    plan: plan.id.clone(),
-                    degree: plan.degree,
-                    followers: vec![],
-                    loaded: false,
-                    executor,
-                    sources,
-                    budget_cells: BTreeMap::new(),
-                    actor: plan.actor.clone(),
-                    peer,
-                    grants,
-                    sealed,
-                    descriptors,
-                    sharing: false,
-                    launch,
-                },
-            );
+            sessions.insert(plan.id.clone(), session);
         } else {
             let session = &sessions[&plan.id];
             let cancel = session.executor.cancellation();
@@ -1279,7 +1362,16 @@ impl GpuPool {
         }
         // Out of the map for the call: its requests may unmap or end the others.
         let mut session = sessions.remove(&plan.id).expect("session retained above");
-        match self.call(engine, id, &held, plan, &load_caps, &mut session, sessions) {
+        match self.call(
+            engine,
+            id,
+            &held,
+            plan,
+            &load_caps,
+            &mut session,
+            sessions,
+            false,
+        ) {
             Ok(true) => {
                 sessions.insert(session.plan.clone(), session);
                 Ok(())
@@ -1290,7 +1382,117 @@ impl GpuPool {
         }
     }
 
-    /// Load (once), grant and invoke. Ok(false): the executor must not be reused.
+    /// Launch an executor for `plan` (fork from its generation's import-only executor, else
+    /// spawn) and open its model sources and host-tier grants. Unsupported: the configured
+    /// source mode is unavailable to this executor.
+    fn new_session(
+        &self,
+        engine: &Arc<Engine>,
+        held: &HeldGeneration,
+        plan: &GpuPlan,
+        on_birth: impl Fn(&ProcessBirth, &Cancellation) -> io::Result<()>,
+    ) -> io::Result<Session> {
+        let launched = Instant::now();
+        let (root, socket, directory) = self.executor_endpoint()?;
+        let config = self.executor_config(held, root, socket, plan.degree)?;
+        // The import-only parent is sealed to one GPU: a group is always spawned.
+        let zygote = (plan.degree == 1).then(|| self.zygote(held)).flatten();
+        let (mut executor, mode) = match zygote {
+            Some((zygote, start)) => {
+                if start {
+                    zygote.set(self.import_only(held));
+                }
+                match zygote.fork(config, &on_birth)? {
+                    Forked::Ready(executor) => (*executor, "fork"),
+                    Forked::Refused(config, reason) => {
+                        eprintln!("executor fork refused, spawning: {reason}");
+                        let spawned =
+                            DeviceExecutor::spawn_owned(*config, &self.launcher, &on_birth)?;
+                        (spawned, "spawn")
+                    }
+                }
+            }
+            None => (
+                DeviceExecutor::spawn_owned(config, &self.launcher, &on_birth)?,
+                "spawn",
+            ),
+        };
+        let launch = Launch {
+            mode,
+            ms: launched.elapsed().as_secs_f64() * 1e3,
+            start_ms: 0.0,
+            start: vec![],
+        };
+        executor.retain_until_exit(directory);
+        executor.retain_until_exit(WakeOnExit(Arc::downgrade(engine)));
+        // Weights from the machine's sealed tier when the executor adopts them; its header
+        // and configs then come from the store (descriptors would lease every object).
+        let sealed =
+            executor.hello.offers("weight_plane/1") && executor.hello.offers("host_tiers.sealed/1");
+        let descriptors = match self.config.source_mode {
+            SourceMode::Legacy => false,
+            // Descriptor sources are world-one; a group reads the store or the sealed tier.
+            SourceMode::Auto => {
+                !sealed && plan.degree == 1 && executor.hello.offers("model_sources.descriptors/1")
+            }
+            SourceMode::Descriptors
+                if plan.degree == 1 && executor.hello.offers("model_sources.descriptors/1") =>
+            {
+                true
+            }
+            SourceMode::Descriptors => {
+                executor.shutdown()?;
+                return Err(io::Error::new(io::ErrorKind::Unsupported, "requested descriptor-source operation is unavailable; automatic or legacy mode remains available"));
+            }
+        };
+        let selections = plan.selections();
+        let sources = Arc::new(Mutex::new(ModelSources::open_shared(
+            self.store.clone(),
+            &selections,
+        )?));
+        executor.retain_until_exit(sources.clone());
+        let peer = self.host.register_peer(
+            executor.observer_pidfd()?,
+            executor.hello.offers("host_tiers.filling/1"),
+        );
+        let grants = selections
+            .iter()
+            .map(|selected| {
+                Ok(HostGrant {
+                    manifest: selected.manifest.clone(),
+                    header: sources
+                        .lock()
+                        .unwrap()
+                        .authorized_header(&selected.manifest)?,
+                    components: selected.components.iter().cloned().collect(),
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        // Start on this model's layouts while the executor imports and constructs.
+        if sealed {
+            self.host.prepare(grants.clone());
+        }
+        Ok(Session {
+            plan: plan.id.clone(),
+            degree: plan.degree,
+            followers: vec![],
+            loaded: false,
+            executor,
+            sources,
+            budget_cells: BTreeMap::new(),
+            actor: plan.actor.clone(),
+            peer,
+            grants,
+            sealed,
+            descriptors,
+            sharing: false,
+            launch,
+            invoked: false,
+        })
+    }
+
+    /// Load (once), grant and invoke (unless `load_only`: a prewarm, no request). Ok(false):
+    /// the executor must not be reused.
     #[allow(clippy::too_many_arguments)]
     fn call(
         &self,
@@ -1301,6 +1503,7 @@ impl GpuPool {
         load_caps: &[Option<u64>],
         session: &mut Session,
         others: &mut BTreeMap<String, Session>,
+        load_only: bool,
     ) -> io::Result<bool> {
         let capped = session.executor.hello.offers("process_cap/1");
         // A group whose followers each read their own cap and cell; otherwise every rank
@@ -1492,6 +1695,9 @@ impl GpuPool {
             )?)?;
             session.loaded = true;
         }
+        if load_only {
+            return Ok(true);
+        }
         let record = engine.get(id)?;
         let prepared = session.executor.command(
             &DeviceCommand::PrepareRequest {
@@ -1596,6 +1802,9 @@ impl GpuPool {
             }
         }
         callbacks.spool = Some(spool.clone());
+        let invoked = Instant::now();
+        let first = !session.invoked;
+        session.invoked = true;
         let reply = session.executor.command_with(
             &DeviceCommand::Invoke {
                 request_id: id.into(),
@@ -1621,6 +1830,7 @@ impl GpuPool {
             &reply,
             session.executor.birth.pid,
         );
+        self.record_invoke(&plan.id, first, invoked.elapsed(), &reply);
         let mut facts = plane_facts(reply.plane.as_ref());
         facts.activation = facts.activation.or_else(|| {
             reply

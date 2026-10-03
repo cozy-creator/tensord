@@ -45,7 +45,7 @@ fn restart_ends_a_retained_gpu_birth_before_admitting_gpu_work() {
         .unwrap();
     // Cross a journal page boundary and exercise repeated requests on one retained process.
     for n in 0..258 {
-        complete(&mut journal, n, &generation, birth.clone(), true);
+        complete(&mut journal, n, &generation, birth.clone(), "gpu-plan");
     }
     let first = journal.gpu_births_after(0, 256).unwrap();
     assert_eq!(first.len(), 256);
@@ -56,12 +56,29 @@ fn restart_ends_a_retained_gpu_birth_before_admitting_gpu_work() {
             .len(),
         2
     );
+    // Prewarm reads the constructions recent runs used, newest first, each once.
+    journal
+        .bind_preparation(Preparation {
+            actor: "actor".into(),
+            id: "gpu-later".into(),
+            installation: "published".into(),
+            document: b"{}".to_vec(),
+        })
+        .unwrap();
+    complete(&mut journal, 300, &generation, birth.clone(), "gpu-later");
+    let recent: Vec<_> = journal
+        .recent_preparations(8)
+        .unwrap()
+        .into_iter()
+        .map(|preparation| preparation.id)
+        .collect();
+    assert_eq!(recent, ["gpu-later", "gpu-plan"]);
     // Same PID with a different birth is already ended, and an ordinary CPU process
     // is not a GPU reservation merely because it is still alive.
     let mut obsolete = birth.clone();
     obsolete.start_ticks += 1;
-    complete(&mut journal, 258, &generation, obsolete, true);
-    complete(&mut journal, 259, &generation, birth.clone(), false);
+    complete(&mut journal, 258, &generation, obsolete, "gpu-plan");
+    complete(&mut journal, 259, &generation, birth.clone(), "");
     drop(journal);
     let service = Service::open(&state, &root.join("generations"), 1).unwrap();
     assert!(service.idle().unwrap()); // terminal results never authorize freeing a context
@@ -74,17 +91,13 @@ fn restart_ends_a_retained_gpu_birth_before_admitting_gpu_work() {
     fs::remove_dir_all(root).unwrap();
 }
 
-fn complete(journal: &mut Journal, n: usize, generation: &str, birth: ProcessBirth, gpu: bool) {
+fn complete(journal: &mut Journal, n: usize, generation: &str, birth: ProcessBirth, preparation: &str) {
     let context = SubmissionContext {
         actor: "actor".into(),
         request_id: format!("request-{n}"),
         submission_id: format!("submission-{n}"),
         expected_workspace_id: journal.workspace_id().into(),
-        preparation_id: if gpu {
-            "gpu-plan".into()
-        } else {
-            String::new()
-        },
+        preparation_id: preparation.into(),
         ..Default::default()
     };
     let record = journal
