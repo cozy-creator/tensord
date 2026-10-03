@@ -49,12 +49,24 @@ def read_metadata(project: Path) -> PackageMetadata:
                            metadata.entry_points.application.default)
 
 
+def probe_cpu_bridge(interpreter: Path) -> str:
+    """Import the CPU runner's SDK adapter in the new environment, isolated from this one.
+    Empty means it imports; otherwise the reason CPU runs of this generation cannot start.
+    GPU executors do not use the adapter, so a failure never refuses the installation."""
+    probe = subprocess.run([str(interpreter), "-I", "-c", "import cozy_machine_client.runtime_bridge"],
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    if probe.returncode == 0:
+        return ""
+    lines = [line for line in probe.stderr.strip().splitlines() if line.strip()]
+    return (lines[-1] if lines else f"bridge import exited {probe.returncode}")[:1024]
+
+
 def publish_generation(root: Path, metadata: PackageMetadata, interface: msgspec.Raw) -> Generation:
     interpreter = root / "env" / "bin" / "python"
     inventory = subprocess.check_output(["uv", "pip", "list", "--python", str(interpreter), "--format", "json"])
     dependencies = msgspec.json.decode(inventory, type=list[Dependency])
     generation = Generation(root.name, metadata.name, metadata.version, metadata.application,
-                            str(interpreter), dependencies, interface)
+                            str(interpreter), dependencies, interface, probe_cpu_bridge(interpreter))
     with (root / ".generation.json.new").open("wb") as output:
         output.write(msgspec.json.encode(generation))
         output.flush()

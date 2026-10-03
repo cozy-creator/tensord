@@ -15,6 +15,8 @@ class Generation(msgspec.Struct, frozen=True):
     python: str
     dependencies: list[Dependency]
     interface: msgspec.Raw
+    # Empty: the CPU runner's SDK adapter imports in this environment; else why it cannot.
+    cpu_bridge: str = ""
 
 
 class ApplicationEntry(msgspec.Struct, frozen=True):

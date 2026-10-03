@@ -42,6 +42,7 @@ impl Fixture {
             module: "runner_fixture".into(),
             import_paths: vec![self.root.clone()],
             generation_hold: None,
+            unavailable: None,
         }
     }
     fn invocation(&self, mode: &str) -> Invocation {
@@ -897,6 +898,7 @@ fn owner_process_fixture() {
                 module: "runner_fixture".into(),
                 import_paths: vec![PathBuf::from(config["imports"].as_str().unwrap())],
                 generation_hold: None,
+                unavailable: None,
             },
         )
         .unwrap();
@@ -978,6 +980,24 @@ def infer(inputs, output_root, canceled, progress):
     else:(root/'prediction').write_text(','.join(map(str,prediction))+'\n')
     return {'prediction':prediction},['prediction']
 "#;
+
+#[test]
+fn an_environment_whose_runner_cannot_import_fails_without_launching() {
+    let fixture = Fixture::new();
+    let record = fixture
+        .engine
+        .submit("no-bridge", fixture.invocation("infer"))
+        .unwrap();
+    let mut config = fixture.config();
+    config.unavailable =
+        Some("CPU runner adapter unavailable in this environment: ImportError".into());
+    assert!(fixture.engine.dispatch(&record.id, config).unwrap());
+    let failed = fixture.wait(&record.id, |record| record.state.terminal());
+    assert_eq!(failed.state, State::Failed);
+    assert!(failed.failure.unwrap().contains("adapter unavailable"));
+    assert!(failed.process.is_none());
+    assert!(!fixture.root.join("effect").exists());
+}
 
 #[test]
 fn a_settled_run_keeps_one_custody_copy_and_its_logs() {

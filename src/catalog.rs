@@ -26,6 +26,9 @@ pub struct Generation {
     #[serde(default)]
     pub dependencies: Vec<Dependency>,
     pub interface: serde_json::Value,
+    /// Empty when the CPU runner's SDK adapter imported at install; else the reason.
+    #[serde(default)]
+    pub cpu_bridge: String,
 }
 pub struct HeldGeneration {
     pub record: Generation,
@@ -118,6 +121,12 @@ impl HeldGeneration {
             module: "cozy_machine_client.runner".into(),
             import_paths: vec![],
             generation_hold: Some(self.hold.clone()),
+            unavailable: (!self.record.cpu_bridge.is_empty()).then(|| {
+                format!(
+                    "CPU runner adapter unavailable in this environment: {}",
+                    self.record.cpu_bridge
+                )
+            }),
         }
     }
 }

@@ -70,6 +70,8 @@ pub struct RunnerConfig {
     /// Already acquired shared environment-generation hold from the installer.
     /// The runner also holds its generation independently before package imports.
     pub generation_hold: Option<Arc<File>>,
+    /// Measured at install: why a runner cannot start in this environment.
+    pub unavailable: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -816,6 +818,11 @@ impl Engine {
         let record = self.get(id)?;
         if record.cancel_actor.is_some() {
             self.finish(id, Outcome::Canceled)?;
+            return Ok(());
+        }
+        if let Some(reason) = &config.unavailable {
+            // Known before any launch: fail now rather than start a runner that cannot import.
+            self.finish(id, Outcome::Failed(reason.clone()))?;
             return Ok(());
         }
         let output_root = self.root.join("staging").join(id);
