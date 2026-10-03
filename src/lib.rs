@@ -16,7 +16,6 @@ pub mod local_source;
 pub mod machine;
 pub mod machine_api;
 pub mod memory;
-pub mod model_source_driver;
 pub mod model_sources;
 pub mod native_inputs;
 pub mod objects;

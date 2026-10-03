@@ -155,26 +155,10 @@ impl Fixture {
                 .unwrap();
         Layout::build(&plan, &self.regions()).unwrap()
     }
-    /// The executor's half: adopt read-only through TensorFS and check every byte.
+    /// The executor's half: adopt read-only through TensorFS, wait per region, check every
+    /// byte.
     fn adopt(&self, granted: &File) {
-        let plane = Plane::open(PlaneConfig {
-            readers: 1,
-            ..Default::default()
-        })
-        .unwrap();
-        let plan =
-            read::plan_for_traversal(&self.header, &self.traversal(), &["unet".into()], 4 << 20)
-                .unwrap();
-        let ws = plane
-            .register_sealed("unet", &plan, &self.regions(), granted.as_raw_fd())
-            .unwrap();
-        self.check(granted, &plane.layout(ws).unwrap());
-        assert_eq!(
-            plane.stats().host.counters.fill_bytes,
-            0,
-            "adoption reads nothing"
-        );
-        plane.close().unwrap();
+        assert!(self.adopt_filling(granted), "the layout's fill failed");
     }
     /// An executor that waits per region: adopt a layout still filling, pin it (each region
     /// once its filler marks it Ready), then check every byte. Never reads the store. False
@@ -250,18 +234,11 @@ fn sealed(body: &[u8]) -> File {
 struct Executor(Child);
 impl Executor {
     fn spawn(tier: &HostTier) -> (Self, u64) {
-        Self::spawn_as(tier, false)
-    }
-    /// One that adopts layouts still filling (`host_tiers.filling/1`).
-    fn spawn_filling(tier: &HostTier) -> (Self, u64) {
-        Self::spawn_as(tier, true)
-    }
-    fn spawn_as(tier: &HostTier, filling: bool) -> (Self, u64) {
         let child = Command::new("sleep").arg("1000").spawn().unwrap();
         // SAFETY: pidfd_open of our own live child.
         let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::c_int, 0) };
         assert!(pidfd >= 0);
-        let peer = tier.register_peer(unsafe { File::from_raw_fd(pidfd as i32) }, filling);
+        let peer = tier.register_peer(unsafe { File::from_raw_fd(pidfd as i32) });
         (Self(child), peer)
     }
     fn exit(mut self) {
@@ -294,6 +271,19 @@ fn tier(fx: &Fixture, limit: u64) -> Arc<HostTier> {
         Box::new(Fixed(limit)),
     )
     .unwrap()
+}
+
+/// The tier's facts once no fill is running (adopters see each region before the filler
+/// records the fill).
+fn settled(tier: &HostTier) -> cozy_machine::host_tier::HostTierFacts {
+    for _ in 0..500 {
+        let facts = tier.facts();
+        if facts.filling_bytes == 0 {
+            return facts;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("a fill never finished: {:?}", tier.facts());
 }
 
 fn ask(tier: &HostTier, peer: u64, fx: &Fixture) -> Option<File> {
@@ -329,7 +319,7 @@ fn one_fill_serves_every_executor_read_only_and_outlives_them() {
         );
     }
     fx.adopt(&granted);
-    let facts = tier.facts();
+    let facts = settled(&tier);
     assert_eq!(
         (facts.ledger.fills.len(), facts.ledger.hits, facts.entries),
         (1, 0, 1)
@@ -373,8 +363,8 @@ fn unheld_layouts_go_oldest_first_and_held_ones_never() {
     )
     .unwrap();
     let (first, a) = Executor::spawn(&tier);
-    assert!(ask(&tier, a, &small).is_some());
-    // Held by a live executor: the other model gets no room; it reads the store.
+    small.adopt(&ask(&tier, a, &small).unwrap());
+    // Held by a live executor: no room for the other model, so it streams (never refused).
     let other_tier_ask = |tier: &HostTier, peer| {
         let (plan, sha256, length) = other.plan(&["unet"]);
         tier.seal(
@@ -389,15 +379,16 @@ fn unheld_layouts_go_oldest_first_and_held_ones_never() {
     };
     // `other` lives in another store: the tier reads its own, so bring the bytes over.
     copy_store(&other, &small);
-    assert!(other_tier_ask(&tier, a).unwrap().is_none());
-    assert_eq!(tier.facts().ledger.no_room, 1);
-    // Unheld once its executor exits: released for the next model, its bytes recorded.
+    drop(other_tier_ask(&tier, a).unwrap().expect("streamed"));
+    assert_eq!(tier.facts().windows, 1);
+    // Unheld once its executor exits: the window goes with it, the small layout on demand,
+    // and the other model then gets a whole layout.
     first.exit();
     let (_second, b) = Executor::spawn(&tier);
-    let granted = other_tier_ask(&tier, b).unwrap().expect("released room");
+    let granted = other_tier_ask(&tier, b).unwrap().expect("room");
     other.adopt(&granted);
-    let facts = tier.facts();
-    assert_eq!(facts.ledger.released, 1, "{facts:?}");
+    let facts = settled(&tier);
+    assert_eq!((facts.windows, facts.ledger.released), (0, 2), "{facts:?}");
     assert!(facts.ledger.released_bytes >= 8 * MIB as u64, "{facts:?}");
     assert_eq!(facts.entries, 1);
 }
@@ -545,7 +536,13 @@ fn in_scope(memory: &[&str], name: &str) {
     let inner = Command::new("systemd-run")
         .args(&scope)
         .arg(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--ignored", "--test-threads=1", "--nocapture"])
+        .args([
+            "--exact",
+            name,
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+        ])
         .status()
         .unwrap();
     assert!(inner.success());
@@ -567,7 +564,9 @@ fn inside_a_256_mib_scope() {
     )
     .unwrap();
     let (_executor, a) = Executor::spawn(&tier);
-    assert!(ask(&tier, a, &big).is_none(), "{:?}", tier.facts());
+    let streamed = ask(&tier, a, &big).expect("streamed, never refused");
+    assert_eq!(stream_through(&big, &streamed, 1), 160 * MIB as u64);
+    drop(streamed);
     let small = Fixture::new("fits", &[16 * MIB]);
     copy_store(&small, &big);
     let (plan, sha256, length) = small.plan(&["unet"]);
@@ -582,10 +581,23 @@ fn inside_a_256_mib_scope() {
             plan,
         )
         .unwrap();
-    small.adopt(&granted.expect("16 MiB fits half of the headroom"));
-    let facts = tier.facts();
-    assert_eq!((facts.ledger.no_room, facts.entries), (1, 1), "{facts:?}");
-    assert!(facts.charged_bytes <= facts.limit, "{facts:?}");
+    let granted = granted.expect("never refused");
+    let streamed =
+        tensorfs_plane::host::HostMem::adopt_sealed(granted.as_raw_fd(), &small.layout())
+            .unwrap()
+            .window()
+            .is_some();
+    if streamed {
+        stream_through(&small, &granted, 1);
+    } else {
+        small.adopt(&granted);
+    }
+    let facts = settled(&tier);
+    assert_eq!(
+        (facts.ledger.windows_opened, facts.entries),
+        (1 + u64::from(streamed), 2),
+        "{facts:?}"
+    );
 }
 
 /// A machine restart (a new tier, empty) refills a model's layouts from the plans it
@@ -601,7 +613,8 @@ fn remembered_plans_refill_layouts_before_the_executor_asks() {
     };
     let first = HostTier::new(fx.store.clone(), config.clone(), Box::new(Fixed(1 << 30))).unwrap();
     let (executor, a) = Executor::spawn(&first);
-    assert!(ask(&first, a, &fx).is_some());
+    fx.adopt(&ask(&first, a, &fx).unwrap());
+    settled(&first); // remembered once filled
     executor.exit();
     drop(first);
     assert_eq!(fs::read_dir(&plans).unwrap().count(), 1);
@@ -611,7 +624,7 @@ fn remembered_plans_refill_layouts_before_the_executor_asks() {
     // The executor would be importing now; its ask waits for the fill under way, or hits.
     let (_executor, b) = Executor::spawn(&second);
     fx.adopt(&ask(&second, b, &fx).expect("prefilled"));
-    let facts = second.facts();
+    let facts = settled(&second);
     assert_eq!(
         (
             facts.ledger.fills.len(),
@@ -685,7 +698,7 @@ fn a_prefetch_fills_while_the_executor_registers_and_the_ask_finds_it() {
 fn an_executor_adopts_its_layout_while_it_fills_and_waits_per_region() {
     let fx = Fixture::new("filling", &[64 * MIB, 64 * MIB + 3, 64 * MIB, 5]);
     let tier = tier(&fx, 1 << 30);
-    let (_executor, a) = Executor::spawn_filling(&tier);
+    let (_executor, a) = Executor::spawn(&tier);
     let granted = ask(&tier, a, &fx).expect("room");
     let at_grant = tier.facts();
     assert!(
@@ -693,9 +706,9 @@ fn an_executor_adopts_its_layout_while_it_fills_and_waits_per_region() {
         "granted before its bytes: {at_grant:?}"
     );
     assert!(fx.adopt_filling(&granted));
-    let (_older, b) = Executor::spawn(&tier);
-    fx.adopt(&ask(&tier, b, &fx).expect("complete for an older executor"));
-    let facts = tier.facts();
+    let (_other, b) = Executor::spawn(&tier);
+    fx.adopt(&ask(&tier, b, &fx).expect("the same layout"));
+    let facts = settled(&tier);
     assert_eq!(
         (
             facts.ledger.fills.len(),
@@ -710,8 +723,8 @@ fn an_executor_adopts_its_layout_while_it_fills_and_waits_per_region() {
 }
 
 /// A fill that fails (a corrupt object the verified read path refuses): the executor that
-/// adopted the layout early gets an error, never the bytes; the tier drops the layout; an older
-/// executor is told nothing is held and reads the store itself.
+/// adopted the layout early gets an error, never the bytes; the tier drops the layout, and the
+/// next ask fails the same way.
 #[test]
 fn a_failed_fill_is_an_error_for_its_adopters_and_leaves_the_tier() {
     let fx = Fixture::new("corrupt", &[8 * MIB, 8 * MIB]);
@@ -730,12 +743,25 @@ fn a_failed_fill_is_an_error_for_its_adopters_and_leaves_the_tier() {
     drop(file);
 
     let tier = tier(&fx, 1 << 30);
-    let (_executor, a) = Executor::spawn_filling(&tier);
+    let (_executor, a) = Executor::spawn(&tier);
     let granted = ask(&tier, a, &fx).expect("opened at once");
     assert!(!fx.adopt_filling(&granted), "a failed region is never read");
-    let (_older, b) = Executor::spawn(&tier);
-    assert!(ask(&tier, b, &fx).is_none());
-    let facts = tier.facts();
+    let (_other, b) = Executor::spawn(&tier);
+    let (plan, sha256, length) = fx.plan(&["unet"]);
+    let again = tier.seal(
+        b,
+        &[fx.grant()],
+        SealedRequest {
+            sha256: &sha256,
+            length,
+        },
+        plan,
+    );
+    assert!(match again {
+        Ok(Some(granted)) => !fx.adopt_filling(&granted),
+        _ => true,
+    });
+    let facts = settled(&tier);
     assert!(
         facts.ledger.failed >= 1 && facts.ledger.fills.is_empty() && facts.entries == 0,
         "{facts:?}"
@@ -784,13 +810,13 @@ fn stream_through(fx: &Fixture, granted: &File, passes: usize) -> u64 {
 fn a_model_far_larger_than_the_tier_streams_through_a_window() {
     let fx = Fixture::new("window", &[8 * MIB; 16]);
     let tier = tier(&fx, 16 * MIB as u64);
-    let (executor, a) = Executor::spawn_filling(&tier);
+    let (executor, a) = Executor::spawn(&tier);
     let granted = ask(&tier, a, &fx).expect("streamed, never refused");
     assert_eq!(stream_through(&fx, &granted, 2), 2 * 128 * MIB as u64);
     let facts = tier.facts();
     assert_eq!(
-        (facts.windows, facts.ledger.windows_opened, facts.ledger.no_room),
-        (1, 1, 0),
+        (facts.windows, facts.ledger.windows_opened),
+        (1, 1),
         "{facts:?}"
     );
     assert!(
@@ -798,11 +824,6 @@ fn a_model_far_larger_than_the_tier_streams_through_a_window() {
         "two 8 MiB slots: {facts:?}"
     );
     assert!(facts.window_read_bytes >= 2 * 128 * MIB as u64, "{facts:?}");
-    let (_older, b) = Executor::spawn(&tier);
-    assert!(
-        ask(&tier, b, &fx).is_none(),
-        "an older executor reads the store"
-    );
     executor.exit();
     drop(granted);
     let facts = tier.facts();
@@ -837,11 +858,11 @@ fn inside_a_192_mib_scope() {
         Box::new(cozy_machine::host_tier::HalfOfHeadroom),
     )
     .unwrap();
-    let (_executor, a) = Executor::spawn_filling(&tier);
+    let (_executor, a) = Executor::spawn(&tier);
     let granted = ask(&tier, a, &fx).expect("streamed, never refused");
     assert_eq!(stream_through(&fx, &granted, 1), 256 * MIB as u64);
     let facts = tier.facts();
-    assert_eq!((facts.windows, facts.ledger.no_room), (1, 0), "{facts:?}");
+    assert_eq!(facts.windows, 1, "{facts:?}");
     assert!(facts.window_bytes < 192 << 20, "{facts:?}");
     eprintln!(
         "window: {} bytes, {} read; host {:?}",

@@ -233,7 +233,6 @@ fn exec(
             authorized_device_limit_bytes: Some(config.authorized_device_limit_bytes),
             attention_pin: String::new(),
             stages: false,
-            descriptor_sources: false,
             sealed_tiers: false,
             pinned_bytes: Some(config.pinned_budget_bytes),
             device_weights: sharing,

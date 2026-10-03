@@ -44,15 +44,6 @@ fn yes() -> bool {
     true
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SourceMode {
-    #[default]
-    Auto,
-    Legacy,
-    Descriptors,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ModelGrant {
     pub package: String,
@@ -86,8 +77,6 @@ pub struct HostOptions {
 pub struct GpuConfig {
     #[serde(default)]
     pub identity: Option<crate::launch_identity::LaunchIdentity>,
-    #[serde(default)]
-    pub source_mode: SourceMode,
     /// The GPU envelope, `"0"` or `"0,1,..."`: a degree-K plan runs on the first K.
     pub devices: String,
     /// Load's device limit where NVML cannot read the device total.
@@ -244,15 +233,12 @@ struct Session {
     followers: Vec<crate::process::Exact>,
     loaded: bool,
     executor: DeviceExecutor,
-    sources: Arc<Mutex<ModelSources>>,
     /// Budget cells by rank: rank 0's own, and each follower's (`rank_cells/1`).
     budget_cells: BTreeMap<u32, File>,
     actor: String,
-    /// This executor in the host tier, the layouts it may adopt, and whether it adopts them.
+    /// This executor in the host tier and the layouts it may adopt.
     peer: u64,
     grants: Vec<HostGrant>,
-    sealed: bool,
-    descriptors: bool,
     /// Its weights stay on the GPU under custody (Degree 2), decided once at its load.
     sharing: bool,
     launch: Launch,
@@ -898,7 +884,6 @@ impl GpuPool {
     fn record_load(
         &self,
         plan: &str,
-        sealed: bool,
         took: std::time::Duration,
         loaded: &Frame,
         executor: u32,
@@ -908,7 +893,6 @@ impl GpuPool {
         #[derive(Serialize)]
         struct Line<'a> {
             plan: &'a str,
-            sealed: bool,
             load_ms: f64,
             facts: &'a Option<device_executor::LoadFacts>,
             host_tier: crate::host_tier::HostTierFacts,
@@ -918,7 +902,6 @@ impl GpuPool {
         }
         let line = Line {
             plan,
-            sealed,
             load_ms: took.as_secs_f64() * 1e3,
             facts: &loaded.facts,
             host_tier: self.host.facts(),
@@ -1585,8 +1568,8 @@ impl GpuPool {
     }
 
     /// Launch an executor for `plan` (fork from its generation's import-only executor, else
-    /// spawn) and open its model sources and host-tier grants. Unsupported: the configured
-    /// source mode is unavailable to this executor.
+    /// spawn) and open its model sources and host-tier grants. Unsupported: an executor that
+    /// cannot take its weights from the sealed host tier.
     fn new_session(
         &self,
         engine: &Arc<Engine>,
@@ -1649,66 +1632,47 @@ impl GpuPool {
         };
         executor.retain_until_exit(directory);
         executor.retain_until_exit(WakeOnExit(Arc::downgrade(engine)));
-        // Weights from the machine's sealed tier when the executor adopts them; its header
-        // and configs then come from the store (descriptors would lease every object).
-        let sealed =
-            executor.hello.offers("weight_plane/1") && executor.hello.offers("host_tiers.sealed/1");
-        let descriptors = match self.config.source_mode {
-            SourceMode::Legacy => false,
-            // Descriptor sources are world-one; a group reads the store or the sealed tier.
-            SourceMode::Auto => {
-                !sealed && plan.degree == 1 && executor.hello.offers("model_sources.descriptors/1")
-            }
-            SourceMode::Descriptors
-                if plan.degree == 1 && executor.hello.offers("model_sources.descriptors/1") =>
-            {
-                true
-            }
-            SourceMode::Descriptors => {
+        // Weights come only from the machine's sealed host tier: adopted while it fills, and
+        // streamed when it does not fit (TensorFS #313/#314, Runtime #1130). Header and configs
+        // come from the store.
+        for needed in [
+            "weight_plane/1",
+            "host_tiers.sealed/1",
+            "host_tiers.filling/1",
+        ] {
+            if !executor.hello.offers(needed) {
                 executor.shutdown()?;
-                return Err(io::Error::new(io::ErrorKind::Unsupported, "requested descriptor-source operation is unavailable; automatic or legacy mode remains available"));
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("executor lacks {needed}: its weights would come from the store"),
+                ));
             }
-        };
+        }
         let selections = plan.selections();
-        let sources = Arc::new(Mutex::new(ModelSources::open_shared(
-            self.store.clone(),
-            &selections,
-        )?));
-        executor.retain_until_exit(sources.clone());
-        let peer = self.host.register_peer(
-            executor.observer_pidfd()?,
-            executor.hello.offers("host_tiers.filling/1"),
-        );
+        let sources = ModelSources::open_shared(self.store.clone(), &selections)?;
+        let peer = self.host.register_peer(executor.observer_pidfd()?);
         let grants = selections
             .iter()
             .map(|selected| {
                 Ok(HostGrant {
                     manifest: selected.manifest.clone(),
-                    header: sources
-                        .lock()
-                        .unwrap()
-                        .authorized_header(&selected.manifest)?,
+                    header: sources.authorized_header(&selected.manifest)?,
                     components: selected.components.iter().cloned().collect(),
                 })
             })
             .collect::<io::Result<Vec<_>>>()?;
         // Start on this model's layouts while the executor imports and constructs.
-        if sealed {
-            self.host.prepare(grants.clone());
-        }
+        self.host.prepare(grants.clone());
         Ok(Session {
             plan: plan.id.clone(),
             degree: plan.degree,
             followers: vec![],
             loaded: false,
             executor,
-            sources,
             budget_cells: BTreeMap::new(),
             actor: plan.actor.clone(),
             peer,
             grants,
-            sealed,
-            descriptors,
             sharing: false,
             launch,
             invoked: false,
@@ -1748,7 +1712,6 @@ impl GpuPool {
         let mut callbacks = Callbacks {
             engine,
             id,
-            sources: &session.sources,
             cells: &mut session.budget_cells,
             completed: 0,
             host: &self.host,
@@ -1819,11 +1782,7 @@ impl GpuPool {
             {
                 device.memory.with(|gpu| gpu.spawned(&plan.id, *pid));
             }
-            let store = if session.descriptors {
-                String::new()
-            } else {
-                self.store.root().to_string_lossy().into_owned()
-            };
+            let store = self.store.root().to_string_lossy().into_owned();
             let mut models: Vec<ModelLoad> = plan
                 .slots
                 .iter()
@@ -1876,8 +1835,7 @@ impl GpuPool {
                         device_total.or(self.config.authorized_device_limit_bytes),
                     attention_pin: String::new(),
                     stages: false,
-                    descriptor_sources: session.descriptors,
-                    sealed_tiers: session.sealed,
+                    sealed_tiers: true,
                     pinned_bytes: at_load.then_some(pinned),
                     device_weights: sharing,
                     cap_bytes: load_cap,
@@ -1894,7 +1852,6 @@ impl GpuPool {
             );
             self.record_load(
                 &plan.id,
-                session.sealed,
                 started.elapsed(),
                 &loaded,
                 session.executor.birth.pid,
@@ -2046,10 +2003,9 @@ impl GpuPool {
                 .and_then(|m| m.activation_peak_bytes)
                 .and_then(|v| u64::try_from(v).ok())
         });
-        let facts = self.observe(&plan.id, plan.degree, facts, &reply.rank_planes, Some(true));
-        // Pinned bytes outside the machine's tier (every rank's) count against its limit.
-        self.host_ledger
-            .private(&plan.id, facts.pinned.filter(|_| !session.sealed));
+        self.observe(&plan.id, plan.degree, facts, &reply.rank_planes, Some(true));
+        // Every executor's weights are the tier's: none pins memory of its own.
+        self.host_ledger.private(&plan.id, None);
         if let Some(plane) = &reply.plane {
             crate::memory::note(
                 serde_json::json!({"event": "call", "plan": plan.id, "id": id, "degree": plan.degree,
@@ -2766,7 +2722,6 @@ fn command_ok(frame: Frame) -> io::Result<Frame> {
 struct Callbacks<'a> {
     engine: &'a Arc<Engine>,
     id: &'a str,
-    sources: &'a Arc<Mutex<ModelSources>>,
     cells: &'a mut BTreeMap<u32, File>,
     completed: u64,
     host: &'a Arc<HostTier>,
@@ -2914,12 +2869,6 @@ impl Services for Callbacks<'_> {
                 None => Answer::unavailable(frame.seq),
             };
             return Ok((answer, None));
-        }
-        if frame.kind == Kind::ModelSourceRead {
-            drop(descriptor);
-            let (answer, file) =
-                crate::model_source_driver::answer(&mut self.sources.lock().unwrap(), frame)?;
-            return Ok((answer, Some(file)));
         }
         let mut answer = Answer::unavailable(frame.seq);
         match frame.kind {

@@ -16,7 +16,7 @@ use std::{
     fs::{self, File},
     io::{self, Write},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Instant,
 };
 
@@ -34,8 +34,6 @@ struct Pilot {
     pinned_budget_bytes: i64,
     #[serde(default)]
     generation_hold: Option<PathBuf>,
-    #[serde(default)]
-    model_sources: SourceMode,
     /// Auto negotiates existing stage policy; false is a fixed-allowance single-executor experiment.
     #[serde(default)]
     stages: Option<bool>,
@@ -56,49 +54,13 @@ impl TierLimit for FixedLimit {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum SourceMode {
-    #[default]
-    Legacy,
-    Descriptors,
-}
-
-#[derive(Default, Serialize)]
-struct SourceEvidence {
-    selected_objects: u64,
-    selected_bytes: u64,
-    exports: u64,
-    headers: u64,
-    assets: u64,
-    objects: u64,
-    exported_bytes: u64,
-    read_wall_ms: f64,
-    owner_fd_peak: usize,
-    owner_fd_samples: u64,
-    // The provider's cache is private; absence of an RPC is not a measured cache hit.
-    receiver_cache_hits: Option<u64>,
-}
-
 struct Turns {
     budget: i64,
     held: Vec<File>,
     events: File,
     phase: String,
-    sources: Option<Arc<Mutex<ModelSources>>>,
-    source_evidence: SourceEvidence,
     /// The host tier, this executor in it, and what it may adopt.
     host: Option<(Arc<HostTier>, u64, Vec<HostGrant>)>,
-}
-impl Turns {
-    fn sample_source_fds(&mut self) -> io::Result<()> {
-        if self.sources.is_some() {
-            self.source_evidence.owner_fd_peak =
-                self.source_evidence.owner_fd_peak.max(fd_count()?);
-            self.source_evidence.owner_fd_samples += 1;
-        }
-        Ok(())
-    }
 }
 impl Services for Turns {
     fn progress(&mut self, frame: &Frame) {
@@ -146,27 +108,6 @@ impl Services for Turns {
             writeln!(self.events, "{row}")?;
             return Ok((answer, granted));
         }
-        if frame.kind == Kind::ModelSourceRead {
-            drop(descriptor);
-            let Some(sources) = &self.sources else {
-                return Ok((answer, None));
-            };
-            let started = Instant::now();
-            let (answer, file) =
-                cozy_machine::model_source_driver::answer(&mut sources.lock().unwrap(), frame)?;
-            let evidence = &mut self.source_evidence;
-            evidence.read_wall_ms += started.elapsed().as_secs_f64() * 1000.;
-            evidence.exports += 1;
-            evidence.exported_bytes += answer.length;
-            match frame.role {
-                device_executor::SourceRole::Header => evidence.headers += 1,
-                device_executor::SourceRole::Asset => evidence.assets += 1,
-                device_executor::SourceRole::Object => evidence.objects += 1,
-                device_executor::SourceRole::Unknown => (),
-            }
-            // Caller transfers one readonly descriptor and closes this duplicate immediately.
-            return Ok((answer, Some(file)));
-        }
         match frame.kind {
             Kind::BudgetCell => {
                 let descriptor =
@@ -206,8 +147,6 @@ struct RunEvidence {
     bindings: Vec<device_executor::AssetBinding>,
     metrics: Option<device_executor::Metrics>,
     plane: Option<device_executor::PlaneFacts>,
-    source_exports: u64,
-    source_read_ms: f64,
 }
 
 fn main() {
@@ -265,7 +204,7 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
     if action == "validate" {
         println!(
             "{}",
-            serde_json::json!({"validated":true,"mode":"stock-executor-pilot","requested_model_sources":config.model_sources,"requested_stages":config.stages,"model":config.binding.model_class,"snapshots":config.binding.snapshots,"requests":config.payloads.len(),"gpu_started":false})
+            serde_json::json!({"validated":true,"mode":"stock-executor-pilot","requested_stages":config.stages,"model":config.binding.model_class,"snapshots":config.binding.snapshots,"requests":config.payloads.len(),"gpu_started":false})
         );
         return Ok(());
     }
@@ -316,8 +255,6 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
         .unwrap_or_default();
     let stages = config.stages.unwrap_or(true) && executor.hello.offers("stage/1");
     let plane = executor.hello.offers("weight_plane/1");
-    let descriptors = matches!(config.model_sources, SourceMode::Descriptors)
-        && executor.hello.offers("model_sources.descriptors/1");
     let sealed = config.host_tier && plane && executor.hello.offers("host_tiers.sealed/1");
     let at_load = plane && executor.hello.offers("load_pinned/1");
     fs::write(
@@ -330,11 +267,9 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
             "requested_stages":config.stages,
             "weight_plane":plane,
             "legacy_residency":!plane,
-            "requested_model_sources":config.model_sources,
-            "descriptor_sources":descriptors,
             "sealed_tiers":sealed,
             "pinned_at_load":at_load,
-            "executor_store_path":if descriptors { "" } else { &config.binding.store }
+            "executor_store_path":&config.binding.store
         }))?,
     )?;
     let mut turns = Turns {
@@ -342,8 +277,6 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
         held: Vec::new(),
         events: File::create(config.root.join("events.jsonl"))?,
         phase: "start".into(),
-        sources: None,
-        source_evidence: SourceEvidence::default(),
         host: None,
     };
     if let (true, Some(tier)) = (sealed, tier) {
@@ -360,38 +293,11 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
             })
             .collect::<io::Result<Vec<_>>>()?;
         tier.prepare(grants.clone());
-        let filling = executor.hello.offers("host_tiers.filling/1");
-        turns.host = Some((tier.clone(), tier.register_peer(executor.observer_pidfd()?, filling), grants));
+        turns.host = Some((tier.clone(), tier.register_peer(executor.observer_pidfd()?), grants));
     }
     let disk_before = disk_read_bytes();
     let mut timings = BTreeMap::new();
     timings.insert("spawn_ms", spawn_ms);
-    if descriptors {
-        let selection_started = Instant::now();
-        let selections = selected_sources(&config.binding)?;
-        let mut sources = ModelSources::open(&PathBuf::from(&config.binding.store), &selections)?;
-        timings.insert(
-            "source_selection_ms",
-            selection_started.elapsed().as_secs_f64() * 1000.,
-        );
-        let admission_started = Instant::now();
-        let (objects, bytes) = sources.verify_selected()?;
-        timings.insert(
-            "source_admission_ms",
-            admission_started.elapsed().as_secs_f64() * 1000.,
-        );
-        timings.insert(
-            "source_setup_ms",
-            selection_started.elapsed().as_secs_f64() * 1000.,
-        );
-        turns.source_evidence.selected_objects = objects as u64;
-        turns.source_evidence.selected_bytes = bytes;
-        turns.source_evidence.owner_fd_peak = fd_count()?;
-        turns.source_evidence.owner_fd_samples = 1;
-        let sources = Arc::new(Mutex::new(sources));
-        executor.retain_until_exit(Arc::clone(&sources));
-        turns.sources = Some(sources);
-    }
     let start = Instant::now();
     let started = executor.command(
         &DeviceCommand::Start {
@@ -412,11 +318,7 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
     }
     turns.phase = "load".into();
     let start = Instant::now();
-    let mut load_binding = config.binding;
-    if descriptors {
-        // The negotiated provider receives all bytes through the owner, not a local Store path.
-        load_binding.store.clear();
-    }
+    let load_binding = config.binding;
     let loaded = executor.command(
         &DeviceCommand::Load {
             construction: "pilot-model".into(),
@@ -430,7 +332,6 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
             authorized_device_limit_bytes: Some(config.authorized_device_limit_bytes),
             attention_pin: String::new(),
             stages,
-            descriptor_sources: descriptors,
             device_weights: false,
             cap_bytes: None,
             sealed_tiers: sealed,
@@ -454,7 +355,6 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
             loaded.code, loaded.detail
         )));
     }
-    turns.sample_source_fds()?;
     fs::write(
         config.root.join("load-facts.json"),
         serde_json::to_vec_pretty(&loaded.facts)?,
@@ -493,8 +393,6 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
         turns.phase = id.clone();
         let spool = config.root.join(&id);
         fs::create_dir(&spool)?;
-        let source_exports_before = turns.source_evidence.exports;
-        let source_read_before = turns.source_evidence.read_wall_ms;
         let all = Instant::now();
         let start = Instant::now();
         let prepared = executor.command(
@@ -537,7 +435,6 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
         let start = Instant::now();
         let (result, bindings) = postprocess(&executor.codec(), &spool, &reply)?;
         let post_ms = start.elapsed().as_secs_f64() * 1000.;
-        turns.sample_source_fds()?;
         results.push(RunEvidence {
             id,
             pid: executor.birth.pid,
@@ -549,19 +446,16 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
             bindings,
             metrics: reply.metrics,
             plane: reply.plane,
-            source_exports: turns.source_evidence.exports - source_exports_before,
-            source_read_ms: turns.source_evidence.read_wall_ms - source_read_before,
         });
         fs::write(
             config.root.join("results.json"),
             serde_json::to_vec_pretty(
-                &serde_json::json!({"qualification":"stock executor pilot; machine host/GPU ownership/full machine API unqualified","stage_turns":stages,"weight_plane":plane,"descriptor_sources":descriptors,"timings":timings,"sources":turns.source_evidence,"runs":results}),
+                &serde_json::json!({"qualification":"stock executor pilot; machine host/GPU ownership/full machine API unqualified","stage_turns":stages,"weight_plane":plane,"timings":timings,"runs":results}),
             )?,
         )?;
     }
     let shutdown_started = Instant::now();
     executor.shutdown()?;
-    turns.sample_source_fds()?;
     timings.insert(
         "shutdown_ms",
         shutdown_started.elapsed().as_secs_f64() * 1000.,
@@ -573,7 +467,7 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
     fs::write(
         config.root.join("results.json"),
         serde_json::to_vec_pretty(
-            &serde_json::json!({"qualification":"stock executor pilot; machine host/GPU ownership/full machine API unqualified","stage_turns":stages,"weight_plane":plane,"descriptor_sources":descriptors,"sealed_tiers":sealed,"timings":timings,"sources":turns.source_evidence,"runs":results,"host_tier":tier.map(|t| t.facts())}),
+            &serde_json::json!({"qualification":"stock executor pilot; machine host/GPU ownership/full machine API unqualified","stage_turns":stages,"weight_plane":plane,"sealed_tiers":sealed,"timings":timings,"runs":results,"host_tier":tier.map(|t| t.facts())}),
         )?,
     )?;
     Ok(())

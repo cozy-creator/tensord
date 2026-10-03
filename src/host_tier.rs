@@ -2,8 +2,7 @@
 //! (nobody else can write, resize or punch it), filled once through TensorFS's verified read
 //! path by one background filler, in the order asked, and kept across executors and model
 //! switches. Executors adopt it read-only (`host_tiers.sealed/1`, `Plane.register_sealed`) the
-//! moment it exists and use each region once its Ready word is set (`host_tiers.filling/1`;
-//! older executors get it complete). The machine holds one descriptor per layout. The tier's
+//! moment it exists and use each region once its Ready word is set (`host_tiers.filling/1`). The machine holds one descriptor per layout. The tier's
 //! size follows live host headroom (`host_memory`), read at every admission; unheld, complete
 //! layouts are released least recently used first, or after `ttl` unused. How much of the
 //! headroom the tier may take is `TierLimit`'s decision (the memory policy module's). No lock
@@ -146,9 +145,6 @@ pub struct Ledger {
     /// that used such an allocation.
     pub reserved: u64,
     pub reserved_used: u64,
-    /// Asks refused because the tier could not make room: that weight set read the store
-    /// (only an executor that cannot adopt a streamed layout).
-    pub no_room: u64,
     /// Layouts streamed through a window because they did not fit, and the bytes ended windows
     /// read from disk.
     pub windows_opened: u64,
@@ -224,8 +220,6 @@ struct Job {
 }
 struct Peer {
     pidfd: File,
-    /// It adopts a layout still filling (`host_tiers.filling/1`).
-    filling: bool,
 }
 /// A component's memory allocated before its plan exists (`prepare`).
 enum Reservation {
@@ -383,7 +377,7 @@ impl HostTier {
             for body in bodies {
                 let filled = serde_json::from_slice::<SealedPlan>(&body)
                     .map_err(failure)
-                    .and_then(|plan| tier.ensure(&plan, &grants, &body, true, false).map(|_| ()));
+                    .and_then(|plan| tier.ensure(&plan, &grants, &body, true).map(|_| ()));
                 if let Err(error) = filled {
                     eprintln!("host tier prefill skipped: {error}");
                 }
@@ -460,19 +454,16 @@ impl HostTier {
     }
 
     /// An executor, by its pidfd: what it adopted stays held until that exact process exits.
-    /// `filling`: it adopts a layout still filling (`host_tiers.filling/1`).
-    pub fn register_peer(&self, pidfd: File, filling: bool) -> u64 {
+    pub fn register_peer(&self, pidfd: File) -> u64 {
         let mut state = self.state.lock().unwrap();
         state.next_peer += 1;
         let id = state.next_peer;
-        state.peers.insert(id, Peer { pidfd, filling });
+        state.peers.insert(id, Peer { pidfd });
         id
     }
 
-    /// One weight set's sealed layout for `peer`, read-only, from the tier or opened now: at
-    /// once for an executor that waits per region, complete for an older one. None when the
-    /// tier cannot make room (or the fill an older executor waited for failed): the executor
-    /// reads the store itself.
+    /// One weight set's layout for `peer`, read-only: from the tier, or opened now (whole and
+    /// filling, or streamed when it does not fit). The executor waits per region either way.
     pub fn seal(
         &self,
         peer: u64,
@@ -484,43 +475,23 @@ impl HostTier {
             return Err(denied("host tier peer is not a registered live executor"));
         }
         let (plan, body) = Self::plan(request, plan)?;
-        let filling = self
-            .state
-            .lock()
-            .unwrap()
-            .peers
-            .get(&peer)
-            .is_some_and(|p| p.filling);
-        let Some(key) = self.ensure(&plan, grants, &body, false, filling)? else {
-            return Ok(None);
-        };
+        let key = self.ensure(&plan, grants, &body, false)?;
         let mut state = self.state.lock().unwrap();
-        loop {
-            let filling = state.peers.get(&peer).is_some_and(|p| p.filling);
-            match state.slots.get(&key) {
-                // A streamed layout never completes: an executor that cannot wait per region
-                // reads the store.
-                Some(Slot::Open(e)) if e.window.is_some() && !filling => return Ok(None),
-                Some(Slot::Open(e)) if e.complete || filling => {
-                    return self.grant(&mut state, &key, peer).map(Some)
-                }
-                Some(_) => state = self.filled.wait(state).unwrap(),
-                None => return Ok(None),
-            }
+        match state.slots.get(&key) {
+            Some(Slot::Open(_)) => self.grant(&mut state, &key, peer).map(Some),
+            _ => Err(failure("the layout's fill failed before it was granted")),
         }
     }
 
     /// The layout `plan` names, held or opened now: whole (its fill queued) when the tier can
-    /// make room, else streamed through a window (`stream`: for an executor that waits per
-    /// region; otherwise None). Its key.
+    /// make room, else streamed through a window. Its key.
     fn ensure(
         &self,
         plan: &SealedPlan,
         grants: &[HostGrant],
         body: &[u8],
         prefill: bool,
-        stream: bool,
-    ) -> io::Result<Option<String>> {
+    ) -> io::Result<String> {
         let grant = grants
             .iter()
             .find(|g| hex(&g.manifest) == hex(&plan.manifest))
@@ -559,7 +530,7 @@ impl HostTier {
                     if !prefill {
                         state.ledger.hits += 1;
                     }
-                    return Ok(Some(key));
+                    return Ok(key);
                 }
                 Some(Slot::Opening(_)) => state = self.filled.wait(state).unwrap(),
                 None if reservation.as_ref().is_some_and(|r| {
@@ -584,10 +555,6 @@ impl HostTier {
                 break;
             }
             if !self.release_lru(&mut state) {
-                if !stream {
-                    state.ledger.no_room += 1;
-                    return Ok(None);
-                }
                 let staging = self.limit.staging(&host, charged);
                 drop(state);
                 if let Some(fd) = reserved {
@@ -628,7 +595,7 @@ impl HostTier {
                 // A send fails only once the filler is gone with the tier: the job's drop
                 // poisons the layout, so no adopter waits for it.
                 let _ = self.fills.lock().unwrap().send(job);
-                Ok(Some(key))
+                Ok(key)
             }
             Err(error) => {
                 state.slots.remove(&key);
@@ -649,7 +616,7 @@ impl HostTier {
         read_plan: read::ReadPlan,
         layout: Layout,
         staging: u64,
-    ) -> io::Result<Option<String>> {
+    ) -> io::Result<String> {
         let span = layout
             .regions
             .iter()
@@ -670,7 +637,7 @@ impl HostTier {
             state.slots.get(&key),
             Some(Slot::Open(_)) | Some(Slot::Opening(_))
         ) {
-            return Ok(Some(key)); // another ask opened it meanwhile; ours goes unused
+            return Ok(key); // another ask opened it meanwhile; ours goes unused
         }
         state.slots.insert(
             key.clone(),
@@ -701,7 +668,7 @@ impl HostTier {
                 eprintln!("host tier window stopped: {error}");
             }
         });
-        Ok(Some(key))
+        Ok(key)
     }
 
     /// The filler: one layout's bytes, then it is complete (charged what it holds) or, failed,
@@ -834,17 +801,10 @@ impl HostTier {
                 body,
             ));
         }
-        let filling = self
-            .state
-            .lock()
-            .unwrap()
-            .peers
-            .get(&peer)
-            .is_some_and(|p| p.filling);
         let (tier, grants) = (self.clone(), grants.to_vec());
         std::thread::spawn(move || {
             for (plan, body) in queued {
-                if let Err(error) = tier.ensure(&plan, &grants, &body, true, filling) {
+                if let Err(error) = tier.ensure(&plan, &grants, &body, true) {
                     eprintln!("host tier prefetch skipped: {error}");
                 }
             }

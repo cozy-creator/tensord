@@ -127,7 +127,6 @@ fn a_forked_executor_is_sealed_serves_and_is_reaped_with_its_status() {
                 authorized_device_limit_bytes: None,
                 attention_pin: String::new(),
                 stages: false,
-                descriptor_sources: false,
                 device_weights: false,
                 cap_bytes: None,
                 sealed_tiers: false,
