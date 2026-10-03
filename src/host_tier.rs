@@ -11,12 +11,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::File,
+    fs::{self, File},
     io,
     os::{
         fd::{AsRawFd, OwnedFd},
         unix::fs::{FileExt, MetadataExt},
     },
+    path::PathBuf,
     sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
@@ -32,12 +33,15 @@ use tensorfs_plane::{
     layout::Layout,
 };
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct HostTierConfig {
     /// Threads of one fill (read + copy). Default: the CPUs this process may use, at most 16.
     pub fill_threads: usize,
     /// An unheld layout unused this long is released.
     pub ttl: Duration,
+    /// Where the plans of filled layouts are remembered (across machine restarts), so a
+    /// model's layouts refill while its executor starts (`prefill`). None: not remembered.
+    pub plans: Option<PathBuf>,
 }
 impl Default for HostTierConfig {
     fn default() -> Self {
@@ -45,6 +49,7 @@ impl Default for HostTierConfig {
         Self {
             fill_threads: cpus.clamp(1, 16),
             ttl: Duration::from_secs(30 * 60),
+            plans: None,
         }
     }
 }
@@ -66,6 +71,7 @@ impl TierLimit for HalfOfHeadroom {
 }
 
 /// What one executor may adopt: these components of this manifest (its selected model).
+#[derive(Clone)]
 pub struct HostGrant {
     pub manifest: String,
     pub header: Header,
@@ -83,6 +89,15 @@ struct SealedPlan {
     regions: Vec<Vec<String>>,
     #[serde(default)]
     parts: Vec<String>,
+}
+
+/// (manifest, components): the latest plan per model part.
+type PlanKey = (String, Vec<String>);
+
+impl SealedPlan {
+    fn identity(&self) -> PlanKey {
+        (hex(&self.manifest).to_string(), self.components.clone())
+    }
 }
 
 /// The `SealedTier` request's envelope; the plan itself arrives as a sealed memfd.
@@ -109,6 +124,8 @@ pub struct Ledger {
     /// The latest fills, newest last (at most 32).
     pub fills: Vec<Fill>,
     pub hits: u64,
+    /// Layouts filled from a remembered plan while their executor started.
+    pub prefills: u64,
     /// Asks refused because the tier could not make room: that weight set read the store.
     pub no_room: u64,
     pub released: u64,
@@ -174,6 +191,8 @@ pub struct HostTier {
     limit: Box<dyn TierLimit>,
     state: Mutex<State>,
     filled: Condvar,
+    /// The latest verified plan body per (manifest, components).
+    plans: Mutex<BTreeMap<PlanKey, Vec<u8>>>,
 }
 
 fn failure(error: impl std::fmt::Display) -> io::Error {
@@ -202,6 +221,16 @@ impl HostTier {
         limit: Box<dyn TierLimit>,
     ) -> io::Result<Arc<Self>> {
         let meta = Arc::new(Meta::open(&store).map_err(failure)?);
+        let mut plans = BTreeMap::new();
+        if let Some(dir) = &config.plans {
+            fs::create_dir_all(dir)?;
+            for entry in fs::read_dir(dir)? {
+                let body = fs::read(entry?.path())?;
+                if let Ok(plan) = serde_json::from_slice::<SealedPlan>(&body) {
+                    plans.insert(plan.identity(), body); // an unreadable one is ignored
+                }
+            }
+        }
         Ok(Arc::new(Self {
             store,
             meta,
@@ -209,7 +238,40 @@ impl HostTier {
             limit,
             state: Mutex::default(),
             filled: Condvar::new(),
+            plans: Mutex::new(plans),
         }))
+    }
+
+    /// Refill, in the background, every layout of these grants a remembered plan describes:
+    /// the executor's asks then find them filled, or wait for the fill already under way.
+    pub fn prefill(self: &Arc<Self>, grants: Vec<HostGrant>) {
+        let bodies: Vec<Vec<u8>> = self
+            .plans
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((manifest, components), _)| {
+                grants.iter().any(|g| {
+                    hex(&g.manifest) == manifest
+                        && components.iter().all(|c| g.components.contains(c))
+                })
+            })
+            .map(|(_, body)| body.clone())
+            .collect();
+        if bodies.is_empty() {
+            return;
+        }
+        let tier = self.clone();
+        std::thread::spawn(move || {
+            for body in bodies {
+                let filled = serde_json::from_slice::<SealedPlan>(&body)
+                    .map_err(failure)
+                    .and_then(|plan| tier.ensure(&plan, &grants, &body, true).map(|_| ()));
+                if let Err(error) = filled {
+                    eprintln!("host tier prefill skipped: {error}");
+                }
+            }
+        });
     }
 
     /// An executor, by its pidfd: what it adopted stays held until that exact process exits.
@@ -233,7 +295,24 @@ impl HostTier {
         if !self.state.lock().unwrap().peers.contains_key(&peer) {
             return Err(denied("host tier peer is not a registered live executor"));
         }
-        let plan = Self::plan(request, plan)?;
+        let (plan, body) = Self::plan(request, plan)?;
+        match self.ensure(&plan, grants, &body, false)? {
+            Some(key) => self
+                .grant(&mut self.state.lock().unwrap(), &key, peer)
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// The layout `plan` names, filled now unless the tier holds it or a fill of it is under
+    /// way (then waited for). Its key, or None when the tier cannot make room.
+    fn ensure(
+        &self,
+        plan: &SealedPlan,
+        grants: &[HostGrant],
+        body: &[u8],
+        prefill: bool,
+    ) -> io::Result<Option<String>> {
         let grant = grants
             .iter()
             .find(|g| hex(&g.manifest) == hex(&plan.manifest))
@@ -264,8 +343,10 @@ impl HostTier {
             self.reap(&mut state);
             match state.slots.get(&key) {
                 Some(Slot::Ready(_)) => {
-                    state.ledger.hits += 1;
-                    return self.grant(&mut state, &key, peer).map(Some);
+                    if !prefill {
+                        state.ledger.hits += 1;
+                    }
+                    return Ok(Some(key));
                 }
                 Some(Slot::Filling(_)) => state = self.filled.wait(state).unwrap(),
                 None => break,
@@ -286,7 +367,12 @@ impl HostTier {
         }
         state.slots.insert(key.clone(), Slot::Filling(need));
         drop(state);
-        let filled = self.fill(&plan, &read_plan, &layout);
+        let filled = self.fill(plan, &read_plan, &layout);
+        if filled.is_ok() {
+            if let Err(error) = self.remember(plan, body) {
+                eprintln!("host tier plan not remembered: {error}");
+            }
+        }
         let mut state = self.state.lock().unwrap();
         let result = match filled {
             Ok((fd, fill)) => {
@@ -305,7 +391,8 @@ impl HostTier {
                     state.ledger.fills.remove(0);
                 }
                 state.ledger.fills.push(fill);
-                self.grant(&mut state, &key, peer).map(Some)
+                state.ledger.prefills += u64::from(prefill);
+                Ok(Some(key))
             }
             Err(error) => {
                 state.slots.remove(&key);
@@ -351,8 +438,20 @@ impl HostTier {
         }
     }
 
+    fn remember(&self, plan: &SealedPlan, body: &[u8]) -> io::Result<()> {
+        let identity = plan.identity();
+        if let Some(dir) = &self.config.plans {
+            let name = format!("{:x}.json", Sha256::digest(serde_json::to_vec(&identity)?));
+            let temporary = dir.join(format!(".{name}.tmp"));
+            fs::write(&temporary, body)?;
+            fs::rename(temporary, dir.join(name))?;
+        }
+        self.plans.lock().unwrap().insert(identity, body.to_vec());
+        Ok(())
+    }
+
     /// The plan the executor sent: a sealed memfd of exactly the declared bytes and digest.
-    fn plan(request: SealedRequest<'_>, plan: File) -> io::Result<SealedPlan> {
+    fn plan(request: SealedRequest<'_>, plan: File) -> io::Result<(SealedPlan, Vec<u8>)> {
         if os::seals(&plan)? & os::FULL_SEALS != os::FULL_SEALS
             || plan.metadata()?.len() != request.length
             || request.length > 64 << 20
@@ -370,7 +469,7 @@ impl HostTier {
                 "sealed plan digest differs",
             ));
         }
-        serde_json::from_slice(&body).map_err(failure)
+        Ok((serde_json::from_slice(&body).map_err(failure)?, body))
     }
 
     fn fill(

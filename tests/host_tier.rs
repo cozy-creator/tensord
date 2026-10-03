@@ -250,6 +250,7 @@ fn tier(fx: &Fixture, limit: u64) -> Arc<HostTier> {
         HostTierConfig {
             fill_threads: 3,
             ttl: Duration::from_secs(3600),
+            plans: None,
         },
         Box::new(Fixed(limit)),
     )
@@ -327,6 +328,7 @@ fn unheld_layouts_go_oldest_first_and_held_ones_never() {
         HostTierConfig {
             fill_threads: 2,
             ttl: Duration::from_secs(3600),
+            plans: None,
         },
         Box::new(Fixed(size + size / 2)),
     )
@@ -542,4 +544,39 @@ fn inside_a_256_mib_scope() {
     let facts = tier.facts();
     assert_eq!((facts.ledger.no_room, facts.entries), (1, 1), "{facts:?}");
     assert!(facts.charged_bytes <= facts.limit, "{facts:?}");
+}
+
+/// A machine restart (a new tier, empty) refills a model's layouts from the plans it
+/// remembered while that model's executor starts; the executor's ask then finds them filled.
+#[test]
+fn remembered_plans_refill_layouts_before_the_executor_asks() {
+    let fx = Fixture::new("prefill", &[3 * MIB, 40 * MIB]);
+    let plans = fx.root.join("plans");
+    let config = HostTierConfig {
+        fill_threads: 2,
+        ttl: Duration::from_secs(3600),
+        plans: Some(plans.clone()),
+    };
+    let first = HostTier::new(fx.store.clone(), config.clone(), Box::new(Fixed(1 << 30))).unwrap();
+    let (executor, a) = Executor::spawn(&first);
+    assert!(ask(&first, a, &fx).is_some());
+    executor.exit();
+    drop(first);
+    assert_eq!(fs::read_dir(&plans).unwrap().count(), 1);
+
+    let second = HostTier::new(fx.store.clone(), config, Box::new(Fixed(1 << 30))).unwrap();
+    second.prefill(vec![fx.grant()]);
+    // The executor would be importing now; its ask waits for the fill under way, or hits.
+    let (_executor, b) = Executor::spawn(&second);
+    fx.adopt(&ask(&second, b, &fx).expect("prefilled"));
+    let facts = second.facts();
+    assert_eq!(
+        (
+            facts.ledger.fills.len(),
+            facts.ledger.prefills,
+            facts.entries
+        ),
+        (1, 1, 1),
+        "{facts:?}"
+    );
 }

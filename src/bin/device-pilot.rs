@@ -205,7 +205,8 @@ fn run() -> io::Result<()> {
         let config: Pilot = serde_json::from_slice(&fs::read(&path)?)?;
         if config.host_tier && tier.is_none() {
             let store = Arc::new(tensorfs_core::store::Store::open(std::path::Path::new(&config.binding.store)).map_err(io::Error::other)?);
-            tier = Some(HostTier::new(store, HostTierConfig::default(), Box::new(HalfOfHeadroom))?);
+            let plans = Some(config.root.parent().unwrap_or(&config.root).join("host-plans"));
+            tier = Some(HostTier::new(store, HostTierConfig { plans, ..HostTierConfig::default() }, Box::new(HalfOfHeadroom))?);
         }
         pilot(&action, config, tier.as_ref())?;
     }
@@ -328,6 +329,7 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
                 })
             })
             .collect::<io::Result<Vec<_>>>()?;
+        tier.prefill(grants.clone());
         turns.host = Some((tier.clone(), tier.register_peer(executor.observer_pidfd()?), grants));
     }
     let disk_before = disk_read_bytes();

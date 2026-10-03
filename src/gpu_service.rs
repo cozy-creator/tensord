@@ -211,6 +211,7 @@ impl GpuPool {
                     .host
                     .ttl_seconds
                     .map_or(defaults.ttl, std::time::Duration::from_secs),
+                plans: Some(root.join("host-plans")),
             },
             Box::new(HalfOfHeadroom),
         )?;
@@ -810,6 +811,10 @@ impl GpuPool {
                     .authorized_header(&plan.binding.snapshot)?,
                 components: plan.binding.components.iter().cloned().collect(),
             }];
+            // Layouts this model had before refill while the executor imports and starts.
+            if sealed {
+                self.host.prefill(grants.clone());
+            }
             sessions.insert(
                 plan.id.clone(),
                 Session {
