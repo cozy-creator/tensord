@@ -26,6 +26,8 @@ from cozy_runtime.author import (
 app = App()
 
 Reference = Annotated[ImageAsset, AssetBound(max_bytes=1 << 20)]
+#: One declared media type, as H3's video outputs: a client saves it under a known extension.
+Video = Annotated[FileAsset, AssetBound(max_bytes=64 << 20, media_types=("video/mp4",))]
 
 
 class SegmentInput(msgspec.Struct):
@@ -40,7 +42,7 @@ class SegmentInput(msgspec.Struct):
 
 
 class SegmentOutput(msgspec.Struct):
-    video: FileAsset
+    video: Video
     context: str
 
 
@@ -69,7 +71,7 @@ class LongFormInput(msgspec.Struct):
 
 
 class LongFormOutput(msgspec.Struct):
-    video: FileAsset
+    video: Video
     segments: int
 
 
