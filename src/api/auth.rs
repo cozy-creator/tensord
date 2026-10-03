@@ -21,7 +21,10 @@ pub struct Authority {
 /// then each lease holds until it expires; a transport failure neither revokes nor extends
 /// it, a denial revokes it at once. Losing authority never cancels accepted work.
 #[derive(Clone)]
-pub struct Keys(Arc<RwLock<KeyState>>);
+pub struct Keys {
+    state: Arc<RwLock<KeyState>>,
+    changes: Arc<tokio::sync::watch::Sender<u64>>,
+}
 struct KeyState {
     keys: Vec<VerifyingKey>,
     until: Option<Instant>,
@@ -29,25 +32,33 @@ struct KeyState {
 }
 impl Keys {
     pub fn fixed(keys: Vec<VerifyingKey>) -> Self {
-        Self(Arc::new(RwLock::new(KeyState {
+        let state = KeyState {
             keys,
             until: None,
             leased: false,
-        })))
+        };
+        Self {
+            state: Arc::new(RwLock::new(state)),
+            changes: Arc::new(tokio::sync::watch::channel(0).0),
+        }
+    }
+    fn replace(&self, state: KeyState) {
+        *self.state.write().unwrap() = state;
+        self.changes.send_modify(|generation| *generation += 1);
     }
     pub fn renew(&self, keys: Vec<VerifyingKey>, lease: Duration) {
-        *self.0.write().unwrap() = KeyState {
+        self.replace(KeyState {
             keys,
             until: Some(Instant::now() + lease),
             leased: true,
-        };
+        });
     }
     pub fn revoke(&self) {
-        *self.0.write().unwrap() = KeyState {
+        self.replace(KeyState {
             keys: vec![],
             until: None,
             leased: true,
-        };
+        });
     }
     /// The keys that may authorize a new control now: none without a current lease.
     pub fn admitted(&self) -> Vec<VerifyingKey> {
@@ -57,9 +68,30 @@ impl Keys {
         }
     }
     fn current(&self) -> (Vec<VerifyingKey>, bool) {
-        let state = self.0.read().unwrap();
+        let state = self.state.read().unwrap();
         let live = !state.leased || state.until.is_some_and(|until| Instant::now() < until);
         (state.keys.clone(), live)
+    }
+    /// Resolves once `key` no longer authorizes: it left the set, or the lease that admits
+    /// it expired. Ends only that key's open transports; accepted work is never cancelled.
+    pub async fn revoked(&self, key: [u8; 32]) {
+        let mut changes = self.changes.subscribe();
+        loop {
+            if !self.admitted().iter().any(|k| k.to_bytes() == key) {
+                return;
+            }
+            let until = self.state.read().unwrap().until;
+            let expiry = async {
+                match until {
+                    Some(until) => tokio::time::sleep_until(until.into()).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                _ = changes.changed() => (),
+                _ = expiry => (),
+            }
+        }
     }
 }
 impl From<Vec<VerifyingKey>> for Keys {

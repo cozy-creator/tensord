@@ -106,7 +106,7 @@ fn run() -> io::Result<()> {
     }
 }
 /// Runs the machine from its grant: identity and readiness under the machine root, the engine
-/// under `var/lib/cozy/machine/engine`, the API on the granted port.
+/// under `var/lib/cozy/rust-machine`, the API on the granted port.
 fn run_machine(
     mut grant: cozy_machine::machine::grant::Grant,
     mut ready: cozy_machine::machine::supervise::Ready,

@@ -2,10 +2,11 @@
 # Development worker image with the Rust machine: one layer appended to the current qualified
 # tensorhub/worker image of KIND (cpu | cuda). `push` pushes it untagged by digest, never onto a
 # tag (record the digest in D2/IMAGES.md); without it the staged layer is left for a local boot.
+# A third argument names a directory of Runtime/TensorFS wheels the Rust machine's executors use.
 # Rent it with `cozy rental new <sku> --image=sha256:<digest>`. The cuda image also keeps the
 # Go agent behind a dev dispatcher (/var/lib/cozy/machine-arm = rust | go) for same-pod A/B.
 set -eu
-kind=$1; push=${2:-}; case $kind in cpu) tag=cpu-linux-x86 ;; cuda) tag=torch2.14.0-cu130-linux-x86 ;; *) echo "usage: $0 cpu|cuda" >&2; exit 2 ;; esac
+kind=$1; push=${2:-}; own_wheels=${3:-}; case $kind in cpu) tag=cpu-linux-x86 ;; cuda) tag=torch2.14.0-cu130-linux-x86 ;; *) echo "usage: $0 cpu|cuda" >&2; exit 2 ;; esac
 repo=$(cd "$(dirname "$0")/.." && pwd); commit=$(git -C "$repo" rev-parse HEAD); base=$(crane digest "tensorhub/worker:$tag")
 target=$HOME/cozy/.cargo-target/cozy-machine-bookworm; stage=$(mktemp -d); mkdir -p "$target" "$stage/opt/cozy/machine" "$stage/usr/local/bin" "$stage/etc/cozy"
 
@@ -20,6 +21,8 @@ uv build -q --wheel --out-dir "$stage/opt/cozy/machine" "$repo"
 docker run --rm --runtime=runc --entrypoint sh -v "$stage/opt/cozy/machine:/opt/cozy/machine" "tensorhub/worker@$(crane digest tensorhub/worker:cpu-linux-x86)" -c \
   'w=$(ls /opt/cozy/machine/*.whl) && uv venv -q --python /opt/cozy/python/bin/python3 /opt/cozy/machine/helper && uv pip install -q --python /opt/cozy/machine/helper/bin/python "$w[installer]" && chown -R '"$(id -u):$(id -g)"' /opt/cozy/machine'
 
+# Optional: this machine's own executor SDK (Runtime/TensorFS wheels), apart from the Go agent's pair.
+if [ -n "$own_wheels" ]; then mkdir -p "$stage/opt/cozy/machine/wheels" && cp "$own_wheels"/*.whl "$stage/opt/cozy/machine/wheels/"; fi
 if [ "$kind" = cuda ]; then
   install -m 0755 "$repo/scripts/machine-arm-dispatcher.sh" "$stage/usr/local/bin/cozy-machine"
   echo '{"startup_update":"off","agent":"explicit"}' > "$stage/etc/cozy/software-policy.json"

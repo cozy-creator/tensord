@@ -349,6 +349,38 @@ impl<B: MachineBackend> Api<B> {
             _ => "ready",
         }
     }
+    /// Ends a response stream once the key that opened it stops authorizing (it left the Hub
+    /// lease, or the lease expired). Only this transport ends; the work it observes or feeds is
+    /// untouched.
+    fn revocable<T: Send + 'static>(
+        &self,
+        stream: ResponseStream<T>,
+        actor: super::auth::VerifiedActor,
+    ) -> ResponseStream<T> {
+        use tokio_stream::StreamExt;
+        let keys = self.identity.authority.keys.clone();
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        tokio::spawn(async move {
+            let mut stream = stream;
+            let revoked = keys.revoked(actor.public_key);
+            tokio::pin!(revoked);
+            loop {
+                tokio::select! {
+                    _ = &mut revoked => {
+                        let _ = sender.send(Err(Status::unauthenticated("the key that opened this stream no longer authorizes it"))).await;
+                        return;
+                    }
+                    item = stream.next() => {
+                        let Some(item) = item else { return };
+                        if sender.send(item).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        Box::pin(tokio_stream::wrappers::ReceiverStream::new(receiver))
+    }
     /// Holds a rental's idle release while a call that may start work runs.
     fn admit(&self) -> Result<Option<crate::machine::lifecycle::Admission>, Status> {
         self.identity
@@ -907,8 +939,9 @@ impl<B: MachineBackend> pb::pod_host_server::PodHost for Api<B> {
                 }
             }
         });
-        Ok(Response::new(Box::pin(
-            tokio_stream::wrappers::ReceiverStream::new(receiver),
+        Ok(Response::new(self.revocable(
+            Box::pin(tokio_stream::wrappers::ReceiverStream::new(receiver)),
+            actor,
         )))
     }
 
@@ -1184,8 +1217,9 @@ impl<B: MachineBackend> pb::pod_host_server::PodHost for Api<B> {
                 }
             }
         });
-        Ok(Response::new(Box::pin(
-            tokio_stream::wrappers::ReceiverStream::new(receiver),
+        Ok(Response::new(self.revocable(
+            Box::pin(tokio_stream::wrappers::ReceiverStream::new(receiver)),
+            actor,
         )))
     }
 }
@@ -1217,24 +1251,25 @@ impl<B: MachineBackend> pb::worker_control_server::WorkerControl for Api<B> {
             Some(pb::record_owner_frame::Msg::Claim(claim)) => claim,
             _ => return Err(Status::unauthenticated("Control requires a Claim first")),
         };
-        if let Err(status) = self.auth(Some(&claim)) {
-            if status.code() != tonic::Code::Unauthenticated {
-                return Err(status);
+        let actor = match self.auth(Some(&claim)) {
+            Ok(actor) => actor,
+            Err(status) if status.code() != tonic::Code::Unauthenticated => return Err(status),
+            Err(_) => {
+                // The deployed answer to a foreign credential, observed by readiness.
+                let refused = pb::WorkerFrame {
+                    msg: Some(pb::worker_frame::Msg::ClaimAck(pb::ClaimAck {
+                        accepted: false,
+                        rejection: pb::ClaimRejection::Unauthenticated as i32,
+                        record_owner_epoch: claim.record_owner_epoch,
+                        worker_id: self.identity.authority.worker_id.clone(),
+                        worker_boot_id: self.identity.authority.boot_id.clone(),
+                        wire_minor: WIRE_MINOR,
+                        ..Default::default()
+                    })),
+                };
+                return Ok(Response::new(Box::pin(tokio_stream::iter([Ok(refused)]))));
             }
-            // The deployed answer to a foreign credential, observed by readiness.
-            let refused = pb::WorkerFrame {
-                msg: Some(pb::worker_frame::Msg::ClaimAck(pb::ClaimAck {
-                    accepted: false,
-                    rejection: pb::ClaimRejection::Unauthenticated as i32,
-                    record_owner_epoch: claim.record_owner_epoch,
-                    worker_id: self.identity.authority.worker_id.clone(),
-                    worker_boot_id: self.identity.authority.boot_id.clone(),
-                    wire_minor: WIRE_MINOR,
-                    ..Default::default()
-                })),
-            };
-            return Ok(Response::new(Box::pin(tokio_stream::iter([Ok(refused)]))));
-        }
+        };
         let epoch = self.control_epoch.fetch_add(1, Ordering::Relaxed) + 1;
         let ack = pb::WorkerFrame {
             msg: Some(pb::worker_frame::Msg::ClaimAck(pb::ClaimAck {
@@ -1269,8 +1304,9 @@ impl<B: MachineBackend> pb::worker_control_server::WorkerControl for Api<B> {
                 }
             }
         });
-        Ok(Response::new(Box::pin(
-            tokio_stream::wrappers::ReceiverStream::new(receiver),
+        Ok(Response::new(self.revocable(
+            Box::pin(tokio_stream::wrappers::ReceiverStream::new(receiver)),
+            actor,
         )))
     }
     async fn describe_machine(

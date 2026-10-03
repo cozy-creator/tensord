@@ -81,9 +81,16 @@ pub struct Paths {
 }
 impl Paths {
     pub fn new(engine: &Path, root: &Path) -> Self {
+        // A development image may vendor this machine's own executor SDK beside the Go agent's.
+        let own = root.join("opt/cozy/machine/wheels");
+        let image_wheels = if own.is_dir() {
+            own
+        } else {
+            root.join("opt/cozy/wheels")
+        };
         Self {
             engine: engine.into(),
-            image_wheels: root.join("opt/cozy/wheels"),
+            image_wheels,
         }
     }
     fn update(&self, name: &str) -> PathBuf {

@@ -91,9 +91,10 @@ impl Layout {
             store: store.unwrap_or_else(|| root.join("var/lib/tensorfs")),
         }
     }
-    /// This service's execution journal, package generations and owned store state.
+    /// This service's execution journal, package generations and owned store state: outside
+    /// `var/lib/cozy/machine`, whose ownership the Go agent claims when it boots the same root.
     pub fn engine(&self) -> PathBuf {
-        self.state.join("engine")
+        self.root.join("var/lib/cozy/rust-machine")
     }
 }
 
