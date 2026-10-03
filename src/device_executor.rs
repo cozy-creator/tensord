@@ -154,6 +154,25 @@ pub struct Budgets {
     pub declared_weight_bytes: u64,
 }
 
+/// An executor capability: a group's followers obey their own GPU's cap and budget cell.
+pub const RANK_CELLS: &str = "rank_cells/1";
+
+/// A group's per-rank fields (`rank_cells/1`), sent beside `Start`, `Load` and `Invoke`.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct Group {
+    /// `Start`: rank 0 hands its owner one budget cell per follower (`BudgetCell.rank`).
+    #[serde(skip_serializing_if = "is_false")]
+    pub rank_cells: bool,
+    /// `Load`/`Invoke`: each rank's own process cap, rank 0 first.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rank_caps: Vec<u64>,
+}
+impl Group {
+    pub fn is_empty(&self) -> bool {
+        !self.rank_cells && self.rank_caps.is_empty()
+    }
+}
+
 /// One model of a many-model construction (an entrypoint with several model slots).
 #[derive(Clone, Debug, Serialize)]
 pub struct ModelLoad {
@@ -492,6 +511,8 @@ pub struct Frame {
     pub reused: bool,
     /// `start` of a group (degree > 1): the follower ranks' pids, rank 1 first.
     pub follower_pids: Vec<u32>,
+    /// `budget_cell`: the GPU of the group whose process reads it (0: rank 0's own).
+    pub rank: u32,
     pub result_ref: Option<ResultRef>,
     pub outputs: Vec<Output>,
     pub frames: Vec<HostFrame>,
@@ -1422,7 +1443,24 @@ impl DeviceExecutor {
         command: &DeviceCommand,
         services: &mut impl Services,
     ) -> io::Result<Frame> {
+        self.command_with(command, &Group::default(), services)
+    }
+
+    /// `command` with a group's per-rank fields (`rank_cells/1`): only an executor that offers
+    /// the capability is sent them.
+    pub fn command_with(
+        &mut self,
+        command: &DeviceCommand,
+        group: &Group,
+        services: &mut impl Services,
+    ) -> io::Result<Frame> {
         self.offered(command)?;
+        if !group.is_empty() && !self.hello.offers(RANK_CELLS) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "per-rank caps and cells without the executor capability",
+            ));
+        }
         let meter = match command {
             DeviceCommand::Invoke { .. } => Meter::Frames,
             _ => Meter::Burn,
@@ -1435,7 +1473,7 @@ impl DeviceExecutor {
             command.name(),
         )?;
         *self.watched.lock().unwrap() = Some(watching.watch());
-        let result = self.exchange(command, services, &watching.watch());
+        let result = self.exchange(command, group, services, &watching.watch());
         *self.watched.lock().unwrap() = None;
         let (killed, worst_gap) = watching.finish();
         if meter == Meter::Frames {
@@ -1450,10 +1488,21 @@ impl DeviceExecutor {
     fn exchange(
         &mut self,
         command: &DeviceCommand,
+        group: &Group,
         services: &mut impl Services,
         watch: &Watch,
     ) -> io::Result<Frame> {
-        write_frame(&mut self.stream, command)?;
+        if group.is_empty() {
+            write_frame(&mut self.stream, command)?;
+        } else {
+            let mut value = serde_json::to_value(command)?;
+            if let (Some(object), Value::Object(extra)) =
+                (value.as_object_mut(), serde_json::to_value(group)?)
+            {
+                object.extend(extra);
+            }
+            write_frame(&mut self.stream, &value)?;
+        }
         loop {
             let frame = read_frame(&mut self.stream)?
                 .ok_or_else(|| io::Error::other("stock executor EOF before reply"))?;

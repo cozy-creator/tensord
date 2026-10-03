@@ -44,7 +44,9 @@ executor per plan; `memory::GpuMemory` decides every device byte. Acceptance, jo
   and forms its followers inside `Start` (Runtime `RankGroup`); the machine never talks to a follower.
   Every command's watch meters rank 0 plus its process-group members, so formation ends only on
   measured lack of progress. Each GPU of the group is admitted by its own memory decision (device
-  order); the cap is the smallest. Followers' pids from `Start` name their GPU's tenant for NVML.
+  order). With `rank_cells/1` each rank gets its own GPU's cap (`rank_caps`) and its own budget cell
+  (rank 0 hands the machine one per follower at formation), so every GPU's floor watchdog lowers the
+  process on that GPU. Followers' pids from `Start` name their GPU's tenant for NVML.
   Teardown waits for every group member's exit. Startup fences GPU dispatch until a previous
   machine's leaders and their followers are gone. A refusal or poisoned group call fails the run
   with the executor's own code (a group's first fault names its GPU). Descriptor sources and
@@ -102,7 +104,8 @@ thread.
 ## Known gaps
 
 - Groups always take the first K envelope GPUs; one GPU call runs at a time machine-wide. No adapters.
-- A follower GPU's floor watchdog does not write the budget cell (it caps rank 0's process only).
+- Per-rank caps and cells need an executor with `rank_cells/1` and `process_cap/1`; otherwise every
+  rank takes the smallest cap and only rank 0's GPU has a floor watchdog cell.
 - No host ledger (pinned tier, RSS/PSS, cgroup headroom) in the policy yet.
 - Executors before `process_cap/1` get only a plane budget: their context and activations are
   estimated, not capped.

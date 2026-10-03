@@ -4,7 +4,7 @@ use crate::{
     catalog::HeldGeneration,
     device_executor::{
         self, Answer, Binding, Budgets, Cancellation, DeviceCommand, DeviceExecutor,
-        ExecutorConfig, Forked, Frame, Kind, ModelLoad, Services,
+        ExecutorConfig, Forked, Frame, Group, Kind, ModelLoad, Services, RANK_CELLS,
     },
     execution::{process_ended, Engine},
     host_tier::{HostGrant, HostTier, HostTierConfig, SealedRequest},
@@ -240,7 +240,8 @@ struct Session {
     loaded: bool,
     executor: DeviceExecutor,
     sources: Arc<Mutex<ModelSources>>,
-    budget_cells: Vec<File>,
+    /// Budget cells by rank: rank 0's own, and each follower's (`rank_cells/1`).
+    budget_cells: BTreeMap<u32, File>,
     actor: String,
     /// This executor in the host tier, the layouts it may adopt, and whether it adopts them.
     peer: u64,
@@ -473,29 +474,25 @@ impl GpuPool {
             device.memory.observe(plan, facts, mapped);
         }
     }
-    /// Each GPU of the group decides for itself (device order, so two groups never wait
-    /// on each other); the group's cap is the smallest. None: no GPU could say.
+    /// Each GPU of the group decides for itself, in device order (so two groups never wait
+    /// on each other): one cap per GPU, rank 0's first. None: that GPU could not say.
     fn decide(
         &self,
         plan: &str,
         degree: u32,
         spawn: bool,
         sessions: &mut BTreeMap<String, Session>,
-    ) -> io::Result<Option<u64>> {
-        let mut cap: Option<u64> = None;
+    ) -> io::Result<Vec<Option<u64>>> {
+        let mut caps = vec![];
         for (index, device) in self.lane(degree)?.iter().enumerate() {
-            let got = device.memory.decide(
+            caps.push(device.memory.decide(
                 plan,
                 spawn,
                 || if index == 0 { self.holdings() } else { vec![] },
                 |step| self.carry_out(step, sessions),
-            )?;
-            cap = match (cap, got) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            };
+            )?);
         }
-        Ok(cap)
+        Ok(caps)
     }
     pub fn host_tier(&self) -> &Arc<HostTier> {
         &self.host
@@ -1136,12 +1133,12 @@ impl GpuPool {
             self.ended(&key);
         }
         let cold = !sessions.contains_key(&plan.id);
-        let mut load_cap = None;
+        let mut load_caps = vec![];
         if cold {
             self.host_room(&plan.id, sessions);
             // A context and the first working set are reserved on every GPU of the group
             // before the process exists.
-            load_cap = self.decide(&plan.id, plan.degree, true, sessions)?;
+            load_caps = self.decide(&plan.id, plan.degree, true, sessions)?;
             for device in self.lane(plan.degree)? {
                 device
                     .memory
@@ -1250,7 +1247,7 @@ impl GpuPool {
                     loaded: false,
                     executor,
                     sources,
-                    budget_cells: vec![],
+                    budget_cells: BTreeMap::new(),
                     actor: plan.actor.clone(),
                     peer,
                     grants,
@@ -1282,7 +1279,7 @@ impl GpuPool {
         }
         // Out of the map for the call: its requests may unmap or end the others.
         let mut session = sessions.remove(&plan.id).expect("session retained above");
-        match self.call(engine, id, &held, plan, load_cap, &mut session, sessions) {
+        match self.call(engine, id, &held, plan, &load_caps, &mut session, sessions) {
             Ok(true) => {
                 sessions.insert(session.plan.clone(), session);
                 Ok(())
@@ -1301,11 +1298,14 @@ impl GpuPool {
         id: &str,
         held: &HeldGeneration,
         plan: GpuPlan,
-        load_cap: Option<u64>,
+        load_caps: &[Option<u64>],
         session: &mut Session,
         others: &mut BTreeMap<String, Session>,
     ) -> io::Result<bool> {
         let capped = session.executor.hello.offers("process_cap/1");
+        // A group whose followers each read their own cap and cell; otherwise every rank
+        // takes the smallest cap and only rank 0's GPU has a cell.
+        let ranked = plan.degree > 1 && capped && session.executor.hello.offers(RANK_CELLS);
         if !session.loaded {
             // Degree 2 keeps every component resident until revoked, and a running call never
             // revokes what it reads: only when the whole construction and its activations fit
@@ -1345,7 +1345,7 @@ impl GpuPool {
             let starting = Instant::now();
             // Rank 0 spawns and forms every follower inside this command; its watch meters
             // the whole group's work, so formation ends only on measured lack of progress.
-            let started = command_ok(session.executor.command(
+            let started = command_ok(session.executor.command_with(
                 &DeviceCommand::Start {
                     devices: lane.clone(),
                     application: held.record.application.clone(),
@@ -1353,8 +1353,18 @@ impl GpuPool {
                     sequence_parallel_degree: plan.degree,
                     import_only: false,
                 },
+                &Group {
+                    rank_cells: ranked,
+                    ..Group::default()
+                },
                 &mut callbacks,
             )?)?;
+            if ranked && (1..plan.degree).any(|rank| !callbacks.cells.contains_key(&rank)) {
+                return Err(io::Error::other(Refused {
+                    code: "group_unformed".into(),
+                    detail: "a follower's budget cell did not reach the machine".into(),
+                }));
+            }
             session.launch.start_ms = starting.elapsed().as_secs_f64() * 1e3;
             session.launch.start =
                 serde_json::from_value(started.stages.clone()).unwrap_or_default();
@@ -1428,7 +1438,8 @@ impl GpuPool {
                 .and_then(|split| split.get(&plan.id).copied())
                 .map_or(-1, |share| i64::try_from(share).unwrap_or(i64::MAX));
             let started = std::time::Instant::now();
-            let loaded = command_ok(session.executor.command(
+            let (load_cap, load_group) = rank_grant(load_caps, ranked);
+            let loaded = command_ok(session.executor.command_with(
                 &DeviceCommand::Load {
                     construction: plan.id.clone(),
                     devices: lane.clone(),
@@ -1446,6 +1457,7 @@ impl GpuPool {
                     device_weights: sharing,
                     cap_bytes: load_cap.filter(|_| capped),
                 },
+                &load_group,
                 &mut callbacks,
             )?)?;
             self.observe(
@@ -1551,7 +1563,8 @@ impl GpuPool {
         self.shed(&plan.id, callbacks.others);
         // A real grant for the whole call: one tenant needs no per-stage turns.
         // A group's cap holds on every GPU of it (each rank caps its own process).
-        let cap = self.decide(&plan.id, plan.degree, false, callbacks.others)?;
+        let caps = self.decide(&plan.id, plan.degree, false, callbacks.others)?;
+        let (cap, group) = rank_grant(&caps, ranked);
         let first = &self.lane(plan.degree)?[0].memory;
         let (plane_budget_bytes, cap_bytes) = match cap {
             Some(cap) if capped => (-1, Some(cap)),
@@ -1566,18 +1579,24 @@ impl GpuPool {
             _ => (-1, None),
         };
         if let Some(cap) = cap {
-            // The budget cell caps rank 0's process: only its GPU's floor watchdog writes it
-            // (two watchdogs on one cell would overwrite each other's asks).
+            // Each GPU's floor watchdog writes the cell of the process on that GPU. Without
+            // per-rank cells only rank 0's GPU has one (a cell caps one process).
             for (index, device) in self.lane(plan.degree)?.iter().enumerate() {
-                let cell = match index {
-                    0 => callbacks.cells.first().map(File::try_clone).transpose()?,
+                let rank = index as u32;
+                let cell = match (rank, ranked) {
+                    (0, _) | (_, true) => callbacks
+                        .cells
+                        .get(&rank)
+                        .map(File::try_clone)
+                        .transpose()?,
                     _ => None,
                 };
-                device.memory.running(&plan.id, cap, cell);
+                let own = group.rank_caps.get(index).copied().unwrap_or(cap);
+                device.memory.running(&plan.id, own, cell);
             }
         }
         callbacks.spool = Some(spool.clone());
-        let reply = session.executor.command(
+        let reply = session.executor.command_with(
             &DeviceCommand::Invoke {
                 request_id: id.into(),
                 construction: plan.id.clone(),
@@ -1592,6 +1611,7 @@ impl GpuPool {
                 floor_bytes: self.first().floor(),
                 activation_bytes: self.first().with(|gpu| gpu.seeds(&plan.id)),
             },
+            &group,
             &mut callbacks,
         )?;
         self.learn(
@@ -1844,6 +1864,22 @@ impl GpuPool {
             };
         }
         Ok(cap)
+    }
+}
+
+/// A grant from one cap per GPU: rank 0's cap and, for a group whose followers read their
+/// own (`ranked`), every rank's; otherwise the smallest for all. None: no GPU could say.
+fn rank_grant(caps: &[Option<u64>], ranked: bool) -> (Option<u64>, Group) {
+    let smallest = caps.iter().flatten().min().copied();
+    match caps.iter().copied().collect::<Option<Vec<u64>>>() {
+        Some(each) if ranked && !each.is_empty() => (
+            Some(each[0]),
+            Group {
+                rank_caps: each,
+                ..Group::default()
+            },
+        ),
+        _ => (smallest, Group::default()),
     }
 }
 
@@ -2219,7 +2255,7 @@ struct Callbacks<'a> {
     engine: &'a Arc<Engine>,
     id: &'a str,
     sources: &'a Arc<Mutex<ModelSources>>,
-    cells: &'a mut Vec<File>,
+    cells: &'a mut BTreeMap<u32, File>,
     completed: u64,
     host: &'a Arc<HostTier>,
     peer: u64,
@@ -2381,7 +2417,7 @@ impl Services for Callbacks<'_> {
                 if file.metadata()?.len() != 32 {
                     return Err(io::Error::other("budget cell layout differs"));
                 }
-                self.cells.push(file);
+                self.cells.insert(frame.rank, file);
                 answer.ok = true;
             }
             // Calls never ask for turns (Invoke sends `stages: false`); keep the budget.
@@ -2411,6 +2447,18 @@ impl Services for Callbacks<'_> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_ranked_group_gets_each_gpus_cap_and_otherwise_the_smallest() {
+        let (cap, group) = rank_grant(&[Some(30), Some(20)], true);
+        assert_eq!((cap, group.rank_caps), (Some(30), vec![30, 20]));
+        let (cap, group) = rank_grant(&[Some(30), Some(20)], false);
+        assert_eq!((cap, group.is_empty()), (Some(20), true));
+        // A GPU that cannot say leaves the whole group on the smallest known cap.
+        let (cap, group) = rank_grant(&[Some(30), None], true);
+        assert_eq!((cap, group.is_empty()), (Some(30), true));
+        assert_eq!(rank_grant(&[], true).0, None);
+    }
 
     #[test]
     fn a_group_is_the_widest_degree_every_slot_declares_on_this_machine() {
