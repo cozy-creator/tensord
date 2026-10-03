@@ -223,6 +223,12 @@ pub enum DeviceCommand {
         /// File inputs by field path: read-only copies in this call's spool.
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         inputs: BTreeMap<String, Value>,
+        /// The machine's physical free floor on this GPU.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        floor_bytes: Option<u64>,
+        /// Activation growth per stage method learned for this request's shape.
+        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+        activation_bytes: BTreeMap<String, u64>,
     },
     Budget {
         vram_bytes: i64,
@@ -413,6 +419,7 @@ pub struct Metrics {
     pub rss_at_end_bytes: Option<i64>,
     pub started_unix: Option<f64>,
     pub gpu_count: Option<u32>,
+    pub shape_cell: Option<String>,
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -505,6 +512,8 @@ pub struct Frame {
     pub overall_fraction: Option<f64>,
     pub step_ms: Option<f64>,
     pub advance: u64,
+    /// PrepareRequest: the request's normalized features (its shape).
+    pub features: BTreeMap<String, Value>,
     /// `device_tier`: fds that follow the frame, one per chunk of `regions`.
     pub descriptors: u32,
     pub device: String,

@@ -145,6 +145,8 @@ fn invoke(
                 stages: false,
                 cap_bytes: None,
                 inputs: Default::default(),
+                floor_bytes: None,
+                activation_bytes: Default::default(),
             },
             services,
         )
@@ -288,6 +290,8 @@ fn stock_executor_deferred_webp_reuses_sdk_encoder_and_exact_asset_binding() {
                 stages: false,
                 cap_bytes: None,
                 inputs: Default::default(),
+                floor_bytes: None,
+                activation_bytes: Default::default(),
             },
             &mut Baseline,
         )

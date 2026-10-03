@@ -1,5 +1,6 @@
 //! Per-GPU ledger and decisions. Pure: callers bring NVML samples and executor facts, carry out
 //! the step returned, sample again and ask again.
+use super::learned::Learned;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const MIB: u64 = 1 << 20;
@@ -122,6 +123,12 @@ pub struct Gpu {
     /// Degree 2 holdings custody charges on this GPU, counted once; the caller refreshes them
     /// before each decision.
     pub holdings: Vec<Holding>,
+    /// What executors measured here and in earlier runs (contexts, activations per shape).
+    pub learned: Learned,
+    /// This GPU and driver, the key its contexts are learned under.
+    pub device: String,
+    /// Each plan's next request shape (PrepareRequest features), for its learned activations.
+    shapes: BTreeMap<String, String>,
     clock: u64,
 }
 
@@ -276,13 +283,41 @@ impl Gpu {
             .saturating_sub(self.floor(sample) + self.external(sample) + others + self.resident())
     }
 
-    /// A new executor's context: twice the largest measured here (its library workspaces
-    /// grow as much again), else `UNMEASURED_CONTEXT`.
+    /// A new executor's context: the largest an executor measured on this GPU and driver,
+    /// here or in an earlier run (taken after its libraries' first launches), else twice the
+    /// largest measured this run, else `UNMEASURED_CONTEXT`.
     pub fn context_estimate(&self) -> u64 {
+        if let Some(learned) = self.learned.contexts.get(&self.device).filter(|c| **c > 0) {
+            return learned + MARGIN;
+        }
         match self.facts.values().filter_map(|f| f.context).max() {
             Some(measured) if measured > 0 => 2 * measured + MARGIN,
             _ => UNMEASURED_CONTEXT,
         }
+    }
+
+    /// The request shape `plan` runs next.
+    pub fn set_shape(&mut self, plan: &str, shape: &str) {
+        self.shapes.insert(plan.into(), shape.into());
+    }
+
+    /// `plan`'s activation growth for its next shape as learned, else its largest this run.
+    pub fn activation(&self, plan: &str) -> Option<u64> {
+        self.shapes
+            .get(plan)
+            .and_then(|shape| self.learned.shape(plan, shape))
+            .map(|measured| measured.peak)
+            .filter(|peak| *peak > 0)
+            .or(self.facts(plan).activation)
+    }
+
+    /// Per-method activation growth learned for `plan`'s next shape: the executor's seeds.
+    pub fn seeds(&self, plan: &str) -> BTreeMap<String, u64> {
+        self.shapes
+            .get(plan)
+            .and_then(|shape| self.learned.shape(plan, shape))
+            .map(|measured| measured.methods.clone())
+            .unwrap_or_default()
     }
 
     /// Everything resident: context, every weight byte, activations. None: not known yet.
@@ -291,7 +326,7 @@ impl Gpu {
         Some(
             facts.context.unwrap_or(self.context_estimate())
                 + facts.weights?
-                + facts.activation?
+                + self.activation(plan)?
                 + MARGIN,
         )
     }
@@ -301,14 +336,16 @@ impl Gpu {
         let facts = self.facts(plan);
         facts.context.unwrap_or(self.context_estimate())
             + facts.weights_floor.unwrap_or(0)
-            + facts.activation.unwrap_or(0)
+            + self.activation(plan).unwrap_or(0)
             + MARGIN
     }
 
     /// What a spawn of `plan` reserves: a context and its first working set when known.
     pub fn spawn_need(&self, plan: &str) -> u64 {
         let facts = self.facts(plan);
-        self.context_estimate() + facts.weights_floor.unwrap_or(0) + facts.activation.unwrap_or(0)
+        self.context_estimate()
+            + facts.weights_floor.unwrap_or(0)
+            + self.activation(plan).unwrap_or(0)
     }
 
     /// The next step toward `want` (None: everything) and `need` bytes for `plan`, or its cap.
@@ -389,6 +426,15 @@ impl Gpu {
             return Decision::Wait;
         }
         Decision::Go(room)
+    }
+
+    /// The least recently used idle tenant other than `plan`: what the host gives up first.
+    pub fn lru_idle(&self, plan: &str) -> Option<String> {
+        self.tenants
+            .iter()
+            .filter(|(other, t)| other.as_str() != plan && t.phase == Phase::Idle)
+            .min_by_key(|(_, t)| t.last_used)
+            .map(|(other, _)| other.clone())
     }
 
     /// Every live tenant as `(plan, weights, pinned now)`, `first` ahead and then most

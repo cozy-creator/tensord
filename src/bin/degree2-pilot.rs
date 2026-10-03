@@ -290,6 +290,8 @@ fn exec(
                 stages: false,
                 cap_bytes: None,
                 inputs: Default::default(),
+                floor_bytes: None,
+                activation_bytes: Default::default(),
             },
             &mut pilot,
         )?;

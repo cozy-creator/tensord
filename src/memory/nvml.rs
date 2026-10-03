@@ -16,6 +16,8 @@ type ByUuid = unsafe extern "C" fn(*const c_char, *mut Handle) -> c_int;
 type MemoryInfo = unsafe extern "C" fn(Handle, *mut Memory) -> c_int;
 type Display = unsafe extern "C" fn(Handle, *mut c_int) -> c_int;
 type Processes = unsafe extern "C" fn(Handle, *mut c_uint, *mut ProcessInfo) -> c_int;
+type Uuid = unsafe extern "C" fn(Handle, *mut c_char, c_uint) -> c_int;
+type DriverVersion = unsafe extern "C" fn(*mut c_char, c_uint) -> c_int;
 
 const SUCCESS: c_int = 0;
 const INSUFFICIENT_SIZE: c_int = 7;
@@ -39,6 +41,8 @@ struct ProcessInfo {
 
 /// One GPU's handle in an initialized NVML.
 pub struct Device {
+    /// `<GPU UUID>/<driver version>`: what a learned context is valid for.
+    pub key: String,
     handle: Handle,
     memory: MemoryInfo,
     display: [Display; 2],
@@ -96,7 +100,23 @@ impl Device {
                     format!("NVML has no device {entry:?} ({found})"),
                 ));
             }
+            let text = |fill: &dyn Fn(*mut c_char) -> c_int| {
+                let mut buffer = [0 as c_char; 96];
+                (fill(buffer.as_mut_ptr()) == SUCCESS).then(|| {
+                    std::ffi::CStr::from_ptr(buffer.as_ptr())
+                        .to_string_lossy()
+                        .into_owned()
+                })
+            };
+            let uuid: Uuid = symbol(library, "nvmlDeviceGetUUID")?;
+            let driver: DriverVersion = symbol(library, "nvmlSystemGetDriverVersion")?;
+            let key = format!(
+                "{}/{}",
+                text(&|b| uuid(handle, b, 96)).unwrap_or_else(|| entry.into()),
+                text(&|b| driver(b, 96)).unwrap_or_default()
+            );
             Ok(Self {
+                key,
                 handle,
                 memory: symbol(library, "nvmlDeviceGetMemoryInfo")?,
                 display: [

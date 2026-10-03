@@ -6,7 +6,7 @@ use crate::{
         ExecutorConfig, Forked, Frame, Kind, Services,
     },
     execution::{process_ended, Engine},
-    host_tier::{HalfOfHeadroom, HostGrant, HostTier, HostTierConfig, SealedRequest},
+    host_tier::{HostGrant, HostTier, HostTierConfig, SealedRequest},
     journal::{
         AssetBinding, Execution, Failure, Outcome, OutputChecksum, Preparation, ProcessBirth, State,
     },
@@ -242,6 +242,8 @@ pub struct GpuPool {
     zygotes: Mutex<BTreeMap<String, Arc<Zygote>>>,
     memory: GpuMemory,
     host: Arc<HostTier>,
+    /// The memory policy's host ledger; the tier's limit reads it.
+    host_ledger: Arc<crate::memory::host::HostLedger>,
     /// Degree 2: GPU weights kept across executors. None on a GPU that drives a display.
     custody: Option<Mutex<ResidentCustody>>,
     // Drop session/resource custody before ending the actual spawning thread.
@@ -279,6 +281,7 @@ impl GpuPool {
             )?;
         }
         let defaults = HostTierConfig::default();
+        let host_ledger = Arc::new(crate::memory::host::HostLedger::default());
         let host = HostTier::new(
             store.clone(),
             HostTierConfig {
@@ -289,7 +292,7 @@ impl GpuPool {
                     .map_or(defaults.ttl, std::time::Duration::from_secs),
                 plans: Some(root.join("host-plans")),
             },
-            Box::new(HalfOfHeadroom),
+            Box::new(crate::memory::host::TierPolicy(host_ledger.clone())),
         )?;
         // Fill leases and GPU custody hold one descriptor per object or chunk.
         raise_fd_limit();
@@ -301,7 +304,7 @@ impl GpuPool {
         Ok(Arc::new(Self {
             launcher: crate::child_launcher::ChildLauncher::new()?,
             root: root.to_path_buf(),
-            memory: GpuMemory::start(&config.devices, &config.memory),
+            memory: GpuMemory::start(&config.devices, &config.memory, root),
             incarnation,
             config,
             store,
@@ -309,6 +312,7 @@ impl GpuPool {
             sessions: Mutex::new(BTreeMap::new()),
             zygotes: Mutex::new(BTreeMap::new()),
             host,
+            host_ledger,
             custody,
         }))
     }
@@ -668,6 +672,7 @@ impl GpuPool {
         for (plan, session) in sessions {
             session.executor.shutdown()?;
             self.memory.with(|gpu| gpu.ended(&plan));
+            self.host_ledger.private(&plan, None);
         }
         for zygote in std::mem::take(&mut *self.zygotes.lock().unwrap()).into_values() {
             if let ZygoteState::Ready(parent) = std::mem::take(&mut *zygote.state.lock().unwrap()) {
@@ -841,6 +846,7 @@ impl GpuPool {
         }
         if !sessions.contains_key(&key) {
             self.memory.with(|gpu| gpu.ended(&key));
+            self.host_ledger.private(&key, None);
         }
         result
     }
@@ -921,6 +927,7 @@ impl GpuPool {
             eprintln!("memory: ending idle executor {plan}: {error}");
         }
         self.memory.with(|gpu| gpu.ended(plan));
+        self.host_ledger.private(plan, None);
         Ok(true)
     }
 
@@ -944,10 +951,12 @@ impl GpuPool {
         for key in ended {
             sessions.remove(&key);
             self.memory.with(|gpu| gpu.ended(&key));
+            self.host_ledger.private(&key, None);
         }
         let cold = !sessions.contains_key(&plan.id);
         let mut load_cap = None;
         if cold {
+            self.host_room(&plan.id, sessions);
             // A context and the first working set are reserved before the process exists.
             load_cap = self.memory.decide(
                 &plan.id,
@@ -1255,7 +1264,9 @@ impl GpuPool {
             engine.finish(id, Outcome::Failed(failure.encode()))?;
             return Ok(true);
         }
-        command_ok(prepared)?;
+        let prepared = command_ok(prepared)?;
+        let shape = crate::memory::learned::shape_cell(&prepared.features);
+        self.memory.with(|gpu| gpu.set_shape(&plan.id, &shape));
         let spool = if let Some(identity) = self.config.identity {
             // Keep Journal/results/admin paths private to the core. A separate peer-owned
             // spool lives only inside this executor's already authorized output directory.
@@ -1310,9 +1321,12 @@ impl GpuPool {
                 stages: false,
                 cap_bytes,
                 inputs,
+                floor_bytes: self.memory.floor(),
+                activation_bytes: self.memory.with(|gpu| gpu.seeds(&plan.id)),
             },
             &mut callbacks,
         )?;
+        self.learn(&plan.id, &shape, &reply, session.executor.birth.pid);
         let mut facts = plane_facts(reply.plane.as_ref());
         facts.activation = facts.activation.or_else(|| {
             reply
@@ -1322,6 +1336,9 @@ impl GpuPool {
                 .and_then(|v| u64::try_from(v).ok())
         });
         self.memory.observe(&plan.id, facts, Some(true));
+        // Pinned bytes outside the machine's tier count against the tier's limit.
+        self.host_ledger
+            .private(&plan.id, facts.pinned.filter(|_| !session.sealed));
         if let Some(plane) = &reply.plane {
             crate::memory::note(
                 serde_json::json!({"event": "call", "plan": plan.id, "id": id,
@@ -1396,6 +1413,66 @@ impl GpuPool {
             }
         }
         Ok(true)
+    }
+
+    /// Before a spawn: the host has room for the executor's private bytes as measured in
+    /// earlier runs, or gives it back in order: unheld sealed layouts (their bytes come from
+    /// the page cache or the store again), then idle executors, least recently used first.
+    /// A plan never measured asks nothing; nothing is refused for the room that is left.
+    fn host_room(&self, plan: &str, sessions: &mut BTreeMap<String, Session>) {
+        let need = self.memory.with(|gpu| {
+            gpu.learned
+                .plans
+                .get(plan)
+                .map_or(0, |learned| learned.host_bytes)
+        });
+        if need == 0 {
+            return;
+        }
+        loop {
+            let host = crate::host_memory::read();
+            let Ok(available) = u64::try_from(host.available) else {
+                return;
+            };
+            if available >= need {
+                return;
+            }
+            let released = self.host.release(need - available);
+            let ended = released == 0
+                && match self.memory.with(|gpu| gpu.lru_idle(plan)) {
+                    Some(victim) => self
+                        .carry_out(&Step::End(victim), sessions)
+                        .unwrap_or(false),
+                    None => false,
+                };
+            crate::memory::note(serde_json::json!({"event": "host_room", "plan": plan,
+                "need": need, "available": available, "released": released, "ended": ended}));
+            if released == 0 && !ended {
+                return;
+            }
+        }
+    }
+
+    /// What a call measured, for later executors and runs: its shape's activation growth
+    /// (the call's peak and each stage method's), its context, its private host bytes.
+    fn learn(&self, plan: &str, shape: &str, reply: &Frame, pid: u32) {
+        let metrics = reply.metrics.clone().unwrap_or_default();
+        let plane = reply.plane.clone().unwrap_or_default();
+        let peak = known(plane.activation_peak_bytes)
+            .or(known(metrics.activation_peak_bytes))
+            .unwrap_or(0);
+        let methods = metrics
+            .activation_peaks
+            .iter()
+            .filter_map(|(method, bytes)| Some((method.clone(), u64::try_from(*bytes).ok()?)))
+            .collect();
+        let shape = metrics.shape_cell.as_deref().unwrap_or(shape);
+        self.memory
+            .learn_call(plan, shape, peak, &methods, known(plane.context_bytes));
+        if let Ok(host) = crate::host_memory::process(pid) {
+            self.memory
+                .learn_host(plan, host.pss.saturating_sub(host.pss_shmem));
+        }
     }
 
     /// Idle tenants pinning more than their share of the host's pinned total give it back

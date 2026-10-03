@@ -2,6 +2,7 @@
 //! `policy` decides from samples and executor facts; `nvml` samples on its own thread; this
 //! module joins them and keeps the floor while a call runs.
 pub mod host;
+pub mod learned;
 pub mod nvml;
 pub mod policy;
 
@@ -65,8 +66,12 @@ pub struct GpuMemory {
 }
 
 impl GpuMemory {
-    pub fn start(device: &str, config: &MemoryConfig) -> Self {
-        let ledger = Arc::new(Mutex::new(Gpu::with_floor(config.floor_bytes)));
+    /// `root` keeps what executors measured across runs (`memory-learned.json`).
+    pub fn start(device: &str, config: &MemoryConfig, root: &std::path::Path) -> Self {
+        let mut gpu = Gpu::with_floor(config.floor_bytes);
+        gpu.learned = learned::Learned::open(&root.join("memory-learned.json"));
+        gpu.device = device.into();
+        let ledger = Arc::new(Mutex::new(gpu));
         let running: Arc<Mutex<Option<Running>>> = Arc::new(Mutex::new(None));
         let log = config.sample_log.as_ref().and_then(|path| {
             OpenOptions::new()
@@ -78,6 +83,7 @@ impl GpuMemory {
         });
         let sampler = match nvml::Device::open(device) {
             Ok(opened) => {
+                ledger.lock().unwrap().device = opened.key.clone();
                 let (watched, cells) = (ledger.clone(), running.clone());
                 let log = Mutex::new(log);
                 nvml::Sampler::start(opened, move |sample| {
@@ -277,6 +283,38 @@ impl GpuMemory {
         let order = self.with(|gpu| gpu.pinned_order(first));
         let memory = crate::host_memory::read();
         host::pinned_split(memory.available, memory.shmem, &order)
+    }
+
+    /// The floor this GPU keeps now (the executor's own floor follows it).
+    pub fn floor(&self) -> Option<u64> {
+        let sample = self.sample()?;
+        Some(self.with(|gpu| gpu.floor(&sample)))
+    }
+
+    /// One call's measurements, kept for later executors and runs: its shape's activation
+    /// growth (the call's peak and each method's) and the context it measured.
+    pub fn learn_call(
+        &self,
+        plan: &str,
+        shape: &str,
+        peak: u64,
+        methods: &std::collections::BTreeMap<String, u64>,
+        context: Option<u64>,
+    ) {
+        self.with(|gpu| {
+            gpu.learned.call(plan, shape, peak, methods);
+            if let Some(context) = context.filter(|c| *c > 0) {
+                let device = gpu.device.clone();
+                gpu.learned.context(&device, context);
+            }
+            if let Err(error) = gpu.learned.save() {
+                note(serde_json::json!({"event": "learned_unsaved", "error": error.to_string()}));
+            }
+        });
+    }
+
+    pub fn learn_host(&self, plan: &str, bytes: u64) {
+        self.with(|gpu| gpu.learned.host(plan, bytes));
     }
 
     pub fn observe(&self, plan: &str, facts: Facts, mapped: Option<bool>) {

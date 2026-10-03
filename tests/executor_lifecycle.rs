@@ -141,6 +141,8 @@ fn invoke(
             stages: false,
             cap_bytes: None,
             inputs: Default::default(),
+            floor_bytes: None,
+            activation_bytes: Default::default(),
         },
         &mut Baseline,
     )
@@ -457,6 +459,8 @@ fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
                 plane_budget_bytes: -1,
                 stages: false,
                 cap_bytes: None,
+                floor_bytes: None,
+                activation_bytes: Default::default(),
             },
             &mut Baseline,
         )

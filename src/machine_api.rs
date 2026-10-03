@@ -2171,6 +2171,8 @@ print(json.dumps({"identity": generation.identity}))
                     stages: false,
                     cap_bytes: None,
                     inputs: granted,
+                    floor_bytes: None,
+                    activation_bytes: Default::default(),
                 },
                 &mut Baseline,
             )
@@ -2374,6 +2376,8 @@ print(json.dumps({"identity": generation.identity}))
                             stages: false,
                             cap_bytes: None,
                             inputs: Default::default(),
+                            floor_bytes: None,
+                            activation_bytes: Default::default(),
                         },
                         &mut Publisher {
                             store: &task_store,

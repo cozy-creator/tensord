@@ -1,7 +1,48 @@
-//! Per-host pinned budgets: one machine-wide pinned total shared most recently used first
-//! (Runtime `weight_policy.pinned_total` and `worker/memory.pinned_split`). Pinned memory is
-//! unreclaimable: half of what the host has for it stays for processes and the page cache.
-use std::collections::BTreeMap;
+//! The host ledger: one rule for every host byte that holds weights. What the host has is read
+//! live at every decision (`host_memory`: the tightest cgroup on the path and `MemAvailable`);
+//! weights in RAM, the machine's sealed tier and executors' own pinned tiers together, may hold
+//! half of it plus what they hold now (Runtime `weight_policy.pinned_total`). The other half
+//! stays for processes and the page cache, the tier's own fallback.
+use crate::{host_memory::HostMemory, host_tier::TierLimit};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
+
+/// Pinned host bytes executors hold outside the machine's tier (their own memfds when they
+/// read the store); an executor adopting sealed layouts page-locks the tier's pages instead.
+#[derive(Default)]
+pub struct HostLedger {
+    private: Mutex<BTreeMap<String, u64>>,
+}
+
+impl HostLedger {
+    pub fn private(&self, plan: &str, pinned: Option<u64>) {
+        let mut private = self.private.lock().unwrap();
+        match pinned {
+            Some(bytes) => private.insert(plan.into(), bytes),
+            None => private.remove(plan),
+        };
+    }
+
+    fn private_total(&self) -> u64 {
+        self.private.lock().unwrap().values().sum()
+    }
+}
+
+/// The tier's limit from the one ledger: the weights' half of the host, less what executors
+/// pin outside the tier.
+pub struct TierPolicy(pub Arc<HostLedger>);
+
+impl TierLimit for TierPolicy {
+    fn limit(&self, host: &HostMemory, charged: u64) -> u64 {
+        if host.available < 0 {
+            return 0; // unreadable: nothing is admitted, executors read the store
+        }
+        let private = self.0.private_total();
+        ((host.available as u64 + charged + private) / 2).saturating_sub(private)
+    }
+}
 
 /// Budgets over `(plan, weights, pinned now)`, most recently used first. `available` is what
 /// the host has before its tightest limit and `held` what is pinned or sealed now (shmem);
@@ -44,6 +85,22 @@ mod tests {
         assert_eq!(split["anima"], 6 * GIB);
         // SDXL keeps what is left of the total, 5.5 GiB: lowered from the 7 it pins.
         assert_eq!(split["sdxl"], 11 * GIB / 2);
+    }
+
+    #[test]
+    fn executors_pinning_outside_the_tier_shrink_its_limit_by_as_much() {
+        let ledger = Arc::new(HostLedger::default());
+        let policy = TierPolicy(ledger.clone());
+        let host = HostMemory {
+            available: (20 * GIB) as i64,
+            shmem: 0,
+            mem_available: -1,
+        };
+        assert_eq!(policy.limit(&host, 4 * GIB), 12 * GIB);
+        ledger.private("anima", Some(2 * GIB));
+        assert_eq!(policy.limit(&host, 4 * GIB), 11 * GIB);
+        ledger.private("anima", None);
+        assert_eq!(policy.limit(&host, 4 * GIB), 12 * GIB);
     }
 
     #[test]
