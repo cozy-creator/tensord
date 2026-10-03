@@ -1,3 +1,4 @@
+pub mod adapter_views;
 pub mod api;
 mod boundary_json;
 pub mod catalog;
