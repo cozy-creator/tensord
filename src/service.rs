@@ -34,6 +34,8 @@ pub struct Service {
     gpu: Mutex<Option<Arc<crate::gpu_service::GpuPool>>>,
     /// Jobs and model-less child runs, in deviceless executors.
     jobs: Mutex<Option<Arc<crate::jobs::Jobs>>>,
+    /// The TensorFS store's caches (`Publisher::reclaim`), swept with the machine's.
+    publisher: Mutex<Option<Arc<crate::published::Publisher>>>,
     startup_gpu_births: Mutex<Vec<ProcessBirth>>,
     /// Package/model preparations in flight: work a rental's idle release must wait for.
     preparing: std::sync::atomic::AtomicUsize,
@@ -110,6 +112,7 @@ impl Service {
             retained: Mutex::new(HashMap::new()),
             gpu: Mutex::new(None),
             jobs: Mutex::new(None),
+            publisher: Mutex::new(None),
             startup_gpu_births: Mutex::new(startup_gpu_births),
             preparing: std::sync::atomic::AtomicUsize::new(0),
             started_ticks,
@@ -142,6 +145,9 @@ impl Service {
     }
     pub fn jobs(&self) -> Option<Arc<crate::jobs::Jobs>> {
         self.jobs.lock().unwrap().clone()
+    }
+    pub fn configure_publisher(&self, publisher: Arc<crate::published::Publisher>) {
+        *self.publisher.lock().unwrap() = Some(publisher);
     }
     pub fn configure_jobs(&self, jobs: Arc<crate::jobs::Jobs>) {
         *self.jobs.lock().unwrap() = Some(jobs);
@@ -345,6 +351,15 @@ impl Service {
             Ok(mut swept) => {
                 if let Some(jobs) = self.jobs() {
                     swept.scratch = jobs.sweep_scratch(&self.engine);
+                }
+                let publisher = self.publisher.lock().unwrap().clone();
+                match publisher.map(|publisher| publisher.reclaim(self)) {
+                    Some(Ok((views, bytes))) => {
+                        swept.adapter_views = views;
+                        swept.store_bytes = bytes;
+                    }
+                    Some(Err(error)) => eprintln!("reclaim store: {error}"),
+                    None => {}
                 }
                 if swept != crate::reclaim::Swept::default() {
                     eprintln!("reclaimed {swept:?}");

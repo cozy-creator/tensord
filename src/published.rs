@@ -313,6 +313,25 @@ impl Publisher {
         }
     }
 
+    /// The store's share of the machine's self-managing caches: idle adapter views lose
+    /// their repositories, then TensorFS relieves storage pressure under its GC policy.
+    /// Neither evicts what live executors read, unfinished runs prepared, or preparations
+    /// are fetching. Returns (views removed, bytes collected).
+    pub fn reclaim(&self, service: &Service) -> io::Result<(usize, u64)> {
+        let keep = match service.gpu() {
+            Some(gpu) => self.protected(service, &gpu),
+            None => self.fetching.lock().unwrap().keys().cloned().collect(),
+        };
+        let pressure = crate::reclaim::Disk::measure(self.store.root())?.pressure();
+        let views = crate::adapter_views::evict(&self.store, &keep, pressure)?;
+        let relief =
+            tensorfs_core::ensure::relieve(&self.store, &keep).map_err(io::Error::other)?;
+        if let Some(unable) = relief.unable {
+            eprintln!("store relief: a GC tier could not run: {unable}");
+        }
+        Ok((views, relief.collected_bytes))
+    }
+
     /// What a download's GC must never evict: what live executors read, every unfinished
     /// run's prepared models, and what preparations are fetching (this one's included).
     fn protected(&self, service: &Service, gpu: &GpuPool) -> Vec<String> {

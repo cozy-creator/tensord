@@ -60,6 +60,10 @@ pub struct Swept {
     pub generations: usize,
     /// Ended jobs' scratch trees (`jobs::Jobs::sweep_scratch`).
     pub scratch: usize,
+    /// Adapter views whose repositories went (`adapter_views::evict`).
+    pub adapter_views: usize,
+    /// Bytes TensorFS's GC collected under storage pressure (`ensure::relieve`).
+    pub store_bytes: u64,
 }
 
 /// The persistent compiled-kernel store (`Seal::prepare`'s `<root>/u<uid>/`). Recompiling is

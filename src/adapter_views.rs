@@ -6,7 +6,7 @@
 //! (`<path>.lora_A.weight`, `<path>.lora_B.weight`, optional scalar `<path>.alpha`): foreign
 //! layouts are normalized when a model is ingested, never here.
 use serde::Serialize;
-use std::{collections::BTreeMap, io, io::Read};
+use std::{collections::BTreeMap, io, io::Read, time::SystemTime};
 use tensorfs_core::{
     checkpoint::load_header,
     derived::{
@@ -15,14 +15,15 @@ use tensorfs_core::{
     },
     dtype::Dtype,
     header::{Body, Header, Tensor},
-    ids::ObjectRef,
+    ids::{Doc, ObjectRef},
     meta::Meta,
-    repository::{Mutation, RepositoryName},
+    repository::{Mutation, Repository, RepositoryName},
     store::{Fault, Store},
 };
 
 pub const FORMAT: &str = "cozy.model.lora/1";
 pub const GRAPH_CONFIG: &str = "model_adapters";
+const VIEW_PREFIX: &str = "adapters-";
 const PLAIN: &str = "sha256:1fb882a7e46d0aff520f9d8a28cefd643954c19371737443101ba3c5fcc3613f";
 
 /// One caller adapter, in order. An empty `component` is inferred when exactly one base
@@ -495,8 +496,9 @@ fn prepare(
     Ok((declaration, config))
 }
 
-/// The adapter view of `base` with `selections`, composed once and kept as the local
-/// repository `local/adapters-<id>`; a held view is reused.
+/// The adapter view of `base` with `selections`, kept as the local repository
+/// `local/adapters-<id>`: the repository is its only root (the composition's derived root
+/// is released once it lands) and `evict` reclaims it. A held view is reused.
 pub fn compose(store: &Store, base: &ObjectRef, selections: &[Selection]) -> io::Result<Composed> {
     let rows: Vec<_> = selections
         .iter()
@@ -513,68 +515,166 @@ pub fn compose(store: &Store, base: &ObjectRef, selections: &[Selection]) -> io:
         &serde_json_canonicalizer::to_vec(&serde_json::json!([FORMAT, id(base), rows]))
             .map_err(native)?,
     );
-    let transaction = format!("sha256:{identity}");
-    let name = format!("adapters-{}", &identity[..40]);
+    let name = format!("{VIEW_PREFIX}{}", &identity[..40]);
     let meta = Meta::open(store).map_err(native)?;
-    let manifest = match derived::lookup(store, &meta, &transaction).map_err(native)? {
-        Lookup::Committed(done) => done.receipt().manifest.clone(),
-        previous => {
-            if let Lookup::Open { writer_session } = previous {
+    // A transaction id never reopens once committed or abandoned, so a view whose bytes were
+    // collected (or whose composition died mid-way) is composed again under the next one.
+    let mut generation = 0u64;
+    let (transaction, manifest) = loop {
+        let transaction = match generation {
+            0 => format!("sha256:{identity}"),
+            n => format!(
+                "sha256:{}",
+                tensorfs_core::sha256::hex_digest(format!("{identity}/{n}").as_bytes())
+            ),
+        };
+        generation += 1;
+        match derived::lookup(store, &meta, &transaction).map_err(native)? {
+            Lookup::Committed(done) => {
+                let manifest = done.receipt().manifest.clone();
+                if store.manifest_path(&manifest.sha256).is_file() {
+                    break (transaction, manifest);
+                }
+            }
+            Lookup::Open { writer_session } => {
                 if let Some(session) = writer_session {
                     derived::fence(&meta, &transaction, session).map_err(native)?;
                 }
                 derived::abandon(store, &meta, &transaction).map_err(native)?;
             }
-            let base_header = header(store, base)?;
-            let adapters = selections
-                .iter()
-                .map(|s| Ok((s.clone(), header(store, &s.manifest)?)))
-                .collect::<io::Result<Vec<_>>>()?;
-            let (mut declaration, config) = prepare(store, (base, &base_header), &adapters)?;
-            declaration.work_fingerprint = Some(transaction.clone());
-            let session =
-                (tensorfs_core::meta::now_nanos_unique() / 1_000_000) as u64 & ((1 << 53) - 1);
-            let begun = derived::begin(store, &meta, &transaction, session, declaration, None)
-                .map_err(native)?;
-            let written = derived::add_config(
-                &meta,
-                &transaction,
-                session,
-                GRAPH_CONFIG,
-                &mut config.as_slice(),
-            )
-            .and_then(|()| derived::commit(store, &meta, &transaction, session));
-            for (_, lease) in begun.source_leases {
-                let _ = lease.release(&meta);
-            }
-            let _ = begun.writer_hold.release(&meta);
-            match written {
-                Ok(receipt) => receipt.manifest,
-                Err(error) => {
-                    let _ = derived::fence(&meta, &transaction, session);
-                    let _ = derived::abandon(store, &meta, &transaction);
-                    return Err(native(error));
-                }
+            Lookup::Abandoned => {}
+            Lookup::Absent => {
+                let manifest = derive(store, &meta, &transaction, base, selections)?;
+                break (transaction, manifest);
             }
         }
     };
     let repo = RepositoryName::new("local", &name).map_err(native)?;
-    let current = std::fs::read(store.repository_path(&repo)).ok();
-    store
-        .apply_repository(
-            current.as_deref(),
-            &Mutation::ReplaceLocal {
-                repo,
-                version: identity,
-                manifest: manifest.clone(),
-            },
-            &Fault::default(),
-        )
-        .map_err(native)?;
+    let path = store.repository_path(&repo);
+    let replace = Mutation::ReplaceLocal {
+        repo,
+        version: identity,
+        manifest: manifest.clone(),
+    };
+    // A concurrent `evict` can change the repository between the read and the write.
+    let mut attempts = 0;
+    while let Err(error) = store.apply_repository(
+        std::fs::read(&path).ok().as_deref(),
+        &replace,
+        &Fault::default(),
+    ) {
+        attempts += 1;
+        if error.code != tensorfs_core::err::Code::REPOSITORY_CONFLICT || attempts == 3 {
+            return Err(native(error));
+        }
+    }
+    // Last use, for `evict`.
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .and_then(|file| file.set_modified(SystemTime::now()))?;
+    if let Err(error) = derived::dispose(store, &meta, &transaction) {
+        eprintln!("adapter view {name}: composition root not released: {error}");
+    }
     Ok(Composed {
         repository: format!("local/{name}"),
         manifest,
     })
+}
+
+/// One composition through the derived writer: no byte copied, one config added.
+fn derive(
+    store: &Store,
+    meta: &Meta,
+    transaction: &str,
+    base: &ObjectRef,
+    selections: &[Selection],
+) -> io::Result<ObjectRef> {
+    let base_header = header(store, base)?;
+    let adapters = selections
+        .iter()
+        .map(|s| Ok((s.clone(), header(store, &s.manifest)?)))
+        .collect::<io::Result<Vec<_>>>()?;
+    let (mut declaration, config) = prepare(store, (base, &base_header), &adapters)?;
+    declaration.work_fingerprint = Some(transaction.to_string());
+    let session = (tensorfs_core::meta::now_nanos_unique() / 1_000_000) as u64 & ((1 << 53) - 1);
+    let begun =
+        derived::begin(store, meta, transaction, session, declaration, None).map_err(native)?;
+    let written = derived::add_config(
+        meta,
+        transaction,
+        session,
+        GRAPH_CONFIG,
+        &mut config.as_slice(),
+    )
+    .and_then(|()| derived::commit(store, meta, transaction, session));
+    for (_, lease) in begun.source_leases {
+        let _ = lease.release(meta);
+    }
+    let _ = begun.writer_hold.release(meta);
+    match written {
+        Ok(receipt) => Ok(receipt.manifest),
+        Err(error) => {
+            let _ = derived::fence(meta, transaction, session);
+            let _ = derived::abandon(store, meta, transaction);
+            Err(native(error))
+        }
+    }
+}
+
+/// Adapter views manage themselves like the machine's other caches (`reclaim`): a view
+/// unused for the TTL, or idle under storage pressure, loses its repository, and GC then
+/// takes its header and manifest. A view a live executor, an unfinished run or a
+/// preparation names (`keep`) is never touched. Returns the views removed.
+pub fn evict(store: &Store, keep: &[String], pressure: bool) -> io::Result<usize> {
+    let mut removed = 0;
+    let directory = store.root().join("repos").join("local");
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    for entry in entries.flatten() {
+        let file = entry.file_name().to_string_lossy().into_owned();
+        let Some(name) = file
+            .strip_suffix(".json")
+            .filter(|name| name.starts_with(VIEW_PREFIX))
+        else {
+            continue;
+        };
+        let age = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+            .unwrap_or_default();
+        if age <= crate::reclaim::TTL && !(pressure && age > crate::reclaim::IDLE) {
+            continue;
+        }
+        let Ok(body) = std::fs::read(entry.path()) else {
+            continue;
+        };
+        let repository = Repository::parse(&body).map_err(native)?;
+        let manifest = &repository.local_checkpoint().map_err(native)?.manifest;
+        if keep
+            .iter()
+            .any(|k| k.trim_start_matches("sha256:") == manifest.sha256)
+        {
+            continue;
+        }
+        let repo = RepositoryName::new("local", name).map_err(native)?;
+        match store.apply_repository(
+            Some(&body),
+            &Mutation::DeleteRepository { repo },
+            &Fault::default(),
+        ) {
+            Ok(_) => removed += 1,
+            // Composed again since it was read: it is in use.
+            Err(error) if error.code == tensorfs_core::err::Code::REPOSITORY_CONFLICT => {}
+            Err(error) => return Err(native(error)),
+        }
+    }
+    Ok(removed)
 }
 
 #[cfg(test)]
@@ -642,6 +742,210 @@ mod tests {
         let receipt = derived::commit(store, meta, &transaction, 1).unwrap();
         let _ = begun.writer_hold.release(meta);
         receipt.manifest
+    }
+
+    /// Back-date a repository's last use.
+    fn unused_for(store: &Store, repository: &str, age: std::time::Duration) {
+        let (org, name) = repository.split_once('/').unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(store.repository_path(&RepositoryName::new(org, name).unwrap()))
+            .unwrap()
+            .set_modified(SystemTime::now() - age)
+            .unwrap();
+    }
+
+    fn put_local(store: &Store, name: &str, manifest: &ObjectRef) {
+        store
+            .apply_repository(
+                None,
+                &Mutation::ReplaceLocal {
+                    repo: RepositoryName::new("local", name).unwrap(),
+                    version: manifest.sha256.clone(),
+                    manifest: manifest.clone(),
+                },
+                &Fault::default(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_view_is_rooted_only_by_its_repository_which_evicts_itself() {
+        let root = std::env::temp_dir().join(format!("adapter-views-{}", uuid::Uuid::new_v4()));
+        let store = Store::init(&root).unwrap();
+        let meta = Meta::open(&store).unwrap();
+        let base = checkpoint(
+            &store,
+            &meta,
+            "unet",
+            &[("proj.weight", vec![4, 3], f32s(&[0.5; 12]))],
+            0xb1,
+        );
+        let lora = checkpoint(
+            &store,
+            &meta,
+            "adapter",
+            &[
+                ("proj.lora_A.weight", vec![2, 3], f32s(&[0.25; 6])),
+                ("proj.lora_B.weight", vec![4, 2], f32s(&[0.75; 8])),
+            ],
+            0xa1,
+        );
+        // Base and adapter are held by their repositories alone, as downloads are.
+        put_local(&store, "base", &base);
+        put_local(&store, "lora", &lora);
+        for tag in [0xb1u8, 0xa1] {
+            derived::dispose(
+                &store,
+                &meta,
+                &format!("sha256:{}", format!("{tag:02x}").repeat(32)),
+            )
+            .unwrap();
+        }
+        let selection = [Selection {
+            manifest: lora.clone(),
+            component: String::new(),
+            source_component: String::new(),
+            strength: 1.0,
+        }];
+        let held = |m: &ObjectRef| store.manifest_path(&m.sha256).is_file();
+        let collect = || tensorfs_core::gc::collect(store.root(), false).unwrap();
+        let view = compose(&store, &base, &selection).unwrap();
+        let hour = std::time::Duration::from_secs(3600);
+
+        // In use, or young without pressure: kept.
+        unused_for(&store, &view.repository, hour);
+        assert_eq!(evict(&store, &[id(&view.manifest)], true).unwrap(), 0);
+        assert_eq!(evict(&store, &[], false).unwrap(), 0);
+        unused_for(&store, &view.repository, crate::reclaim::TTL + hour);
+        assert_eq!(evict(&store, &[id(&view.manifest)], false).unwrap(), 0);
+        // Past the TTL (or idle under pressure) and unused: its repository goes, then GC
+        // takes the view and nothing else.
+        unused_for(&store, &view.repository, hour);
+        assert_eq!(evict(&store, &[], true).unwrap(), 1);
+        collect();
+        assert!(!held(&view.manifest), "the view outlived its repository");
+        assert!(held(&base) && held(&lora));
+
+        // Composed again after collection, under the next transaction.
+        let again = compose(&store, &base, &selection).unwrap();
+        assert_eq!(again, view);
+        assert!(held(&again.manifest));
+
+        // The view pins no source: once the adapter's repository is gone, GC takes the
+        // adapter's manifest while the factors the view grafts stay.
+        store
+            .apply_repository(
+                Some(
+                    &std::fs::read(
+                        store.repository_path(&RepositoryName::new("local", "lora").unwrap()),
+                    )
+                    .unwrap(),
+                ),
+                &Mutation::DeleteRepository {
+                    repo: RepositoryName::new("local", "lora").unwrap(),
+                },
+                &Fault::default(),
+            )
+            .unwrap();
+        collect();
+        assert!(
+            !held(&lora),
+            "the view's composition still roots its adapter"
+        );
+        assert!(held(&again.manifest) && held(&base));
+        let grafted = header(&store, &again.manifest).unwrap();
+        for (_, tensor) in tensors(&grafted, "unet").unwrap() {
+            for (_, part) in &tensor.parts {
+                if let Body::Segments(objects) = &part.body {
+                    assert!(objects
+                        .iter()
+                        .all(|o| store.object_path(&o.sha256).is_file()));
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The machine's periodic sweep reaches the store: an unused view goes, and under
+    /// storage pressure TensorFS's GC collects what nothing references.
+    #[test]
+    fn the_machine_sweep_evicts_views_and_relieves_the_store() {
+        let root = std::env::temp_dir().join(format!("adapter-sweep-{}", uuid::Uuid::new_v4()));
+        let state = root.join("state");
+        let service = crate::service::Service::open(&state, &root.join("generations"), 1).unwrap();
+        let store = std::sync::Arc::new(Store::ensure(&state.join("tensorfs")).unwrap());
+        service.configure_publisher(
+            crate::published::Publisher::new(
+                &state.join("published"),
+                Default::default(),
+                store.clone(),
+            )
+            .unwrap(),
+        );
+        let meta = Meta::open(&store).unwrap();
+        let base = checkpoint(
+            &store,
+            &meta,
+            "unet",
+            &[("proj.weight", vec![4, 3], f32s(&[0.5; 12]))],
+            0xb2,
+        );
+        let lora = checkpoint(
+            &store,
+            &meta,
+            "adapter",
+            &[
+                ("proj.lora_A.weight", vec![2, 3], f32s(&[0.25; 6])),
+                ("proj.lora_B.weight", vec![4, 2], f32s(&[0.75; 8])),
+            ],
+            0xa2,
+        );
+        put_local(&store, "base", &base);
+        put_local(&store, "lora", &lora);
+        for tag in [0xb2u8, 0xa2] {
+            derived::dispose(
+                &store,
+                &meta,
+                &format!("sha256:{}", format!("{tag:02x}").repeat(32)),
+            )
+            .unwrap();
+        }
+        let view = compose(
+            &store,
+            &base,
+            &[Selection {
+                manifest: lora,
+                component: String::new(),
+                source_component: String::new(),
+                strength: 1.0,
+            }],
+        )
+        .unwrap();
+        unused_for(
+            &store,
+            &view.repository,
+            crate::reclaim::TTL + std::time::Duration::from_secs(60),
+        );
+        let garbage = vec![7u8; 1 << 20];
+        let garbage = store
+            .put_stream(&mut garbage.as_slice(), None, &Fault::default())
+            .unwrap()
+            .obj;
+        let swept = service.reclaim();
+        assert_eq!(swept.adapter_views, 1, "{swept:?}");
+        if crate::reclaim::Disk::measure(store.root())
+            .unwrap()
+            .pressure()
+        {
+            assert!(swept.store_bytes >= garbage.length, "{swept:?}");
+            assert!(!store.object_path(&garbage.sha256).exists());
+            assert!(!store.manifest_path(&view.manifest.sha256).exists());
+        } else {
+            assert_eq!(swept.store_bytes, 0, "{swept:?}");
+            assert!(store.object_path(&garbage.sha256).exists());
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

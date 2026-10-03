@@ -322,11 +322,10 @@ fn start_api(
         uploads,
     );
     backend.own_hub = own_hub;
-    backend.publisher = Some(cozy_machine::published::Publisher::new(
-        &root.join("published"),
-        sdk,
-        store.clone(),
-    )?);
+    let publisher =
+        cozy_machine::published::Publisher::new(&root.join("published"), sdk, store.clone())?;
+    service.configure_publisher(publisher.clone());
+    backend.publisher = Some(publisher);
     // Local packages install only with the helper; package environments get the client either way.
     backend.installer = match (helper, wheel) {
         (Some(helper_python), Some(client_wheel)) => Some(api::install::InstallerConfig {
