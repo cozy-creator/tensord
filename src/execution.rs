@@ -743,6 +743,23 @@ impl Engine {
         }
     }
 
+    /// Write and bind a failed attempt's triage bundle before the run settles. A failure to
+    /// keep it is reported, never fatal to the settlement.
+    pub fn record_triage(&self, id: &str, facts: &crate::triage::Facts) {
+        let result = crate::triage::write(&self.root, facts)
+            .and_then(|triage| self.journal.lock().unwrap().bind_triage(id, &triage));
+        if let Err(error) = result {
+            eprintln!("execution {id}: triage bundle not kept: {error}");
+        }
+    }
+    /// The run's triage bundle bytes and their reference, if it kept one.
+    pub fn triage(&self, id: &str) -> io::Result<Option<(crate::triage::TriageRef, Vec<u8>)>> {
+        let Some(triage) = self.journal.lock().unwrap().triage(id)? else {
+            return Ok(None);
+        };
+        let bytes = crate::triage::read(&self.root, &triage)?;
+        Ok(Some((triage, bytes)))
+    }
     pub(crate) fn staging(&self, id: &str) -> io::Result<PathBuf> {
         let root = self.root.join("staging").join(id);
         fs::create_dir_all(&root)?;

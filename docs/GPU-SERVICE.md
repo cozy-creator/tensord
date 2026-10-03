@@ -48,6 +48,10 @@ executor per plan; `memory::GpuMemory` decides every device byte. Acceptance, jo
   size: with nothing left, the cap is what there is.
 - Floor: 512 MiB or 1/16 of the card on a display GPU, 256 MiB otherwise. A 1 s sample below it
   during a call lowers the call's cap through its budget cell by the deficit.
+- An executor's failed terminal (its own refusal before entry, or a failed invoke) first keeps a
+  triage bundle (`triage.rs`: terminal, traceback, executor pid and stderr tail; canonical JSON
+  under `execution/triage/`, fsynced) and binds it in the journal; the outcome body names it as
+  `triage_bundle`, and `ReadMachineExecutionTriage` returns its bytes.
 - Start happens only after `authorize_managed`.
 - Invoke must be quiescent. Then `postprocess` and `managed_result` run. A custody failure is
   `failed`.

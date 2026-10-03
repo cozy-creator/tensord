@@ -1240,6 +1240,18 @@ impl GpuPool {
             };
             let failure =
                 Failure::executor(terminal, &prepared.origin, &prepared.code, &prepared.detail);
+            keep_triage(
+                engine,
+                id,
+                &session.executor,
+                &device_executor::Outcome {
+                    terminal: terminal.into(),
+                    origin: prepared.origin.clone(),
+                    code: prepared.code.clone(),
+                    message: prepared.detail.clone(),
+                    traceback: prepared.traceback.clone(),
+                },
+            );
             engine.finish(id, Outcome::Failed(failure.encode()))?;
             return Ok(true);
         }
@@ -1356,6 +1368,7 @@ impl GpuPool {
                 engine.finish(id, Outcome::Canceled)?;
             }
             _ => {
+                keep_triage(engine, id, &session.executor, outcome);
                 engine.finish(
                     id,
                     Outcome::Failed(
@@ -1708,6 +1721,30 @@ pub(crate) fn stage_inputs(
         identity.readable(&directory)?;
     }
     Ok(granted)
+}
+
+/// The failed attempt's triage bundle, kept before the run settles: the executor's own terminal
+/// and traceback, and its stderr tail.
+pub(crate) fn keep_triage(engine: &Engine, id: &str, executor: &DeviceExecutor, outcome: &device_executor::Outcome) {
+    let record = engine.get(id).ok();
+    let request = record
+        .as_ref()
+        .and_then(|record| record.submission.as_ref())
+        .map_or_else(|| id.to_string(), |s| s.request_id.clone());
+    engine.record_triage(
+        id,
+        &crate::triage::Facts {
+            request_id: &request,
+            attempt: record.map_or(0, |record| record.attempt),
+            terminal: &outcome.terminal,
+            origin: &outcome.origin,
+            code: &outcome.code,
+            message: &outcome.message,
+            traceback: &outcome.traceback,
+            executor_pid: executor.birth.pid,
+            stderr_tail: &crate::process::tail(&executor.root_path().join("stderr.log")),
+        },
+    );
 }
 
 pub(crate) fn output_bindings(

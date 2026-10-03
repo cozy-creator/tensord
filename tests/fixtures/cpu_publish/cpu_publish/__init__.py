@@ -34,3 +34,13 @@ def make(payload: Request, ctx: Context, out: Outputs) -> Response:
     third = out.save_bytes(b"frame-3", media_type="application/octet-stream")
     final = out.save_bytes(b"preview-final", media_type="text/plain")
     return Response(frames=[first, second, third], preview=final)
+
+
+class Nothing(msgspec.Struct):
+    pass
+
+
+@app.entrypoint
+def explode(payload: Nothing, ctx: Context, out: Outputs) -> Response:
+    """Fails inside authored code: its traceback is what a triage bundle keeps."""
+    raise ValueError("boom from the fixture")

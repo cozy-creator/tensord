@@ -333,6 +333,11 @@ impl NativeBackend {
             json!({"code":code,"origin":origin,"detail":safe(&message, 1024)})
         };
         body["safe_message"] = json!(message);
+        // Observation only: the failed attempt's bundle, written before the run settled.
+        if let Some((triage, _)) = self.service.engine.triage(&record.id).map_err(problem)? {
+            body["triage_bundle"] = json!({"subject_id":triage.subject_id,
+                "write_receipt_digest":format!("sha256:{}", triage.sha256),"length":triage.length});
+        }
         if !output_entries.is_empty() {
             body["output_manifest"] = json!({"outputs":output_entries});
         }
@@ -699,6 +704,36 @@ impl MachineBackend for NativeBackend {
             .with_journal(|j| j.forget_resolutions(&actor_id(actor), package))
             .map_err(problem)?;
         Ok(pb::ForgetPackageResult {})
+    }
+    fn read_triage(
+        &self,
+        actor: VerifiedActor,
+        request: pb::MachineExecutionTriageQuery,
+    ) -> Result<pb::MachineExecutionTriage, Status> {
+        let record = self.query(
+            actor,
+            request
+                .execution
+                .ok_or_else(|| Status::invalid_argument("execution query absent"))?,
+        )?;
+        if request.attempt_ordinal != 0 && request.attempt_ordinal != record.attempt.max(1) as u64
+        {
+            return Err(Status::not_found("this machine keeps one attempt per run"));
+        }
+        let (triage, bytes) = self
+            .service
+            .engine
+            .triage(&record.id)
+            .map_err(problem)?
+            .ok_or_else(|| Status::not_found("this attempt kept no triage bundle"))?;
+        Ok(pb::MachineExecutionTriage {
+            bundle: Some(pb::TriageBundleRef {
+                subject_id: triage.subject_id,
+                write_receipt_digest: digest_bytes(&format!("sha256:{}", triage.sha256))?,
+                length: triage.length,
+            }),
+            bundle_canonical_bytes: bytes,
+        })
     }
     fn read_machine_log(
         &self,
@@ -2150,14 +2185,26 @@ print(json.dumps({"identity": generation.identity}))
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn published_products_stream_while_running_and_the_result_adds_only_what_is_new() {
-        struct Scratch(PathBuf);
-        impl Drop for Scratch {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
+    struct Scratch(PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// One public run of a fixture entrypoint on the real executor, settled as the GPU pool
+    /// settles it (`products::publish` for publishes, `keep_triage` for a failure).
+    struct Fixture {
+        root: PathBuf,
+        engine: Arc<Execution_Engine>,
+        backend: NativeBackend,
+        actor: VerifiedActor,
+        failure: Arc<Mutex<Option<String>>>,
+        until: std::time::Instant,
+        _scratch: Scratch,
+    }
+    impl Fixture {
+        fn start(entrypoint: &'static str, input: impl FnOnce(&Path) -> Value) -> Self {
         let scratch =
             Scratch(std::env::temp_dir().join(format!("cm-products-{}", uuid::Uuid::new_v4())));
         let root = scratch.0.clone();
@@ -2198,7 +2245,6 @@ print(json.dumps({"identity": generation.identity}))
                 interface: serde_json::to_vec(&held.record.interface).unwrap(),
             })
             .unwrap();
-        let gate = root.join("gate");
         let digest = format!("sha256:{}", "a".repeat(64));
         let record = engine
             .submit_public(
@@ -2216,8 +2262,8 @@ print(json.dumps({"identity": generation.identity}))
                     package: held.record.package.clone(),
                     generation: identity,
                     module: held.record.application.clone(),
-                    entrypoint: "make".into(),
-                    input: json!({"gate": gate}),
+                    entrypoint: entrypoint.into(),
+                    input: input(&root),
                     attention_kernel: String::new(),
                     inputs: vec![],
                 },
@@ -2309,7 +2355,7 @@ print(json.dumps({"identity": generation.identity}))
                         &DeviceCommand::PrepareRequest {
                             request_id: id.clone(),
                             construction: "fixture".into(),
-                            entrypoint: "make".into(),
+                            entrypoint: entrypoint.into(),
                             payload: record.invocation.input,
                             attention_kernel: String::new(),
                             input_metadata: Default::default(),
@@ -2320,7 +2366,7 @@ print(json.dumps({"identity": generation.identity}))
                         &DeviceCommand::Invoke {
                             request_id: id.clone(),
                             construction: "fixture".into(),
-                            entrypoint: "make".into(),
+                            entrypoint: entrypoint.into(),
                             spool: spool.clone(),
                             deadline_s: None,
                             attention_kernel: String::new(),
@@ -2339,10 +2385,15 @@ print(json.dumps({"identity": generation.identity}))
                     if let Some(outcome) =
                         reply.outcome.as_ref().filter(|o| o.terminal != "succeeded")
                     {
-                        return Err(io::Error::other(format!(
-                            "{}: {}",
-                            outcome.code, outcome.message
-                        )));
+                        crate::gpu_service::keep_triage(&engine, &id, &executor, outcome);
+                        let failure = crate::journal::Failure::executor(
+                            &outcome.terminal,
+                            &outcome.origin,
+                            &outcome.code,
+                            &outcome.message,
+                        );
+                        engine.finish(&id, crate::journal::Outcome::Failed(failure.encode()))?;
+                        return executor.shutdown();
                     }
                     let (value, bindings) =
                         device_executor::postprocess(&executor.codec(), &spool, &reply)?;
@@ -2360,28 +2411,58 @@ print(json.dumps({"identity": generation.identity}))
                 result
             })
             .unwrap());
-        // Harness bound on a broken run only; the product never kills by elapsed time.
-        let until = std::time::Instant::now() + Duration::from_secs(300);
-        let check = || {
+        Self {
+            root,
+            engine,
+            backend,
+            actor,
+            failure,
+            // Harness bound on a broken run only; the product never kills by elapsed time.
+            until: std::time::Instant::now() + Duration::from_secs(300),
+            _scratch: scratch,
+        }
+        }
+        fn check(&self) {
             assert!(
-                failure.lock().unwrap().is_none(),
+                self.failure.lock().unwrap().is_none(),
                 "run failed: {:?}",
-                failure.lock().unwrap()
+                self.failure.lock().unwrap()
             );
-            assert!(std::time::Instant::now() < until, "run made no progress");
-        };
-
-        let workspace = engine.workspace_id();
-        let query = |after| pb::MachineExecutionEventsQuery {
-            execution: Some(pb::MachineExecutionQuery {
+            assert!(std::time::Instant::now() < self.until, "run made no progress");
+        }
+        fn query(&self, after: u64) -> pb::MachineExecutionEventsQuery {
+            pb::MachineExecutionEventsQuery {
+                execution: Some(self.execution()),
+                after,
+                limit: 0,
+                wait: true,
+            }
+        }
+        fn execution(&self) -> pb::MachineExecutionQuery {
+            pb::MachineExecutionQuery {
                 request_id: "request-1".into(),
-                expected_execution_workspace_id: workspace.clone(),
+                expected_execution_workspace_id: self.engine.workspace_id(),
                 ..Default::default()
-            }),
-            after,
-            limit: 0,
-            wait: true,
-        };
+            }
+        }
+        fn terminal_page(&self) -> pb::MachineExecutionEventPage {
+            loop {
+                self.check();
+                let page = self.backend.events(self.actor, self.query(0)).unwrap();
+                if page.events.iter().any(|event| event.kind == "outcome") {
+                    return page;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn published_products_stream_while_running_and_the_result_adds_only_what_is_new() {
+        let fixture = Fixture::start("make", |root| json!({"gate": root.join("gate")}));
+        let (engine, backend, actor) = (&fixture.engine, &fixture.backend, fixture.actor);
+        let gate = fixture.root.join("gate");
+        let check = || fixture.check();
+        let query = |after| fixture.query(after);
         let (append, set) = (
             pb::RunProductOp::Append as i32,
             pb::RunProductOp::Set as i32,
@@ -2395,7 +2476,7 @@ print(json.dumps({"identity": generation.identity}))
             cursor = page.next_after;
             live.extend(products(&page));
         }
-        assert_eq!(engine.get(&record.id).unwrap().state, State::Running);
+        assert_eq!(engine.get("1").unwrap().state, State::Running);
         assert_eq!(
             live.iter()
                 .map(|p| (p.1.as_str(), p.2, p.3, p.4.as_str()))
@@ -2479,6 +2560,52 @@ print(json.dumps({"identity": generation.identity}))
                 b"preview-final"
             ]
         );
-        drop(scratch);
+    }
+
+    #[test]
+    fn a_failed_attempt_keeps_a_triage_bundle_its_outcome_names_and_the_owner_can_read() {
+        let fixture = Fixture::start("explode", |_| json!({}));
+        let page = fixture.terminal_page();
+        let outcome = page.events.last().unwrap().outcome.clone().unwrap();
+        let body: Value = serde_json::from_slice(&outcome.outcome_canonical_bytes).unwrap();
+        assert_eq!(body["status"], 3, "{body}");
+        let named = &body["triage_bundle"];
+        let triage = fixture
+            .backend
+            .read_triage(
+                fixture.actor,
+                pb::MachineExecutionTriageQuery {
+                    execution: Some(fixture.execution()),
+                    attempt_ordinal: 0,
+                },
+            )
+            .unwrap();
+        let reference = triage.bundle.unwrap();
+        // What the CLI checks: the bytes are exactly the ones the outcome names.
+        assert_eq!(reference.length, triage.bundle_canonical_bytes.len() as u64);
+        assert_eq!(
+            reference.write_receipt_digest,
+            sha256::digest(&triage.bundle_canonical_bytes).to_vec()
+        );
+        assert_eq!(named["subject_id"], json!(reference.subject_id));
+        assert_eq!(named["length"], json!(reference.length));
+        assert_eq!(
+            named["write_receipt_digest"],
+            json!(format!("sha256:{}", sha256::hex(&reference.write_receipt_digest)))
+        );
+        let bundle: Value = serde_json::from_slice(&triage.bundle_canonical_bytes).unwrap();
+        let traceback = bundle["terminal"]["traceback"].as_str().unwrap();
+        assert!(traceback.contains("ValueError") && traceback.contains("boom from the fixture"), "{bundle}");
+        assert_eq!(bundle["request_id"], "request-1");
+        assert!(bundle["executor"]["pid"].as_u64().unwrap() > 0);
+        // A later attempt ordinal names no bundle on this machine.
+        let later = fixture.backend.read_triage(
+            fixture.actor,
+            pb::MachineExecutionTriageQuery {
+                execution: Some(fixture.execution()),
+                attempt_ordinal: 9,
+            },
+        );
+        assert_eq!(later.unwrap_err().code(), tonic::Code::NotFound);
     }
 }

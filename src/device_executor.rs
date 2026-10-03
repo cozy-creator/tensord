@@ -330,6 +330,9 @@ pub struct Outcome {
     pub code: String,
     #[serde(default)]
     pub message: String,
+    /// The raising traceback of a failed invocation (diagnostics, never a terminal field).
+    #[serde(default)]
+    pub traceback: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -461,6 +464,8 @@ pub struct Frame {
     /// A refusal's own terminal (`refused`/`failed`) and origin (`request`/`author`/`runtime`).
     pub terminal: String,
     pub origin: String,
+    /// A traced command refusal's raising traceback.
+    pub traceback: String,
     #[serde(flatten)]
     pub hello: Hello,
     pub outcome: Option<Outcome>,

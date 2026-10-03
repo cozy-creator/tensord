@@ -332,6 +332,7 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS native_outputs(actor TEXT NOT NULL,owner TEXT NOT NULL,source BLOB NOT NULL,PRIMARY KEY(actor,owner));
             CREATE TABLE IF NOT EXISTS input_intakes(actor TEXT NOT NULL,retention TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,retention));
             CREATE TABLE IF NOT EXISTS hub_access(actor TEXT NOT NULL,origin TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,origin));
+            CREATE TABLE IF NOT EXISTS triage(execution INTEGER PRIMARY KEY REFERENCES executions(id),record TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS resolutions(actor TEXT NOT NULL,key TEXT NOT NULL,package TEXT NOT NULL,preparation TEXT NOT NULL,PRIMARY KEY(actor,key));
             CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_request ON executions(actor,request_id) WHERE actor IS NOT NULL;
             CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_submission ON executions(actor,submission_id) WHERE actor IS NOT NULL;
@@ -642,6 +643,26 @@ impl Journal {
             .execute("INSERT OR REPLACE INTO resolutions(actor,key,package,preparation) VALUES(?1,?2,?3,?4)", params![actor, key, package, preparation])
             .map_err(db_error)?;
         Ok(())
+    }
+    /// The failed attempt's triage bundle reference; written before the run settles.
+    pub fn bind_triage(&mut self, id: &str, triage: &crate::triage::TriageRef) -> io::Result<()> {
+        self.connection
+            .execute(
+                "INSERT OR REPLACE INTO triage(execution,record) VALUES(?1,?2)",
+                params![id, encoded(triage)?],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+    pub fn triage(&self, id: &str) -> io::Result<Option<crate::triage::TriageRef>> {
+        let record: Option<String> = self
+            .connection
+            .query_row("SELECT record FROM triage WHERE execution=?1", [id], |r| r.get(0))
+            .optional()
+            .map_err(db_error)?;
+        record
+            .map(|record| serde_json::from_str(&record).map_err(db_error))
+            .transpose()
     }
     /// Drops cached model resolutions of a package: the next run reads its bindings again.
     pub fn forget_resolutions(&mut self, actor: &str, package: &str) -> io::Result<()> {

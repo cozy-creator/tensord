@@ -59,7 +59,7 @@ is required. Hooks: `describe_runtime`, `list_packages`, `list_models`, `retain_
 `release_bytes`, `begin_input_tree`, `workspace`, `submit`, `get`, `events[_observed]`,
 `control`, `list[_observed]`, `close_submission`, `collect`, `ack_collection`,
 `read_bytes`/`read_stream`, `uploads`, `prepare_local`, `read_machine_log`, `forget_package`,
-`open_output`.
+`open_output`, `read_triage`.
 
 - `Observation` is set when the reader goes away. It only ends a wait. It has no run-control authority.
 - Event pages: default and max 256. Execution lists: default 64, max 256.

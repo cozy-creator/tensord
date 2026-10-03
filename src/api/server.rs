@@ -1121,6 +1121,21 @@ impl<B: MachineBackend> pb::pod_host_server::PodHost for Api<B> {
         self.call(move |backend| backend.forget_package(actor, request))
             .await
     }
+    async fn read_machine_execution_triage(
+        &self,
+        request: Request<pb::MachineExecutionTriageQuery>,
+    ) -> Result<Response<pb::MachineExecutionTriage>, Status> {
+        let actor = self.auth(
+            request
+                .get_ref()
+                .execution
+                .as_ref()
+                .and_then(|q| q.claim.as_ref()),
+        )?;
+        let request = request.into_inner();
+        self.call(move |backend| backend.read_triage(actor, request))
+            .await
+    }
     async fn read_machine_log(
         &self,
         request: Request<pb::MachineLogQuery>,
@@ -1320,6 +1335,12 @@ impl<B: MachineBackend> pb::worker_control_server::WorkerControl for Api<B> {
             self, request,
         )
         .await
+    }
+    async fn read_machine_execution_triage(
+        &self,
+        request: Request<pb::MachineExecutionTriageQuery>,
+    ) -> Result<Response<pb::MachineExecutionTriage>, Status> {
+        <Self as pb::pod_host_server::PodHost>::read_machine_execution_triage(self, request).await
     }
 }
 

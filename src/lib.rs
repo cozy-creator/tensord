@@ -25,3 +25,4 @@ pub mod protocol;
 pub mod published;
 pub mod resident_custody;
 pub mod service;
+pub mod triage;

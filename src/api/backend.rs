@@ -194,6 +194,14 @@ pub trait MachineBackend: Send + Sync + 'static {
         unsupported()
     }
     /// One kept log's bytes, oldest first (wire 72). A log not written yet is empty.
+    /// A failed attempt's retained triage bundle.
+    fn read_triage(
+        &self,
+        _: VerifiedActor,
+        _: pb::MachineExecutionTriageQuery,
+    ) -> Result<pb::MachineExecutionTriage, Status> {
+        unsupported()
+    }
     fn read_machine_log(
         &self,
         _: VerifiedActor,
