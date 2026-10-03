@@ -1311,7 +1311,8 @@ impl Iterator for ByteReader {
         if self.remaining == 0 {
             return None;
         }
-        let mut data = vec![0; self.remaining.min(1 << 20) as usize];
+        // worker.proto MaxNativeByteReadChunkBytes: clients refuse larger chunks.
+        let mut data = vec![0; self.remaining.min(32 << 10) as usize];
         if let Err(error) = self.file.read_exact(&mut data) {
             self.remaining = 0;
             return Some(Err(problem(error)));
