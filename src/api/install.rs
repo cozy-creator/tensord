@@ -174,7 +174,11 @@ pub fn prepare_uploaded(
         &config.python
     };
     let mut command = Command::new(&config.helper_python);
+    // The uploaded build backend runs here: it gets the machine's environment without
+    // credentials or Runtime-owned names, never the whole service environment.
     command
+        .env_clear()
+        .envs(crate::launch_identity::inherited())
         .arg("-m")
         .arg("cozy_machine_client.packages")
         .arg("install-captured")
