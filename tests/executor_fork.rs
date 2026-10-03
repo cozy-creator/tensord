@@ -55,6 +55,7 @@ fn config(generation: &Generation, hold: &File, root: &Path, name: &str) -> Exec
         seal,
         generation_hold: Some(Arc::new(hold.try_clone().unwrap())),
         identity: None,
+        cgroup_namespace: Some("fork".into()),
     }
 }
 
