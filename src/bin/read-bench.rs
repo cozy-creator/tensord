@@ -180,30 +180,31 @@ async fn measure(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (host, port) = address.rsplit_once(':').ok_or("address is host:port")?;
     let ca = std::env::temp_dir().join("read-bench-leaf.pem");
     std::fs::write(&ca, pem)?;
-    // One connection per window mode: adaptive (BDP), fixed (16 MiB stream / 32 MiB
-    // connection) or default (hyper's own).
-    let mut clients = vec![];
-    for window in window.split(',') {
-        let channel = Endpoint::from_shared(format!("https://{address}"))?
-            .http2_adaptive_window(window == "adaptive")
-            .initial_stream_window_size((window == "fixed").then_some(16 << 20))
-            .initial_connection_window_size((window == "fixed").then_some(32 << 20))
-            .tls_config(
-                ClientTlsConfig::new()
-                    .ca_certificate(Certificate::from_pem(pem))
-                    .domain_name("localhost"),
-            )?
-            .connect()
-            .await?;
-        clients.push((
-            window,
-            v1::machine_client::MachineClient::new(channel).max_decoding_message_size(16 << 20),
-        ));
-    }
+    // Each transfer opens its own connection, as curl does: adaptive (BDP), fixed (16 MiB
+    // stream / 32 MiB connection) or default (hyper's own) HTTP/2 windows.
+    let connect = |window: &str| {
+        Endpoint::from_shared(format!("https://{address}")).map(|endpoint| {
+            endpoint
+                .http2_adaptive_window(window == "adaptive")
+                .initial_stream_window_size((window == "fixed").then_some(16 << 20))
+                .initial_connection_window_size((window == "fixed").then_some(32 << 20))
+        })
+    };
     for attempt in 1..=repeat {
-        for (window, client) in &mut clients {
+        for window in window.split(',') {
+            // Timed from the connection, as curl's total is.
             let (cpu, served) = (ticks("self", 11), server_cpu());
             let started = Instant::now();
+            let channel = connect(window)?
+                .tls_config(
+                    ClientTlsConfig::new()
+                        .ca_certificate(Certificate::from_pem(pem))
+                        .domain_name("localhost"),
+                )?
+                .connect()
+                .await?;
+            let mut client =
+                v1::machine_client::MachineClient::new(channel).max_decoding_message_size(16 << 20);
             let mut request = tonic::Request::new(v1::ReadRequest {
                 target: Some(v1::read_request::Target::Output(v1::OutputTarget {
                     run: "bench".into(),
