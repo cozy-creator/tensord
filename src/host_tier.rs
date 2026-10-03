@@ -7,7 +7,10 @@
 //! size follows live host headroom (`host_memory`), read at every admission; unheld, complete
 //! layouts are released least recently used first, or after `ttl` unused. How much of the
 //! headroom the tier may take is `TierLimit`'s decision (the memory policy module's). No lock
-//! is held across a fill.
+//! is held across a fill. A layout that does not fit even after releases is streamed instead
+//! (the disk rung): a sealed window of a few slots (`TierLimit::staging` sizes it; one region
+//! at least) that the machine refills from disk in order as the executor claims regions;
+//! nothing is refused for size, and the executor reads no store either way.
 use crate::{host_memory::HostMemory, os};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -20,7 +23,10 @@ use std::{
         unix::fs::{FileExt, MetadataExt},
     },
     path::PathBuf,
-    sync::{mpsc, Arc, Condvar, Mutex, Weak},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc, Arc, Condvar, Mutex, Weak,
+    },
     time::{Duration, Instant},
 };
 use tensorfs_core::{
@@ -33,6 +39,7 @@ use tensorfs_plane::{
     host::{self, OpenFill},
     io::{IoTally, Source},
     layout::Layout,
+    window::{self, OpenWindow},
 };
 
 #[derive(Clone, Debug)]
@@ -60,6 +67,12 @@ impl Default for HostTierConfig {
 /// The most the tier may charge, given live host memory and what it charges now.
 pub trait TierLimit: Send + Sync {
     fn limit(&self, host: &HostMemory, charged: u64) -> u64;
+    /// The most a streamed layout's slots may take now (`charged` counts every layout): by
+    /// default the room left under `limit`. A window gets one slot (its largest region)
+    /// whatever this says.
+    fn staging(&self, host: &HostMemory, charged: u64) -> u64 {
+        self.limit(host, charged).saturating_sub(charged)
+    }
 }
 /// Until the memory policy module decides: half of what the host has for the tier (free
 /// before its tightest limit, plus what the tier holds), Runtime's `pinned_total` rule.
@@ -133,8 +146,13 @@ pub struct Ledger {
     /// that used such an allocation.
     pub reserved: u64,
     pub reserved_used: u64,
-    /// Asks refused because the tier could not make room: that weight set read the store.
+    /// Asks refused because the tier could not make room: that weight set read the store
+    /// (only an executor that cannot adopt a streamed layout).
     pub no_room: u64,
+    /// Layouts streamed through a window because they did not fit, and the bytes ended windows
+    /// read from disk.
+    pub windows: u64,
+    pub streamed_bytes: u64,
     /// Fills that failed: their adopters got an error, the layout was dropped.
     pub failed: u64,
     pub released: u64,
@@ -155,6 +173,10 @@ pub struct HostTierFacts {
     pub filling_bytes: u64,
     /// Memory allocated at admission for components not yet planned.
     pub reserved_bytes: u64,
+    /// Live windows (streamed layouts), what they charge, and what they have read so far.
+    pub windows: usize,
+    pub window_bytes: u64,
+    pub window_read_bytes: u64,
     pub entries: usize,
     pub peers: usize,
     #[serde(flatten)]
@@ -168,6 +190,22 @@ struct Entry {
     holders: BTreeSet<u64>,
     /// Every region is in; until then nothing releases it.
     complete: bool,
+    /// A streamed layout: its machine's staging loop. Released once its last holder exits.
+    window: Option<Streamer>,
+    granted: bool,
+}
+struct Streamer {
+    stop: Arc<AtomicBool>,
+    tally: Arc<IoTally>,
+}
+impl Streamer {
+    fn read_bytes(&self) -> u64 {
+        let t = &self.tally;
+        [&t.cached_bytes, &t.direct_bytes, &t.buffered_bytes]
+            .iter()
+            .map(|n: &&AtomicU64| n.load(Ordering::Relaxed))
+            .sum()
+    }
 }
 enum Slot {
     /// Admitted, its memfd being created.
@@ -228,9 +266,10 @@ impl State {
             + self.ledger.stranded_bytes
     }
     fn filling(&self) -> bool {
-        self.slots
-            .values()
-            .any(|s| !matches!(s, Slot::Open(Entry { complete: true, .. })))
+        self.slots.values().any(|s| match s {
+            Slot::Opening(_) => true,
+            Slot::Open(e) => !e.complete && e.window.is_none(),
+        })
     }
 }
 
@@ -344,7 +383,7 @@ impl HostTier {
             for body in bodies {
                 let filled = serde_json::from_slice::<SealedPlan>(&body)
                     .map_err(failure)
-                    .and_then(|plan| tier.ensure(&plan, &grants, &body, true).map(|_| ()));
+                    .and_then(|plan| tier.ensure(&plan, &grants, &body, true, false).map(|_| ()));
                 if let Err(error) = filled {
                     eprintln!("host tier prefill skipped: {error}");
                 }
@@ -445,13 +484,23 @@ impl HostTier {
             return Err(denied("host tier peer is not a registered live executor"));
         }
         let (plan, body) = Self::plan(request, plan)?;
-        let Some(key) = self.ensure(&plan, grants, &body, false)? else {
+        let filling = self
+            .state
+            .lock()
+            .unwrap()
+            .peers
+            .get(&peer)
+            .is_some_and(|p| p.filling);
+        let Some(key) = self.ensure(&plan, grants, &body, false, filling)? else {
             return Ok(None);
         };
         let mut state = self.state.lock().unwrap();
         loop {
             let filling = state.peers.get(&peer).is_some_and(|p| p.filling);
             match state.slots.get(&key) {
+                // A streamed layout never completes: an executor that cannot wait per region
+                // reads the store.
+                Some(Slot::Open(e)) if e.window.is_some() && !filling => return Ok(None),
                 Some(Slot::Open(e)) if e.complete || filling => {
                     return self.grant(&mut state, &key, peer).map(Some)
                 }
@@ -461,14 +510,16 @@ impl HostTier {
         }
     }
 
-    /// The layout `plan` names, held or opened now (its fill queued). Its key, or None when the
-    /// tier cannot make room.
+    /// The layout `plan` names, held or opened now: whole (its fill queued) when the tier can
+    /// make room, else streamed through a window (`stream`: for an executor that waits per
+    /// region; otherwise None). Its key.
     fn ensure(
         &self,
         plan: &SealedPlan,
         grants: &[HostGrant],
         body: &[u8],
         prefill: bool,
+        stream: bool,
     ) -> io::Result<Option<String>> {
         let grant = grants
             .iter()
@@ -533,8 +584,16 @@ impl HostTier {
                 break;
             }
             if !self.release_lru(&mut state) {
-                state.ledger.no_room += 1;
-                return Ok(None);
+                if !stream {
+                    state.ledger.no_room += 1;
+                    return Ok(None);
+                }
+                let staging = self.limit.staging(&host, charged);
+                drop(state);
+                if let Some(fd) = reserved {
+                    drop(fd); // the component's reservation: a window is smaller
+                }
+                return self.stream(key, plan, read_plan, layout, staging);
             }
         }
         state.ledger.reserved_used += u64::from(reserved.is_some());
@@ -553,6 +612,8 @@ impl HostTier {
                         used: Instant::now(),
                         holders: BTreeSet::new(),
                         complete: false,
+                        window: None,
+                        granted: false,
                     }),
                 );
                 let job = Job {
@@ -576,6 +637,71 @@ impl HostTier {
         };
         self.filled.notify_all();
         result
+    }
+
+    /// The disk rung: `layout` streamed through a window of as many of its largest regions as
+    /// `staging` bytes hold (one at least: the indivisible working set; two let one refill
+    /// while another is read), served from disk on its own thread until its last holder exits.
+    fn stream(
+        &self,
+        key: String,
+        plan: &SealedPlan,
+        read_plan: read::ReadPlan,
+        layout: Layout,
+        staging: u64,
+    ) -> io::Result<Option<String>> {
+        let span = layout
+            .regions
+            .iter()
+            .map(|r| r.span)
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let slots = ((staging / span) as usize).clamp(1, layout.regions.len().max(1));
+        let (fd, open) = window::open_window(&plan.name, &layout, slots).map_err(failure)?;
+        let streamer = Streamer {
+            stop: Arc::new(AtomicBool::new(false)),
+            tally: Arc::new(IoTally::default()),
+        };
+        let (stop, tally) = (streamer.stop.clone(), streamer.tally.clone());
+        let charged = open.bytes();
+        let mut state = self.state.lock().unwrap();
+        if matches!(
+            state.slots.get(&key),
+            Some(Slot::Open(_)) | Some(Slot::Opening(_))
+        ) {
+            return Ok(Some(key)); // another ask opened it meanwhile; ours goes unused
+        }
+        state.slots.insert(
+            key.clone(),
+            Slot::Open(Entry {
+                fd: File::from(fd),
+                charged,
+                used: Instant::now(),
+                holders: BTreeSet::new(),
+                complete: false,
+                window: Some(streamer),
+                granted: false,
+            }),
+        );
+        state.ledger.windows += 1;
+        drop(state);
+        self.filled.notify_all();
+        let (store, meta, threads) = (
+            self.store.clone(),
+            self.meta.clone(),
+            self.config.fill_threads,
+        );
+        let manifest = hex(&plan.manifest).to_string();
+        std::thread::spawn(move || {
+            if let Err(error) = serve(
+                &store, &meta, &manifest, &read_plan, &layout, open, threads, &tally, &stop,
+            ) {
+                // Dropping the window failed every region: its readers get the error.
+                eprintln!("host tier window stopped: {error}");
+            }
+        });
+        Ok(Some(key))
     }
 
     /// The filler: one layout's bytes, then it is complete (charged what it holds) or, failed,
@@ -635,8 +761,18 @@ impl HostTier {
         let host = crate::host_memory::read();
         let charged = state.charged();
         let (mut held, mut filling) = (0, 0);
+        let (mut windows, mut window_bytes, mut window_read_bytes) = (0, 0, 0);
         for slot in state.slots.values() {
             match slot {
+                Slot::Open(
+                    e @ Entry {
+                        window: Some(w), ..
+                    },
+                ) => {
+                    windows += 1;
+                    window_bytes += e.charged;
+                    window_read_bytes += w.read_bytes();
+                }
                 Slot::Opening(n)
                 | Slot::Open(Entry {
                     charged: n,
@@ -654,6 +790,9 @@ impl HostTier {
             held_bytes: held,
             filling_bytes: filling,
             reserved_bytes: state.reserved.values().map(Reservation::bytes).sum(),
+            windows,
+            window_bytes,
+            window_read_bytes,
             entries: state.slots.len(),
             peers: state.peers.len(),
             ledger: state.ledger.clone(),
@@ -695,10 +834,17 @@ impl HostTier {
                 body,
             ));
         }
+        let filling = self
+            .state
+            .lock()
+            .unwrap()
+            .peers
+            .get(&peer)
+            .is_some_and(|p| p.filling);
         let (tier, grants) = (self.clone(), grants.to_vec());
         std::thread::spawn(move || {
             for (plan, body) in queued {
-                if let Err(error) = tier.ensure(&plan, &grants, &body, true) {
+                if let Err(error) = tier.ensure(&plan, &grants, &body, true, filling) {
                     eprintln!("host tier prefetch skipped: {error}");
                 }
             }
@@ -780,6 +926,7 @@ impl HostTier {
         };
         entry.used = Instant::now();
         entry.holders.insert(peer);
+        entry.granted = true;
         // A new read-only description: the recipient can neither write nor resize, and the
         // seals forbid it any other way.
         File::open(format!("/proc/self/fd/{}", entry.fd.as_raw_fd()))
@@ -801,7 +948,13 @@ impl HostTier {
         for (key, slot) in &mut state.slots {
             if let Slot::Open(entry) = slot {
                 entry.holders.retain(|h| !ended.contains(h));
-                if entry.holders.is_empty() && entry.complete && entry.used.elapsed() >= ttl {
+                let unused = entry.used.elapsed() >= ttl;
+                let done = match entry.window {
+                    // A window holds nothing worth keeping: it goes with its last holder.
+                    Some(_) => entry.granted || unused,
+                    None => entry.complete && unused,
+                };
+                if entry.holders.is_empty() && done {
                     expired.push(key.clone());
                 }
             }
@@ -852,6 +1005,14 @@ impl HostTier {
         let Some(Slot::Open(entry)) = state.slots.remove(key) else {
             return;
         };
+        if let Some(window) = &entry.window {
+            // Its staging loop unmaps the slots within a poll; nothing else maps them.
+            window.stop.store(true, Ordering::Release);
+            state.ledger.streamed_bytes += window.read_bytes();
+            state.ledger.released += 1;
+            state.ledger.released_bytes += entry.charged;
+            return;
+        }
         let quiet = !state.filling();
         let before = crate::host_memory::read().shmem;
         drop(entry.fd);
@@ -863,4 +1024,30 @@ impl HostTier {
             state.ledger.stranded_bytes += entry.charged;
         }
     }
+}
+
+/// A window's staging loop: a read lease over its objects for as long as it serves.
+#[allow(clippy::too_many_arguments)]
+fn serve(
+    store: &Arc<Store>,
+    meta: &Arc<Meta>,
+    manifest: &str,
+    read_plan: &read::ReadPlan,
+    layout: &Layout,
+    open: OpenWindow,
+    threads: usize,
+    tally: &IoTally,
+    stop: &AtomicBool,
+) -> io::Result<()> {
+    let mut objects = BTreeMap::new();
+    for item in &read_plan.items {
+        if let Item::Object(range) = &item.source {
+            objects.insert(range.obj.sha256.clone(), range.obj.clone());
+        }
+    }
+    let (lease, _) =
+        read::acquire(store, meta, manifest, objects.into_values().collect()).map_err(failure)?;
+    let source = Source::new(store.clone(), meta.clone(), lease, true, 0);
+    open.serve(layout, &source, threads, tally, stop)
+        .map_err(failure)
 }

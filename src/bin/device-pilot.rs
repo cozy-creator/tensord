@@ -2,7 +2,7 @@
 //! `run A.json B.json ...` runs each config's executor in turn in one process: with
 //! `host_tier`, their weights come from one machine host tier that outlives each executor.
 use cozy_machine::device_executor;
-use cozy_machine::host_tier::{HalfOfHeadroom, HostGrant, HostTier, HostTierConfig, SealedRequest};
+use cozy_machine::host_tier::{HalfOfHeadroom, HostGrant, HostTier, HostTierConfig, SealedRequest, TierLimit};
 use cozy_machine::model_sources::{ModelSources, SelectedManifest};
 
 use device_executor::{
@@ -42,7 +42,18 @@ struct Pilot {
     /// Weights from the machine's sealed host tier (`host_tiers.sealed/1`) when offered.
     #[serde(default)]
     host_tier: bool,
+    /// A fixed host tier limit for this pilot (an experiment's stand-in for a smaller host);
+    /// otherwise half the live headroom.
+    #[serde(default)]
+    host_tier_limit_bytes: Option<u64>,
     payloads: Vec<Value>,
+}
+
+struct FixedLimit(u64);
+impl TierLimit for FixedLimit {
+    fn limit(&self, _: &cozy_machine::host_memory::HostMemory, _: u64) -> u64 {
+        self.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
@@ -220,7 +231,11 @@ fn run() -> io::Result<()> {
         if config.host_tier && tier.is_none() {
             let store = Arc::new(tensorfs_core::store::Store::open(std::path::Path::new(&config.binding.store)).map_err(io::Error::other)?);
             let plans = Some(config.root.parent().unwrap_or(&config.root).join("host-plans"));
-            tier = Some(HostTier::new(store, HostTierConfig { plans, ..HostTierConfig::default() }, Box::new(HalfOfHeadroom))?);
+            let limit: Box<dyn TierLimit> = match config.host_tier_limit_bytes {
+                Some(bytes) => Box::new(FixedLimit(bytes)),
+                None => Box::new(HalfOfHeadroom),
+            };
+            tier = Some(HostTier::new(store, HostTierConfig { plans, ..HostTierConfig::default() }, limit)?);
         }
         pilot(&action, config, tier.as_ref())?;
     }

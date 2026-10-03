@@ -513,20 +513,28 @@ fn sealed_not(body: &[u8]) -> File {
 /// layout past half the headroom is refused (its executor reads the store), a small one fits.
 #[test]
 fn the_tier_follows_live_headroom_in_a_memory_limited_cgroup() {
-    let scope = [
+    in_scope(
+        &["MemoryHigh=256M", "MemoryMax=1G"],
+        "inside_a_256_mib_scope",
+    );
+}
+
+/// Run the ignored test `name` in a transient user scope with these memory properties (no
+/// swap); skipped where the session cannot create one.
+fn in_scope(memory: &[&str], name: &str) {
+    let mut scope = vec![
         "--user",
         "--scope",
         "--quiet",
         "--collect",
         "-p",
-        "MemoryHigh=256M",
-        "-p",
-        "MemoryMax=1G",
-        "-p",
         "MemorySwapMax=0",
     ];
+    for p in memory {
+        scope.extend(["-p", p]);
+    }
     if !Command::new("systemd-run")
-        .args(scope)
+        .args(&scope)
         .arg("true")
         .status()
         .is_ok_and(|s| s.success())
@@ -535,14 +543,9 @@ fn the_tier_follows_live_headroom_in_a_memory_limited_cgroup() {
         return;
     }
     let inner = Command::new("systemd-run")
-        .args(scope)
+        .args(&scope)
         .arg(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "inside_a_256_mib_scope",
-            "--ignored",
-            "--test-threads=1",
-        ])
+        .args(["--exact", name, "--ignored", "--test-threads=1"])
         .status()
         .unwrap();
     assert!(inner.success());
@@ -736,5 +739,112 @@ fn a_failed_fill_is_an_error_for_its_adopters_and_leaves_the_tier() {
     assert!(
         facts.ledger.failed >= 1 && facts.ledger.fills.is_empty() && facts.entries == 0,
         "{facts:?}"
+    );
+}
+
+/// Read every region of a streamed layout as an executor's plane does (`with_region`), in
+/// order, `passes` times, checking every byte; returns the bytes checked.
+fn stream_through(fx: &Fixture, granted: &File, passes: usize) -> u64 {
+    let layout = fx.layout();
+    let host = tensorfs_plane::host::HostMem::adopt_sealed(granted.as_raw_fd(), &layout).unwrap();
+    assert!(host.window().is_some(), "a streamed layout");
+    let mut checked = 0;
+    for _ in 0..passes {
+        for (r, region) in layout.regions.iter().enumerate() {
+            host.with_region(r as u32, |p| {
+                for part in layout.parts.iter().filter(|p| p.region as usize == r) {
+                    let key = part
+                        .what
+                        .trim_start_matches("unet/")
+                        .trim_end_matches("#value");
+                    let n = fx.tensors.iter().find(|(k, _)| k == key).unwrap().1;
+                    // SAFETY: the region's bytes, held by our claim while this runs.
+                    let got = unsafe {
+                        std::slice::from_raw_parts(p.add((part.offset - region.offset) as usize), n)
+                    };
+                    assert!(
+                        got == &bytes_of(key, n)[..],
+                        "{} differs in the window",
+                        part.what
+                    );
+                    checked += n as u64;
+                }
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+    checked
+}
+
+/// The disk rung: a model eight times the tier's limit is streamed, not refused. The executor
+/// reads every byte, twice over, through two slots; the window goes when the executor does. An
+/// executor that cannot wait per region reads the store instead.
+#[test]
+fn a_model_far_larger_than_the_tier_streams_through_a_window() {
+    let fx = Fixture::new("window", &[8 * MIB; 16]);
+    let tier = tier(&fx, 16 * MIB as u64);
+    let (executor, a) = Executor::spawn_filling(&tier);
+    let granted = ask(&tier, a, &fx).expect("streamed, never refused");
+    assert_eq!(stream_through(&fx, &granted, 2), 2 * 128 * MIB as u64);
+    let facts = tier.facts();
+    assert_eq!(
+        (facts.windows, facts.ledger.windows, facts.ledger.no_room),
+        (1, 1, 0),
+        "{facts:?}"
+    );
+    assert!(
+        facts.window_bytes <= 17 * MIB as u64,
+        "two 8 MiB slots: {facts:?}"
+    );
+    assert!(facts.window_read_bytes >= 2 * 128 * MIB as u64, "{facts:?}");
+    let (_older, b) = Executor::spawn(&tier);
+    assert!(
+        ask(&tier, b, &fx).is_none(),
+        "an older executor reads the store"
+    );
+    executor.exit();
+    drop(granted);
+    let facts = tier.facts();
+    assert_eq!(
+        (facts.windows, facts.entries),
+        (0, 0),
+        "released with its executor: {facts:?}"
+    );
+    assert!(facts.ledger.streamed_bytes >= 2 * 128 * MIB as u64);
+}
+
+/// In a cgroup whose hard limit is below the model's size, with the real limit
+/// (`HalfOfHeadroom` over live headroom): the model streams, every byte checks, nothing is
+/// refused and nothing is killed.
+#[test]
+fn a_model_larger_than_its_cgroup_streams_and_checks() {
+    in_scope(&["MemoryMax=192M"], "inside_a_192_mib_scope");
+}
+
+#[test]
+#[ignore = "run inside a memory-limited scope by the test above"]
+fn inside_a_192_mib_scope() {
+    let host = cozy_machine::host_memory::read();
+    assert!(
+        host.available > 0 && host.available <= 192 << 20,
+        "{host:?}"
+    );
+    let fx = Fixture::new("cgroup-window", &[8 * MIB; 32]);
+    let tier = HostTier::new(
+        fx.store.clone(),
+        HostTierConfig::default(),
+        Box::new(cozy_machine::host_tier::HalfOfHeadroom),
+    )
+    .unwrap();
+    let (_executor, a) = Executor::spawn_filling(&tier);
+    let granted = ask(&tier, a, &fx).expect("streamed, never refused");
+    assert_eq!(stream_through(&fx, &granted, 1), 256 * MIB as u64);
+    let facts = tier.facts();
+    assert_eq!((facts.windows, facts.ledger.no_room), (1, 0), "{facts:?}");
+    assert!(facts.window_bytes < 192 << 20, "{facts:?}");
+    eprintln!(
+        "window: {} bytes, {} read; host {:?}",
+        facts.window_bytes, facts.window_read_bytes, facts.host
     );
 }
