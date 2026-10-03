@@ -320,6 +320,29 @@ impl Publisher {
             .map_err(|(code, message)| Refused { code, message })
     }
 
+    /// A Hub checkpoint downloaded into the store (a warm run's model choice), held from
+    /// eviction while it downloads.
+    pub fn download(
+        &self,
+        service: &Service,
+        source: &hub::Source,
+        repository: &str,
+        manifest: &str,
+        bytes: &(dyn Fn(u64, u64) + Sync),
+    ) -> Result<(), Refused> {
+        let catalog = Catalog::new(source).map_err(|e| Refused {
+            code: "catalog_read_failed",
+            message: e.0,
+        })?;
+        let _fetching = self.fetch(vec![manifest.to_string()]);
+        let keep = match service.gpu() {
+            Some(gpu) => self.protected(service, &gpu),
+            None => self.fetching.lock().unwrap().keys().cloned().collect(),
+        };
+        ensure(&self.store, &catalog, repository, manifest, &keep, bytes)
+            .map_err(|(code, message)| Refused { code, message })
+    }
+
     fn fetch(&self, manifests: Vec<String>) -> Fetching<'_> {
         let mut fetching = self.fetching.lock().unwrap();
         for manifest in &manifests {
@@ -998,7 +1021,7 @@ impl Publisher {
                 "downloading {}@{} {}",
                 grant.repository, grant.release, grant.lane
             ));
-            ensure(&self.store, catalog, &grant.repository, &grant.manifest, &keep, job)?;
+            ensure(&self.store, catalog, &grant.repository, &grant.manifest, &keep, &|d, t| job.bytes(d, t))?;
         }
         for grant in &mut grants {
             let parameter = grant
@@ -1098,14 +1121,13 @@ fn ensure(
     repository: &str,
     manifest: &str,
     keep: &[String],
-    job: &Job,
+    bytes: &(dyn Fn(u64, u64) + Sync),
 ) -> Result<(), Failure> {
     let credential = catalog.credential();
     let refspec = format!("{repository}@{manifest}");
     let mut keep = keep.to_vec();
     keep.push(manifest.to_string());
-    let on_event =
-        |event: &tensorfs_core::ensure::Event| job.bytes(event.bytes_done, event.bytes_total);
+    let on_event = |event: &tensorfs_core::ensure::Event| bytes(event.bytes_done, event.bytes_total);
     let mut request = tensorfs_core::ensure::Request::new(
         store,
         catalog.origin(),
@@ -1259,7 +1281,7 @@ fn apply_adapters(
     for adapter in &choice.adapters {
         let manifest = if adapter.source.is_empty() {
             let (repository, manifest) = resolve_adapter(catalog, adapter)?;
-            ensure(store, catalog, &repository, &manifest, &keep, job)?;
+            ensure(store, catalog, &repository, &manifest, &keep, &|d, t| job.bytes(d, t))?;
             manifest
         } else {
             // A provider-source LoRA (civitai://, hf://) is made here, normalized at ingest.

@@ -47,8 +47,10 @@ pub struct Spec {
     pub hub: Option<hub::Source>,
     /// Provider tokens for source models, held the same way.
     pub providers: Providers,
-    /// `model://org/name` (or `org/name`): a model-only warm run puts what it made there.
+    /// `org/name`: a model-only warm run puts the source model it made there.
     pub weights_destination: String,
+    /// The machine-publication authorization the weights destination is written under.
+    pub publication: String,
     pub owner: String,
     /// The spec's identity (its token excluded): a resubmitted id must carry the same.
     pub digest: String,
@@ -210,44 +212,73 @@ impl Runs {
         Ok(record)
     }
 
-    /// A model-only warm run (`cozy model upload`): each choice's provider source is made here,
-    /// and with a weights destination its checkpoint goes into that Hub repository.
-    fn upload(
+    /// A warm run's model choices made present when it names no entrypoint (`cozy package
+    /// install`, `cozy model download`) or no code (`cozy model upload`): a Hub checkpoint
+    /// downloaded, a provider source made, and with a weights destination that source's
+    /// checkpoint put there under the run's publication authorization.
+    fn warm_models(
         &self,
         actor: &str,
         id: &str,
         spec: &Spec,
         observe: &(dyn Fn(&str, u64, u64) + Sync),
-    ) -> Result<ResultRecord, Refused> {
-        if !spec.warm || spec.models.is_empty() || spec.models.iter().any(|c| c.source.is_empty()) {
+    ) -> Result<Vec<Value>, Refused> {
+        let destination = spec.weights_destination.trim_start_matches("model://");
+        if !destination.is_empty() && (spec.models.len() != 1 || spec.models[0].source.is_empty()) {
             return Err(refused(
                 "invalid_request",
-                "a run with no package is a warm run of provider-source model choices",
+                "a weights destination takes one provider-source model",
             ));
         }
-        let destination = spec.weights_destination.trim_start_matches("model://");
-        if !destination.is_empty() && spec.models.len() != 1 {
-            return Err(refused(
-                "invalid_request",
-                "a weights destination takes one model",
-            ));
+        if spec.models.is_empty() {
+            return Ok(vec![]);
         }
         let publisher = self.publisher.as_ref().ok_or_else(|| {
-            refused("capability_unavailable", "this machine makes no source models")
+            refused("capability_unavailable", "this machine prepares no models")
         })?;
+        let hub = spec.hub.clone().or_else(|| self.own_hub.clone());
+        let hub_access = || {
+            hub.as_ref().ok_or_else(|| {
+                refused("hub_access_absent", "this needs the run's Hub access, and it carries none")
+            })
+        };
         let mut models = vec![];
         for choice in &spec.models {
+            if choice.source.is_empty() {
+                let manifest = choice
+                    .manifest
+                    .as_ref()
+                    .map(|m| format!("sha256:{}", tensorfs_core::sha256::hex(&m.digest)))
+                    .ok_or_else(|| {
+                        refused(
+                            "invalid_request",
+                            format!(
+                                "model choice {:?} names no exact manifest or provider source",
+                                choice.parameter
+                            ),
+                        )
+                    })?;
+                let stage = format!("downloading {}", choice.repository);
+                publisher.download(&self.service, hub_access()?, &choice.repository, &manifest, &|done, total| {
+                    observe(&stage, done, total)
+                })?;
+                models.push(json!({"parameter": choice.parameter,
+                    "repository": choice.repository, "manifest": manifest}));
+                continue;
+            }
             let made = publisher.make_source(&choice.source, &choice.profiles, &spec.providers, observe)?;
             let mut row = json!({"parameter": choice.parameter, "source": choice.source,
                 "resolved": made.resolved, "profiles": made.profiles,
                 "repository": made.repository, "manifest": made.manifest.id()});
             if !destination.is_empty() {
-                let hub = spec.hub.clone().or_else(|| self.own_hub.clone()).ok_or_else(|| {
-                    refused("hub_access_absent", "a weights destination needs the run's Hub access")
-                })?;
-                let catalog = hub::Catalog::new(&hub)
-                    .map_err(|e| refused("hub_access_invalid", e.0))?;
-                let credential = catalog.credential();
+                if spec.publication.is_empty() {
+                    return Err(refused(
+                        "publication_unauthorized",
+                        "a weights destination needs the run's publication authorization",
+                    ));
+                }
+                let publishing = hub::Publishing::new(hub_access()?, &spec.publication)
+                    .map_err(|e| refused("publication_unauthorized", e.0))?;
                 let operation = format!(
                     "upload-{}",
                     &tensorfs_core::sha256::hex_digest(format!("{actor}\0{id}").as_bytes())[..40]
@@ -255,12 +286,12 @@ impl Runs {
                 let stage = format!("uploading to {destination}");
                 let published = tensorfs_core::transport::publish(&tensorfs_core::transport::Publication {
                     store: publisher.store(),
-                    hub: catalog.origin(),
+                    hub: publishing.origin(),
                     destination,
                     manifest: &made.manifest,
                     operation: &operation,
-                    credential: &credential,
-                    policy: catalog.policy(),
+                    credential: &publishing,
+                    policy: publishing.policy(),
                     progress: &|done, total| observe(&stage, done, total),
                     streams: 8,
                 })
@@ -270,11 +301,7 @@ impl Runs {
             }
             models.push(row);
         }
-        Ok(ResultRecord {
-            value: json!({"models": models}),
-            artifacts: vec![],
-            asset_bindings: vec![],
-        })
+        Ok(models)
     }
 
     /// The run's code and models made ready: Ok(None) once it is dispatchable, Ok(Some) for a
@@ -284,7 +311,7 @@ impl Runs {
         let run = id.to_string();
         // Byte counts arrive per chunk: a new stage shows at once, bytes at most 4 times a second.
         let last = std::sync::Mutex::new((String::new(), std::time::Instant::now()));
-        let observe = move |stage: &str, done: u64, total: u64| {
+        let observe = Arc::new(move |stage: &str, done: u64, total: u64| {
             let mut last = last.lock().unwrap();
             if last.0 == stage && last.1.elapsed() < std::time::Duration::from_millis(250) && done < total {
                 return;
@@ -292,11 +319,23 @@ impl Runs {
             *last = (stage.to_string(), std::time::Instant::now());
             let detail = json!({"stage": stage, "bytes_done": done, "bytes_total": total});
             let _ = engine.observe_progress(&run, 0, detail.to_string());
-        };
+        });
         observe("preparing", 0, 0);
+        let warm_result = |installed: Value, models: Vec<Value>| -> Result<Option<ResultRecord>, Refused> {
+            let mut value = installed;
+            value["models"] = Value::Array(models);
+            Ok(Some(ResultRecord {
+                value,
+                artifacts: vec![],
+                asset_bindings: vec![],
+            }))
+        };
         if let Source::Models = spec.source {
-            return self.upload(actor, id, &spec, &observe).map(Some);
+            let models = self.warm_models(actor, id, &spec, &*observe)?;
+            return warm_result(json!({}), models);
         }
+        // A warm run naming no entrypoint installs its code, then makes its choices present.
+        let install_only = spec.warm && spec.entrypoint.is_empty();
         let held = match &spec.source {
             Source::Release { .. } | Source::Models => None,
             Source::Installation(alias) => Some(
@@ -323,7 +362,7 @@ impl Runs {
             _ => None,
         };
         // A job's choices address its callables; its children resolve them.
-        let choices = if spec.job { &[][..] } else { &spec.models[..] };
+        let choices = if spec.job || install_only { &[][..] } else { &spec.models[..] };
         let hub = spec.hub.clone().or_else(|| self.own_hub.clone());
         let (installation, plan) = self.resolve(
             actor,
@@ -332,7 +371,10 @@ impl Runs {
             hub.clone(),
             &spec,
             choices,
-            Box::new(observe),
+            Box::new({
+                let observe = observe.clone();
+                move |stage: &str, done: u64, total: u64| observe(stage, done, total)
+            }),
         )?;
         let interface: Value = serde_json::from_slice(&installation.interface)
             .map_err(|_| refused("package_interface_invalid", "held interface is corrupt"))?;
@@ -343,7 +385,7 @@ impl Runs {
         let declared = interface[rows]
             .as_array()
             .is_some_and(|rows| rows.iter().any(|row| row["name"] == spec.entrypoint.as_str()));
-        if !declared {
+        if !declared && !install_only {
             return Err(refused(
                 "invalid_entrypoint",
                 format!("{} declares no {noun} {:?}", installation.package, spec.entrypoint),
@@ -376,11 +418,12 @@ impl Runs {
             ));
         }
         if spec.warm {
-            return Ok(Some(ResultRecord {
-                value: json!({"package": installation.package, "release": installation.release}),
-                artifacts: vec![],
-                asset_bindings: vec![],
-            }));
+            let models = match install_only {
+                true => self.warm_models(actor, id, &spec, &*observe)?,
+                false => vec![],
+            };
+            let installed = json!({"package": installation.package, "release": installation.release});
+            return warm_result(installed, models);
         }
         if spec.job {
             let context = JobContext {
@@ -534,6 +577,7 @@ impl Runs {
             hub: context.hub,
             providers: context.providers,
             weights_destination: String::new(),
+            publication: String::new(),
             owner: context.owner,
             digest: digest.into(),
         })
@@ -663,6 +707,7 @@ mod tests {
             hub: None,
             providers: Default::default(),
             weights_destination: String::new(),
+            publication: String::new(),
             owner: "alice".into(),
             digest: digest.into(),
         }

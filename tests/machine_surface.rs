@@ -1169,6 +1169,24 @@ mod v1_api {
         .await
         .unwrap();
         assert_eq!(outcome(&warm).status, "succeeded", "{warm:?}");
+        // A warm run naming no entrypoint installs the code alone (`cozy package install`).
+        let mut install = local(v1::RunKind::Warm);
+        install.entrypoint.clear();
+        install.payload.clear();
+        let installed = collect(
+            client
+                .run(authorized(run("warm-2", install), &all))
+                .await
+                .unwrap()
+                .into_inner(),
+        )
+        .await
+        .unwrap();
+        let installed = outcome(&installed);
+        assert_eq!(installed.status, "succeeded", "{installed:?}");
+        let result: serde_json::Value = serde_json::from_slice(&installed.result).unwrap();
+        assert_eq!(result["package"], "local/cozy-machine-cpu-lifecycle");
+        assert_eq!(result["models"], serde_json::json!([]));
         let called = collect(
             client
                 .run(authorized(run("call-1", local(v1::RunKind::Call)), &all))

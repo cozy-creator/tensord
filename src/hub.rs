@@ -7,6 +7,8 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tensorfs_core::{
     sha256,
     transport::{self, Deadline, Ledger, ScopedHeaders, SourcePolicy},
@@ -349,6 +351,106 @@ impl Catalog {
         serde_json::from_slice(&self.bytes(path, 4 << 20)?)
             .map_err(|_| Refusal(format!("{path}: invalid JSON")))
     }
+}
+
+/// Hub writes under a machine-publication authorization: the Hub mints a short bearer for this
+/// machine's leaf, proven by the run's execution access, and it is renewed at half its life.
+/// Both go to the Hub host only; presigned object hosts see neither.
+pub struct Publishing {
+    catalog: Catalog,
+    sender: String,
+    authorization: String,
+    bearer: Mutex<Option<(String, Instant)>>,
+}
+
+impl Publishing {
+    pub fn new(source: &Source, authorization: &str) -> Result<Self, Refusal> {
+        let sender = match source.credential.split_once(' ') {
+            Some(("bearer", token)) if !token.is_empty() => token.to_string(),
+            _ => {
+                return Err(Refusal(
+                    "publication needs the run's execution access".into(),
+                ))
+            }
+        };
+        let publishing = Self {
+            catalog: Catalog::new(source)?,
+            sender,
+            authorization: authorization.to_string(),
+            bearer: Mutex::new(None),
+        };
+        // A refused authorization surfaces here, before any byte moves.
+        *publishing.bearer.lock().unwrap() = Some(publishing.renew()?);
+        Ok(publishing)
+    }
+    pub fn origin(&self) -> &str {
+        self.catalog.origin()
+    }
+    pub fn policy(&self) -> &SourcePolicy {
+        self.catalog.policy()
+    }
+    fn renew(&self) -> Result<(String, Instant), Refusal> {
+        let path = format!(
+            "/v1/worker/machine-authorizations/{}/token",
+            escape(&self.authorization)
+        );
+        let sender = ScopedHeaders {
+            hosts: vec![self.catalog.host.clone()],
+            headers: vec![("x-cozy-execution-access".into(), self.sender.clone())],
+        };
+        let answer =
+            transport::hub_call("POST", self.origin(), &path, b"{}", &sender, self.policy())
+                .map_err(|e| Refusal(format!("publication authorization: {}", e.detail)))?;
+        let token = match &answer {
+            tensorfs_core::canon::Value::Obj(pairs) => pairs.iter().find_map(|(k, v)| match v {
+                tensorfs_core::canon::Value::Str(token) if k == "token" => Some(token.clone()),
+                _ => None,
+            }),
+            _ => None,
+        }
+        .ok_or_else(|| Refusal("the Hub minted no publication token".into()))?;
+        let renew_after = Duration::from_secs(remaining_life(&token) / 2);
+        Ok((token, Instant::now() + renew_after))
+    }
+}
+
+impl transport::CredentialProvider for Publishing {
+    fn headers(&self, host: &str) -> Vec<(String, String)> {
+        if !host.eq_ignore_ascii_case(&self.catalog.host) {
+            return vec![];
+        }
+        let mut held = self.bearer.lock().unwrap();
+        if held
+            .as_ref()
+            .is_none_or(|(_, renew)| Instant::now() >= *renew)
+        {
+            match self.renew() {
+                Ok(fresh) => *held = Some(fresh),
+                // The Hub refuses the stale bearer and the publication fails with its answer.
+                Err(Refusal(why)) => eprintln!("{why}"),
+            }
+        }
+        let mut headers = vec![("x-cozy-execution-access".into(), self.sender.clone())];
+        if let Some((token, _)) = held.as_ref() {
+            headers.push(("authorization".into(), format!("Bearer {token}")));
+        }
+        headers
+    }
+}
+
+/// Seconds until a JWT's `exp`, from its own claims; 0 when it names none.
+fn remaining_life(token: &str) -> u64 {
+    let exp = token
+        .split('.')
+        .nth(1)
+        .and_then(|claims| URL_SAFE_NO_PAD.decode(claims).ok())
+        .and_then(|claims| serde_json::from_slice::<Value>(&claims).ok())
+        .and_then(|claims| claims["exp"].as_u64())
+        .unwrap_or(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    exp.saturating_sub(now)
 }
 
 /// Path segment escaping for catalog names and refs.

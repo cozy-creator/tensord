@@ -44,7 +44,7 @@ message RunSpec {
   string binding_revision = 10;   // the owner's binding revision the caller knows
   repeated MemoResult known_results = 11;
   string attention_kernel = 12;
-  string weights_destination = 13;  // model://… for a job's weights outputs
+  string weights_destination = 13;  // org/name: a job's weights outputs, or a warm run's source model
   HubAccess hub = 14;               // held in memory for this run's preparation only
   string owner = 15;                // the account that org-relative references of local code name
   ProviderAccess providers = 16;    // provider tokens for source models, memory only like hub
@@ -111,6 +111,10 @@ message HubAccess {
   int64 expires_at = 3;  // unix seconds
   bytes ca_der = 4;      // an origin's private CA, when it has one
   repeated string object_hosts = 5;  // the Hub's object-storage hosts downloads may follow
+  // A machine-publication authorization (POST /v1/machine-authorizations) for this machine's
+  // leaf: the run puts its weights destination's checkpoint under it, renewing its bearer
+  // with the token above as sender proof.
+  string publication = 6;
 }
 
 message RunEvent {
