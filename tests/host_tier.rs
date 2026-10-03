@@ -285,8 +285,8 @@ fn one_fill_serves_every_executor_read_only_and_outlives_them() {
             libc::O_RDONLY
         );
         assert_eq!(
-            libc::fcntl(granted.as_raw_fd(), libc::F_GET_SEALS) & libc::F_SEAL_WRITE,
-            libc::F_SEAL_WRITE
+            libc::fcntl(granted.as_raw_fd(), libc::F_GET_SEALS) & 0x10, // F_SEAL_FUTURE_WRITE
+            0x10
         );
     }
     fx.adopt(&granted);
@@ -565,7 +565,7 @@ fn remembered_plans_refill_layouts_before_the_executor_asks() {
     assert_eq!(fs::read_dir(&plans).unwrap().count(), 1);
 
     let second = HostTier::new(fx.store.clone(), config, Box::new(Fixed(1 << 30))).unwrap();
-    second.prefill(vec![fx.grant()]);
+    second.prepare(vec![fx.grant()]);
     // The executor would be importing now; its ask waits for the fill under way, or hits.
     let (_executor, b) = Executor::spawn(&second);
     fx.adopt(&ask(&second, b, &fx).expect("prefilled"));
@@ -577,6 +577,61 @@ fn remembered_plans_refill_layouts_before_the_executor_asks() {
             facts.entries
         ),
         (1, 1, 1),
+        "{facts:?}"
+    );
+}
+
+/// A first-ever model: no plan yet, so at admission the tier allocates each component's
+/// memory from the manifest; the executor's plan then fills into it (and frees the excess).
+#[test]
+fn a_first_load_fills_into_memory_reserved_at_admission() {
+    let fx = Fixture::new("reserve", &[3 * MIB, 40 * MIB]);
+    let tier = tier(&fx, 1 << 30);
+    tier.prepare(vec![fx.grant()]);
+    let (_executor, a) = Executor::spawn(&tier);
+    // The ask waits for an allocation under way rather than allocating again.
+    let granted = ask(&tier, a, &fx).expect("room");
+    fx.adopt(&granted);
+    let facts = tier.facts();
+    assert_eq!(
+        (
+            facts.ledger.reserved,
+            facts.ledger.reserved_used,
+            facts.reserved_bytes
+        ),
+        (1, 1, 0),
+        "{facts:?}"
+    );
+    assert!(
+        facts.charged_bytes < (43 * MIB + (4 << 20)) as u64,
+        "the excess was freed: {facts:?}"
+    );
+}
+
+/// An executor sends all its components' plans at once (`SealedPrefetch`): the tier fills them
+/// in the background and the ask that follows finds its layout filled or filling.
+#[test]
+fn a_prefetch_fills_while_the_executor_registers_and_the_ask_finds_it() {
+    let fx = Fixture::new("prefetch", &[3 * MIB, 40 * MIB]);
+    let tier = tier(&fx, 1 << 30);
+    let (_executor, a) = Executor::spawn(&tier);
+    let doc = serde_json::json!([{
+        "manifest": fx.manifest, "name": "sdxl/unet", "layout": "sha256:00", "window": 4 << 20,
+        "traversal": fx.traversal(), "components": ["unet"], "regions": fx.regions(), "parts": [],
+    }]);
+    let body = serde_json::to_vec(&doc).unwrap();
+    let sha256 = format!("{:x}", Sha256::digest(&body));
+    let request = SealedRequest {
+        sha256: &sha256,
+        length: body.len() as u64,
+    };
+    tier.prefetch(a, &[fx.grant()], request, sealed(&body))
+        .unwrap();
+    fx.adopt(&ask(&tier, a, &fx).expect("prefetched"));
+    let facts = tier.facts();
+    assert_eq!(
+        (facts.ledger.fills.len(), facts.entries),
+        (1, 1),
         "{facts:?}"
     );
 }

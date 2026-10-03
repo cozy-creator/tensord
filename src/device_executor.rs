@@ -281,6 +281,7 @@ pub enum Event {
 pub enum Kind {
     ModelSourceRead,
     SealedTier,
+    SealedPrefetch,
     DeviceTier,
     BudgetCell,
     StageEnter,
@@ -372,6 +373,8 @@ pub struct PlaneFacts {
     pub h2d_gbps: Option<f64>,
     pub disk_copy_bytes: Option<u64>,
     pub disk_read_bytes: Option<u64>,
+    /// RAM of the machine's sealed layouts the executor maps (the machine's, not its own).
+    pub sealed_bytes: Option<u64>,
     pub late: Option<u64>,
     pub stall_ns: Option<u64>,
     pub misses: Option<u64>,

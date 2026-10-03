@@ -100,6 +100,20 @@ impl Services for Turns {
         descriptor: Option<File>,
     ) -> io::Result<(Answer, Option<File>)> {
         let mut answer = Answer::unavailable(frame.seq);
+        if let (Kind::SealedPrefetch, Some((tier, peer, grants))) = (frame.kind, &self.host) {
+            let plans = descriptor.ok_or_else(|| io::Error::other("sealed prefetch omitted its plans"))?;
+            let request = SealedRequest { sha256: &frame.sha256, length: frame.length };
+            if let Err(error) = tier.prefetch(*peer, grants, request, plans) {
+                answer.detail = error.to_string();
+            } else {
+                answer.ok = true;
+                answer.code.clear();
+                answer.detail.clear();
+            }
+            let row = serde_json::json!({"phase":self.phase,"exchange":"SealedPrefetch","ok":answer.ok,"detail":answer.detail});
+            writeln!(self.events, "{row}")?;
+            return Ok((answer, None));
+        }
         if let (Kind::SealedTier, Some((tier, peer, grants))) = (frame.kind, &self.host) {
             let plan = descriptor.ok_or_else(|| io::Error::other("sealed tier omitted its plan"))?;
             let started = Instant::now();
@@ -329,7 +343,7 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
                 })
             })
             .collect::<io::Result<Vec<_>>>()?;
-        tier.prefill(grants.clone());
+        tier.prepare(grants.clone());
         turns.host = Some((tier.clone(), tier.register_peer(executor.observer_pidfd()?), grants));
     }
     let disk_before = disk_read_bytes();

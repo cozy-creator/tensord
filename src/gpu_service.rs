@@ -812,9 +812,9 @@ impl GpuPool {
                     .authorized_header(&plan.binding.snapshot)?,
                 components: plan.binding.components.iter().cloned().collect(),
             }];
-            // Layouts this model had before refill while the executor imports and starts.
+            // Start on this model's layouts while the executor imports and constructs.
             if sealed {
-                self.host.prefill(grants.clone());
+                self.host.prepare(grants.clone());
             }
             sessions.insert(
                 plan.id.clone(),
@@ -1616,6 +1616,20 @@ impl Services for Callbacks<'_> {
         frame: &Frame,
         descriptor: Option<File>,
     ) -> io::Result<(Answer, Option<File>)> {
+        if frame.kind == Kind::SealedPrefetch {
+            let mut answer = Answer::unavailable(frame.seq);
+            let plans = descriptor.ok_or_else(|| io::Error::other("sealed prefetch omitted its plans"))?;
+            let request = SealedRequest { sha256: &frame.sha256, length: frame.length };
+            match self.host.prefetch(self.peer, self.grants, request, plans) {
+                Ok(()) => {
+                    answer.ok = true;
+                    answer.code.clear();
+                    answer.detail.clear();
+                }
+                Err(error) => answer.detail = error.to_string(),
+            }
+            return Ok((answer, None));
+        }
         if frame.kind == Kind::SealedTier {
             let mut answer = Answer::unavailable(frame.seq);
             let plan = descriptor

@@ -126,6 +126,10 @@ pub struct Ledger {
     pub hits: u64,
     /// Layouts filled from a remembered plan while their executor started.
     pub prefills: u64,
+    /// Components whose memory was allocated at admission, before any plan, and the fills
+    /// that used such an allocation.
+    pub reserved: u64,
+    pub reserved_used: u64,
     /// Asks refused because the tier could not make room: that weight set read the store.
     pub no_room: u64,
     pub released: u64,
@@ -144,6 +148,8 @@ pub struct HostTierFacts {
     pub charged_bytes: u64,
     pub held_bytes: u64,
     pub filling_bytes: u64,
+    /// Memory allocated at admission for components not yet planned.
+    pub reserved_bytes: u64,
     pub entries: usize,
     pub peers: usize,
     #[serde(flatten)]
@@ -160,6 +166,22 @@ enum Slot {
     Filling(u64),
     Ready(Entry),
 }
+/// A component's memory allocated before its plan exists (`prepare`).
+enum Reservation {
+    Allocating(u64),
+    Ready {
+        fd: OwnedFd,
+        bytes: u64,
+        made: Instant,
+    },
+}
+impl Reservation {
+    fn bytes(&self) -> u64 {
+        match self {
+            Self::Allocating(n) | Self::Ready { bytes: n, .. } => *n,
+        }
+    }
+}
 #[derive(Default)]
 struct State {
     /// By TensorFS layout digest: the same bytes at the same offsets, whoever asks.
@@ -167,6 +189,8 @@ struct State {
     peers: BTreeMap<u64, File>,
     next_peer: u64,
     ledger: Ledger,
+    /// By (manifest, component).
+    reserved: BTreeMap<(String, String), Reservation>,
 }
 impl State {
     fn charged(&self) -> u64 {
@@ -177,6 +201,7 @@ impl State {
                 Slot::Ready(e) => e.charged,
             })
             .sum::<u64>()
+            + self.reserved.values().map(Reservation::bytes).sum::<u64>()
             + self.ledger.stranded_bytes
     }
     fn filling(&self) -> bool {
@@ -242,27 +267,40 @@ impl HostTier {
         }))
     }
 
-    /// Refill, in the background, every layout of these grants a remembered plan describes:
-    /// the executor's asks then find them filled, or wait for the fill already under way.
-    pub fn prefill(self: &Arc<Self>, grants: Vec<HostGrant>) {
-        let bodies: Vec<Vec<u8>> = self
-            .plans
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|((manifest, components), _)| {
-                grants.iter().any(|g| {
-                    hex(&g.manifest) == manifest
-                        && components.iter().all(|c| g.components.contains(c))
-                })
-            })
-            .map(|(_, body)| body.clone())
-            .collect();
-        if bodies.is_empty() {
+    /// Start on what an executor of these grants will ask for, while it starts: refill every
+    /// layout a remembered plan describes, and for each component without one allocate its
+    /// memory now (sized from the manifest) and read its objects ahead. The layout itself
+    /// needs the model code's plan; when it arrives the fill mostly copies.
+    pub fn prepare(self: &Arc<Self>, grants: Vec<HostGrant>) {
+        let plans = self.plans.lock().unwrap().clone();
+        let mut bodies = Vec::new();
+        let mut unplanned = Vec::new();
+        for grant in &grants {
+            for component in &grant.components {
+                let known = plans.iter().find(|((manifest, components), _)| {
+                    manifest == hex(&grant.manifest) && components.contains(component)
+                });
+                match known {
+                    Some((_, body)) if !bodies.contains(body) => bodies.push(body.clone()),
+                    Some(_) => {}
+                    None => unplanned.push((
+                        grant.manifest.clone(),
+                        grant.header.clone(),
+                        component.clone(),
+                    )),
+                }
+            }
+        }
+        if bodies.is_empty() && unplanned.is_empty() {
             return;
         }
         let tier = self.clone();
         std::thread::spawn(move || {
+            for (manifest, header, component) in unplanned {
+                if let Err(error) = tier.reserve(&manifest, &header, &component) {
+                    eprintln!("host tier reservation skipped: {error}");
+                }
+            }
             for body in bodies {
                 let filled = serde_json::from_slice::<SealedPlan>(&body)
                     .map_err(failure)
@@ -272,6 +310,74 @@ impl HostTier {
                 }
             }
         });
+    }
+
+    /// Allocate one component's memory before its plan: every byte its tensors declare, plus
+    /// room for region padding; a fill frees what its layout does not use.
+    fn reserve(&self, manifest: &str, header: &Header, component: &str) -> io::Result<()> {
+        let traversal: Vec<(String, String)> = header
+            .components
+            .iter()
+            .filter(|(name, _)| name == component)
+            .flat_map(|(name, tensors)| {
+                tensors
+                    .iter()
+                    .map(move |(key, _)| (name.clone(), key.clone()))
+            })
+            .collect();
+        let plan = read::plan_for_traversal(header, &traversal, &[component.to_string()], 4 << 20)
+            .map_err(failure)?;
+        let bytes = plan.bytes + plan.bytes / 50 + (32 << 20);
+        let key = (hex(manifest).to_string(), component.to_string());
+        {
+            let mut state = self.state.lock().unwrap();
+            self.reap(&mut state);
+            if state.reserved.contains_key(&key) {
+                return Ok(());
+            }
+            loop {
+                let host = crate::host_memory::read();
+                let charged = state.charged();
+                if charged + bytes <= self.limit.limit(&host, charged) {
+                    break;
+                }
+                if !self.release_lru(&mut state) {
+                    return Ok(()); // no room: the fill allocates as it copies
+                }
+            }
+            state
+                .reserved
+                .insert(key.clone(), Reservation::Allocating(bytes));
+        }
+        // Read ahead what the page cache lacks; the fill then copies instead of reading disk.
+        for item in &plan.items {
+            if let Item::Object(range) = &item.source {
+                if let Ok(file) = File::open(self.store.blob_path(&range.obj.sha256)) {
+                    // SAFETY: advice on a descriptor we hold.
+                    unsafe {
+                        libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_WILLNEED)
+                    };
+                }
+            }
+        }
+        let made = host::reserve(component, bytes, self.config.fill_threads);
+        let mut state = self.state.lock().unwrap();
+        let result = match made {
+            Ok(fd) => {
+                let made = Instant::now();
+                state
+                    .reserved
+                    .insert(key, Reservation::Ready { fd, bytes, made });
+                state.ledger.reserved += 1;
+                Ok(())
+            }
+            Err(error) => {
+                state.reserved.remove(&key);
+                Err(failure(error))
+            }
+        };
+        self.filled.notify_all();
+        result
     }
 
     /// An executor, by its pidfd: what it adopted stays held until that exact process exits.
@@ -338,6 +444,11 @@ impl HostTier {
         }
         let layout = Layout::build(&read_plan, &plan.regions).map_err(failure)?;
         let key = layout.digest.clone();
+        // A one-component plan uses the memory `prepare` allocated for that component.
+        let reservation = match plan.components.as_slice() {
+            [component] => Some((hex(&plan.manifest).to_string(), component.clone())),
+            _ => None,
+        };
         let mut state = self.state.lock().unwrap();
         loop {
             self.reap(&mut state);
@@ -349,9 +460,19 @@ impl HostTier {
                     return Ok(Some(key));
                 }
                 Some(Slot::Filling(_)) => state = self.filled.wait(state).unwrap(),
+                None if reservation.as_ref().is_some_and(|r| {
+                    matches!(state.reserved.get(r), Some(Reservation::Allocating(_)))
+                }) =>
+                {
+                    state = self.filled.wait(state).unwrap()
+                }
                 None => break,
             }
         }
+        let reserved = reservation.and_then(|r| match state.reserved.remove(&r) {
+            Some(Reservation::Ready { fd, .. }) => Some(fd),
+            _ => None,
+        });
         // Admission over live headroom, read now: release unheld layouts, oldest first.
         let need = layout.nbytes;
         loop {
@@ -365,9 +486,10 @@ impl HostTier {
                 return Ok(None);
             }
         }
+        state.ledger.reserved_used += u64::from(reserved.is_some());
         state.slots.insert(key.clone(), Slot::Filling(need));
         drop(state);
-        let filled = self.fill(plan, &read_plan, &layout);
+        let filled = self.fill(plan, &read_plan, &layout, reserved);
         if filled.is_ok() {
             if let Err(error) = self.remember(plan, body) {
                 eprintln!("host tier plan not remembered: {error}");
@@ -432,6 +554,7 @@ impl HostTier {
             charged_bytes: charged,
             held_bytes: held,
             filling_bytes: filling,
+            reserved_bytes: state.reserved.values().map(Reservation::bytes).sum(),
             entries: state.slots.len(),
             peers: state.peers.len(),
             ledger: state.ledger.clone(),
@@ -451,7 +574,40 @@ impl HostTier {
     }
 
     /// The plan the executor sent: a sealed memfd of exactly the declared bytes and digest.
+    /// Fill every plan of one construction (`SealedPrefetch`), each on its own thread, while
+    /// its executor registers them in order; each `seal` ask then waits only for its own.
+    pub fn prefetch(
+        self: &Arc<Self>,
+        peer: u64,
+        grants: &[HostGrant],
+        request: SealedRequest<'_>,
+        plans: File,
+    ) -> io::Result<()> {
+        if !self.state.lock().unwrap().peers.contains_key(&peer) {
+            return Err(denied("host tier peer is not a registered live executor"));
+        }
+        let body = Self::body(request, plans)?;
+        let plans: Vec<serde_json::Value> = serde_json::from_slice(&body).map_err(failure)?;
+        for value in plans {
+            let body = serde_json::to_vec(&value)?;
+            let plan: SealedPlan = serde_json::from_value(value).map_err(failure)?;
+            let (tier, grants) = (self.clone(), grants.to_vec());
+            std::thread::spawn(move || {
+                if let Err(error) = tier.ensure(&plan, &grants, &body, true) {
+                    eprintln!("host tier prefetch skipped: {error}");
+                }
+            });
+        }
+        Ok(())
+    }
+
     fn plan(request: SealedRequest<'_>, plan: File) -> io::Result<(SealedPlan, Vec<u8>)> {
+        let body = Self::body(request, plan)?;
+        Ok((serde_json::from_slice(&body).map_err(failure)?, body))
+    }
+
+    /// A sealed memfd of exactly the declared bytes and digest.
+    fn body(request: SealedRequest<'_>, plan: File) -> io::Result<Vec<u8>> {
         if os::seals(&plan)? & os::FULL_SEALS != os::FULL_SEALS
             || plan.metadata()?.len() != request.length
             || request.length > 64 << 20
@@ -469,7 +625,7 @@ impl HostTier {
                 "sealed plan digest differs",
             ));
         }
-        Ok((serde_json::from_slice(&body).map_err(failure)?, body))
+        Ok(body)
     }
 
     fn fill(
@@ -477,6 +633,7 @@ impl HostTier {
         plan: &SealedPlan,
         read_plan: &read::ReadPlan,
         layout: &Layout,
+        reserved: Option<OwnedFd>,
     ) -> io::Result<(OwnedFd, Fill)> {
         let mut objects = BTreeMap::new();
         for item in &read_plan.items {
@@ -500,6 +657,7 @@ impl HostTier {
             &source,
             self.config.fill_threads,
             &tally,
+            reserved,
         )
         .map_err(failure)?;
         drop(source); // ends the lease and its descriptors: one descriptor per layout stays
@@ -554,9 +712,25 @@ impl HostTier {
         for key in expired {
             self.release_entry(state, &key);
         }
+        state
+            .reserved
+            .retain(|_, r| !matches!(r, Reservation::Ready { made, .. } if made.elapsed() >= ttl));
     }
 
     fn release_lru(&self, state: &mut State) -> bool {
+        // Speculative memory goes first: a reservation no plan has claimed.
+        let reservation = state
+            .reserved
+            .iter()
+            .filter_map(|(key, r)| match r {
+                Reservation::Ready { made, .. } => Some((*made, key.clone())),
+                Reservation::Allocating(_) => None,
+            })
+            .min();
+        if let Some((_, key)) = reservation {
+            state.reserved.remove(&key);
+            return true;
+        }
         let oldest = state
             .slots
             .iter()
