@@ -290,10 +290,13 @@ enum ZygoteState {
     Ready(Box<DeviceExecutor>),
     /// Executors of this generation spawn: its Runtime does not fork, or the parent ended.
     Off(String),
+    /// Its import-only start failed: this launch spawns, the next one starts a parent again
+    /// (a slow or broken first import is not a reason to stop forking for the machine's life).
+    Failed(String),
 }
 impl Zygote {
     fn set(&self, state: ZygoteState) {
-        if let ZygoteState::Off(reason) = &state {
+        if let ZygoteState::Off(reason) | ZygoteState::Failed(reason) = &state {
             eprintln!("executor prespawn off: {reason}");
         }
         *self.state.lock().unwrap() = state;
@@ -336,6 +339,9 @@ impl Zygote {
             Forked::Refused(..) => {}
         }
         Ok(forked)
+    }
+    fn failed(&self) -> bool {
+        matches!(*self.state.lock().unwrap(), ZygoteState::Failed(_))
     }
     /// Ready and with no live child: ending it ends nothing else.
     fn childless(&self) -> bool {
@@ -1286,7 +1292,7 @@ impl GpuPool {
             )?;
             if !reply.ok {
                 executor.shutdown()?;
-                return Ok(ZygoteState::Off(format!(
+                return Ok(ZygoteState::Failed(format!(
                     "import-only start refused: {}: {}",
                     reply.code, reply.detail
                 )));
@@ -1299,7 +1305,8 @@ impl GpuPool {
             }
             io::Result::Ok(ZygoteState::Ready(Box::new(executor)))
         })();
-        started.unwrap_or_else(|error| ZygoteState::Off(format!("import-only executor: {error}")))
+        started
+            .unwrap_or_else(|error| ZygoteState::Failed(format!("import-only executor: {error}")))
     }
 
     /// A new executor root and its socket path. The socket is named through this process's
@@ -1611,6 +1618,9 @@ impl GpuPool {
                 Forked::Refused(returned, reason) => {
                     eprintln!("executor fork refused, spawning: {reason}");
                     config = Some(*returned);
+                    if zygote.failed() {
+                        self.forget_parent(&held.record.identity, &zygote);
+                    }
                     break;
                 }
                 Forked::Lost(returned, reason) => {
