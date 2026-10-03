@@ -29,6 +29,13 @@ layout survives executor death and model switches. No CUDA or NVML.
   shared memory; if memory did not come back, the bytes stay charged (`stranded_bytes`).
 - `release(want)` and `facts()` are the policy module's handles (see B1 `INTERFACE.md`).
 
+## Remembered plans
+
+A filled layout's verified plan is kept in `<gpu>/host-plans` (latest per manifest and
+components). When `GpuPool` spawns an executor that adopts sealed tiers, layouts of its model the
+tier no longer holds refill in the background while it imports (`prefill`); its asks then hit or
+wait for that fill. Only a model's first load ever has the fill on its Load path.
+
 ## Bounds
 
 - One descriptor per layout, plus one pidfd per executor. A fill's read lease (one descriptor per
@@ -36,7 +43,8 @@ layout survives executor death and model switches. No CUDA or NVML.
 - No lock across a fill: other asks, and other models' executors, proceed meanwhile; a second ask
   for a layout being filled waits for that fill.
 - `GpuPool` appends one line per Load to `<state>/gpu/loads.jsonl`: executor load facts and the
-  host tier's facts (fills with ms, bytes by read mode and disk reads; hits; releases).
+  host tier's facts (fills with ms, bytes by read mode and disk reads; hits; prefills;
+  releases), and the machine's and executor's RSS/PSS.
 
 ## Fallbacks
 
