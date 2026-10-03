@@ -79,4 +79,5 @@ async def long_form(
     )
 
 
+app.entrypoint(internal=True)(render_segment)
 app.job(long_form, emits_media=True)
