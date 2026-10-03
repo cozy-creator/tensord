@@ -1,0 +1,263 @@
+//! A run's local source: unpublished code the CLI uploaded with Write, named by the digest of
+//! its manifest object. It installs once per manifest and signer; a later run of the same code
+//! reopens that installation.
+use crate::{
+    api::{
+        install::{prepare_uploaded, InstallerConfig},
+        workspaces::{RootSet, UploadedFile, UploadedPackage},
+    },
+    journal::Installation,
+    objects::{Objects, Refused},
+    service::Service,
+};
+use serde::Deserialize;
+use std::{fs, sync::Arc, sync::Mutex};
+use tensorfs_core::{ids::ObjectRef, store::Store};
+
+/// The manifest object (JSON). Members are objects the same signer wrote.
+#[derive(Deserialize)]
+pub struct Manifest {
+    pub package: String,
+    #[serde(default)]
+    pub release: String,
+    #[serde(default)]
+    pub python_requires: String,
+    #[serde(default)]
+    pub python_version: String,
+    /// The project's source tree as a tar archive.
+    #[serde(default)]
+    pub source: Option<Member>,
+    /// Wheels the project vendors, by file name.
+    #[serde(default)]
+    pub wheels: Vec<Member>,
+    /// The locked dependency requirements (`uv export` text).
+    #[serde(default)]
+    pub requirements: Option<Member>,
+}
+#[derive(Deserialize)]
+pub struct Member {
+    #[serde(default)]
+    pub name: String,
+    pub digest: String,
+    pub length: u64,
+}
+
+pub struct LocalSources {
+    pub objects: Arc<Objects>,
+    pub installer: InstallerConfig,
+    pub store: Arc<Store>,
+    installing: Mutex<()>,
+}
+
+fn refused(code: &'static str, message: impl Into<String>) -> Refused {
+    Refused {
+        code,
+        message: message.into(),
+    }
+}
+
+impl LocalSources {
+    pub fn new(objects: Arc<Objects>, installer: InstallerConfig, store: Arc<Store>) -> Self {
+        Self {
+            objects,
+            installer,
+            store,
+            installing: Mutex::new(()),
+        }
+    }
+
+    /// This signer's installation of the manifest `digest` (`sha256:<hex>`).
+    pub fn install(
+        &self,
+        service: &Service,
+        actor: &str,
+        digest: &str,
+    ) -> Result<Installation, Refused> {
+        let alias = format!(
+            "local-{}",
+            digest.strip_prefix("sha256:").unwrap_or_default().get(..32).unwrap_or_default()
+        );
+        let _installing = self.installing.lock().unwrap();
+        if let Some(held) = service.engine.installation(actor, &alias)? {
+            if service.catalog.resolve(&held.generation).is_ok() {
+                return Ok(held);
+            }
+        }
+        let member = |m: &Member| -> Result<ObjectRef, Refused> {
+            match self.objects.path(actor, &m.digest)? {
+                Some((_, length)) if length == m.length => Ok(ObjectRef {
+                    sha256: m.digest.trim_start_matches("sha256:").to_string(),
+                    length,
+                }),
+                _ => Err(refused(
+                    "local_source_incomplete",
+                    format!("{} {} was not written to this machine", m.name, m.digest),
+                )),
+            }
+        };
+        let (path, length) = self.objects.path(actor, digest)?.ok_or_else(|| {
+            refused(
+                "local_source_incomplete",
+                "the local package manifest was not written to this machine",
+            )
+        })?;
+        if length > 1 << 20 {
+            return Err(refused(
+                "local_source_invalid",
+                "a local package manifest is at most 1 MiB",
+            ));
+        }
+        let manifest: Manifest = serde_json::from_slice(&fs::read(path)?).map_err(|e| {
+            refused(
+                "local_source_invalid",
+                format!("the local package manifest is invalid: {e}"),
+            )
+        })?;
+        if !manifest.package.starts_with("local/") || manifest.source.is_none() {
+            return Err(refused(
+                "local_source_invalid",
+                "a local package manifest names local/<name> and its source archive",
+            ));
+        }
+        let requirements = match &manifest.requirements {
+            Some(m) => {
+                let object = member(m)?;
+                fs::read(self.store.object_path(&object.sha256))?
+            }
+            None => Vec::new(),
+        };
+        let source = manifest.source.as_ref().expect("checked above");
+        let source_name = "source.tar".to_string();
+        let mut files = vec![UploadedFile::held(
+            source_name.clone(),
+            &member(source)?,
+            self.store.clone(),
+        )];
+        for wheel in &manifest.wheels {
+            if !wheel.name.ends_with(".whl") || wheel.name.contains('/') {
+                return Err(refused(
+                    "local_source_invalid",
+                    format!("{:?} is not a wheel file name", wheel.name),
+                ));
+            }
+            files.push(UploadedFile::held(
+                wheel.name.clone(),
+                &member(wheel)?,
+                self.store.clone(),
+            ));
+        }
+        let uploaded = UploadedPackage {
+            root: RootSet {
+                operation_id: String::new(),
+                package: manifest.package.clone(),
+                release: manifest.release.clone(),
+                installation_id: alias.clone(),
+                python_requires: manifest.python_requires,
+                python_version: manifest.python_version,
+                source_archive: source_name,
+                dependency_requirements: requirements,
+                files: Vec::new(),
+            },
+            files,
+        };
+        let prepared = prepare_uploaded(&self.installer, &uploaded)
+            .map_err(|status| refused("package_installation_failed", status.message()))?;
+        let installed = service.engine.bind_installation(Installation {
+            actor: actor.to_string(),
+            alias,
+            generation: prepared.record.identity,
+            package: manifest.package,
+            release: manifest.release,
+            interface: prepared.interface_bytes,
+        })?;
+        service.changed_environment()?;
+        Ok(installed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{path::Path, process::Command};
+    use tensorfs_core::sha256;
+
+    fn write(objects: &Objects, actor: &str, bytes: &[u8]) -> Member {
+        let digest = format!("sha256:{}", sha256::hex_digest(bytes));
+        let mut writer = objects.begin(actor, &digest, bytes.len() as u64, 0).unwrap();
+        writer.append(bytes).unwrap();
+        writer.finish().unwrap();
+        Member {
+            name: String::new(),
+            digest,
+            length: bytes.len() as u64,
+        }
+    }
+
+    /// The real installer from objects the signer wrote; the same manifest reopens it.
+    #[test]
+    fn a_written_local_package_installs_once_per_manifest() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = std::env::temp_dir().join(format!("cm-local-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let built = Command::new("uv")
+            .current_dir(repo)
+            .args(["build", "--wheel", "--out-dir"])
+            .arg(root.join("client"))
+            .output()
+            .unwrap();
+        assert!(built.status.success());
+        let helper = Command::new("uv")
+            .current_dir(repo)
+            .args(["run", "--locked", "--extra", "test", "python", "-c", "import sys; print(sys.executable)"])
+            .output()
+            .unwrap();
+        let helper = String::from_utf8(helper.stdout).unwrap().trim().to_string();
+        let client = fs::read_dir(root.join("client"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|e| e == "whl"))
+            .unwrap();
+
+        let state = root.join("state");
+        let service = Service::open(&state, &root.join("generations"), 1).unwrap();
+        let store = Arc::new(Store::ensure(&state.join("tensorfs")).unwrap());
+        let objects =
+            Arc::new(Objects::new(&root.join("writes"), store.clone(), service.engine.clone()).unwrap());
+        let sources = LocalSources::new(
+            objects.clone(),
+            InstallerConfig {
+                helper_python: helper.into(),
+                python: "3.12".into(),
+                generations: root.join("generations"),
+                client_wheel: client,
+                staging_root: root.join("staging"),
+            },
+            store,
+        );
+        let mut archive = tar::Builder::new(Vec::new());
+        let fixture = repo.join("tests/fixtures/cpu_input");
+        for name in ["pyproject.toml", "package.toml", "cpu_input/__init__.py"] {
+            archive.append_path_with_name(fixture.join(name), name).unwrap();
+        }
+        let source = write(&objects, "alice", &archive.into_inner().unwrap());
+        let manifest = serde_json::json!({
+            "package": "local/cozy-machine-cpu-input",
+            "release": "0.1.0",
+            "python_version": "3.12",
+            "source": {"digest": source.digest, "length": source.length},
+        });
+        let manifest = write(&objects, "alice", manifest.to_string().as_bytes());
+
+        // Another signer cannot install what it did not write.
+        let refused = sources.install(&service, "bob", &manifest.digest).err().unwrap();
+        assert_eq!(refused.code, "local_source_incomplete");
+
+        let installed = sources.install(&service, "alice", &manifest.digest).unwrap();
+        assert_eq!(installed.package, "local/cozy-machine-cpu-input");
+        let interface: serde_json::Value = serde_json::from_slice(&installed.interface).unwrap();
+        assert!(interface["entrypoints"].as_array().is_some_and(|e| !e.is_empty()));
+        let again = sources.install(&service, "alice", &manifest.digest).unwrap();
+        assert_eq!(again.generation, installed.generation);
+        let _ = fs::remove_dir_all(root);
+    }
+}

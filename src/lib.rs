@@ -12,6 +12,7 @@ pub mod host_tier;
 pub mod hub;
 pub mod journal;
 pub mod launch_identity;
+pub mod local_source;
 pub mod machine;
 pub mod machine_api;
 pub mod memory;

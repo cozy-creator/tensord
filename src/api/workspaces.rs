@@ -29,7 +29,7 @@ pub struct WorkspaceUploads {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct Carrier {
+pub(crate) struct Carrier {
     filename: String,
     length: u64,
     #[serde(default)]
@@ -71,6 +71,17 @@ pub struct UploadedFile {
     store: Arc<Store>,
 }
 impl UploadedFile {
+    /// A carrier already held in the store (an object a run's signer wrote).
+    pub fn held(filename: String, object: &ObjectRef, store: Arc<Store>) -> Self {
+        Self {
+            filename,
+            object: StoredObject {
+                sha256: object.sha256.clone(),
+                length: object.length,
+            },
+            store,
+        }
+    }
     /// Verify and hold the exact inode through a descriptor, never resolve a caller path.
     pub fn open(&self) -> Result<VerifiedFile, Status> {
         self.store
@@ -93,7 +104,7 @@ pub struct RootSet {
     pub source_archive: String,
     #[serde(default)]
     pub dependency_requirements: Vec<u8>,
-    files: Vec<Carrier>,
+    pub(crate) files: Vec<Carrier>,
 }
 pub struct UploadedPackage {
     pub root: RootSet,
