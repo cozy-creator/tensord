@@ -178,13 +178,20 @@ fn run_machine(
         let devices: Vec<String> = gpus.iter().map(|g| g.device_index.to_string()).collect();
         let home = engine.join("executor-home");
         std::fs::create_dir_all(&home)?;
-        let config: cozy_machine::gpu_service::GpuConfig = serde_json::from_value(serde_json::json!({
+        let mut config = serde_json::json!({
             "devices": devices.join(","),
             "authorized_device_limit_bytes": null,
             "pinned_budget_bytes": 4i64 << 30,
             "environment": {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": home, "COZY_HOME": home},
-        }))
-        .map_err(io::Error::other)?;
+        });
+        // The operator's GPU settings, when the machine root has them, over these defaults.
+        if let Ok(file) = std::fs::File::open(layout.state.join("gpu-config.json")) {
+            let settings: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_reader(file).map_err(io::Error::other)?;
+            config.as_object_mut().expect("an object").extend(settings);
+        }
+        let config: cozy_machine::gpu_service::GpuConfig =
+            serde_json::from_value(config).map_err(io::Error::other)?;
         let store = owner.lock().unwrap().store();
         service.configure_gpu(cozy_machine::gpu_service::GpuPool::new(
             &engine.join("gpu"),
