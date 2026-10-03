@@ -438,6 +438,7 @@ fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
                 entrypoint: "probe".into(),
                 payload: json!({ "paths": paths }),
                 attention_kernel: String::new(),
+                input_metadata: Default::default(),
             },
             &mut Baseline,
         )
@@ -450,6 +451,7 @@ fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
                 construction: "lifecycle".into(),
                 entrypoint: "probe".into(),
                 spool: spool.clone(),
+                inputs: Default::default(),
                 deadline_s: None,
                 attention_kernel: String::new(),
                 plane_budget_bytes: -1,
