@@ -50,12 +50,13 @@ PYTHON -I -m cozy_runtime.internal.trampoline --expect-parent <pid> --oom-adj 10
 | Command field | Requires |
 |---|---|
 | `Start.import_only` | `import_only` |
-| `Load.host_tier`, `Budget` | `weight_plane/1` |
+| `Budget` | `weight_plane/1` |
 | `Load.device_weights`, `share` | `weights.attach/1` |
 | `revoke` | `weights.revoke/1` |
 | `Load.stages`, `Invoke.stages` | `stage/1` |
 | `Load.descriptor_sources` | `model_sources.descriptors/1` and degree 1 |
-| `Load.host_tier_owner` | `host_tiers.owner/1`, `host_tier`, and degree 1 |
+| `Load.sealed_tiers` | `host_tiers.sealed/1` and `weight_plane/1` |
+| `Load.pinned_bytes` | `load_pinned/1` and `weight_plane/1` |
 
 Hello's version and revision fields are provenance only. There is no SDK or TensorFS version gate.
 

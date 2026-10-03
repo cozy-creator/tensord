@@ -38,6 +38,10 @@ fn run() -> io::Result<()> {
             let record = Version { name: "cozy-machine", version: env!("CARGO_PKG_VERSION"), tensorfs: tensorfs_core::VERSION, capabilities: CAPS };
             println!("{}", serde_json::to_string(&record)?); Ok(())
         }
+        Some("host-memory") => {
+            println!("{}", serde_json::to_string(&cozy_machine::host_memory::read())?);
+            Ok(())
+        }
         Some("serve") => {
             let mut root = None; let mut generations=None; let mut parallelism=1;
             let mut machine_config=None; let mut listen=None; let mut gpu_config=None;
@@ -83,7 +87,7 @@ fn run() -> io::Result<()> {
             }
             serve(owner,service,listener)
         }
-        _=>Err(io::Error::other("usage: cozy-machine version --json | serve --state PATH [--generations PATH] [--cpu-parallelism N] [--host-bytes N]")),
+        _=>Err(io::Error::other("usage: cozy-machine version --json | host-memory | serve --state PATH [--generations PATH] [--cpu-parallelism N] [--host-bytes N]")),
     }
 }
 /// Runs the machine from its grant: identity and readiness under the machine root, the engine

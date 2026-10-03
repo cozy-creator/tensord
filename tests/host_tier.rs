@@ -1,0 +1,545 @@
+//! The machine's sealed host tier on the real path: a real TensorFS store, TensorFS's verified
+//! fill, real executor stand-in processes (their pidfds hold layouts), and TensorFS's own
+//! read-only adoption (`Plane::register_sealed`) checking every byte.
+use cozy_machine::{
+    host_memory::HostMemory,
+    host_tier::{HostGrant, HostTier, HostTierConfig, SealedRequest, TierLimit},
+};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::BTreeSet,
+    fs::{self, File},
+    io::Write,
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::fs::FileExt,
+    },
+    path::PathBuf,
+    process::{Child, Command},
+    sync::Arc,
+    time::Duration,
+};
+use tensorfs_core::{
+    dtype::Dtype,
+    header::{Header, Part, Tensor},
+    ids::ObjectRef,
+    manifest::{Draft, Entry},
+    read, registry,
+    store::{Fault, Store},
+};
+use tensorfs_plane::{layout::Layout, Plane, PlaneConfig};
+
+const MIB: usize = 1 << 20;
+
+fn bytes_of(key: &str, n: usize) -> Vec<u8> {
+    let seed = key
+        .bytes()
+        .fold(7u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
+    (0..n)
+        .map(|i| (seed.wrapping_add(i as u32).wrapping_mul(2654435761) >> 13) as u8)
+        .collect()
+}
+
+/// One model, component "unet", tensors of the given sizes, in a fresh store.
+struct Fixture {
+    root: PathBuf,
+    store: Arc<Store>,
+    manifest: String,
+    header: Header,
+    tensors: Vec<(String, usize)>,
+}
+impl Fixture {
+    fn new(tag: &str, sizes: &[usize]) -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "machine-tier-{tag}-{}-{}",
+            std::process::id(),
+            tensorfs_core::meta::now_nanos_unique()
+        ));
+        let store = Store::init(&root).unwrap();
+        let plain = registry::seeds()
+            .into_iter()
+            .find(|e| e.alias == "plain/1")
+            .unwrap()
+            .spec;
+        let tensors: Vec<(String, usize)> = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (format!("{tag}{i}.weight"), *n))
+            .collect();
+        let mut rows = Vec::new();
+        for (key, n) in &tensors {
+            let data = bytes_of(key, *n);
+            let part = Part::plan(Dtype::U8, vec![*n as u64], &data);
+            if let tensorfs_core::header::Body::Segments(segments) = &part.body {
+                let mut at = 0;
+                for segment in segments {
+                    let chunk = &data[at..at + segment.length as usize];
+                    store
+                        .put_stream(&mut &chunk[..], Some(segment), &Fault::default())
+                        .unwrap();
+                    at += segment.length as usize;
+                }
+            }
+            rows.push((
+                key.clone(),
+                Tensor {
+                    dtype: Dtype::U8,
+                    shape: vec![*n as u64],
+                    encoding: plain.object_id(),
+                    parts: vec![("value".into(), part)],
+                },
+            ));
+        }
+        let header = Header {
+            configs: vec![],
+            assets: vec![],
+            encodings: vec![plain],
+            components: vec![("unet".into(), rows)],
+        };
+        let header = Header::parse(&header.canonical_bytes().unwrap()).unwrap();
+        let bytes = header.canonical_bytes().unwrap();
+        let object = ObjectRef::of(&bytes);
+        store
+            .put_stream(&mut bytes.as_slice(), Some(&object), &Fault::default())
+            .unwrap();
+        let snapshot = Draft {
+            entries: vec![("model".into(), Entry::CozyTensors(object))],
+        }
+        .seal()
+        .unwrap();
+        store.put_manifest(&snapshot).unwrap();
+        Self {
+            root,
+            store: Arc::new(store),
+            manifest: snapshot.manifest_id(),
+            header,
+            tensors,
+        }
+    }
+    fn grant(&self) -> HostGrant {
+        HostGrant {
+            manifest: self.manifest.clone(),
+            header: self.header.clone(),
+            components: BTreeSet::from(["unet".to_string()]),
+        }
+    }
+    fn traversal(&self) -> Vec<(String, String)> {
+        self.tensors
+            .iter()
+            .map(|(k, _)| ("unet".to_string(), k.clone()))
+            .collect()
+    }
+    /// One region per tensor: the executor's grouping.
+    fn regions(&self) -> Vec<Vec<String>> {
+        self.tensors
+            .iter()
+            .map(|(k, _)| vec![format!("unet/{k}")])
+            .collect()
+    }
+    /// The plan as an executor sends it: canonical JSON in a sealed memfd.
+    fn plan(&self, components: &[&str]) -> (File, String, u64) {
+        let doc = serde_json::json!({
+            "manifest": self.manifest, "name": "sdxl/unet", "layout": "sha256:00", "window": 4 << 20,
+            "traversal": self.traversal(), "components": components, "regions": self.regions(), "parts": [],
+        });
+        let body = serde_json::to_vec(&doc).unwrap();
+        (
+            sealed(&body),
+            format!("{:x}", Sha256::digest(&body)),
+            body.len() as u64,
+        )
+    }
+    fn layout(&self) -> Layout {
+        let plan =
+            read::plan_for_traversal(&self.header, &self.traversal(), &["unet".into()], 4 << 20)
+                .unwrap();
+        Layout::build(&plan, &self.regions()).unwrap()
+    }
+    /// The executor's half: adopt read-only through TensorFS and check every byte.
+    fn adopt(&self, granted: &File) {
+        let plane = Plane::open(PlaneConfig {
+            readers: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        let plan =
+            read::plan_for_traversal(&self.header, &self.traversal(), &["unet".into()], 4 << 20)
+                .unwrap();
+        let ws = plane
+            .register_sealed("unet", &plan, &self.regions(), granted.as_raw_fd())
+            .unwrap();
+        let layout = plane.layout(ws).unwrap();
+        for part in &layout.parts {
+            let key = part
+                .what
+                .trim_start_matches("unet/")
+                .trim_end_matches("#value");
+            let n = self.tensors.iter().find(|(k, _)| k == key).unwrap().1;
+            let mut got = vec![0; n];
+            granted.read_exact_at(&mut got, part.offset).unwrap();
+            assert!(
+                got == bytes_of(key, n),
+                "{} differs in the sealed layout",
+                part.what
+            );
+        }
+        assert_eq!(
+            plane.stats().host.counters.fill_bytes,
+            0,
+            "adoption reads nothing"
+        );
+        plane.close().unwrap();
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn sealed(body: &[u8]) -> File {
+    // SAFETY: plain syscalls on a descriptor this test creates and owns.
+    unsafe {
+        let fd = libc::memfd_create(
+            c"plan".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        );
+        assert!(fd >= 0);
+        let mut file = File::from_raw_fd(fd);
+        file.write_all(body).unwrap();
+        let seals =
+            libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+        assert_eq!(libc::fcntl(fd, libc::F_ADD_SEALS, seals), 0);
+        file
+    }
+}
+
+/// An executor stand-in: a live process the tier holds layouts for until it exits.
+struct Executor(Child);
+impl Executor {
+    fn spawn(tier: &HostTier) -> (Self, u64) {
+        let child = Command::new("sleep").arg("1000").spawn().unwrap();
+        // SAFETY: pidfd_open of our own live child.
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::c_int, 0) };
+        assert!(pidfd >= 0);
+        let peer = tier.register_peer(unsafe { File::from_raw_fd(pidfd as i32) });
+        (Self(child), peer)
+    }
+    fn exit(mut self) {
+        self.0.kill().unwrap();
+        self.0.wait().unwrap();
+    }
+}
+impl Drop for Executor {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+struct Fixed(u64);
+impl TierLimit for Fixed {
+    fn limit(&self, _: &HostMemory, _: u64) -> u64 {
+        self.0
+    }
+}
+
+fn tier(fx: &Fixture, limit: u64) -> Arc<HostTier> {
+    HostTier::new(
+        fx.store.clone(),
+        HostTierConfig {
+            fill_threads: 3,
+            ttl: Duration::from_secs(3600),
+        },
+        Box::new(Fixed(limit)),
+    )
+    .unwrap()
+}
+
+fn ask(tier: &HostTier, peer: u64, fx: &Fixture) -> Option<File> {
+    let (plan, sha256, length) = fx.plan(&["unet"]);
+    tier.seal(
+        peer,
+        &[fx.grant()],
+        SealedRequest {
+            sha256: &sha256,
+            length,
+        },
+        plan,
+    )
+    .unwrap()
+}
+
+#[test]
+fn one_fill_serves_every_executor_read_only_and_outlives_them() {
+    let fx = Fixture::new("share", &[3 * MIB + 100, 70 * MIB + 12, 200]);
+    let tier = tier(&fx, 1 << 30);
+    let (first, a) = Executor::spawn(&tier);
+    let granted = ask(&tier, a, &fx).expect("room");
+    // Read-only, sealed: the executor can neither write nor resize nor punch it.
+    // SAFETY: scalar fcntl queries on a descriptor we hold.
+    unsafe {
+        assert_eq!(
+            libc::fcntl(granted.as_raw_fd(), libc::F_GETFL) & libc::O_ACCMODE,
+            libc::O_RDONLY
+        );
+        assert_eq!(
+            libc::fcntl(granted.as_raw_fd(), libc::F_GET_SEALS) & libc::F_SEAL_WRITE,
+            libc::F_SEAL_WRITE
+        );
+    }
+    fx.adopt(&granted);
+    let facts = tier.facts();
+    assert_eq!(
+        (facts.ledger.fills.len(), facts.ledger.hits, facts.entries),
+        (1, 0, 1)
+    );
+    assert!(
+        facts.charged_bytes >= 73 * MIB as u64 && facts.held_bytes == facts.charged_bytes,
+        "{facts:?}"
+    );
+    let fill = &facts.ledger.fills[0];
+    let read = fill.cached_bytes + fill.direct_bytes + fill.buffered_bytes;
+    assert!(
+        read >= (73 * MIB + 112) as u64 && read <= (73 * MIB + 312) as u64,
+        "{fill:?}"
+    );
+
+    // The executor exits (a model switch): the layout stays, unheld, and serves the next one
+    // with no read at all.
+    first.exit();
+    drop(granted);
+    assert_eq!(tier.facts().held_bytes, 0);
+    let (_second, b) = Executor::spawn(&tier);
+    fx.adopt(&ask(&tier, b, &fx).expect("held"));
+    let facts = tier.facts();
+    assert_eq!((facts.ledger.fills.len(), facts.ledger.hits), (1, 1));
+}
+
+#[test]
+fn unheld_layouts_go_oldest_first_and_held_ones_never() {
+    let small = Fixture::new("small", &[8 * MIB]);
+    let other = Fixture::new("other", &[8 * MIB]);
+    // Room for one layout only.
+    let size = small.layout().nbytes;
+    let tier = HostTier::new(
+        small.store.clone(),
+        HostTierConfig {
+            fill_threads: 2,
+            ttl: Duration::from_secs(3600),
+        },
+        Box::new(Fixed(size + size / 2)),
+    )
+    .unwrap();
+    let (first, a) = Executor::spawn(&tier);
+    assert!(ask(&tier, a, &small).is_some());
+    // Held by a live executor: the other model gets no room; it reads the store.
+    let other_tier_ask = |tier: &HostTier, peer| {
+        let (plan, sha256, length) = other.plan(&["unet"]);
+        tier.seal(
+            peer,
+            &[other.grant()],
+            SealedRequest {
+                sha256: &sha256,
+                length,
+            },
+            plan,
+        )
+    };
+    // `other` lives in another store: the tier reads its own, so bring the bytes over.
+    copy_store(&other, &small);
+    assert!(other_tier_ask(&tier, a).unwrap().is_none());
+    assert_eq!(tier.facts().ledger.no_room, 1);
+    // Unheld once its executor exits: released for the next model, its bytes recorded.
+    first.exit();
+    let (_second, b) = Executor::spawn(&tier);
+    let granted = other_tier_ask(&tier, b).unwrap().expect("released room");
+    other.adopt(&granted);
+    let facts = tier.facts();
+    assert_eq!(facts.ledger.released, 1, "{facts:?}");
+    assert!(facts.ledger.released_bytes >= 8 * MIB as u64, "{facts:?}");
+    assert_eq!(facts.entries, 1);
+}
+
+/// Copy `from`'s objects and manifest into `into`'s store (as a download would put them).
+fn copy_store(from: &Fixture, into: &Fixture) {
+    let snapshot = from
+        .store
+        .read_manifest(&ObjectRef {
+            sha256: from.manifest.trim_start_matches("sha256:").into(),
+            length: fs::metadata(
+                from.store
+                    .manifest_path(from.manifest.trim_start_matches("sha256:")),
+            )
+            .unwrap()
+            .len(),
+        })
+        .unwrap();
+    into.store.put_manifest(&snapshot).unwrap();
+    for (key, n) in &from.tensors {
+        let data = bytes_of(key, *n);
+        let part = Part::plan(Dtype::U8, vec![*n as u64], &data);
+        if let tensorfs_core::header::Body::Segments(segments) = &part.body {
+            let mut at = 0;
+            for segment in segments {
+                let chunk = &data[at..at + segment.length as usize];
+                into.store
+                    .put_stream(&mut &chunk[..], Some(segment), &Fault::default())
+                    .unwrap();
+                at += segment.length as usize;
+            }
+        }
+    }
+    let bytes = from.header.canonical_bytes().unwrap();
+    into.store
+        .put_stream(
+            &mut bytes.as_slice(),
+            Some(&ObjectRef::of(&bytes)),
+            &Fault::default(),
+        )
+        .unwrap();
+}
+
+#[test]
+fn a_plan_outside_the_executors_selection_or_unsealed_is_refused() {
+    let fx = Fixture::new("refuse", &[MIB]);
+    let tier = tier(&fx, 1 << 30);
+    let (_executor, a) = Executor::spawn(&tier);
+    let (plan, sha256, length) = fx.plan(&["text_encoder"]);
+    let err = tier
+        .seal(
+            a,
+            &[fx.grant()],
+            SealedRequest {
+                sha256: &sha256,
+                length,
+            },
+            plan,
+        )
+        .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    let (plan, _, length) = fx.plan(&["unet"]);
+    assert!(tier
+        .seal(
+            a,
+            &[fx.grant()],
+            SealedRequest {
+                sha256: "00",
+                length
+            },
+            plan
+        )
+        .is_err());
+    // An unsealed plan could change after it was checked.
+    let body = b"{}";
+    let open = sealed_not(body);
+    assert!(tier
+        .seal(
+            a,
+            &[fx.grant()],
+            SealedRequest {
+                sha256: &format!("{:x}", Sha256::digest(body)),
+                length: 2
+            },
+            open
+        )
+        .is_err());
+    // An unregistered peer gets nothing.
+    let (plan, sha256, length) = fx.plan(&["unet"]);
+    assert!(tier
+        .seal(
+            a + 99,
+            &[fx.grant()],
+            SealedRequest {
+                sha256: &sha256,
+                length
+            },
+            plan
+        )
+        .is_err());
+    assert_eq!(tier.facts().ledger.fills.len(), 0);
+}
+
+fn sealed_not(body: &[u8]) -> File {
+    // SAFETY: plain syscall; the descriptor is ours.
+    let mut file =
+        unsafe { File::from_raw_fd(libc::memfd_create(c"plan".as_ptr(), libc::MFD_CLOEXEC)) };
+    file.write_all(body).unwrap();
+    file
+}
+
+/// The real limit (`HalfOfHeadroom` over live `memory.high`), in a memory-limited cgroup: a
+/// layout past half the headroom is refused (its executor reads the store), a small one fits.
+#[test]
+fn the_tier_follows_live_headroom_in_a_memory_limited_cgroup() {
+    let scope = [
+        "--user",
+        "--scope",
+        "--quiet",
+        "--collect",
+        "-p",
+        "MemoryHigh=256M",
+        "-p",
+        "MemoryMax=1G",
+        "-p",
+        "MemorySwapMax=0",
+    ];
+    if !Command::new("systemd-run")
+        .args(scope)
+        .arg("true")
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        eprintln!("this session cannot create a memory-limited scope");
+        return;
+    }
+    let inner = Command::new("systemd-run")
+        .args(scope)
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "inside_a_256_mib_scope",
+            "--ignored",
+            "--test-threads=1",
+        ])
+        .status()
+        .unwrap();
+    assert!(inner.success());
+}
+
+#[test]
+#[ignore = "run inside a memory-limited scope by the test above"]
+fn inside_a_256_mib_scope() {
+    let host = cozy_machine::host_memory::read();
+    assert!(
+        host.available > 0 && host.available <= 256 << 20,
+        "{host:?}"
+    );
+    let big = Fixture::new("big", &[160 * MIB]);
+    let tier = HostTier::new(
+        big.store.clone(),
+        HostTierConfig::default(),
+        Box::new(cozy_machine::host_tier::HalfOfHeadroom),
+    )
+    .unwrap();
+    let (_executor, a) = Executor::spawn(&tier);
+    assert!(ask(&tier, a, &big).is_none(), "{:?}", tier.facts());
+    let small = Fixture::new("fits", &[16 * MIB]);
+    copy_store(&small, &big);
+    let (plan, sha256, length) = small.plan(&["unet"]);
+    let granted = tier
+        .seal(
+            a,
+            &[small.grant()],
+            SealedRequest {
+                sha256: &sha256,
+                length,
+            },
+            plan,
+        )
+        .unwrap();
+    small.adopt(&granted.expect("16 MiB fits half of the headroom"));
+    let facts = tier.facts();
+    assert_eq!((facts.ledger.no_room, facts.entries), (1, 1), "{facts:?}");
+    assert!(facts.charged_bytes <= facts.limit, "{facts:?}");
+}

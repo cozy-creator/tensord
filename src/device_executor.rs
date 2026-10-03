@@ -171,12 +171,15 @@ pub enum DeviceCommand {
         authorized_device_limit_bytes: Option<u64>,
         #[serde(skip_serializing_if = "String::is_empty")]
         attention_pin: String,
-        host_tier: bool,
         stages: bool,
         #[serde(skip_serializing_if = "is_false")]
         descriptor_sources: bool,
+        /// `host_tiers.sealed/1`: every weight set asks for the machine's sealed layout.
         #[serde(skip_serializing_if = "is_false")]
-        host_tier_owner: bool,
+        sealed_tiers: bool,
+        /// `load_pinned/1`: the pinned budget, applied before any weight set registers.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pinned_bytes: Option<i64>,
         /// Attach GPU weights the machine keeps (`weights.attach/1`).
         #[serde(skip_serializing_if = "is_false")]
         device_weights: bool,
@@ -262,8 +265,7 @@ pub enum Event {
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     ModelSourceRead,
-    HostTierPrepare,
-    HostTier,
+    SealedTier,
     DeviceTier,
     BudgetCell,
     StageEnter,
@@ -1038,13 +1040,18 @@ impl DeviceExecutor {
             }
         }
         if let DeviceCommand::Load {
-            host_tier: true, ..
+            sealed_tiers,
+            pinned_bytes,
+            ..
         } = command
         {
-            if !self.hello.offers("weight_plane/1") {
+            let plane = self.hello.offers("weight_plane/1");
+            if (*sealed_tiers && !(plane && self.hello.offers("host_tiers.sealed/1")))
+                || (pinned_bytes.is_some() && !(plane && self.hello.offers("load_pinned/1")))
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "host weight tier capability absent",
+                    "sealed host tiers or a Load pinned budget without the executor capability",
                 ));
             }
         }
@@ -1088,23 +1095,6 @@ impl DeviceExecutor {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     "descriptor model sources require qualified world-one capability",
-                ));
-            }
-        }
-        if let DeviceCommand::Load {
-            host_tier_owner: true,
-            host_tier,
-            sequence_parallel_degree,
-            ..
-        } = command
-        {
-            if !*host_tier
-                || *sequence_parallel_degree != 1
-                || !self.hello.offers("host_tiers.owner/1")
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "machine host-tier registration requires qualified world-one capability",
                 ));
             }
         }

@@ -22,7 +22,7 @@ private control socket (owner protocol) ─> main.rs      ▼
                           gpu_service::GpuPool ─> device_executor::DeviceExecutor
                             (one retained executor per plan, via the Runtime trampoline)
                             memory::GpuMemory: admission, process caps, eviction, floor
-                            answers budget-cell, device-room, model-source and host-tier requests
+                            answers budget-cell, device-room, model-source and sealed-tier requests
 ```
 
 A request is accepted durably (`Engine::submit_public`), then `Service::dispatch_ready` resolves
@@ -55,7 +55,8 @@ by `Engine`; outputs are kept in native custody until the client acknowledges co
 | `os.rs` | memfd, seals, `SO_PEERPIDFD`, pidfd exit | — | E |
 | `owner.rs` | TensorFS store owner: import, sealed memfd cache (LRU/TTL), leases per pidfd | `Owner` | B1 |
 | `protocol.rs` | Private control-socket protocol (length-prefixed JSON + `SCM_RIGHTS`) | `Request`, `Command`, `Reply` | E |
-| `shared_host_plane.rs` | Degree 1 host tier: machine-filled sealed host layouts shared across executors | `SharedHostPlane`, `HostScope`, `HostKey`, `HostTierPlan` | B1 |
+| `host_tier.rs` | Degree 1 host tier: machine-filled sealed layouts, adopted read-only, sized by live headroom | `HostTier`, `HostGrant`, `TierLimit`, `HostTierFacts` | B1 |
+| `host_memory.rs` | Live host headroom (cgroup v1/v2 path, `MemAvailable`) | `HostMemory` | B1 |
 | `model_sources.rs` | Selected model byte grants (read-only descriptors) | `ModelSources`, `SelectedManifest`, `SourceGrant` | B1 |
 | `model_source_driver.rs` | Answer one executor model-source request | `answer` | B1 |
 | `resident_custody.rs` | Degree 2: executor-exported GPU regions kept as driver fds (no CUDA), leases, revocation | `ResidentCustody`, `HoldingKey`, `SharedRegion` | C |
@@ -77,7 +78,6 @@ The host ledger (pinned tier, RSS/PSS, cgroup headroom) is not in `memory/` yet 
 | Path | Use | Owner |
 |---|---|---|
 | `src/bin/device-pilot.rs` | Drive one stock executor from a JSON config on a rental | F |
-| `src/bin/host-plane-cpu-owner.rs` | One-shot CPU host-tier/model-source server for SDK adoption tests | B1 |
 | `src/bin/model-source-check.rs`, `scripts/check-model-source-descriptor.py` | Check a selected snapshot's sources | B1 |
 | `src/bin/install-capture.rs` | Run the installer path on a captured archive (used by Python tests) | D1 |
 | `src/bin/front-door.rs`, `tests/*_client`, `tests/creator_*` | Isolated front-door fixture and Go consumer gates | D1 |
@@ -92,7 +92,7 @@ The host ledger (pinned tier, RSS/PSS, cgroup headroom) is not in `memory/` yet 
 - [Package bridge](PACKAGE-BRIDGE.md): CPU runner and generation install.
 - [Device executor](DEVICE-EXECUTOR.md): executor launch and control seam.
 - [GPU service](GPU-SERVICE.md): GPU pool, config, launch identity.
-- [Shared host plane](SHARED-HOST-PLANE.md), [model sources](MODEL-SOURCES.md): Degree 1.
+- [Host tier](HOST-TIER.md), [model sources](MODEL-SOURCES.md): Degree 1.
 - [Resident custody](RESIDENT-CUSTODY.md): Degree 2 foundation.
 - [Matched gate](../scripts/gate/README.md): old stack vs Rust machine, ordinary CLI.
 

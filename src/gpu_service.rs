@@ -6,20 +6,20 @@ use crate::{
         Services,
     },
     execution::{process_ended, Engine},
-    journal::{AssetBinding, Execution, Outcome, OutputChecksum, Preparation, State},
+    host_tier::{HalfOfHeadroom, HostGrant, HostTier, HostTierConfig, SealedRequest},
+    journal::{AssetBinding, Execution, Outcome, OutputChecksum, Preparation, ProcessBirth, State},
     memory::{
         policy::{Facts, Holding, Step, MARGIN},
         GpuMemory, MemoryConfig,
     },
     model_sources::{ModelSources, SelectedManifest},
     resident_custody::{HoldingFacts, HoldingKey, Offered, Reader, ResidentCustody},
-    shared_host_plane::{HostConfig, HostPeer, HostScope, SharedHostPlane},
 };
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs::{self, File},
-    io,
+    io::{self, Write},
     os::fd::{AsRawFd, OwnedFd},
     path::{Path, PathBuf},
     sync::{
@@ -57,11 +57,13 @@ pub struct PublishedPackage {
     pub generation: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+/// The machine's sealed host tier (`host_tier.rs`); always on, sized by live headroom.
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct HostOptions {
-    pub budget_bytes: u64,
-    pub readers: usize,
-    pub max_entries: usize,
+    #[serde(default)]
+    pub fill_threads: Option<usize>,
+    #[serde(default)]
+    pub ttl_seconds: Option<u64>,
 }
 
 /// Root-sealed configuration, never peer-controlled paths or environment logic switches.
@@ -87,7 +89,7 @@ pub struct GpuConfig {
     #[serde(default)]
     pub packages: Vec<PublishedPackage>,
     #[serde(default)]
-    pub host: Option<HostOptions>,
+    pub host: HostOptions,
 }
 impl GpuConfig {
     pub fn load(path: &Path) -> io::Result<Self> {
@@ -130,7 +132,11 @@ struct Session {
     executor: DeviceExecutor,
     sources: Arc<Mutex<ModelSources>>,
     budget_cells: Vec<File>,
-    peer: HostPeer,
+    actor: String,
+    /// This executor in the host tier, the layouts it may adopt, and whether it adopts them.
+    peer: u64,
+    grants: Vec<HostGrant>,
+    sealed: bool,
     descriptors: bool,
 }
 pub struct GpuPool {
@@ -141,7 +147,7 @@ pub struct GpuPool {
     /// One retained executor per plan; the memory policy decides which keep weights mapped.
     sessions: Mutex<BTreeMap<String, Session>>,
     memory: GpuMemory,
-    host: Option<Arc<SharedHostPlane>>,
+    host: Arc<HostTier>,
     /// Degree 2: GPU weights kept across executors. None on a GPU that drives a display.
     custody: Option<Mutex<ResidentCustody>>,
     // Drop session/resource custody before ending the actual spawning thread.
@@ -178,24 +184,19 @@ impl GpuPool {
                     .ok_or_else(|| io::Error::other("GPU root has no owned state parent"))?,
             )?;
         }
-        let host = config
-            .host
-            .as_ref()
-            .map(|options| {
-                SharedHostPlane::new(
-                    store.root(),
-                    HostConfig {
-                        budget_bytes: options.budget_bytes,
-                        readers: options.readers,
-                        max_entries: options.max_entries,
-                    },
-                )
-            })
-            .transpose()?;
-        let custody = (!display_active(&config.devices)).then(|| {
-            raise_fd_limit();
-            Mutex::new(ResidentCustody::default())
-        });
+        let defaults = HostTierConfig::default();
+        let host = HostTier::new(
+            store.clone(),
+            HostTierConfig {
+                fill_threads: config.host.fill_threads.unwrap_or(defaults.fill_threads),
+                ttl: config.host.ttl_seconds.map_or(defaults.ttl, std::time::Duration::from_secs),
+            },
+            Box::new(HalfOfHeadroom),
+        )?;
+        // Fill leases and GPU custody hold one descriptor per object or chunk.
+        raise_fd_limit();
+        let custody =
+            (!display_active(&config.devices)).then(|| Mutex::new(ResidentCustody::default()));
         Ok(Arc::new(Self {
             launcher: crate::child_launcher::ChildLauncher::new()?,
             root: root.to_path_buf(),
@@ -210,6 +211,9 @@ impl GpuPool {
     }
     pub fn config(&self) -> &GpuConfig {
         &self.config
+    }
+    pub fn host_tier(&self) -> &Arc<HostTier> {
+        &self.host
     }
     /// GPU weights kept across executors (Degree 2), for the memory policy. Lets go of
     /// revoked generations whose last reader ended first.
@@ -535,6 +539,33 @@ impl GpuPool {
             result
         })
     }
+    /// One line per Load in `loads.jsonl`: the executor's load facts, the host tier's, and
+    /// the machine's and executor's RSS/PSS.
+    fn record_load(&self, plan: &str, sealed: bool, took: std::time::Duration, loaded: &Frame, executor: u32) -> io::Result<()> {
+        use crate::host_memory::{process, ProcessMemory};
+        #[derive(Serialize)]
+        struct Line<'a> {
+            plan: &'a str,
+            sealed: bool,
+            load_ms: f64,
+            facts: &'a Option<device_executor::LoadFacts>,
+            host_tier: crate::host_tier::HostTierFacts,
+            machine: ProcessMemory,
+            executor: ProcessMemory,
+        }
+        let line = Line {
+            plan,
+            sealed,
+            load_ms: took.as_secs_f64() * 1e3,
+            facts: &loaded.facts,
+            host_tier: self.host.facts(),
+            machine: process(std::process::id()).unwrap_or_default(),
+            executor: process(executor).unwrap_or_default(),
+        };
+        let mut bytes = serde_json::to_vec(&line)?;
+        bytes.push(b'\n');
+        fs::OpenOptions::new().create(true).append(true).open(self.root.join("loads.jsonl"))?.write_all(&bytes)
+    }
     pub fn stop(&self) -> io::Result<()> {
         let sessions = std::mem::take(&mut *self.sessions.lock().unwrap());
         for (plan, session) in sessions {
@@ -722,9 +753,13 @@ impl GpuPool {
             )?;
             executor.retain_until_exit(directory);
             executor.retain_until_exit(WakeOnExit(Arc::downgrade(engine)));
+            // Weights from the machine's sealed tier when the executor adopts them; its header
+            // and configs then come from the store (descriptors would lease every object).
+            let sealed = executor.hello.offers("weight_plane/1")
+                && executor.hello.offers("host_tiers.sealed/1");
             let descriptors = match self.config.source_mode {
                 SourceMode::Legacy => false,
-                SourceMode::Auto => executor.hello.offers("model_sources.descriptors/1"),
+                SourceMode::Auto => !sealed && executor.hello.offers("model_sources.descriptors/1"),
                 SourceMode::Descriptors if executor.hello.offers("model_sources.descriptors/1") => {
                     true
                 }
@@ -742,24 +777,12 @@ impl GpuPool {
                 }],
             )?));
             executor.retain_until_exit(sources.clone());
-            let peer = HostPeer {
-                actor: plan.actor.clone(),
-                plan: plan.id.clone(),
-                birth: executor.birth.clone(),
-            };
-            if let Some(host) = &self.host {
-                host.register_peer(peer.clone(), executor.observer_pidfd()?)?;
-                let sources = sources.lock().unwrap();
-                host.authorize(
-                    HostScope {
-                        actor: plan.actor.clone(),
-                        plan: plan.id.clone(),
-                    },
-                    plan.binding.snapshot.clone(),
-                    sources.authorized_header(&plan.binding.snapshot)?,
-                    plan.binding.components.clone(),
-                )?;
-            }
+            let peer = self.host.register_peer(executor.observer_pidfd()?);
+            let grants = vec![HostGrant {
+                manifest: plan.binding.snapshot.clone(),
+                header: sources.lock().unwrap().authorized_header(&plan.binding.snapshot)?,
+                components: plan.binding.components.iter().cloned().collect(),
+            }];
             sessions.insert(
                 plan.id.clone(),
                 Session {
@@ -768,7 +791,10 @@ impl GpuPool {
                     executor,
                     sources,
                     budget_cells: vec![],
+                    actor: plan.actor.clone(),
                     peer,
+                    grants,
+                    sealed,
                     descriptors,
                 },
             );
@@ -815,8 +841,11 @@ impl GpuPool {
             sources: &session.sources,
             cells: &mut session.budget_cells,
             completed: 0,
-            host: self.host.as_ref(),
-            peer: &session.peer,
+            host: &self.host,
+            peer: session.peer,
+            grants: &session.grants,
+            actor: &session.actor,
+            birth: session.executor.birth.clone(),
             custody: self.custody.as_ref().filter(|_| sharing),
             exit: session.executor.observer_pidfd()?,
             pool: self,
@@ -847,6 +876,11 @@ impl GpuPool {
                 self.store.root().to_string_lossy().into()
             };
             let device_total = self.memory.sample().map(|sample| sample.total);
+            let plane = session.executor.hello.offers("weight_plane/1");
+            // The pinned budget comes with the Load, so no fill pins past it; an executor
+            // without `load_pinned/1` gets it after, as before.
+            let at_load = plane && session.executor.hello.offers("load_pinned/1");
+            let started = std::time::Instant::now();
             let loaded = command_ok(session.executor.command(
                 &DeviceCommand::Load {
                     construction: plan.id.clone(),
@@ -859,12 +893,10 @@ impl GpuPool {
                     authorized_device_limit_bytes:
                         device_total.or(self.config.authorized_device_limit_bytes),
                     attention_pin: String::new(),
-                    host_tier: self.host.is_some()
-                        && session.executor.hello.offers("host_tiers.owner/1"),
                     stages: false,
                     descriptor_sources: session.descriptors,
-                    host_tier_owner: self.host.is_some()
-                        && session.executor.hello.offers("host_tiers.owner/1"),
+                    sealed_tiers: session.sealed,
+                    pinned_bytes: at_load.then_some(self.config.pinned_budget_bytes),
                     device_weights: sharing,
                     cap_bytes: load_cap.filter(|_| capped),
                 },
@@ -872,7 +904,8 @@ impl GpuPool {
             )?)?;
             self.memory
                 .observe(&plan.id, load_facts(loaded.facts.as_ref()), Some(false));
-            if session.executor.hello.offers("weight_plane/1") {
+            self.record_load(&plan.id, session.sealed, started.elapsed(), &loaded, session.executor.birth.pid)?;
+            if plane && !at_load {
                 command_ok(session.executor.command(
                     &DeviceCommand::Budget {
                         vram_bytes: -1,
@@ -1197,8 +1230,11 @@ struct Callbacks<'a> {
     sources: &'a Arc<Mutex<ModelSources>>,
     cells: &'a mut Vec<File>,
     completed: u64,
-    host: Option<&'a Arc<SharedHostPlane>>,
-    peer: &'a HostPeer,
+    host: &'a Arc<HostTier>,
+    peer: u64,
+    grants: &'a [HostGrant],
+    actor: &'a str,
+    birth: ProcessBirth,
     custody: Option<&'a Mutex<ResidentCustody>>,
     /// The executor's pidfd: a reader lease ends when it does.
     exit: File,
@@ -1217,12 +1253,12 @@ impl Services for Callbacks<'_> {
             return Ok((answer, Vec::new()));
         };
         let key = HoldingKey {
-            actor: self.peer.actor.clone(),
+            actor: self.actor.to_string(),
             device: frame.device.clone(),
             layout: frame.layout.clone(),
         };
         let reader = Reader {
-            birth: self.peer.birth.clone(),
+            birth: self.birth.clone(),
             exit: self.exit.try_clone()?,
         };
         answer.ok = true;
@@ -1285,21 +1321,24 @@ impl Services for Callbacks<'_> {
         frame: &Frame,
         descriptor: Option<File>,
     ) -> io::Result<(Answer, Option<File>)> {
-        if matches!(frame.kind, Kind::HostTier | Kind::HostTierPrepare) {
-            if let Some(host) = self.host {
-                return host.request(self.peer, frame, descriptor).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "host-tier operation unavailable",
-                    )
-                })?;
-            }
-            drop(descriptor);
+        if frame.kind == Kind::SealedTier {
             let mut answer = Answer::unavailable(frame.seq);
-            answer.ok = true;
-            answer.code.clear();
-            answer.detail.clear();
-            return Ok((answer, None));
+            let plan = descriptor.ok_or_else(|| io::Error::other("sealed tier request omitted its plan"))?;
+            let request = SealedRequest { sha256: &frame.sha256, length: frame.length };
+            // A refusal is an answer: that weight set reads the store, the session goes on.
+            match self.host.seal(self.peer, self.grants, request, plan) {
+                Ok(granted) => {
+                    (answer.ok, answer.held) = (true, granted.is_some());
+                    answer.code.clear();
+                    answer.detail.clear();
+                    return Ok((answer, granted));
+                }
+                Err(error) => {
+                    answer.code = "sealed_tier_refused".into();
+                    answer.detail = error.to_string();
+                    return Ok((answer, None));
+                }
+            }
         }
         if frame.kind == Kind::ModelSourceRead {
             drop(descriptor);

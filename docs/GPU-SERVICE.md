@@ -16,7 +16,7 @@ executor per plan; `memory::GpuMemory` decides every device byte. Acceptance, jo
   the device total).
 - `memory`: `{ floor_bytes, sample_log }`: raise the free floor; log each 1 s NVML reading.
 - `environment`: keys containing `TOKEN`, `SECRET` or `PASSWORD` are refused.
-- `host`: optional `SharedHostPlane`. `identity`: optional `{uid, gid}`.
+- `host`: optional `{fill_threads, ttl_seconds}` for the always-on `HostTier`. `identity`: optional `{uid, gid}`.
 
 ## Preparation
 
@@ -55,7 +55,7 @@ executor per plan; `memory::GpuMemory` decides every device byte. Acceptance, jo
 Executor requests:
 - `device_room`: idle tenants give room (unmap, then end); the answer's `cap_bytes` raises the
   caller's cap into it. `stage_enter`/`stage_exit` (never asked for) keep the budget.
-- `host_tier*` goes to `SharedHostPlane`, or is acknowledged if no host plane is configured.
+- `sealed_tier` goes to `HostTier` (`HOST-TIER.md`); `Load.pinned_bytes` carries the pinned budget.
 - `model_source_read` goes to `ModelSources`.
 - Progress counts only `advance > 0`.
 
