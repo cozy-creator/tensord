@@ -1220,7 +1220,10 @@ impl GpuPool {
                 &selections,
             )?));
             executor.retain_until_exit(sources.clone());
-            let peer = self.host.register_peer(executor.observer_pidfd()?);
+            let peer = self.host.register_peer(
+                executor.observer_pidfd()?,
+                executor.hello.offers("host_tiers.filling/1"),
+            );
             let grants = selections
                 .iter()
                 .map(|selected| {

@@ -1,11 +1,13 @@
-//! Degree 1: the machine's host weights. Each weight set's layout is filled once through
-//! TensorFS's verified read path into a memfd, sealed (nobody can write, resize or punch it)
-//! and kept across executors and model switches; executors adopt it read-only
-//! (`host_tiers.sealed/1`, `Plane.register_sealed`). The machine holds one descriptor per
-//! layout. The tier's size follows live host headroom (`host_memory`), read at every prepare;
-//! unheld layouts are released least recently used first, or after `ttl` unused. How much of
-//! the headroom the tier may take is `TierLimit`'s decision (the memory policy module's).
-//! No lock is held across a fill: one model's fill never stalls another executor.
+//! Degree 1: the machine's host weights. Each weight set's layout is a memfd sealed at creation
+//! (nobody else can write, resize or punch it), filled once through TensorFS's verified read
+//! path by one background filler, in the order asked, and kept across executors and model
+//! switches. Executors adopt it read-only (`host_tiers.sealed/1`, `Plane.register_sealed`) the
+//! moment it exists and use each region once its Ready word is set (`host_tiers.filling/1`;
+//! older executors get it complete). The machine holds one descriptor per layout. The tier's
+//! size follows live host headroom (`host_memory`), read at every admission; unheld, complete
+//! layouts are released least recently used first, or after `ttl` unused. How much of the
+//! headroom the tier may take is `TierLimit`'s decision (the memory policy module's). No lock
+//! is held across a fill.
 use crate::{host_memory::HostMemory, os};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -18,7 +20,7 @@ use std::{
         unix::fs::{FileExt, MetadataExt},
     },
     path::PathBuf,
-    sync::{Arc, Condvar, Mutex},
+    sync::{mpsc, Arc, Condvar, Mutex, Weak},
     time::{Duration, Instant},
 };
 use tensorfs_core::{
@@ -28,7 +30,7 @@ use tensorfs_core::{
     store::Store,
 };
 use tensorfs_plane::{
-    host,
+    host::{self, OpenFill},
     io::{IoTally, Source},
     layout::Layout,
 };
@@ -80,7 +82,7 @@ pub struct HostGrant {
 }
 
 /// Runtime `SealedPlan`: the read plan and region grouping the model code chose.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct SealedPlan {
     manifest: String,
     name: String,
@@ -133,6 +135,8 @@ pub struct Ledger {
     pub reserved_used: u64,
     /// Asks refused because the tier could not make room: that weight set read the store.
     pub no_room: u64,
+    /// Fills that failed: their adopters got an error, the layout was dropped.
+    pub failed: u64,
     pub released: u64,
     /// What the released layouts charged, and what the kernel's shared memory fell by.
     pub released_bytes: u64,
@@ -162,10 +166,28 @@ struct Entry {
     charged: u64,
     used: Instant,
     holders: BTreeSet<u64>,
+    /// Every region is in; until then nothing releases it.
+    complete: bool,
 }
 enum Slot {
-    Filling(u64),
-    Ready(Entry),
+    /// Admitted, its memfd being created.
+    Opening(u64),
+    Open(Entry),
+}
+/// One layout's fill, queued for the tier's filler.
+struct Job {
+    key: String,
+    plan: SealedPlan,
+    body: Vec<u8>,
+    read_plan: read::ReadPlan,
+    layout: Layout,
+    open: OpenFill,
+    prefill: bool,
+}
+struct Peer {
+    pidfd: File,
+    /// It adopts a layout still filling (`host_tiers.filling/1`).
+    filling: bool,
 }
 /// A component's memory allocated before its plan exists (`prepare`).
 enum Reservation {
@@ -187,7 +209,7 @@ impl Reservation {
 struct State {
     /// By TensorFS layout digest: the same bytes at the same offsets, whoever asks.
     slots: BTreeMap<String, Slot>,
-    peers: BTreeMap<u64, File>,
+    peers: BTreeMap<u64, Peer>,
     next_peer: u64,
     ledger: Ledger,
     /// By (manifest, component).
@@ -198,15 +220,17 @@ impl State {
         self.slots
             .values()
             .map(|s| match s {
-                Slot::Filling(n) => *n,
-                Slot::Ready(e) => e.charged,
+                Slot::Opening(n) => *n,
+                Slot::Open(e) => e.charged,
             })
             .sum::<u64>()
             + self.reserved.values().map(Reservation::bytes).sum::<u64>()
             + self.ledger.stranded_bytes
     }
     fn filling(&self) -> bool {
-        self.slots.values().any(|s| matches!(s, Slot::Filling(_)))
+        self.slots
+            .values()
+            .any(|s| !matches!(s, Slot::Open(Entry { complete: true, .. })))
     }
 }
 
@@ -217,6 +241,8 @@ pub struct HostTier {
     limit: Box<dyn TierLimit>,
     state: Mutex<State>,
     filled: Condvar,
+    /// The filler's queue: one fill at a time, in the order layouts were opened.
+    fills: Mutex<mpsc::Sender<Job>>,
     /// The latest verified plan body per (manifest, components).
     plans: Mutex<BTreeMap<PlanKey, Vec<u8>>>,
 }
@@ -257,15 +283,28 @@ impl HostTier {
                 }
             }
         }
-        Ok(Arc::new(Self {
+        let (fills, jobs) = mpsc::channel::<Job>();
+        let tier = Arc::new(Self {
             store,
             meta,
             config,
             limit,
             state: Mutex::default(),
             filled: Condvar::new(),
+            fills: Mutex::new(fills),
             plans: Mutex::new(plans),
-        }))
+        });
+        // Ends with the tier; a job it never runs poisons its layout (`OpenFill` on drop).
+        let weak: Weak<Self> = Arc::downgrade(&tier);
+        std::thread::spawn(move || {
+            for job in jobs {
+                match weak.upgrade() {
+                    Some(tier) => tier.run(job),
+                    None => return,
+                }
+            }
+        });
+        Ok(tier)
     }
 
     /// Start on what an executor of these grants will ask for, while it starts: refill every
@@ -382,16 +421,19 @@ impl HostTier {
     }
 
     /// An executor, by its pidfd: what it adopted stays held until that exact process exits.
-    pub fn register_peer(&self, pidfd: File) -> u64 {
+    /// `filling`: it adopts a layout still filling (`host_tiers.filling/1`).
+    pub fn register_peer(&self, pidfd: File, filling: bool) -> u64 {
         let mut state = self.state.lock().unwrap();
         state.next_peer += 1;
         let id = state.next_peer;
-        state.peers.insert(id, pidfd);
+        state.peers.insert(id, Peer { pidfd, filling });
         id
     }
 
-    /// One weight set's sealed layout for `peer`, read-only: from the tier, or filled now.
-    /// None when the tier cannot make room: the executor reads the store itself.
+    /// One weight set's sealed layout for `peer`, read-only, from the tier or opened now: at
+    /// once for an executor that waits per region, complete for an older one. None when the
+    /// tier cannot make room (or the fill an older executor waited for failed): the executor
+    /// reads the store itself.
     pub fn seal(
         &self,
         peer: u64,
@@ -403,16 +445,24 @@ impl HostTier {
             return Err(denied("host tier peer is not a registered live executor"));
         }
         let (plan, body) = Self::plan(request, plan)?;
-        match self.ensure(&plan, grants, &body, false)? {
-            Some(key) => self
-                .grant(&mut self.state.lock().unwrap(), &key, peer)
-                .map(Some),
-            None => Ok(None),
+        let Some(key) = self.ensure(&plan, grants, &body, false)? else {
+            return Ok(None);
+        };
+        let mut state = self.state.lock().unwrap();
+        loop {
+            let filling = state.peers.get(&peer).is_some_and(|p| p.filling);
+            match state.slots.get(&key) {
+                Some(Slot::Open(e)) if e.complete || filling => {
+                    return self.grant(&mut state, &key, peer).map(Some)
+                }
+                Some(_) => state = self.filled.wait(state).unwrap(),
+                None => return Ok(None),
+            }
         }
     }
 
-    /// The layout `plan` names, filled now unless the tier holds it or a fill of it is under
-    /// way (then waited for). Its key, or None when the tier cannot make room.
+    /// The layout `plan` names, held or opened now (its fill queued). Its key, or None when the
+    /// tier cannot make room.
     fn ensure(
         &self,
         plan: &SealedPlan,
@@ -454,13 +504,13 @@ impl HostTier {
         loop {
             self.reap(&mut state);
             match state.slots.get(&key) {
-                Some(Slot::Ready(_)) => {
+                Some(Slot::Open(_)) => {
                     if !prefill {
                         state.ledger.hits += 1;
                     }
                     return Ok(Some(key));
                 }
-                Some(Slot::Filling(_)) => state = self.filled.wait(state).unwrap(),
+                Some(Slot::Opening(_)) => state = self.filled.wait(state).unwrap(),
                 None if reservation.as_ref().is_some_and(|r| {
                     matches!(state.reserved.get(r), Some(Reservation::Allocating(_)))
                 }) =>
@@ -488,33 +538,35 @@ impl HostTier {
             }
         }
         state.ledger.reserved_used += u64::from(reserved.is_some());
-        state.slots.insert(key.clone(), Slot::Filling(need));
+        state.slots.insert(key.clone(), Slot::Opening(need));
         drop(state);
-        let filled = self.fill(plan, &read_plan, &layout, reserved);
-        if filled.is_ok() {
-            if let Err(error) = self.remember(plan, body) {
-                eprintln!("host tier plan not remembered: {error}");
-            }
-        }
+        // Sealed now, filled by the filler: adopters wait per region, never for the whole.
+        let opened = host::open_sealed(&plan.name, &layout, reserved).map_err(failure);
         let mut state = self.state.lock().unwrap();
-        let result = match filled {
-            Ok((fd, fill)) => {
-                let fd = File::from(fd);
-                let charged = fd.metadata()?.blocks() * 512;
+        let result = match opened {
+            Ok((fd, open)) => {
                 state.slots.insert(
                     key.clone(),
-                    Slot::Ready(Entry {
-                        fd,
-                        charged,
+                    Slot::Open(Entry {
+                        fd: File::from(fd),
+                        charged: need,
                         used: Instant::now(),
                         holders: BTreeSet::new(),
+                        complete: false,
                     }),
                 );
-                if state.ledger.fills.len() == 32 {
-                    state.ledger.fills.remove(0);
-                }
-                state.ledger.fills.push(fill);
-                state.ledger.prefills += u64::from(prefill);
+                let job = Job {
+                    key: key.clone(),
+                    plan: plan.clone(),
+                    body: body.to_vec(),
+                    read_plan,
+                    layout,
+                    open,
+                    prefill,
+                };
+                // A send fails only once the filler is gone with the tier: the job's drop
+                // poisons the layout, so no adopter waits for it.
+                let _ = self.fills.lock().unwrap().send(job);
                 Ok(Some(key))
             }
             Err(error) => {
@@ -524,6 +576,47 @@ impl HostTier {
         };
         self.filled.notify_all();
         result
+    }
+
+    /// The filler: one layout's bytes, then it is complete (charged what it holds) or, failed,
+    /// dropped (its adopters see the failure in its Ready words).
+    fn run(&self, job: Job) {
+        let Job {
+            key,
+            plan,
+            body,
+            read_plan,
+            layout,
+            open,
+            prefill,
+        } = job;
+        let filled = self.fill(&plan, &read_plan, &layout, open);
+        let mut state = self.state.lock().unwrap();
+        match filled {
+            Ok(fill) => {
+                if let Some(Slot::Open(entry)) = state.slots.get_mut(&key) {
+                    entry.complete = true;
+                    if let Ok(meta) = entry.fd.metadata() {
+                        entry.charged = meta.blocks() * 512;
+                    }
+                }
+                if state.ledger.fills.len() == 32 {
+                    state.ledger.fills.remove(0);
+                }
+                state.ledger.fills.push(fill);
+                state.ledger.prefills += u64::from(prefill);
+                drop(state);
+                if let Err(error) = self.remember(&plan, &body) {
+                    eprintln!("host tier plan not remembered: {error}");
+                }
+            }
+            Err(error) => {
+                eprintln!("host tier fill of {} failed: {error}", plan.name);
+                state.slots.remove(&key);
+                state.ledger.failed += 1;
+            }
+        }
+        self.filled.notify_all();
     }
 
     /// Release unheld layouts, least recently used first, until `want` bytes were charged
@@ -544,9 +637,14 @@ impl HostTier {
         let (mut held, mut filling) = (0, 0);
         for slot in state.slots.values() {
             match slot {
-                Slot::Filling(n) => filling += n,
-                Slot::Ready(e) if !e.holders.is_empty() => held += e.charged,
-                Slot::Ready(_) => (),
+                Slot::Opening(n)
+                | Slot::Open(Entry {
+                    charged: n,
+                    complete: false,
+                    ..
+                }) => filling += n,
+                Slot::Open(e) if !e.holders.is_empty() => held += e.charged,
+                Slot::Open(_) => (),
             }
         }
         HostTierFacts {
@@ -575,8 +673,8 @@ impl HostTier {
     }
 
     /// The plan the executor sent: a sealed memfd of exactly the declared bytes and digest.
-    /// Fill every plan of one construction (`SealedPrefetch`) in the background, in order, while
-    /// its executor registers them; each `seal` ask then waits only for its own.
+    /// Open every plan of one construction (`SealedPrefetch`), in order, while its executor
+    /// registers them: the filler fills them in that order and each `seal` ask finds its own.
     pub fn prefetch(
         self: &Arc<Self>,
         peer: u64,
@@ -597,8 +695,6 @@ impl HostTier {
                 body,
             ));
         }
-        // One after another, in the order the executor registers them: each is done before it
-        // is asked for, and concurrent fills would only contend for the same memory.
         let (tier, grants) = (self.clone(), grants.to_vec());
         std::thread::spawn(move || {
             for (plan, body) in queued {
@@ -642,8 +738,8 @@ impl HostTier {
         plan: &SealedPlan,
         read_plan: &read::ReadPlan,
         layout: &Layout,
-        reserved: Option<OwnedFd>,
-    ) -> io::Result<(OwnedFd, Fill)> {
+        open: OpenFill,
+    ) -> io::Result<Fill> {
         let mut objects = BTreeMap::new();
         for item in &read_plan.items {
             if let Item::Object(range) = &item.source {
@@ -660,18 +756,11 @@ impl HostTier {
         .map_err(failure)?;
         let source = Source::new(self.store.clone(), self.meta.clone(), lease, true, 0);
         let tally = IoTally::default();
-        let fd = host::fill_sealed(
-            &plan.name,
-            layout,
-            &source,
-            self.config.fill_threads,
-            &tally,
-            reserved,
-        )
-        .map_err(failure)?;
+        open.run(layout, &source, self.config.fill_threads, &tally)
+            .map_err(failure)?;
         drop(source); // ends the lease and its descriptors: one descriptor per layout stays
         let read = |n: &std::sync::atomic::AtomicU64| n.load(std::sync::atomic::Ordering::Relaxed);
-        let fill = Fill {
+        Ok(Fill {
             name: plan.name.clone(),
             bytes: layout.nbytes,
             ms: started.0.elapsed().as_secs_f64() * 1e3,
@@ -679,15 +768,14 @@ impl HostTier {
             direct_bytes: read(&tally.direct_bytes),
             buffered_bytes: read(&tally.buffered_bytes),
             disk_read_bytes: disk_read_bytes().saturating_sub(started.1),
-        };
-        Ok((fd, fill))
+        })
     }
 
     fn grant(&self, state: &mut State, key: &str, peer: u64) -> io::Result<File> {
         if !state.peers.contains_key(&peer) {
             return Err(denied("host tier peer is not a registered live executor"));
         }
-        let Some(Slot::Ready(entry)) = state.slots.get_mut(key) else {
+        let Some(Slot::Open(entry)) = state.slots.get_mut(key) else {
             unreachable!()
         };
         entry.used = Instant::now();
@@ -702,7 +790,7 @@ impl HostTier {
         let ended: Vec<u64> = state
             .peers
             .iter()
-            .filter(|(_, pidfd)| os::ended(pidfd))
+            .filter(|(_, peer)| os::ended(&peer.pidfd))
             .map(|(id, _)| *id)
             .collect();
         for id in &ended {
@@ -711,9 +799,9 @@ impl HostTier {
         let ttl = self.config.ttl;
         let mut expired = Vec::new();
         for (key, slot) in &mut state.slots {
-            if let Slot::Ready(entry) = slot {
+            if let Slot::Open(entry) = slot {
                 entry.holders.retain(|h| !ended.contains(h));
-                if entry.holders.is_empty() && entry.used.elapsed() >= ttl {
+                if entry.holders.is_empty() && entry.complete && entry.used.elapsed() >= ttl {
                     expired.push(key.clone());
                 }
             }
@@ -744,7 +832,7 @@ impl HostTier {
             .slots
             .iter()
             .filter_map(|(key, slot)| match slot {
-                Slot::Ready(e) if e.holders.is_empty() => Some((e.used, key.clone())),
+                Slot::Open(e) if e.holders.is_empty() && e.complete => Some((e.used, key.clone())),
                 _ => None,
             })
             .min();
@@ -761,7 +849,7 @@ impl HostTier {
     /// mapping goes; the kernel's shared-memory count says whether it did. If not, the bytes
     /// stay charged (stranded): something still maps them.
     fn release_entry(&self, state: &mut State, key: &str) {
-        let Some(Slot::Ready(entry)) = state.slots.remove(key) else {
+        let Some(Slot::Open(entry)) = state.slots.remove(key) else {
             return;
         };
         let quiet = !state.filling();

@@ -27,7 +27,7 @@ use tensorfs_core::{
     read, registry,
     store::{Fault, Store},
 };
-use tensorfs_plane::{layout::Layout, Plane, PlaneConfig};
+use tensorfs_plane::{layout::Layout, Plane, PlaneConfig, Tier};
 
 const MIB: usize = 1 << 20;
 
@@ -168,7 +168,45 @@ impl Fixture {
         let ws = plane
             .register_sealed("unet", &plan, &self.regions(), granted.as_raw_fd())
             .unwrap();
-        let layout = plane.layout(ws).unwrap();
+        self.check(granted, &plane.layout(ws).unwrap());
+        assert_eq!(
+            plane.stats().host.counters.fill_bytes,
+            0,
+            "adoption reads nothing"
+        );
+        plane.close().unwrap();
+    }
+    /// An executor that waits per region: adopt a layout still filling, pin it (each region
+    /// once its filler marks it Ready), then check every byte. Never reads the store. False
+    /// when the fill failed.
+    fn adopt_filling(&self, granted: &File) -> bool {
+        let plane = Plane::open(PlaneConfig {
+            readers: 2,
+            ..Default::default()
+        })
+        .unwrap();
+        let plan =
+            read::plan_for_traversal(&self.header, &self.traversal(), &["unet".into()], 4 << 20)
+                .unwrap();
+        let pinned = plane
+            .register_sealed("unet", &plan, &self.regions(), granted.as_raw_fd())
+            .and_then(|ws| {
+                plane.set_pinned_budget(1 << 30)?;
+                plane.want(ws, Tier::Pinned, None, 0, false)?.wait()?;
+                Ok(ws)
+            });
+        if let Ok(ws) = pinned {
+            self.check(granted, &plane.layout(ws).unwrap());
+            assert_eq!(
+                plane.stats().host.counters.fill_bytes,
+                0,
+                "waited, never read"
+            );
+        }
+        let _ = plane.close();
+        pinned.is_ok()
+    }
+    fn check(&self, granted: &File, layout: &Layout) {
         for part in &layout.parts {
             let key = part
                 .what
@@ -183,12 +221,6 @@ impl Fixture {
                 part.what
             );
         }
-        assert_eq!(
-            plane.stats().host.counters.fill_bytes,
-            0,
-            "adoption reads nothing"
-        );
-        plane.close().unwrap();
     }
 }
 impl Drop for Fixture {
@@ -218,11 +250,18 @@ fn sealed(body: &[u8]) -> File {
 struct Executor(Child);
 impl Executor {
     fn spawn(tier: &HostTier) -> (Self, u64) {
+        Self::spawn_as(tier, false)
+    }
+    /// One that adopts layouts still filling (`host_tiers.filling/1`).
+    fn spawn_filling(tier: &HostTier) -> (Self, u64) {
+        Self::spawn_as(tier, true)
+    }
+    fn spawn_as(tier: &HostTier, filling: bool) -> (Self, u64) {
         let child = Command::new("sleep").arg("1000").spawn().unwrap();
         // SAFETY: pidfd_open of our own live child.
         let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::c_int, 0) };
         assert!(pidfd >= 0);
-        let peer = tier.register_peer(unsafe { File::from_raw_fd(pidfd as i32) });
+        let peer = tier.register_peer(unsafe { File::from_raw_fd(pidfd as i32) }, filling);
         (Self(child), peer)
     }
     fn exit(mut self) {
@@ -632,6 +671,70 @@ fn a_prefetch_fills_while_the_executor_registers_and_the_ask_finds_it() {
     assert_eq!(
         (facts.ledger.fills.len(), facts.entries),
         (1, 1),
+        "{facts:?}"
+    );
+}
+
+/// A first load with nothing filled: the executor gets its layout the moment it is created and
+/// each region the moment it is in, so its load never waits for the whole fill; an older
+/// executor asking for the same layout gets it complete.
+#[test]
+fn an_executor_adopts_its_layout_while_it_fills_and_waits_per_region() {
+    let fx = Fixture::new("filling", &[64 * MIB, 64 * MIB + 3, 64 * MIB, 5]);
+    let tier = tier(&fx, 1 << 30);
+    let (_executor, a) = Executor::spawn_filling(&tier);
+    let granted = ask(&tier, a, &fx).expect("room");
+    let at_grant = tier.facts();
+    assert!(
+        at_grant.filling_bytes > 0 && at_grant.ledger.fills.is_empty(),
+        "granted before its bytes: {at_grant:?}"
+    );
+    assert!(fx.adopt_filling(&granted));
+    let (_older, b) = Executor::spawn(&tier);
+    fx.adopt(&ask(&tier, b, &fx).expect("complete for an older executor"));
+    let facts = tier.facts();
+    assert_eq!(
+        (
+            facts.ledger.fills.len(),
+            facts.ledger.hits,
+            facts.filling_bytes,
+            facts.entries
+        ),
+        (1, 1, 0, 1),
+        "{facts:?}"
+    );
+    assert!(facts.held_bytes >= 192 * MIB as u64, "{facts:?}");
+}
+
+/// A fill that fails (a corrupt object the verified read path refuses): the executor that
+/// adopted the layout early gets an error, never the bytes; the tier drops the layout; an older
+/// executor is told nothing is held and reads the store itself.
+#[test]
+fn a_failed_fill_is_an_error_for_its_adopters_and_leaves_the_tier() {
+    let fx = Fixture::new("corrupt", &[8 * MIB, 8 * MIB]);
+    let layout = fx.layout();
+    let last = layout.regions.last().unwrap().items.last().unwrap();
+    let tensorfs_plane::layout::ItemSource::Object(range) = &last.source else {
+        panic!("an object-backed tensor")
+    };
+    let blob = fx.store.blob_path(&range.obj.sha256);
+    let mut perms = fs::metadata(&blob).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    fs::set_permissions(&blob, perms).unwrap();
+    let file = fs::OpenOptions::new().write(true).open(&blob).unwrap();
+    file.write_all_at(b"corrupt", 1024).unwrap();
+    drop(file);
+
+    let tier = tier(&fx, 1 << 30);
+    let (_executor, a) = Executor::spawn_filling(&tier);
+    let granted = ask(&tier, a, &fx).expect("opened at once");
+    assert!(!fx.adopt_filling(&granted), "a failed region is never read");
+    let (_older, b) = Executor::spawn(&tier);
+    assert!(ask(&tier, b, &fx).is_none());
+    let facts = tier.facts();
+    assert!(
+        facts.ledger.failed >= 1 && facts.ledger.fills.is_empty() && facts.entries == 0,
         "{facts:?}"
     );
 }

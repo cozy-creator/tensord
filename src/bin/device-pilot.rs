@@ -344,7 +344,8 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
             })
             .collect::<io::Result<Vec<_>>>()?;
         tier.prepare(grants.clone());
-        turns.host = Some((tier.clone(), tier.register_peer(executor.observer_pidfd()?), grants));
+        let filling = executor.hello.offers("host_tiers.filling/1");
+        turns.host = Some((tier.clone(), tier.register_peer(executor.observer_pidfd()?, filling), grants));
     }
     let disk_before = disk_read_bytes();
     let mut timings = BTreeMap::new();
