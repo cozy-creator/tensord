@@ -43,7 +43,7 @@ def cg():   # cgroup v2, else v1 (v1 rss = anon without shmem; shmem sits inside
     if os.path.exists(f"{CG}/memory.stat"):
         m = {l.split()[0]: int(l.split()[1]) for l in open(f"{CG}/memory.stat")}
         r = sum(int(f.split("=")[1]) for l in open(f"{CG}/io.stat") for f in l.split() if f.startswith("rbytes=")) \
-            if os.path.exists(f"{CG}/io.stat") else 0
+            if os.path.exists(f"{CG}/io.stat") else unit_reads(CG)
         anon, shmem, mapped, file = m["anon"], m["shmem"], m["file_mapped"], m["file"]
     else:
         m = {l.split()[0]: int(l.split()[1]) for l in open(f"{CG}/memory/memory.stat")}
@@ -51,6 +51,18 @@ def cg():   # cgroup v2, else v1 (v1 rss = anon without shmem; shmem sits inside
                 if len(l.split()) == 3 and l.split()[1] == "Read")
         anon, shmem, mapped, file = m["total_rss"], m["total_shmem"], m["total_mapped_file"], m["total_cache"]
     return {"anon": anon, "shmem": shmem, "file_mapped": mapped, "file": file, "host": anon + shmem, "read_bytes": r}
+def unit_reads(cg):   # no io controller (a user unit): the storage reads of the unit's live processes
+    total = 0
+    for d, _, fs in os.walk(cg):
+        if "cgroup.procs" in fs:
+            for pid in open(os.path.join(d, "cgroup.procs")).read().split():
+                try: total += next(int(l.split()[1]) for l in open(f"/proc/{pid}/io") if l.startswith("read_bytes"))
+                except (OSError, StopIteration): pass
+    return total
+def load():
+    try: psi = float(open("/proc/pressure/cpu").read().split()[1].split("=")[1])
+    except (OSError, IndexError, ValueError): psi = None
+    return {"load1": os.getloadavg()[0], "cpu_some_avg10": psi}
 def cmd(pid):
     try: return open(f"/proc/{pid}/cmdline", "rb").read().replace(b"\0", b" ").decode(errors="replace").strip()
     except OSError: return ""
@@ -85,10 +97,10 @@ if act == "sample":
     with open(sys.argv[2], "a") as out:
         while True:
             t = time.time(); ex = executors()
-            out.write(json.dumps({"t": t, "gpu": gpu(), "cg": cg(), "executors": len(ex)}) + "\n"); out.flush()
+            out.write(json.dumps({"t": t, "gpu": gpu(), "cg": cg(), "load": load(), "executors": len(ex)}) + "\n"); out.flush()
             time.sleep(max(0.0, 1.0 - (time.time() - t)))
 elif act == "now":
-    print(json.dumps({"t": time.time(), "cg": cg(), "gpu": gpu(), "executors": executors()}))
+    print(json.dumps({"t": time.time(), "cg": cg(), "gpu": gpu(), "load": load(), "executors": executors()}))
 elif act == "newroot":   # block until the root command names a live process other than OLD
     old, root = sys.argv[2], sys.argv[3]
     while True:
@@ -241,7 +253,8 @@ class Gate:
             self.check()
             now = self.pod.helper("now")
             temps.append(now["gpu"]["temp_c"])
-            if temps[-1] <= self.m["start_temp_c"] or (len(temps) >= 12 and min(temps[-6:]) >= min(temps[-12:-6])):
+            cool = temps[-1] <= self.m["start_temp_c"] or (len(temps) >= 12 and min(temps[-6:]) >= min(temps[-12:-6]))
+            if cool and now["load"]["load1"] <= self.m.get("max_load", float("inf")):
                 return now
             log("waiting for the GPU to cool", now["gpu"])
             time.sleep(5)
@@ -325,7 +338,11 @@ class Gate:
             time.sleep(0.2)
         if scenario == "cold_first":
             cache = self.pod.helper("evict", self.cache)
+        if spec.get("start"):   # a platform that does not relaunch by itself (this computer)
+            self.pod.sh(spec["start"])
         new = self.pod.helper("newroot", old, spec["root"])
+        if spec.get("after_start"):
+            self.pod.sh(spec["after_start"])
         if spec.get("cgroup"):
             self.pod.sh(f"({spec['cgroup']}) > {self.pod.dir}/cgroup")
         limits = self.pod.sh(spec["limits"]) if spec.get("limits") else None
@@ -343,6 +360,8 @@ class Gate:
                      "cache_files": listed["files"]})
         if self.m.get("first_images") == "alternate":   # one restart per cycle: a cross-arm switch
             self.first(arm, cycle, "cold_first" if cycle // 2 % 2 == 0 else "warm_first")
+        elif self.m.get("first_images") == "warm":
+            self.first(arm, cycle, "warm_first")
         else:
             self.first(arm, cycle, "cold_first")
             self.first(arm, cycle, "warm_first")
@@ -350,6 +369,9 @@ class Gate:
             self.request(arm, cycle, "warm", "sdxl")
         self.request(arm, cycle, "to_anima", "anima")
         self.request(arm, cycle, "to_sdxl", "sdxl")
+        if not self.m.get("kill", True):   # fault injection stays on rentals (the owner's laptop)
+            self.record({"arm": arm, "cycle": cycle, "event": "end", "now": self.pod.helper("now")})
+            return
         victims = self.pod.helper("now")["executors"]
         if not victims:
             raise RuntimeError("no idle executor to kill; the kill scenario cannot be measured")
@@ -367,11 +389,16 @@ class Gate:
         """Unmeasured: switch to the arm and pay its package install and model download once."""
         spec = self.m["arms"][arm]
         live = self.pod.sh(spec["root"]).split()
-        if live:   # already this arm's machine: no same-arm restart
+        if live and not spec.get("start"):   # already this arm's machine: no same-arm restart
             self.record({"arm": arm, "cycle": -1, "event": "prime", "root": {"pid": int(live[0]), "already": True}})
         else:
             self.pod.sh(spec["restart"])
-            self.record({"arm": arm, "cycle": -1, "event": "prime", "root": self.pod.helper("newroot", "none", spec["root"])})
+            if spec.get("start"):
+                self.pod.sh(spec["start"])
+            root = self.pod.helper("newroot", "none", spec["root"])
+            if spec.get("after_start"):
+                self.pod.sh(spec["after_start"])
+            self.record({"arm": arm, "cycle": -1, "event": "prime", "root": root})
         self.request(arm, -1, "prime", "sdxl")
         self.request(arm, -1, "prime", "anima")
 

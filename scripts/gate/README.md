@@ -63,7 +63,11 @@ checked not flat (per-channel stddev > 2) and hashed.
 Without `rental`, the machine runs on this computer: `work_dir` holds the helper, each arm may name
 `cli`, `run_args` and `show_args` (e.g. a pinned `--machine-endpoint-file`), `cgroup` (the arm's unit,
 followed by the sampler) and `limits` (recorded at each restart). `soak_s` adds equal GPU idle before
-each cycle. `xid_watch: true` follows `journalctl -kf`; any `NVRM: Xid` runs `on_xid` (stop both
+each cycle and `max_load` gates on the 1-minute load. An arm that is not relaunched by its platform
+names `start` (run after the previous machine stopped and the cache step) and `after_start` (e.g. apply
+and record limits). `first_images: "warm"` restarts once per cycle with a warm page cache; `kill: false`
+leaves out the executor kill (fault injection stays on rentals). Disk reads fall back to the unit's
+processes' `/proc/<pid>/io` when its cgroup has no io controller. `xid_watch: true` follows `journalctl -kf`; any `NVRM: Xid` runs `on_xid` (stop both
 machines) and stops the harness at once.
 
 ## Manifest
