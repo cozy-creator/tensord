@@ -16,6 +16,7 @@ pub mod memory;
 pub mod model_source_driver;
 pub mod model_sources;
 pub mod native_inputs;
+pub mod products;
 pub(crate) mod os;
 pub mod owner;
 pub mod process;

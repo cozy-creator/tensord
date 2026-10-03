@@ -484,6 +484,23 @@ pub struct Frame {
     pub regions: Vec<crate::resident_custody::SharedRegion>,
     pub shared_bytes: u64,
     pub released_bytes: u64,
+    // `publish` (Outputs.publish): one product of a declared output.
+    pub output: String,
+    pub label: String,
+    pub asset_ref: String,
+    pub asset_kind: String,
+    pub media_type: String,
+    pub size_bytes: u64,
+    pub digest: String,
+    pub parts: Vec<PublishPart>,
+}
+
+/// One part of a composite product: a spool file and the media time it adds.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct PublishPart {
+    pub local: String,
+    pub duration_us: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -508,6 +525,10 @@ pub struct Answer {
     pub duplicate: bool,
     #[serde(skip_serializing_if = "is_zero")]
     pub descriptors: u64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub digest: String,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub sequence: u64,
 }
 impl Answer {
     pub fn unavailable(seq: u64) -> Self {
@@ -527,6 +548,8 @@ impl Answer {
             regions: Vec::new(),
             duplicate: false,
             descriptors: 0,
+            digest: String::new(),
+            sequence: 0,
         }
     }
 }

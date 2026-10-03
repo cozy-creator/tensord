@@ -61,6 +61,9 @@ Executor requests:
   caller's cap into it. `stage_enter`/`stage_exit` (never asked for) keep the budget.
 - `sealed_tier` goes to `HostTier` (`HOST-TIER.md`); `Load.pinned_bytes` carries the pinned budget.
 - `model_source_read` goes to `ModelSources`.
+- `publish` (`Outputs.publish`) goes to `products.rs`: the spool file is retained as a native
+  one-file tree bound to the run's actor, then journaled as a `product` (list outputs APPEND,
+  single outputs SET; re-publishing identical SET bytes is a no-op). Answers `Published`.
 - Progress counts only `advance > 0`.
 
 ## Launch identity

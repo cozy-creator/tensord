@@ -283,6 +283,27 @@ impl Engine {
             .unwrap()
             .bind_native_output(actor, owner, source)
     }
+    /// Journal one product. `decide` sees the run's earlier products and returns the product
+    /// to append, or `None` when it would change nothing (sequence 0).
+    pub fn append_product(
+        &self,
+        id: &str,
+        decide: impl FnOnce(&[crate::journal::StoredProduct]) -> io::Result<Option<Vec<u8>>>,
+    ) -> io::Result<u64> {
+        let progress = self.progress.lock().unwrap();
+        let mut journal = self.journal.lock().unwrap();
+        let Some(product) = decide(&journal.products(id)?)? else {
+            return Ok(0);
+        };
+        let sequence = journal.append_product(id, progress.get(id), &product)?;
+        drop(journal);
+        drop(progress);
+        self.notify_activity();
+        Ok(sequence)
+    }
+    pub fn products(&self, id: &str) -> io::Result<Vec<crate::journal::StoredProduct>> {
+        self.journal.lock().unwrap().products(id)
+    }
     pub fn commit_public_terminal(
         &self,
         id: &str,

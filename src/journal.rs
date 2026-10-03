@@ -190,6 +190,14 @@ pub struct Execution {
     pub failure: Option<String>,
 }
 
+/// One journaled product of an execution's output log (`api::pb::RunProduct` bytes).
+#[derive(Clone, Debug)]
+pub struct StoredProduct {
+    pub sequence: u64,
+    pub at_ms: u64,
+    pub product: Vec<u8>,
+}
+
 /// Coalesced observation; persisted only as part of an authoritative transition.
 #[derive(Clone, Debug)]
 pub struct ProgressSnapshot {
@@ -273,6 +281,7 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS installations(actor TEXT NOT NULL,alias TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,alias));
             CREATE TABLE IF NOT EXISTS preparations(actor TEXT NOT NULL,id TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,id));
             CREATE TABLE IF NOT EXISTS public_terminals(execution INTEGER PRIMARY KEY REFERENCES executions(id),outcome BLOB NOT NULL,events BLOB NOT NULL);
+            CREATE TABLE IF NOT EXISTS run_products(execution INTEGER NOT NULL REFERENCES executions(id),sequence INTEGER NOT NULL,at_ms INTEGER NOT NULL,product BLOB NOT NULL,PRIMARY KEY(execution,sequence));
             CREATE TABLE IF NOT EXISTS native_outputs(actor TEXT NOT NULL,owner TEXT NOT NULL,source BLOB NOT NULL,PRIMARY KEY(actor,owner));
             CREATE TABLE IF NOT EXISTS input_intakes(actor TEXT NOT NULL,retention TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,retention));
             CREATE TABLE IF NOT EXISTS hub_access(actor TEXT NOT NULL,origin TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,origin));
@@ -1105,6 +1114,18 @@ impl Journal {
         progress: Option<&ProgressSnapshot>,
         change: impl FnOnce(&mut Execution) -> io::Result<bool>,
     ) -> io::Result<Execution> {
+        self.update_with(id, progress, change, |_, _| Ok(()))
+    }
+
+    /// One durable transition; `also` writes in the same transaction, after the record has
+    /// its new revision, only when the transition changed it.
+    fn update_with(
+        &mut self,
+        id: &str,
+        progress: Option<&ProgressSnapshot>,
+        change: impl FnOnce(&mut Execution) -> io::Result<bool>,
+        also: impl FnOnce(&rusqlite::Transaction<'_>, &Execution) -> io::Result<()>,
+    ) -> io::Result<Execution> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1148,9 +1169,60 @@ impl Journal {
                 params![encoded(&record)?, record.state.name(), timestamp(), id],
             )
             .map_err(db_error)?;
+            also(&tx, &record)?;
         }
         tx.commit().map_err(db_error)?;
         Ok(record)
+    }
+
+    /// Journal one product on a started execution's output log. Its event sequence is the
+    /// transition's revision, so products interleave with every other observed change.
+    pub fn append_product(
+        &mut self,
+        id: &str,
+        progress: Option<&ProgressSnapshot>,
+        product: &[u8],
+    ) -> io::Result<u64> {
+        let record = self.update_with(
+            id,
+            progress,
+            |record| {
+                if record.state.terminal() || record.state == State::Queued {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "only a running execution publishes products",
+                    ));
+                }
+                Ok(true)
+            },
+            |tx, record| {
+                tx.execute(
+                    "INSERT INTO run_products(execution,sequence,at_ms,product) VALUES(?1,?2,?3,?4)",
+                    params![id, record.revision as i64, timestamp(), product],
+                )
+                .map_err(db_error)?;
+                Ok(())
+            },
+        )?;
+        Ok(record.revision)
+    }
+
+    /// The execution's output log, oldest first.
+    pub fn products(&self, id: &str) -> io::Result<Vec<StoredProduct>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT sequence,at_ms,product FROM run_products WHERE execution=?1 ORDER BY sequence")
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map([id], |row| {
+                Ok(StoredProduct {
+                    sequence: row.get::<_, i64>(0)? as u64,
+                    at_ms: row.get::<_, i64>(1)? as u64,
+                    product: row.get(2)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.collect::<Result<_, _>>().map_err(db_error)
     }
 
     /// Only one dispatcher can claim a never-started attempt.

@@ -76,6 +76,15 @@ It returns at most 1,024 nonterminal records.
 - Durable transitions jump past `revision_ceiling`. `running` reserves 2^32 revisions for volatile
   progress and renews on exhaustion. A new owner reports the old ceiling, so cursors never regress.
 
+## Output log (products)
+
+- `run_products(execution, sequence, at_ms, product)` holds each published `RunProduct`.
+  Appending is a durable transition: the product's event sequence is that revision, so products
+  interleave with state and keep their sequence in the terminal page.
+- Only a starting/running execution appends. The terminal page lists the log's products, then
+  the result's products the log does not already show, then the outcome.
+- The CPU runner does not publish mid-run yet: its publishes appear with the result.
+
 ## Runner wire
 
 4-byte big-endian length + JSON, max 1 MiB. Unknown kinds are ignored. No version gate.

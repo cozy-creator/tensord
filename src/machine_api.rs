@@ -19,9 +19,8 @@ use std::{
 };
 use tensorfs_core::{
     ids::{ObjectRef, StoredDoc},
-    manifest::{Draft, Entry},
     sha256, source_artifact,
-    store::{Fault, Store},
+    store::Store,
 };
 use tonic::Status;
 
@@ -146,6 +145,28 @@ impl NativeBackend {
             ..Default::default()
         })
     }
+    /// The run's published products, as events with their journaled sequences.
+    fn product_events(&self, record: &Execution) -> Result<Vec<pb::MachineExecutionEvent>, Status> {
+        let attempt = record.attempt.max(1) as u64;
+        self.service
+            .engine
+            .products(&record.id)
+            .map_err(problem)?
+            .iter()
+            .map(|stored| {
+                let product = crate::products::decode(stored).map_err(problem)?;
+                Ok(pb::MachineExecutionEvent {
+                    sequence: stored.sequence,
+                    attempt_ordinal: attempt,
+                    at_ms: stored.at_ms,
+                    kind: "product".into(),
+                    body_canonical_bytes: product_document(&product)?,
+                    product: Some(product),
+                    ..Default::default()
+                })
+            })
+            .collect()
+    }
     fn terminal(&self, record: &Execution) -> Result<pb::MachineExecutionEventPage, Status> {
         let _guard = self.projection.lock().unwrap();
         if let Some(held) = self
@@ -202,44 +223,15 @@ impl NativeBackend {
                     .open_result(&record.id, index)
                     .map_err(problem)?;
                 verify_checksum(&mut source, binding)?;
-                let tree = Draft {
-                    entries: vec![("payload".into(), Entry::File(object.clone()))],
-                }
-                .seal()
-                .map_err(storage)?;
-                // Source writer's shared guard excludes GC until its standing root
-                // records the verified member. This is a native file-tree owner,
-                // not an unrelated catalog operation id.
-                let mut writer = source_artifact::Writer::open(
+                let native = crate::products::retain(
                     &self.store,
+                    &self.service.engine,
+                    &context.actor,
                     &owner,
-                    tree.object_ref().map_err(storage)?,
+                    &mut source,
+                    &object,
                 )
-                .map_err(storage)?;
-                if !writer.completed().map_err(storage)? {
-                    self.store
-                        .put_stream(&mut source, Some(&object), &Fault::default())
-                        .map_err(storage)?;
-                    writer.landed(&object).map_err(storage)?;
-                }
-                let root = writer.finish(&tree).map_err(storage)?;
-                let receipt = root.receipt().map_err(storage)?;
-                let native = pb::NativeByteRetentionRequest {
-                    source: Some(pb::NativeByteTreeRef {
-                        producer_root_id: root.producer,
-                        receipt_digest: sha256::digest(&receipt).to_vec(),
-                        manifest: Some(pb::Ref {
-                            digest: digest_bytes(&format!("sha256:{}", root.manifest.sha256))?,
-                            length: root.manifest.length,
-                        }),
-                        content_bytes: artifact.length,
-                    }),
-                    retention_id: owner.clone(),
-                };
-                self.service
-                    .engine
-                    .bind_native_output(&context.actor, &owner, &native.encode_to_vec())
-                    .map_err(problem)?;
+                .map_err(problem)?;
                 references.insert(
                     binding.asset_ref.clone(),
                     (artifact.clone(), binding.media_type.clone(), native),
@@ -260,12 +252,18 @@ impl NativeBackend {
             }
         }
         let output_entries = output_entries(&products)?;
-        let mut events = vec![];
+        // The log's published products keep their sequences; the result publishes only what
+        // the log does not already show, after them.
+        let mut events = self.product_events(record)?;
+        let shown: Vec<_> = events.iter().filter_map(|e| e.product.clone()).collect();
         let first_sequence = record
             .revision
             .checked_add(1)
             .ok_or_else(|| Status::resource_exhausted("event cursor exhausted"))?;
-        for (index, product) in products.into_iter().enumerate() {
+        let fresh = products
+            .into_iter()
+            .filter(|product| !crate::products::shown(&shown, product));
+        for (index, product) in fresh.enumerate() {
             events.push(pb::MachineExecutionEvent {
                 sequence: first_sequence + index as u64,
                 attempt_ordinal: record.attempt.max(1) as u64,
@@ -323,7 +321,10 @@ impl NativeBackend {
             outcome_canonical_bytes: bytes,
             ..Default::default()
         };
-        let sequence = first_sequence + events.len() as u64;
+        let sequence = events
+            .last()
+            .map_or(record.revision, |event| event.sequence.max(record.revision))
+            + 1;
         events.push(pb::MachineExecutionEvent {
             sequence,
             attempt_ordinal: outcome.attempt_ordinal,
@@ -918,7 +919,10 @@ impl MachineBackend for NativeBackend {
                 ..Default::default()
             })
         };
-        let mut events = vec![];
+        // Published products keep their journaled sequences; see `products.rs`.
+        let mut events = self.product_events(&record)?;
+        let published = events.last().map_or(0, |event| event.sequence);
+        events.retain(|event| event.sequence > request.after);
         let running = record.state == State::Running && record.running_revision > 0;
         if running && record.running_revision > request.after {
             events.push(event(
@@ -930,7 +934,7 @@ impl MachineBackend for NativeBackend {
         let floor = request
             .after
             .max(if running { record.running_revision } else { 0 });
-        if record.revision > floor {
+        if record.revision > floor && record.revision > published {
             if let Some(progress) = record.progress.as_ref().filter(|_| running) {
                 let payload = serde_json::from_str::<Value>(progress)
                     .ok()
@@ -946,6 +950,12 @@ impl MachineBackend for NativeBackend {
                 events.push(event(record.revision, "state", &json!({"state":self.state(&record)?.state,"completed_units":record.completed_units,"waiting_reason":record.waiting_reason}))?);
             }
         }
+        events.sort_by_key(|event| event.sequence);
+        events.truncate(if request.limit == 0 {
+            256
+        } else {
+            request.limit.min(256)
+        } as usize);
         Ok(pb::MachineExecutionEventPage {
             next_after: events.last().map(|e| e.sequence).unwrap_or(request.after),
             events,
@@ -1539,27 +1549,10 @@ fn rewrite_assets(
     Ok(())
 }
 fn product_document(product: &pb::RunProduct) -> Result<Vec<u8>, Status> {
-    let content = product
-        .content
-        .as_ref()
-        .ok_or_else(|| Status::data_loss("product content absent"))?;
-    let source = product
-        .source
-        .as_ref()
-        .ok_or_else(|| Status::data_loss("product source absent"))?;
-    let tree = source
-        .source
-        .as_ref()
-        .ok_or_else(|| Status::data_loss("product tree absent"))?;
-    let manifest = tree
-        .manifest
-        .as_ref()
-        .ok_or_else(|| Status::data_loss("product manifest absent"))?;
-    let mut document = json!({"format":"cozy.worker.v1.RunProduct/1","output":product.output,"op":product.op,"content":{"digest":format!("sha256:{}",sha256::hex(&content.digest)),"length":content.length},"media_type":product.media_type,"source":{"retention_id":source.retention_id,"source":{"producer_root_id":tree.producer_root_id,"receipt_digest":format!("sha256:{}",sha256::hex(&tree.receipt_digest)),"manifest":{"digest":format!("sha256:{}",sha256::hex(&manifest.digest)),"length":manifest.length},"content_bytes":tree.content_bytes}}});
-    if product.index != 0 {
-        document["index"] = json!(product.index);
-    }
-    canonical(&document)
+    canonical(
+        &crate::products::document(product)
+            .map_err(|_| Status::data_loss("product reference absent"))?,
+    )
 }
 
 fn output_entries(products: &[pb::RunProduct]) -> Result<Vec<Value>, Status> {
@@ -1584,4 +1577,416 @@ fn output_entries(products: &[pb::RunProduct]) -> Result<Vec<Value>, Status> {
         }
     }
     Ok(entries.into_values().collect())
+}
+
+/// The SDK's `Outputs.publish` against the real Runtime executor of a real installed package:
+/// products stream on the run's log while it runs, and its result adds only what is new.
+#[cfg(test)]
+mod product_log_tests {
+    use super::*;
+    use crate::{
+        api::MachineIdentity,
+        device_executor::{
+            self, Baseline, Binding, Budgets, DeviceCommand, DeviceExecutor, ExecutorConfig, Frame,
+            Services,
+        },
+        execution::Engine as Execution_Engine,
+        journal::{Installation, Invocation},
+    };
+    use std::{
+        collections::BTreeMap,
+        fs::File,
+        path::{Path, PathBuf},
+        process::Command,
+    };
+
+    const INSTALL: &str = r#"
+import json, subprocess, sys
+from pathlib import Path
+from cozy_machine_client.packages import install
+fixture, out = Path(sys.argv[1]), Path(sys.argv[2])
+subprocess.run(["uv", "build", "--wheel", "--out-dir", str(out / "client"), "."], check=True, capture_output=True)
+generation = install(fixture, out / "generations", next((out / "client").glob("*.whl")), python="3.12")
+print(json.dumps({"identity": generation.identity}))
+"#;
+
+    /// A real uv-installed generation of `tests/fixtures/cpu_publish` (released cozy-runtime).
+    fn install_fixture(root: &Path) -> String {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let output = Command::new("uv")
+            .current_dir(repo)
+            .args([
+                "run", "--locked", "--extra", "test", "python", "-c", INSTALL,
+            ])
+            .arg(repo.join("tests/fixtures/cpu_publish"))
+            .arg(root)
+            .output()
+            .expect("uv runs the repository's installer");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let line = String::from_utf8(output.stdout).unwrap();
+        let value: Value = serde_json::from_str(line.lines().last().unwrap()).unwrap();
+        value["identity"].as_str().unwrap().to_owned()
+    }
+
+    struct Publisher<'a> {
+        store: &'a Store,
+        engine: &'a Execution_Engine,
+        id: &'a str,
+        spool: PathBuf,
+    }
+    impl Services for Publisher<'_> {
+        fn request(
+            &mut self,
+            frame: &Frame,
+            descriptor: Option<File>,
+        ) -> io::Result<(device_executor::Answer, Option<File>)> {
+            drop(descriptor);
+            if frame.kind == device_executor::Kind::Publish {
+                let answer =
+                    crate::products::publish(self.store, self.engine, self.id, &self.spool, frame);
+                return Ok((answer, None));
+            }
+            Ok((device_executor::Answer::unavailable(frame.seq), None))
+        }
+    }
+
+    fn command(executor: &mut DeviceExecutor, command: &DeviceCommand) -> io::Result<()> {
+        let reply = executor.command(command, &mut Baseline)?;
+        if !reply.ok {
+            return Err(io::Error::other(format!(
+                "{}: {}",
+                reply.code, reply.detail
+            )));
+        }
+        Ok(())
+    }
+
+    fn products(page: &pb::MachineExecutionEventPage) -> Vec<(u64, String, i32, u32, String)> {
+        page.events
+            .iter()
+            .filter_map(|event| {
+                let product = event.product.as_ref()?;
+                Some((
+                    event.sequence,
+                    product.output.clone(),
+                    product.op,
+                    product.index,
+                    product.label.clone(),
+                ))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn published_products_stream_while_running_and_the_result_adds_only_what_is_new() {
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let scratch =
+            Scratch(std::env::temp_dir().join(format!("cm-products-{}", uuid::Uuid::new_v4())));
+        let root = scratch.0.clone();
+        std::fs::create_dir_all(&root).unwrap();
+        let identity = install_fixture(&root);
+        let state = root.join("state");
+        let service = Service::open(&state, &root.join("generations"), 1).unwrap();
+        assert!(
+            service.stop().unwrap(),
+            "this test dispatches the run itself"
+        );
+        let engine = service.engine.clone();
+        let store = Arc::new(Store::ensure(&state.join("tensorfs")).unwrap());
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[41; 32]);
+        let machine = MachineIdentity::ephemeral(
+            "products".into(),
+            vec![signer.verifying_key()],
+            vec![7; 32],
+        )
+        .unwrap();
+        let actor = VerifiedActor {
+            public_key: signer.verifying_key().to_bytes(),
+        };
+        let backend = NativeBackend::new(
+            service.clone(),
+            machine.authority.clone(),
+            store.clone(),
+            WorkspaceUploads::open(&state.join("uploads"), store.clone()).unwrap(),
+        );
+        let held = service.catalog.resolve(&identity).unwrap();
+        engine
+            .bind_installation(Installation {
+                actor: actor_id(actor),
+                alias: "fixture".into(),
+                generation: identity.clone(),
+                package: held.record.package.clone(),
+                release: held.record.version.clone(),
+                interface: serde_json::to_vec(&held.record.interface).unwrap(),
+            })
+            .unwrap();
+        let gate = root.join("gate");
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let record = engine
+            .submit_public(
+                SubmissionContext {
+                    actor: actor_id(actor),
+                    request_id: "request-1".into(),
+                    submission_id: "submission-1".into(),
+                    expected_workspace_id: engine.workspace_id(),
+                    capture_digest: digest.clone(),
+                    invocation_digest: digest.clone(),
+                    payload_digest: digest,
+                    ..Default::default()
+                },
+                Invocation {
+                    package: held.record.package.clone(),
+                    generation: identity,
+                    module: held.record.application.clone(),
+                    entrypoint: "make".into(),
+                    input: json!({"gate": gate}),
+                    attention_kernel: String::new(),
+                },
+            )
+            .unwrap();
+        let executor_root = root.join("executor");
+        let task_store = store.clone();
+        let failure = Arc::new(Mutex::new(None::<String>));
+        let failed = failure.clone();
+        assert!(engine
+            .dispatch_managed(&record.id, move |engine, id| {
+                let result = (|| -> io::Result<()> {
+                    std::fs::create_dir(&executor_root)?;
+                    let mut executor = DeviceExecutor::spawn_observed(
+                        ExecutorConfig {
+                            python: held.record.python.clone(),
+                            root: executor_root.clone(),
+                            socket: executor_root.join("e.sock"),
+                            // No device is visible: this package never imports torch.
+                            environment: BTreeMap::from([
+                                ("PATH".into(), "/usr/bin:/bin".into()),
+                                ("CUDA_VISIBLE_DEVICES".into(), String::new()),
+                                ("OMP_NUM_THREADS".into(), "1".into()),
+                            ]),
+                            generation_hold: Some(held.retention()),
+                            identity: None,
+                        },
+                        |birth, cancel| {
+                            let (cancel, request) = (cancel.clone(), id.clone());
+                            engine.register_managed(
+                                &id,
+                                birth.clone(),
+                                Arc::new(move || cancel.cancel(&request)),
+                            )
+                        },
+                    )?;
+                    assert!(!executor.hello.torch_loaded);
+                    assert!(engine.authorize_managed(&id)?);
+                    let interface = executor_root.join("package-interface.json");
+                    std::fs::write(&interface, serde_json::to_vec(&held.record.interface)?)?;
+                    command(
+                        &mut executor,
+                        &DeviceCommand::Start {
+                            devices: String::new(),
+                            application: held.record.application.clone(),
+                            package_interface: interface.clone(),
+                            sequence_parallel_degree: 1,
+                            import_only: false,
+                        },
+                    )?;
+                    command(
+                        &mut executor,
+                        &DeviceCommand::Load {
+                            construction: "fixture".into(),
+                            devices: String::new(),
+                            sequence_parallel_degree: 1,
+                            binding: Box::new(Binding {
+                                application: held.record.application.clone(),
+                                package_interface: interface.display().to_string(),
+                                ..Binding::default()
+                            }),
+                            budgets: Budgets::default(),
+                            authorized_device_limit_bytes: None,
+                            attention_pin: String::new(),
+                            stages: false,
+                            descriptor_sources: false,
+                            device_weights: false,
+                            cap_bytes: None,
+                            sealed_tiers: false,
+                            pinned_bytes: None,
+                        },
+                    )?;
+                    command(
+                        &mut executor,
+                        &DeviceCommand::Activate {
+                            construction: "fixture".into(),
+                        },
+                    )?;
+                    let record = engine.get(&id)?;
+                    command(
+                        &mut executor,
+                        &DeviceCommand::PrepareRequest {
+                            request_id: id.clone(),
+                            construction: "fixture".into(),
+                            entrypoint: "make".into(),
+                            payload: record.invocation.input,
+                        },
+                    )?;
+                    let spool = engine.staging(&id)?;
+                    let reply = executor.command(
+                        &DeviceCommand::Invoke {
+                            request_id: id.clone(),
+                            construction: "fixture".into(),
+                            entrypoint: "make".into(),
+                            spool: spool.clone(),
+                            deadline_s: None,
+                            attention_kernel: String::new(),
+                            plane_budget_bytes: -1,
+                            stages: false,
+                            cap_bytes: None,
+                        },
+                        &mut Publisher {
+                            store: &task_store,
+                            engine: &engine,
+                            id: &id,
+                            spool: spool.clone(),
+                        },
+                    )?;
+                    if let Some(outcome) =
+                        reply.outcome.as_ref().filter(|o| o.terminal != "succeeded")
+                    {
+                        return Err(io::Error::other(format!(
+                            "{}: {}",
+                            outcome.code, outcome.message
+                        )));
+                    }
+                    let (value, bindings) =
+                        device_executor::postprocess(&executor.codec(), &spool, &reply)?;
+                    engine.managed_result(
+                        &id,
+                        &spool,
+                        value,
+                        crate::gpu_service::output_bindings(bindings)?,
+                    )?;
+                    executor.shutdown()
+                })();
+                if let Err(error) = &result {
+                    *failed.lock().unwrap() = Some(error.to_string());
+                }
+                result
+            })
+            .unwrap());
+        // Harness bound on a broken run only; the product never kills by elapsed time.
+        let until = std::time::Instant::now() + Duration::from_secs(300);
+        let check = || {
+            assert!(
+                failure.lock().unwrap().is_none(),
+                "run failed: {:?}",
+                failure.lock().unwrap()
+            );
+            assert!(std::time::Instant::now() < until, "run made no progress");
+        };
+
+        let workspace = engine.workspace_id();
+        let query = |after| pb::MachineExecutionEventsQuery {
+            execution: Some(pb::MachineExecutionQuery {
+                request_id: "request-1".into(),
+                expected_execution_workspace_id: workspace.clone(),
+                ..Default::default()
+            }),
+            after,
+            limit: 0,
+            wait: true,
+        };
+        let (append, set) = (
+            pb::RunProductOp::Append as i32,
+            pb::RunProductOp::Set as i32,
+        );
+        // While the run waits at its gate, the log already shows its first two products.
+        let mut cursor = 0;
+        let mut live = vec![];
+        while live.len() < 2 {
+            check();
+            let page = backend.events(actor, query(cursor)).unwrap();
+            cursor = page.next_after;
+            live.extend(products(&page));
+        }
+        assert_eq!(engine.get(&record.id).unwrap().state, State::Running);
+        assert_eq!(
+            live.iter()
+                .map(|p| (p.1.as_str(), p.2, p.3, p.4.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("frames", append, 0, "Frame 1"),
+                ("preview", set, 0, "Draft")
+            ]
+        );
+        std::fs::write(&gate, b"").unwrap();
+        let page = loop {
+            check();
+            let page = backend.events(actor, query(0)).unwrap();
+            if page.events.iter().any(|event| event.kind == "outcome") {
+                break page;
+            }
+        };
+        let log = products(&page);
+        assert_eq!(
+            &log[..2],
+            &live[..],
+            "published products keep their sequences"
+        );
+        assert_eq!(
+            log.iter()
+                .map(|p| (p.1.as_str(), p.2, p.3, p.4.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("frames", append, 0, "Frame 1"),
+                ("preview", set, 0, "Draft"),
+                ("frames", append, 1, "Frame 2"),
+                ("frames", append, 2, ""),
+                ("preview", set, 0, ""),
+            ],
+            "the result adds only the unpublished third frame and the new preview"
+        );
+        assert!(page
+            .events
+            .windows(2)
+            .all(|w| w[0].sequence < w[1].sequence));
+        assert_eq!(page.events.last().unwrap().kind, "outcome");
+        // Every product's bytes are fetchable with the actor's own Claim.
+        let bytes: Vec<Vec<u8>> = page
+            .events
+            .iter()
+            .filter_map(|event| event.product.as_ref())
+            .map(|product| {
+                backend
+                    .read_stream(
+                        actor,
+                        pb::NativeByteReadCall {
+                            source: product.source.clone(),
+                            object: product.content.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap()
+                    .flat_map(|chunk| chunk.unwrap().data)
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            bytes,
+            [
+                &b"frame-1"[..],
+                b"preview-draft",
+                b"frame-2",
+                b"frame-3",
+                b"preview-final"
+            ]
+        );
+        drop(scratch);
+    }
 }

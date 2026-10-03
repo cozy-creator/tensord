@@ -881,6 +881,8 @@ impl GpuPool {
             pool: self,
             plan: &plan.id,
             others,
+            store: &self.store,
+            spool: None,
         };
         if !session.loaded {
             let interface_path = session.executor.root_path().join("package-interface.json");
@@ -1003,6 +1005,7 @@ impl GpuPool {
             let cell = callbacks.cells.first().map(File::try_clone).transpose()?;
             self.memory.running(&plan.id, cap, cell);
         }
+        callbacks.spool = Some(spool.clone());
         let reply = session.executor.command(
             &DeviceCommand::Invoke {
                 request_id: id.into(),
@@ -1285,7 +1288,7 @@ fn remove_stale_jit(root: &Path, incarnation: &str) {
     }
 }
 
-fn output_bindings(bindings: Vec<device_executor::AssetBinding>) -> io::Result<Vec<AssetBinding>> {
+pub(crate) fn output_bindings(bindings: Vec<device_executor::AssetBinding>) -> io::Result<Vec<AssetBinding>> {
     bindings
         .into_iter()
         .map(|binding| {
@@ -1341,6 +1344,9 @@ struct Callbacks<'a> {
     pool: &'a GpuPool,
     plan: &'a str,
     others: &'a mut BTreeMap<String, Session>,
+    store: &'a Store,
+    /// The invoking request's spool, where its published assets' bytes are.
+    spool: Option<PathBuf>,
 }
 impl Services for Callbacks<'_> {
     fn device_tier(
@@ -1443,6 +1449,14 @@ impl Services for Callbacks<'_> {
                     return Ok((answer, None));
                 }
             }
+        }
+        if frame.kind == Kind::Publish {
+            drop(descriptor);
+            let answer = match &self.spool {
+                Some(spool) => crate::products::publish(self.store, self.engine, self.id, spool, frame),
+                None => Answer::unavailable(frame.seq),
+            };
+            return Ok((answer, None));
         }
         if frame.kind == Kind::ModelSourceRead {
             drop(descriptor);
