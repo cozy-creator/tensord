@@ -29,7 +29,13 @@ fn run() -> io::Result<()> {
         // The image entrypoint and the CLI's machine launcher: no arguments, a grant in the
         // environment (read before any thread starts; the one-shot key leaves the environment).
         None | Some("run") if args.len() == 0 => match cozy_machine::machine::grant::from_process()? {
-            Some(grant) => run_machine(grant),
+            Some(grant) => {
+                if let Some(key) = grant.developer_key.as_deref().filter(|_| nix::unistd::geteuid().is_root()) {
+                    cozy_machine::machine::ssh::start(key)?;
+                }
+                let ready = cozy_machine::machine::supervise::supervise()?;
+                run_machine(grant, ready)
+            }
             None => Err(io::Error::other("this process has no machine grant (COZY_WORKER_ID and the rest of a pod's environment)")),
         },
         Some("version") => {
@@ -92,7 +98,10 @@ fn run() -> io::Result<()> {
 }
 /// Runs the machine from its grant: identity and readiness under the machine root, the engine
 /// under `var/lib/cozy/machine/engine`, the API on the granted port.
-fn run_machine(mut grant: cozy_machine::machine::grant::Grant) -> io::Result<()> {
+fn run_machine(
+    mut grant: cozy_machine::machine::grant::Grant,
+    mut ready: cozy_machine::machine::supervise::Ready,
+) -> io::Result<()> {
     use cozy_machine::machine::{grant::Lifetime, identity, receipt};
     for name in &grant.ignored {
         eprintln!("cozy-machine: ignoring {name}, which this machine does not read");
@@ -126,6 +135,13 @@ fn run_machine(mut grant: cozy_machine::machine::grant::Grant) -> io::Result<()>
         fresh,
     )?;
     identity.lifecycle = Some(lifecycle.clone());
+    let readiness = identity.readiness.clone();
+    std::thread::Builder::new()
+        .name("readiness-report".into())
+        .spawn(move || {
+            readiness.wait_proved();
+            ready.report();
+        })?;
     let engine = layout.engine();
     let generations = engine.join("generations");
     let owner = Owner::new(&engine, 16 * 1024 * 1024, Duration::from_secs(300))?;
@@ -155,7 +171,8 @@ fn run_machine(mut grant: cozy_machine::machine::grant::Grant) -> io::Result<()>
     }
     let control = bind_control(&owner)?;
     let api = std::net::TcpListener::bind((grant.listen_host, grant.worker_port))?;
-    let python = layout.root.join("opt/cozy/python/bin/python3");
+    // The image's installer helper: an environment over its interpreter with the client wheel.
+    let python = layout.root.join("opt/cozy/machine/helper/bin/python");
     let wheel = std::fs::read_dir(layout.root.join("opt/cozy/machine"))
         .into_iter()
         .flatten()
@@ -176,13 +193,31 @@ fn run_machine(mut grant: cozy_machine::machine::grant::Grant) -> io::Result<()>
         installer.0,
         installer.1,
         "3.12".into(),
-        cozy_machine::published::PackageSdk {
-            uv: "uv".into(),
-            python: "3.12".into(),
-            ..Default::default()
-        },
+        image_sdk(&layout.root.join("opt/cozy/wheels")),
     )?;
     serve(owner, service, control)
+}
+
+/// Executors on an image use its own Runtime/TensorFS pair (the wheels it ships), so they speak
+/// this image's protocol; elsewhere each release's locked SDK.
+fn image_sdk(wheels: &std::path::Path) -> cozy_machine::published::PackageSdk {
+    let mut pair: Vec<String> = std::fs::read_dir(wheels)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|e| e == "whl"))
+        .map(|path| path.display().to_string())
+        .collect();
+    pair.sort();
+    let complete = pair.iter().any(|w| w.contains("/cozy_runtime-"))
+        && pair.iter().any(|w| w.contains("/tensorfs-"));
+    cozy_machine::published::PackageSdk {
+        uv: "uv".into(),
+        python: "3.12".into(),
+        find_links: complete.then(|| wheels.to_path_buf()),
+        requirements: if complete { pair } else { vec![] },
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

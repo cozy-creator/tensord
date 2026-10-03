@@ -6,6 +6,8 @@ pub mod identity;
 pub mod lifecycle;
 pub mod probe;
 pub mod receipt;
+pub mod ssh;
+pub mod supervise;
 
 /// Machine contracts this service implements, as named in its readiness receipt.
 pub const CAPABILITIES: &[&str] = &[];

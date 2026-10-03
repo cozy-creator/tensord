@@ -14,7 +14,7 @@ fs2 = "0.4"
 libc = "0.2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
-nix = { version = "0.31.3", default-features = false, features = ["fs", "socket", "uio", "user"] }
+nix = { version = "0.31.3", default-features = false, features = ["fs", "socket", "uio", "user", "signal", "process"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }

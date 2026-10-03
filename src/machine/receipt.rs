@@ -8,7 +8,7 @@ use std::{
     fs, io,
     path::PathBuf,
     process::Command,
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
 };
 
 pub const DOMAIN: &[u8] = b"cozy.pod-readiness/1\0";
@@ -27,12 +27,14 @@ struct Envelope {
 pub struct Readiness {
     path: Option<PathBuf>,
     state: Mutex<State>,
+    proved: Condvar,
 }
 #[derive(Default)]
 struct State {
     key: Option<Vec<u8>>,
     retained: Option<Vec<u8>>,
     sealed: Option<Vec<u8>>,
+    proved: bool,
 }
 
 impl Readiness {
@@ -75,6 +77,7 @@ impl Readiness {
         Ok(Arc::new(Self {
             path,
             state: Mutex::new(state),
+            proved: Condvar::new(),
         }))
     }
 
@@ -99,7 +102,10 @@ impl Readiness {
     pub fn seal(&self, payload: Vec<u8>) -> io::Result<bool> {
         let mut state = self.state.lock().unwrap();
         if let Some(retained) = &state.retained {
-            return same_attestation(retained, &payload).map(|()| false);
+            same_attestation(retained, &payload)?;
+            state.proved = true;
+            self.proved.notify_all();
+            return Ok(false);
         }
         let hmac_sha256 = match &state.key {
             Some(key) => mac(key, &payload),
@@ -126,7 +132,15 @@ impl Readiness {
             state.retained = Some(payload);
         }
         state.sealed = Some(raw);
+        state.proved = true;
+        self.proved.notify_all();
         Ok(true)
+    }
+
+    /// Blocks until this process has proved readiness (sealed, or matched the retained seal).
+    pub fn wait_proved(&self) {
+        let state = self.state.lock().unwrap();
+        drop(self.proved.wait_while(state, |s| !s.proved).unwrap());
     }
 }
 

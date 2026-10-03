@@ -79,6 +79,14 @@ fn awaited(machine: &mut Machine, root: &Path, port: u16) -> Vec<u8> {
     }
 }
 
+fn children(pid: u32) -> Vec<u32> {
+    std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(|p| p.parse().unwrap())
+        .collect()
+}
+
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -120,6 +128,25 @@ fn receipt_verifies_and_a_restart_keeps_boot_and_bytes() {
     assert_eq!(facts["worker_listener_bound"], true);
     assert_eq!(facts["worker_foreign_credential_refused"], true);
     assert_eq!(facts["runtime_gpus"], serde_json::json!([]));
+    // The supervisor starts a crashed service again: same boot, same bytes.
+    let service = children(first.0.id());
+    assert_eq!(service.len(), 1, "one service under its supervisor");
+    Command::new("kill")
+        .args(["-KILL", &service[0].to_string()])
+        .status()
+        .unwrap();
+    let start = Instant::now();
+    while children(first.0.id())
+        .first()
+        .is_none_or(|pid| *pid == service[0])
+    {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the service was not started again"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(awaited(&mut first, &root, port), sealed);
     drop(first);
     // A container restart replays the key; without one the retained envelope still serves.
     for key in [Some(&KEY[..]), None] {
@@ -129,5 +156,50 @@ fn receipt_verifies_and_a_restart_keeps_boot_and_bytes() {
     // A foreign key cannot adopt this boot.
     let mut foreign = boot(&root, port, Some(&[8; 32]));
     assert!(!foreign.0.wait().unwrap().success());
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn a_root_the_go_agent_booted_keeps_its_boot_and_leaf() {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-root");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target/machine-readiness-go")
+        .join(std::process::id().to_string());
+    let _ = std::fs::remove_dir_all(&root);
+    for file in [
+        "run/cozy/bootstrap/tls.crt",
+        "run/cozy/bootstrap/tls.key",
+        "var/lib/cozy/machine/boot-id",
+    ] {
+        std::fs::create_dir_all(root.join(file).parent().unwrap()).unwrap();
+        std::fs::copy(fixture.join(file), root.join(file)).unwrap();
+    }
+    let port = free_port();
+    let mut machine = boot(&root, port, Some(&KEY));
+    let sealed = awaited(&mut machine, &root, port);
+    #[derive(serde::Deserialize)]
+    struct Envelope {
+        payload: String,
+    }
+    let envelope: Envelope = serde_json::from_slice(&sealed).unwrap();
+    let facts: serde_json::Value =
+        serde_json::from_slice(&STANDARD.decode(envelope.payload).unwrap()).unwrap();
+    let boot_id = std::fs::read_to_string(fixture.join("var/lib/cozy/machine/boot-id")).unwrap();
+    assert_eq!(facts["pod_boot_id"], boot_id.as_str());
+    let pem = std::fs::read(fixture.join("run/cozy/bootstrap/tls.crt")).unwrap();
+    let leaf = rustls_pemfile::certs(&mut pem.as_slice())
+        .next()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        facts["tls_certificate_der_base64"],
+        STANDARD.encode(leaf.as_ref())
+    );
+    assert_eq!(
+        facts["worker_listener_bound"], true,
+        "the Go SEC1 key serves TLS"
+    );
+    assert_eq!(facts["worker_foreign_credential_refused"], true);
+    drop(machine);
     std::fs::remove_dir_all(&root).unwrap();
 }
