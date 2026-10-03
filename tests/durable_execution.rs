@@ -961,6 +961,8 @@ def infer(inputs, output_root, canceled, progress):
     progress(1)
     if inputs['mode']=='wedge':
         import threading;threading.Event().wait()
+    if inputs['mode']=='crash':
+        import os,sys;sys.stderr.write('crashing on purpose\n');sys.stderr.flush();os._exit(3)
     if inputs['mode']=='progress':
         while not Path(inputs['advance']).exists() and not canceled.wait(0.01):pass
         for units in range(2,258):progress(units)
@@ -1073,6 +1075,25 @@ fn age(path: &std::path::Path, days: u64) {
 }
 
 #[test]
+fn a_failed_cpu_run_keeps_a_triage_bundle_with_the_runner_stderr() {
+    let fixture = Fixture::new();
+    // The package ends its runner in the middle of the run: a lifecycle failure.
+    let record = fixture.engine.submit("crash", fixture.invocation("crash")).unwrap();
+    assert!(fixture.engine.dispatch(&record.id, fixture.config()).unwrap());
+    let failed = fixture.wait(&record.id, |record| record.state.terminal());
+    assert_eq!(failed.state, State::Failed, "{failed:?}");
+    let (reference, bytes) = fixture.engine.triage(&record.id).unwrap().unwrap();
+    assert_eq!(reference.length, bytes.len() as u64);
+    let bundle: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(bundle["terminal"]["code"], "runner_ended");
+    assert!(bundle["executor"]["stderr_tail"]
+        .as_str()
+        .unwrap()
+        .contains("crashing on purpose"));
+    assert!(bundle["executor"]["pid"].as_u64().unwrap() > 0);
+}
+
+#[test]
 fn caches_expire_but_held_named_and_uncollected_work_stays() {
     use cozy_machine::{catalog::Catalog, reclaim};
     let fixture = Fixture::new();
@@ -1109,8 +1130,30 @@ fn caches_expire_but_held_named_and_uncollected_work_stays() {
     let lease = fs::File::open(held.join(".hold")).unwrap();
     fs2::FileExt::lock_shared(&lease).unwrap(); // a run or executor holding it
     let bound = std::collections::HashSet::from(["c".repeat(32)]);
-    let swept = reclaim::sweep(&fixture.engine, &catalog, &bound).unwrap();
+    let kernels = fixture.root.join("kernels");
+    for (namespace, entry, days) in [("u1", "old", 9), ("u1", "new", 0), ("u2", "busy", 9)] {
+        let directory = kernels.join(namespace).join("triton").join(entry);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("kernel.cubin"), b"compiled").unwrap();
+        age(&directory.join("kernel.cubin"), days);
+        age(&directory, days);
+    }
+    let caches = reclaim::KernelCaches {
+        root: kernels.clone(),
+        busy: std::collections::HashSet::from(["u2".to_string()]),
+    };
+    let swept = reclaim::sweep(&fixture.engine, &catalog, &bound, Some(&caches)).unwrap();
     assert_eq!((swept.staging, swept.results, swept.generations), (1, 1, 1), "{swept:?}");
+    // Kernels go only under storage pressure, least recently used first, never a live
+    // executor's namespace.
+    let pressure = reclaim::Disk::measure(&fixture.root).unwrap().pressure();
+    assert!(kernels.join("u2/triton/busy").exists());
+    if pressure {
+        assert!(!kernels.join("u1/triton/old").exists(), "{swept:?}");
+    } else {
+        assert_eq!(swept.kernels, 0);
+        assert!(kernels.join("u1/triton/old").exists());
+    }
     assert!(!state.join("staging").join(&collected).exists());
     assert!(state.join("staging").join(&queued).exists());
     assert!(!state.join("results").join(&collected).exists());

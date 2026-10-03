@@ -483,6 +483,26 @@ impl GpuPool {
     pub fn config(&self) -> &GpuConfig {
         &self.config
     }
+    /// The kernel store and the namespaces live executors use. The pool's executors share
+    /// one identity; a call in progress (the sessions lock is held) counts as live.
+    pub fn kernel_caches(&self) -> crate::reclaim::KernelCaches {
+        let uid = self
+            .config
+            .identity
+            .map_or_else(|| unsafe { libc::geteuid() }, |identity| identity.uid);
+        let live = match (self.sessions.try_lock(), self.zygotes.try_lock()) {
+            (Ok(sessions), Ok(zygotes)) => !sessions.is_empty() || !zygotes.is_empty(),
+            _ => true,
+        };
+        crate::reclaim::KernelCaches {
+            root: self.root.join("kernels"),
+            busy: if live {
+                std::collections::HashSet::from([format!("u{uid}")])
+            } else {
+                std::collections::HashSet::new()
+            },
+        }
+    }
     /// The first GPU's ledger: every plan runs there (groups take the first K), so it also
     /// orders the host's pinned shares.
     fn first(&self) -> &GpuMemory {
@@ -1053,7 +1073,8 @@ impl GpuPool {
                 sessions.insert(session.plan.clone(), session);
                 Ok("loaded")
             }
-            Err(error) => Err(ended_with(error, session.executor)),
+            // A prewarm is no run: there is no triage to keep.
+            Err(error) => Err(ended_with(engine, "", error, session.executor)),
         }
     }
 
@@ -1480,7 +1501,7 @@ impl GpuPool {
             }
             // Not reusable: gone (exit observed) before its context is released.
             Ok(false) => session.executor.terminate().map(drop),
-            Err(error) => Err(ended_with(error, session.executor)),
+            Err(error) => Err(ended_with(engine, id, error, session.executor)),
         }
     }
 
@@ -2327,7 +2348,17 @@ fn raise_fd_limit() {
 
 /// An error ends its executor; the exact exit is observed before the run settles, and a
 /// kill's measurement joins the reason.
-fn ended_with(error: io::Error, executor: DeviceExecutor) -> io::Error {
+fn ended_with(engine: &Engine, id: &str, error: io::Error, executor: DeviceExecutor) -> io::Error {
+    let (pid, stderr_tail) = (
+        executor.birth.pid,
+        crate::process::tail(&executor.root_path().join("stderr.log")),
+    );
+    let error = ending(error, executor);
+    keep_lifecycle_triage(engine, id, pid, &error.to_string(), &stderr_tail);
+    error
+}
+
+fn ending(error: io::Error, executor: DeviceExecutor) -> io::Error {
     match executor.terminate() {
         Ok(device_executor::Ended {
             killed: Some(killed),
@@ -2363,6 +2394,13 @@ fn settle(engine: &Arc<Engine>, id: &str, error: &io::Error) -> io::Result<()> {
     }
     if record.state == State::Starting && crate::process::transient(error) {
         return engine.defer_managed(id, format!("device startup unavailable: {error}"));
+    }
+    if let Some(ended) = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<device_executor::EndedBeforeStart>())
+    {
+        let pid = record.process.as_ref().map_or(0, |birth| birth.pid);
+        keep_lifecycle_triage(engine, id, pid, &ended.to_string(), &ended.stderr_tail);
     }
     let outcome = if record.cancel_actor.is_some() {
         Outcome::Canceled
@@ -2471,6 +2509,35 @@ pub(crate) fn stage_inputs(
 
 /// The failed attempt's triage bundle, kept before the run settles: the executor's own terminal
 /// and traceback, and its stderr tail.
+/// A lifecycle failure's bundle, when the executor wrote no terminal of its own: the reason
+/// (with any kill measurement) and the end of its stderr. A canceled run keeps none.
+fn keep_lifecycle_triage(engine: &Engine, id: &str, pid: u32, reason: &str, stderr_tail: &str) {
+    let Ok(record) = engine.get(id) else {
+        return;
+    };
+    if record.cancel_actor.is_some() || engine.triage(id).ok().flatten().is_some() {
+        return;
+    }
+    let request = record
+        .submission
+        .as_ref()
+        .map_or_else(|| id.to_string(), |s| s.request_id.clone());
+    engine.record_triage(
+        id,
+        &crate::triage::Facts {
+            request_id: &request,
+            attempt: record.attempt,
+            terminal: "failed",
+            origin: "machine",
+            code: "executor_ended",
+            message: reason,
+            traceback: "",
+            executor_pid: pid,
+            stderr_tail,
+        },
+    );
+}
+
 pub(crate) fn keep_triage(
     engine: &Engine,
     id: &str,

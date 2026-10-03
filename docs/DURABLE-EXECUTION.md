@@ -121,8 +121,14 @@ logs, collected results and generations go after a 7-day TTL (a generation's las
 `.hold` mtime) or, least recently used first, under the host's storage pressure (below 1/10 of
 the filesystem free, until above 1/5: TensorFS's thresholds). Never evicted: uncollected results,
 journal rows, a generation any run or executor holds (its `.hold` lock) or an installation or
-configured package names. Below the reserve, max(1 GiB, 1/50), an executor's compiled kernels go
-to its run-scoped JIT directory instead of the persistent store.
+configured package names. Under pressure the persistent kernel store goes too, least recently
+used first (one compiled kernel, or one generation's torch kernels), before generations and never
+while an executor of that identity is alive. Below the reserve, max(1 GiB, 1/50), an executor's
+compiled kernels go to its run-scoped JIT directory instead of the persistent store.
+
+Triage: every failed CPU run, and every GPU run whose executor ended, failed to start or was killed
+without writing its own terminal, keeps a bundle (`triage.rs`) before it settles: the reason, which
+carries any kill measurement, the process id and the end of its stderr. `Read{triage}` serves it.
 
 Journal: `machine_metadata.journal_format` records the layout (1). A newer journal still opens;
 a row this machine cannot decode is skipped (logged) instead of failing every list, and a state

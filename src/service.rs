@@ -321,7 +321,10 @@ impl Service {
             }
             bound
         });
-        match bound.and_then(|bound| crate::reclaim::sweep(&self.engine, &self.catalog, &bound)) {
+        let kernels = self.gpu().map(|gpu| gpu.kernel_caches());
+        match bound.and_then(|bound| {
+            crate::reclaim::sweep(&self.engine, &self.catalog, &bound, kernels.as_ref())
+        }) {
             Ok(swept) => {
                 if swept != crate::reclaim::Swept::default() {
                     eprintln!("reclaimed {swept:?}");

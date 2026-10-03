@@ -973,10 +973,9 @@ impl Engine {
             }
             Err(error) => {
                 // Nothing authored ran; a deterministic launch failure is not retried.
-                self.finish(
-                    id,
-                    Outcome::Failed(format!("runner did not start: {error}")),
-                )?;
+                let reason = format!("runner did not start: {error}");
+                self.runner_triage(id, 0, &reason, &logs);
+                self.finish(id, Outcome::Failed(reason))?;
                 return Ok(());
             }
         };
@@ -1031,8 +1030,36 @@ impl Engine {
         };
         // Custody is complete: a settled run never has a spool.
         drop(spool);
+        if let Outcome::Failed(reason) = &outcome {
+            self.runner_triage(id, exact.birth.pid, reason, &logs);
+        }
         self.finish(id, outcome)?;
         Ok(())
+    }
+
+    /// A failed CPU run's bundle: its reason and the end of the runner's stderr.
+    fn runner_triage(&self, id: &str, pid: u32, reason: &str, logs: &Path) {
+        let Ok(record) = self.get(id) else {
+            return;
+        };
+        let request = record
+            .submission
+            .as_ref()
+            .map_or_else(|| id.to_string(), |s| s.request_id.clone());
+        self.record_triage(
+            id,
+            &crate::triage::Facts {
+                request_id: &request,
+                attempt: record.attempt,
+                terminal: "failed",
+                origin: "machine",
+                code: "runner_ended",
+                message: reason,
+                traceback: "",
+                executor_pid: pid,
+                stderr_tail: &crate::process::tail(&logs.join(format!("{id}.stderr.log"))),
+            },
+        );
     }
 
     fn supervise(

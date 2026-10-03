@@ -9,7 +9,7 @@ use std::{
     collections::HashSet,
     fs::{self, File},
     io,
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
 
@@ -56,7 +56,64 @@ pub struct Swept {
     pub staging: usize,
     pub logs: usize,
     pub results: usize,
+    pub kernels: usize,
     pub generations: usize,
+}
+
+/// The persistent compiled-kernel store (`Seal::prepare`'s `<root>/u<uid>/`). Recompiling is
+/// cheaper than reinstalling, so it goes before generations, and only under pressure.
+pub struct KernelCaches {
+    pub root: PathBuf,
+    /// Namespaces (`u<uid>`) a live executor uses: never touched.
+    pub busy: HashSet<String>,
+}
+
+/// Newest modification anywhere inside: an entry's last use.
+fn last_use(path: &Path) -> SystemTime {
+    let own = fs::symlink_metadata(path)
+        .and_then(|m| m.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    match fs::read_dir(path) {
+        Ok(entries) => entries
+            .flatten()
+            .map(|entry| last_use(&entry.path()))
+            .fold(own, SystemTime::max),
+        Err(_) => own,
+    }
+}
+
+/// Kernel entries least recently used first: one compiled kernel (a `triton` or `flash-attn4`
+/// entry) or one generation's torch kernels.
+fn kernel_entries(caches: &KernelCaches) -> Vec<PathBuf> {
+    let mut entries = vec![];
+    let Ok(namespaces) = fs::read_dir(&caches.root) else {
+        return entries;
+    };
+    for namespace in namespaces.flatten() {
+        if caches
+            .busy
+            .contains(&*namespace.file_name().to_string_lossy())
+        {
+            continue;
+        }
+        for child in fs::read_dir(namespace.path()).into_iter().flatten().flatten() {
+            let name = child.file_name();
+            if matches!(name.to_str(), Some("triton" | "flash-attn4")) {
+                entries.extend(
+                    fs::read_dir(child.path())
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .map(|e| e.path()),
+                );
+            } else {
+                entries.push(child.path());
+            }
+        }
+    }
+    let mut dated: Vec<_> = entries.into_iter().map(|path| (last_use(&path), path)).collect();
+    dated.sort();
+    dated.into_iter().map(|(_, path)| path).collect()
 }
 
 fn older_than(path: &Path, age: Duration) -> bool {
@@ -83,7 +140,12 @@ fn remove(path: &Path) -> bool {
 
 /// TTL always; under pressure each tier in turn, stopping once the disk is relieved.
 /// `bound`: generations installations or configured packages still name.
-pub fn sweep(engine: &Engine, catalog: &Catalog, bound: &HashSet<String>) -> io::Result<Swept> {
+pub fn sweep(
+    engine: &Engine,
+    catalog: &Catalog,
+    bound: &HashSet<String>,
+    kernels: Option<&KernelCaches>,
+) -> io::Result<Swept> {
     let mut swept = Swept::default();
     let root = &engine.root;
     let disk = || Disk::measure(root);
@@ -120,6 +182,17 @@ pub fn sweep(engine: &Engine, catalog: &Catalog, bound: &HashSet<String>) -> io:
         }
     }
     pressure = pressure && !disk()?.relieved();
+    if let Some(kernels) = kernels.filter(|_| pressure) {
+        for entry in kernel_entries(kernels) {
+            if remove(&entry) {
+                swept.kernels += 1;
+            }
+            if disk()?.relieved() {
+                pressure = false;
+                break;
+            }
+        }
+    }
     // Generations: unbound, unheld, and unused for the TTL (or the disk is short).
     let mut candidates: Vec<_> = fs::read_dir(catalog.root())?
         .flatten()
