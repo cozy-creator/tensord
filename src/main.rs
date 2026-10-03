@@ -46,10 +46,11 @@ fn run() -> io::Result<()> {
         },
         Some("version") => {
             #[derive(serde::Serialize)]
-            struct Version { name: &'static str, implementation: &'static str, version: &'static str, tensorfs: &'static str, wire_minor: u32, minimum_wire_minor: u32, capabilities: Vec<&'static str> }
+            struct Version { name: &'static str, implementation: &'static str, version: &'static str, tensorfs: &'static str, api: [&'static str; 1], wire_minor: u32, minimum_wire_minor: u32, capabilities: Vec<&'static str> }
             // Machine contracts beside the private socket's: clients choose by capability.
             let capabilities = cozy_machine::machine::CAPABILITIES.iter().chain(CAPS).copied().collect();
-            let record = Version { name: "cozy-machine", implementation: "rust", version: env!("CARGO_PKG_VERSION"), tensorfs: tensorfs_core::VERSION,
+            // `api` names the client API it serves (G/API.md): a controller chooses its machine by it.
+            let record = Version { name: "cozy-machine", implementation: "rust", version: env!("CARGO_PKG_VERSION"), tensorfs: tensorfs_core::VERSION, api: ["cozy.machine.v1"],
                 wire_minor: cozy_machine::api::WIRE_MINOR, minimum_wire_minor: cozy_machine::api::WIRE_MINIMUM, capabilities };
             println!("{}", serde_json::to_string(&record)?); Ok(())
         }
