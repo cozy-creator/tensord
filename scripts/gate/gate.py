@@ -333,20 +333,25 @@ class Gate:
         Warm reads the cache files before the restart; cold evicts them once the old machine's
         executors (which map the libraries) are gone. Measured disk reads prove which one held."""
         spec = self.m["arms"][arm]
-        cache = self.pod.helper("warm", self.cache) if scenario == "warm_first" else None
+        # Weights are not memory-mapped, so evicting (or warming) them before the restart takes effect.
+        cache = self.pod.helper("warm" if scenario == "warm_first" else "evict", self.cache)
         old = (self.pod.sh(spec["root"]).split() or ["none"])[0]
         stop = self.pod.helper("now")["t"]
         self.pod.sh(spec["restart"])
-        while True:   # exclusive card: every executor of the previous machine is gone
-            now = self.pod.helper("now")
-            if not [e for e in now["executors"] if e["started"] < stop]:
-                break
-            time.sleep(0.2)
-        if scenario == "cold_first":
-            cache = self.pod.helper("evict", self.cache)
-        if spec.get("start"):   # a platform that does not relaunch by itself (this computer)
+        if spec.get("start"):   # this computer: nothing relaunches by itself
+            while self.pod.helper("now")["executors"]:   # every machine stopped
+                time.sleep(0.2)
+            if scenario == "cold_first":   # native libraries were mapped until now
+                cache = self.pod.helper("evict", self.cache)
             self.pod.sh(spec["start"])
-        new = self.pod.helper("newroot", old, spec["root"])
+            new = self.pod.helper("newroot", old, spec["root"])
+        else:   # the platform relaunches the arm: wait for the new root, then for the old machine's executors to go
+            new = self.pod.helper("newroot", old, spec["root"])
+            while [e for e in self.pod.helper("now")["executors"] if e["started"] < new["started"] - 1]:
+                time.sleep(0.2)
+            if scenario == "cold_first":
+                cache = self.pod.helper("evict", self.cache)
+        now = self.pod.helper("now")
         if spec.get("after_start"):
             self.pod.sh(spec["after_start"])
         if spec.get("cgroup"):
