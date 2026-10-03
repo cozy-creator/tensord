@@ -74,8 +74,8 @@ fn process_stat(pid: u32) -> io::Result<Stat> {
 pub struct Exact {
     pidfd: File,
     pub birth: ProcessBirth,
-    /// The executor's own cgroup, when the host delegates one: kills reach every descendant.
-    cgroup: Option<Arc<crate::cgroup::CgroupScope>>,
+    /// The executor's own scope (a cgroup or a token): kills reach every descendant.
+    scope: Option<Arc<crate::scope::Scope>>,
 }
 
 impl Exact {
@@ -100,7 +100,7 @@ impl Exact {
             Ok(stat) if stat.start_ticks == birth.start_ticks => Ok(Some(Self {
                 pidfd,
                 birth: birth.clone(),
-                cgroup: None,
+                scope: None,
             })),
             Ok(_) => Ok(None),
             Err(error) if gone(&error) => Ok(None),
@@ -112,12 +112,12 @@ impl Exact {
         Ok(Self {
             pidfd: self.pidfd.try_clone()?,
             birth: self.birth.clone(),
-            cgroup: self.cgroup.clone(),
+            scope: self.scope.clone(),
         })
     }
 
-    pub fn with_cgroup(mut self, cgroup: Option<Arc<crate::cgroup::CgroupScope>>) -> Self {
-        self.cgroup = cgroup;
+    pub fn with_scope(mut self, scope: Option<Arc<crate::scope::Scope>>) -> Self {
+        self.scope = scope;
         self
     }
 
@@ -129,12 +129,12 @@ impl Exact {
         self.pidfd
     }
 
-    /// SIGKILL this birth and everything it started: its cgroup when it has one, else the
+    /// SIGKILL this birth and everything it started: its scope when it has one, and the
     /// process group it still anchors (a group outlives its leader's number while members
     /// remain, so it cannot be reused).
     pub fn kill(&self) -> io::Result<()> {
-        if let Some(cgroup) = &self.cgroup {
-            cgroup.kill()?;
+        if let Some(scope) = &self.scope {
+            scope.kill()?;
         }
         let leads_group = process_stat(self.birth.pid).is_ok_and(|stat| {
             stat.start_ticks == self.birth.start_ticks && stat.pgrp as u32 == self.birth.pid
@@ -483,7 +483,7 @@ impl Drop for Watching {
 
 /// After its channel closed: wait for this exact process to exit, killing it only on a
 /// measured wedge, then reap it. The sample period is the meter's cadence, not a deadline.
-/// Then its cgroup: whatever outlived it (a `setsid` daemon) is killed and counted, and the
+/// Then its scope: whatever outlived it (a `setsid` daemon) is killed and counted, and the
 /// scope is removed.
 pub fn reap(
     exact: &Exact,
@@ -514,8 +514,8 @@ pub fn reap(
         Some(child) => child.wait()?,
         None => ExitStatus::from_raw(0),
     };
-    let stragglers = match &exact.cgroup {
-        Some(cgroup) => cgroup.end()?,
+    let stragglers = match &exact.scope {
+        Some(scope) => scope.end()?,
         None => 0,
     };
     Ok(Reaped {
@@ -526,7 +526,7 @@ pub fn reap(
 }
 
 /// How a process ended: its status, the measurement behind a kill, and how many of its
-/// descendants were still alive in its cgroup and were killed after it.
+/// descendants were still alive in its scope and were killed after it.
 #[derive(Debug)]
 pub struct Reaped {
     pub status: ExitStatus,
@@ -541,7 +541,7 @@ pub fn reap_group(
     child: Option<&mut Child>,
     liveness: Liveness,
 ) -> io::Result<Reaped> {
-    // With a cgroup the leader's reap already ended its followers (they share its scope).
+    // With a scope the leader's reap already ended its followers (they share it).
     let mut reaped = reap(exact, child, liveness)?;
     for member in group_members(&exact.birth) {
         let Some(member) = Exact::open(&member)? else {

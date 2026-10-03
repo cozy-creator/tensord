@@ -317,15 +317,17 @@ fn retained_executors_killed_while_idle_lose_their_channel_before_any_handler() 
 
 #[test]
 #[ignore = "needs installed cpu_lifecycle generations"]
-fn a_setsid_descendant_is_killed_with_its_executor_cgroup() {
+fn a_setsid_descendant_is_killed_with_its_executor_scope() {
     for (generation, hold) in generations() {
         let (mut executor, root, _) = launch(&generation, &hold);
         let member = fs::read_to_string(format!("/proc/{}/cgroup", executor.birth.pid)).unwrap();
-        if !member.contains("cozy-executor-") {
-            eprintln!("no delegated cgroup here: process-group containment applies");
-            executor.shutdown().unwrap();
-            return;
-        }
+        let environ = fs::read(format!("/proc/{}/environ", executor.birth.pid)).unwrap();
+        let token = environ
+            .split(|b| *b == 0)
+            .any(|entry| entry.starts_with(b"COZY_EXECUTOR_SCOPE=lifecycle-"));
+        // A delegated cgroup where the host has one, else the token its descendants inherit.
+        assert!(member.contains("cozy-executor-lifecycle-") != token, "{member}");
+        eprintln!("scope: {}", if token { "token" } else { "cgroup" });
         let reply = invoke(&mut executor, &root, "daemon", "daemon", json!({})).unwrap();
         assert_eq!(terminal(&reply), "succeeded", "{reply:?}");
         let spool = root.join("daemon");

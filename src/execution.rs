@@ -946,24 +946,20 @@ impl Engine {
             let (parent, runner) = UnixStream::pair()?;
             let stdout = File::create(logs.join(format!("{id}.stdout.log")))?;
             let stderr = File::create(logs.join(format!("{id}.stderr.log")))?;
-            let scope = crate::cgroup::CgroupScope::create(&crate::cgroup::namespace(
+            let scope = Arc::new(crate::scope::Scope::create(&crate::scope::namespace(
                 self.root.parent().unwrap_or(&self.root),
-            ))?
-            .map(Arc::new);
-            let child = spawn_runner(config, &seal, scope.as_deref(), &runner, stdout, stderr);
-            let child = match child {
+            ))?);
+            let child = match spawn_runner(config, &seal, &scope, &runner, stdout, stderr) {
                 Ok(child) => child,
                 Err(error) => {
-                    if let Some(scope) = &scope {
-                        let _ = scope.end();
-                    }
+                    let _ = scope.end();
                     return Err(error);
                 }
             };
             drop(runner);
             let exact = crate::process::Exact::open(&process_birth(child.id())?)?
                 .ok_or_else(|| io::Error::other("launched runner has no exact birth"))?
-                .with_cgroup(scope);
+                .with_scope(Some(scope));
             Ok::<_, io::Error>((child, parent, exact))
         })();
         let (mut child, mut reader, exact) = match launch {
@@ -1313,7 +1309,7 @@ fn overlay_observation(
 fn spawn_runner(
     config: RunnerConfig,
     seal: &Seal,
-    scope: Option<&crate::cgroup::CgroupScope>,
+    scope: &crate::scope::Scope,
     socket: &UnixStream,
     stdout: File,
     stderr: File,
@@ -1330,7 +1326,7 @@ fn spawn_runner(
                 .into_owned(),
         );
     }
-    let mut command = crate::launch_identity::trampoline(&config.python, None, scope)?;
+    let mut command = crate::launch_identity::trampoline(&config.python, None, Some(scope))?;
     command
         .arg("-m")
         .arg(config.module)
@@ -1338,6 +1334,7 @@ fn spawn_runner(
         .arg(fd.to_string())
         .env_clear()
         .envs(seal.environment(&configured))
+        .envs(scope.environment())
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));

@@ -38,8 +38,8 @@ executor per plan; `memory::GpuMemory` decides every device byte. Acceptance, jo
   CPU dispatch continues meanwhile.
 - Startup: every journaled birth still alive from a previous machine run (GPU births including
   completed requests', and any nonterminal run's) is killed, since nothing can adopt it. GPU
-  dispatch stays fenced until each exit is observed. Leftover executor cgroups of this machine
-  are killed and removed. A leader still tearing down (no pidfd yet) is watched by sampling.
+  dispatch stays fenced until each exit is observed. Leftover executor scopes of this machine
+  (cgroups, tokens) are killed and removed. A leader still tearing down (no pidfd yet) is watched by sampling.
 - Groups (degree K > 1): one executor sealed to the K GPUs with the NCCL seal (`NCCL_NVLS_ENABLE=0`,
   `NCCL_P2P_LEVEL=NVL`); `Start`/`Load` carry `sequence_parallel_degree: K`. Rank 0 spawns, dials back
   and forms its followers inside `Start` (Runtime `RankGroup`); the machine never talks to a follower.
@@ -117,8 +117,8 @@ thread.
 - Executors before `process_cap/1` get only a plane budget: their context and activations are
   estimated, not capped.
 - One Python post helper per request.
-- Each executor gets its own cgroup-v2 scope where the host delegates one (laptop systemd
-  scopes, rootful hosts); in containers with a read-only hierarchy it is the process group.
+- Each executor gets its own scope: a cgroup-v2 where the host delegates one (laptop systemd
+  scopes, rootful hosts), else a token (containers with a read-only or v1 hierarchy, RunPod).
 - Seal: `alloc_conf`/`threads` config fields; `<root>/home`, `<root>/kernels` (per UID) and
   `<root>/jit/<run>/<generation>`. Earlier runs' JIT scopes, and executor roots (logs) older than a day, are removed at pool start.
 - `PDEATHSIG` retention after a UID drop is unverified.

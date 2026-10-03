@@ -41,7 +41,8 @@ pub struct ExecutorConfig {
     pub seal: Seal,
     pub generation_hold: Option<Arc<File>>,
     pub identity: Option<LaunchIdentity>,
-    /// Give the executor its own cgroup in this namespace when the host delegates one.
+    /// Give the executor its own scope in this namespace: a cgroup when the host delegates
+    /// one, else a token its descendants inherit.
     pub cgroup_namespace: Option<String>,
 }
 
@@ -1110,7 +1111,7 @@ impl DeviceExecutor {
     ) -> io::Result<Self> {
         let (listener, environment) = endpoint(&config)?;
         let scope = match &config.cgroup_namespace {
-            Some(namespace) => crate::cgroup::CgroupScope::create(namespace)?.map(Arc::new),
+            Some(namespace) => Some(Arc::new(crate::scope::Scope::create(namespace)?)),
             None => None,
         };
         let mut command =
@@ -1122,6 +1123,7 @@ impl DeviceExecutor {
             .arg(&config.root)
             .env_clear()
             .envs(&environment)
+            .envs(scope.as_deref().and_then(crate::scope::Scope::environment))
             .stdin(Stdio::null())
             .stdout(File::create(config.root.join("stdout.log"))?)
             .stderr(File::create(config.root.join("stderr.log"))?);
@@ -1162,11 +1164,19 @@ impl DeviceExecutor {
         on_birth: impl FnOnce(&ProcessBirth, &Cancellation) -> io::Result<()>,
     ) -> io::Result<Forked> {
         let (listener, environment) = endpoint(&config)?;
+        let scope = match &config.cgroup_namespace {
+            Some(namespace) => Some(Arc::new(crate::scope::Scope::create(namespace)?)),
+            None => None,
+        };
+        let mut forked = environment.clone();
+        if let Some((name, token)) = scope.as_deref().and_then(crate::scope::Scope::environment) {
+            forked.insert(name.into(), token.into());
+        }
         let reply = self.command(
             &DeviceCommand::Fork {
                 socket: config.socket.clone(),
                 root: config.root.clone(),
-                environment: environment.clone(),
+                environment: forked,
             },
             &mut Baseline,
         );
@@ -1175,6 +1185,10 @@ impl DeviceExecutor {
             refused => {
                 drop(listener);
                 fs::remove_file(&config.socket)?;
+                // A child the parent made before its channel failed carries the token too.
+                if let Err(error) = scope.as_deref().map_or(Ok(0), crate::scope::Scope::end) {
+                    eprintln!("refused fork's scope not ended: {error}");
+                }
                 return Ok(match refused {
                     Ok(reply) => Forked::Refused(
                         Box::new(config),
@@ -1184,22 +1198,19 @@ impl DeviceExecutor {
                 });
             }
         };
-        let mut launched = Unready {
+        // A fork starts in its parent's cgroup: move it into its own before it dials, so
+        // ending it never touches the import-only parent. A token came with its environment.
+        if let Some(scope) = &scope {
+            scope.adopt(pid)?;
+        }
+        let launched = Unready {
             pid,
             parent: self.birth.pid,
             child: None,
             exact: None,
             birth: None,
-            scope: None,
+            scope,
         };
-        // A fork starts in its parent's cgroup: move it into its own before it dials, so
-        // ending it never touches the import-only parent.
-        if let Some(namespace) = &config.cgroup_namespace {
-            if let Some(scope) = crate::cgroup::CgroupScope::create(namespace)? {
-                scope.adopt(pid)?;
-                launched.scope = Some(Arc::new(scope));
-            }
-        }
         Self::connect(config, listener, environment, launched, on_birth)
             .map(|executor| Forked::Ready(Box::new(executor)))
     }
@@ -1226,7 +1237,7 @@ impl DeviceExecutor {
         let birth = process_birth(pid)?;
         let exact = Exact::open(&birth)?
             .ok_or_else(|| io::Error::other("launched executor has no exact birth"))?
-            .with_cgroup(unready.scope.clone());
+            .with_scope(unready.scope.clone());
         unready.exact = Some(exact.try_clone()?);
         unready.birth = Some(birth.clone());
         if unready.child.is_none() && parent_of(pid)? != unready.parent {
@@ -1339,12 +1350,9 @@ impl DeviceExecutor {
                 hello.hello.pid, hello.hello.ppid, hello.hello.pgid
             )));
         }
-        if let Some(scope) = unready.scope.as_deref() {
+        if let Some(relative) = unready.scope.as_deref().and_then(|s| s.cgroup_relative()) {
             let member = fs::read_to_string(format!("/proc/{}/cgroup", executor.birth.pid))?;
-            if !member
-                .lines()
-                .any(|line| line == format!("0::{}", scope.relative))
-            {
+            if !member.lines().any(|line| line == format!("0::{relative}")) {
                 return Err(io::Error::other("executor is outside its own cgroup"));
             }
         }
@@ -1619,8 +1627,8 @@ struct Unready {
     child: Option<Child>,
     exact: Option<Exact>,
     birth: Option<ProcessBirth>,
-    /// Its own cgroup, ended with it if it never becomes an executor.
-    scope: Option<Arc<crate::cgroup::CgroupScope>>,
+    /// Its own scope, ended with it if it never becomes an executor.
+    scope: Option<Arc<crate::scope::Scope>>,
 }
 impl Unready {
     /// Its exit status, once the process is seen to have exited.

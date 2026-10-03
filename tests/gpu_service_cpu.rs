@@ -130,32 +130,38 @@ fn complete(journal: &mut Journal, n: usize, generation: &str, birth: ProcessBir
 }
 
 #[test]
-fn restart_ends_processes_left_in_earlier_executor_cgroups() {
-    use cozy_machine::cgroup::{namespace, CgroupScope};
-    use std::io::Write;
-    let root = std::env::temp_dir().join(format!("machine-cgroup-sweep-{}", uuid::Uuid::new_v4()));
+fn restart_ends_processes_left_in_earlier_executor_scopes() {
+    use cozy_machine::scope::{namespace, Scope};
+    use std::io::{Read, Write};
+    let root = std::env::temp_dir().join(format!("machine-scope-sweep-{}", uuid::Uuid::new_v4()));
     let state = root.join("state");
     fs::create_dir_all(&state).unwrap();
-    let Some(scope) = CgroupScope::create(&namespace(&state)).unwrap() else {
-        eprintln!("no delegated cgroup-v2 here; process-group containment applies");
-        return;
-    };
+    let scope = Scope::create(&namespace(&state)).unwrap();
     // A daemon an earlier executor left behind, in its own session inside its scope.
-    let mut leader = Command::new("/bin/sh")
-        .args(["-c", "read go; setsid sleep 1000 </dev/null >/dev/null 2>&1 &"])
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", "read go; setsid sleep 1000 </dev/null >/dev/null 2>&1 & echo $!"])
         .stdin(Stdio::piped())
-        .spawn()
-        .unwrap();
-    fs::write(
-        format!("/sys/fs/cgroup{}/cgroup.procs", scope.relative),
-        leader.id().to_string(),
-    )
-    .unwrap();
+        .stdout(Stdio::piped());
+    if let Some((name, value)) = scope.environment() {
+        command.env(name, value);
+    }
+    let mut leader = command.spawn().unwrap();
+    scope.adopt(leader.id()).unwrap();
     leader.stdin.take().unwrap().write_all(b"go\n").unwrap();
+    let mut daemon = String::new();
+    leader.stdout.take().unwrap().read_to_string(&mut daemon).unwrap();
     assert!(leader.wait().unwrap().success());
+    let daemon = cozy_machine::process::process_birth(daemon.trim().parse().unwrap()).unwrap();
     assert_eq!(scope.processes().unwrap(), 1);
+    // That machine is gone: nothing in this process claims the scope any more.
+    let cgroup = scope.cgroup_relative().map(|relative| format!("/sys/fs/cgroup{relative}"));
+    drop(scope);
     let service = Service::open(&state, &root.join("generations"), 1).unwrap();
-    assert!(!std::path::Path::new(&format!("/sys/fs/cgroup{}", scope.relative)).exists());
+    assert!(cozy_machine::process::process_ended(&daemon).unwrap());
+    if let Some(path) = cgroup {
+        assert!(!std::path::Path::new(&path).exists());
+    }
     assert!(service.stop().unwrap());
     fs::remove_dir_all(root).unwrap();
 }

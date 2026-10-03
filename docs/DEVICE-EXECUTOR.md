@@ -107,12 +107,22 @@ longer than eight times the longest pause it has shown, and at least six samples
   measured wedge, then reaps it and every member left in its process group (a group's followers),
   and frees `retain_until_exit` resources. `shutdown()` asks first.
   `Drop` does the same before returning, so a slot or reservation is released only after the exit. If exit cannot be observed, resources are leaked, not released.
-- Containment: with `cgroup_namespace`, each executor gets its own cgroup-v2 scope below the
-  machine's when the host delegates one (a writable unified hierarchy); the trampoline joins it
-  before importing anything and Hello must show the executor inside it. A kill writes
-  `cgroup.kill`, which reaches descendants that called `setsid` or double-forked; after the
-  executor exits, whatever is still in the scope is killed, counted (`Ended.stragglers`) and the
-  scope removed. Without delegation (most containers) the process group is the containment.
+- Containment (`scope.rs`): with `cgroup_namespace`, each executor gets its own scope. Where the
+  host delegates a writable unified hierarchy it is a cgroup-v2 below the machine's: the
+  trampoline joins it before importing anything, Hello must show the executor inside it, and a
+  kill writes `cgroup.kill`. Elsewhere it is a token (Docker, RunPod: cgroups read-only or v1, no
+  `CAP_SYS_ADMIN`, measured in `E/pod-cgroup/`). The Runtime's own
+  `COZY_EXECUTOR_SCOPE=<namespace>-<id>` goes in the leader's environment (a fork's, in the
+  environment it is forked with) and every descendant inherits it. A kill and the end of the scope
+  use a `/proc` census: processes carrying the token, plus anything still parented below one.
+  Each is killed through its pidfd and its exit awaited, until a census finds none alive. Either
+  backend reaches descendants that called `setsid` or double-forked. After the executor exits,
+  whatever is still in the scope is killed and counted (`Ended.stragglers`). The machine's
+  supervisor is the subreaper (`PR_SET_CHILD_SUBREAPER`): escaped processes are adopted and reaped
+  there, never by the service, whose own child handles keep their statuses. A token on no live
+  scope of this service (an earlier run's, or one dropped without an end) is killed at startup
+  and at each token scope's end. Untokened processes, such as an operator's SSH jobs, are never
+  touched.
 - No copy drain before a kill: a kill only follows a measured wedge, so the executor is not
   cooperating and could not drain. Nothing it was copying is shared yet: Degree 2 regions are
   offered to custody only by `Share` after a synchronized, completed call; host-tier layouts are
@@ -124,8 +134,10 @@ longer than eight times the longest pause it has shown, and at least six samples
 - The legacy output-path resolver is imported from the SDK worker module. An executor
   `output_bindings` capability would remove it.
 - Encoders read whole raw buffers. There is no streaming post-processing.
-- Without a delegated cgroup a descendant that calls `setsid` escapes kills. Same-UID package
-  code can reopen store paths, and can write a delegated ancestor's `cgroup.procs`.
+- Same-UID package code can leave containment on purpose: write a delegated ancestor's
+  `cgroup.procs`, or (token) exec with a scrubbed environment and escape its ancestry. A fork's
+  fork-only descendants carry its import-only parent's token, so they end with that parent. It
+  can also reopen store paths.
 - Descriptor sources still use native TensorFS plane, header and read-plan code inside the executor.
 - Degree > 1 reads the store or the sealed tier (rank 0 shares it with followers); descriptor
   sources are world-one.

@@ -90,11 +90,11 @@ impl Service {
             }
         }
         // Descendants of those executors (a setsid daemon, a compile worker) live on in the
-        // executors' own cgroups; every such scope of this machine is ended now.
-        match crate::cgroup::CgroupScope::sweep(&crate::cgroup::namespace(root)) {
+        // executors' own scopes; every such scope of this machine is ended now.
+        match crate::scope::Scope::sweep(&crate::scope::namespace(root)) {
             Ok(0) => (),
-            Ok(held) => eprintln!("ended {held} process(es) left in earlier executor cgroups"),
-            Err(error) => eprintln!("earlier executor cgroups remain: {error}"),
+            Ok(held) => eprintln!("ended {held} process(es) left in earlier executor scopes"),
+            Err(error) => eprintln!("earlier executor scopes remain: {error}"),
         }
         let service = Arc::new(Self {
             engine,

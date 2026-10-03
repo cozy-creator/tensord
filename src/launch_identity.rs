@@ -114,7 +114,7 @@ impl LaunchIdentity {
 pub fn trampoline(
     python: &Path,
     identity: Option<LaunchIdentity>,
-    scope: Option<&crate::cgroup::CgroupScope>,
+    scope: Option<&crate::scope::Scope>,
 ) -> io::Result<Command> {
     let mut command = Command::new(python);
     command
@@ -126,8 +126,8 @@ pub fn trampoline(
         ])
         .arg(std::process::id().to_string())
         .args(["--oom-adj", "1000"]);
-    // The trampoline joins the executor's own cgroup before anything is imported; without
-    // one the process group (set below) is the containment.
+    // The trampoline joins the executor's own cgroup before anything is imported; a token
+    // scope and the process group (set below) need nothing of it.
     match scope {
         Some(scope) => command.args(scope.trampoline_args()),
         None => command.args(["--scope-backend", "inherit"]),

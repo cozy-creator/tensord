@@ -134,6 +134,6 @@ Journal: `machine_metadata.journal_format` records the layout (1). A newer journ
 a row this machine cannot decode is skipped (logged) instead of failing every list, and a state
 it does not know is `unknown`: listed, never dispatched, settled or overwritten.
 
-Runners get the same cgroup scope as executors (see device executor) when the host delegates one.
+Runners get the same scope as executors (a cgroup or a token; see device executor).
 
 Not implemented: same-UID isolation (reads detect mutation), cleanup of orphan `*.pending` files.
