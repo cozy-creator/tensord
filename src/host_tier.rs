@@ -35,7 +35,8 @@ use tensorfs_plane::{
 
 #[derive(Clone, Debug)]
 pub struct HostTierConfig {
-    /// Threads of one fill (read + copy). Default: the CPUs this process may use, at most 16.
+    /// Threads of one fill (read + copy). Default: the CPUs this process may use, at most 8:
+    /// more contended on RunPod (an A5000 pod's UNet fill: 8 threads 0.44 s, 16 threads 1.08 s).
     pub fill_threads: usize,
     /// An unheld layout unused this long is released.
     pub ttl: Duration,
@@ -47,7 +48,7 @@ impl Default for HostTierConfig {
     fn default() -> Self {
         let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
         Self {
-            fill_threads: cpus.clamp(1, 16),
+            fill_threads: cpus.clamp(1, 8),
             ttl: Duration::from_secs(30 * 60),
             plans: None,
         }
@@ -574,8 +575,8 @@ impl HostTier {
     }
 
     /// The plan the executor sent: a sealed memfd of exactly the declared bytes and digest.
-    /// Fill every plan of one construction (`SealedPrefetch`), each on its own thread, while
-    /// its executor registers them in order; each `seal` ask then waits only for its own.
+    /// Fill every plan of one construction (`SealedPrefetch`) in the background, in order, while
+    /// its executor registers them; each `seal` ask then waits only for its own.
     pub fn prefetch(
         self: &Arc<Self>,
         peer: u64,
@@ -588,16 +589,24 @@ impl HostTier {
         }
         let body = Self::body(request, plans)?;
         let plans: Vec<serde_json::Value> = serde_json::from_slice(&body).map_err(failure)?;
+        let mut queued = Vec::new();
         for value in plans {
             let body = serde_json::to_vec(&value)?;
-            let plan: SealedPlan = serde_json::from_value(value).map_err(failure)?;
-            let (tier, grants) = (self.clone(), grants.to_vec());
-            std::thread::spawn(move || {
+            queued.push((
+                serde_json::from_value::<SealedPlan>(value).map_err(failure)?,
+                body,
+            ));
+        }
+        // One after another, in the order the executor registers them: each is done before it
+        // is asked for, and concurrent fills would only contend for the same memory.
+        let (tier, grants) = (self.clone(), grants.to_vec());
+        std::thread::spawn(move || {
+            for (plan, body) in queued {
                 if let Err(error) = tier.ensure(&plan, &grants, &body, true) {
                     eprintln!("host tier prefetch skipped: {error}");
                 }
-            });
-        }
+            }
+        });
         Ok(())
     }
 
