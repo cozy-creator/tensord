@@ -203,10 +203,13 @@ class Gate:
         return {"offset_s": self.offset, "rtt_s": after - before}
 
     def cool(self) -> dict:
-        """Equal thermal start: wait until the card is at or below the manifest's start temperature."""
+        """Equal thermal start: at or below the manifest's ceiling, or at the card's idle floor
+        (no further cooling over 60 s; a card holding a CUDA context never cools past it)."""
+        temps = []
         while True:
             now = self.pod.helper("now")
-            if now["gpu"]["temp_c"] <= self.m["start_temp_c"]:
+            temps.append(now["gpu"]["temp_c"])
+            if temps[-1] <= self.m["start_temp_c"] or (len(temps) >= 12 and min(temps[-6:]) >= min(temps[-12:-6])):
                 return now
             log("waiting for the GPU to cool", now["gpu"])
             time.sleep(5)

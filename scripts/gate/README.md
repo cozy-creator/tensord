@@ -26,8 +26,8 @@ not Rust-machine gains: every row records the Runtime/TensorFS versions the run 
 Before the first cycle, each arm in `prime` runs one SDXL and one Anima request, unmeasured, to pay
 its package install and model download.
 
-1. Wait until the GPU is at or below `start_temp_c`, a ceiling set above the card's idle temperature
-   with a CUDA context resident (an A40 idles at 53–56 °C that way and never gets lower).
+1. Wait until the GPU is at or below `start_temp_c`, or has stopped cooling for 60 s (a card holding
+   a CUDA context has an idle floor: an A40 sits at 53–56 °C). Start temperature is recorded per cycle.
 2. `cold_first`: restart the arm's machine; once every executor of the previous machine is gone,
    evict `cache_paths` from the page cache (`POSIX_FADV_DONTNEED`); submit SDXL as soon as the new
    machine's root process exists. Wall = new root's birth (from `/proc/<pid>/stat`) to verified image.
