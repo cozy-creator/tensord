@@ -789,7 +789,7 @@ fn a_model_far_larger_than_the_tier_streams_through_a_window() {
     assert_eq!(stream_through(&fx, &granted, 2), 2 * 128 * MIB as u64);
     let facts = tier.facts();
     assert_eq!(
-        (facts.windows, facts.ledger.windows, facts.ledger.no_room),
+        (facts.windows, facts.ledger.windows_opened, facts.ledger.no_room),
         (1, 1, 0),
         "{facts:?}"
     );

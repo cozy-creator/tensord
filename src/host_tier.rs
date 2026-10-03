@@ -151,7 +151,7 @@ pub struct Ledger {
     pub no_room: u64,
     /// Layouts streamed through a window because they did not fit, and the bytes ended windows
     /// read from disk.
-    pub windows: u64,
+    pub windows_opened: u64,
     pub streamed_bytes: u64,
     /// Fills that failed: their adopters got an error, the layout was dropped.
     pub failed: u64,
@@ -684,7 +684,7 @@ impl HostTier {
                 granted: false,
             }),
         );
-        state.ledger.windows += 1;
+        state.ledger.windows_opened += 1;
         drop(state);
         self.filled.notify_all();
         let (store, meta, threads) = (
