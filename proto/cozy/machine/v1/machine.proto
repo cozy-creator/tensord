@@ -95,6 +95,10 @@ message Adapter {
   string lane = 4;
   string manifest = 5;
   string scale = 6;  // canonical decimal; empty means 1
+  // A provider source (civitai://<version>, hf://…) made here and normalized at ingest,
+  // under these reviewed profiles (none: the one its headers select); never with model.
+  string source = 7;
+  repeated string profiles = 8;
 }
 message MemoResult {
   string operation = 1;

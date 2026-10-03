@@ -273,48 +273,13 @@ impl Publisher {
                 format!("{path} names a source and a catalog checkpoint"),
             ));
         }
-        let mut profiles = choice.profiles.clone();
-        profiles.sort();
-        let identity = serde_json_canonicalizer::to_vec(&json!([
-            "cozy.machine-source-model/1",
-            choice.source,
-            profiles
-        ]))
-        .map_err(|e| io_failure(io::Error::other(e)))?;
-        let name = format!("source-{}", &sha256::hex_digest(&identity)[..40]);
-        let token = if choice.source.starts_with("civitai://") {
-            &providers.civitai
-        } else {
-            &providers.huggingface
-        };
-        let access = tensorfs_core::source_model::Access {
-            credential: if token.is_empty() {
-                String::new()
-            } else {
-                format!("bearer {token}")
-            },
-            endpoints: Default::default(),
-        };
-        let progress = |stage: &str, moved: u64, total: u64| {
+        let made = make_source(&self.store, &choice.source, &choice.profiles, providers, &|stage, moved, total| {
             job.set(Progress::Preparing {
                 stage: format!("{stage} for {path}"),
                 moved,
                 total,
             })
-        };
-        let made = tensorfs_core::source_model::make(
-            &self.store,
-            &tensorfs_core::source_model::Request {
-                source: &choice.source,
-                profiles: &choice.profiles,
-                name: &name,
-                access: &access,
-                registry: None,
-                progress: &progress,
-                cancellation: None,
-            },
-        )
-        .map_err(|e| ("model_source_failed", e.to_string()))?;
+        })?;
         let manifest = self
             .store
             .read_manifest(&made.manifest)
@@ -1010,7 +975,7 @@ impl Publisher {
                 .iter()
                 .find(|c| c.parameter == grant.slot || c.parameter == parameter)
             {
-                apply_adapters(&self.store, catalog, choice, grant, &keep, job)?;
+                apply_adapters(&self.store, catalog, choice, grant, &keep, &request.providers, job)?;
             }
         }
         job.stage(format!("preparing {}", request.package));
@@ -1044,6 +1009,49 @@ impl Publisher {
             .map_err(io_failure)?;
         Ok(plan)
     }
+}
+
+/// A provider source made into a local model by TensorFS `source_model`, kept as the local
+/// repository named by the source and its profiles (a later choice of it is held).
+fn make_source(
+    store: &Store,
+    source: &str,
+    profiles: &[String],
+    providers: &Providers,
+    progress: &(dyn Fn(&str, u64, u64) + Sync),
+) -> Result<tensorfs_core::source_model::Made, Failure> {
+    let mut sorted = profiles.to_vec();
+    sorted.sort();
+    let identity =
+        serde_json_canonicalizer::to_vec(&json!(["cozy.machine-source-model/1", source, sorted]))
+            .map_err(|e| io_failure(io::Error::other(e)))?;
+    let name = format!("source-{}", &sha256::hex_digest(&identity)[..40]);
+    let token = if source.starts_with("civitai://") {
+        &providers.civitai
+    } else {
+        &providers.huggingface
+    };
+    let access = tensorfs_core::source_model::Access {
+        credential: if token.is_empty() {
+            String::new()
+        } else {
+            format!("bearer {token}")
+        },
+        endpoints: Default::default(),
+    };
+    tensorfs_core::source_model::make(
+        store,
+        &tensorfs_core::source_model::Request {
+            source,
+            profiles,
+            name: &name,
+            access: &access,
+            registry: None,
+            progress,
+            cancellation: None,
+        },
+    )
+    .map_err(|e| ("model_source_failed", e.to_string()))
 }
 
 /// Download one exact checkpoint; `keep` names what its GC must not evict (`protected`).
@@ -1082,12 +1090,6 @@ fn resolve_adapter(
     catalog: &Catalog,
     adapter: &pb::DownloadAdapterRef,
 ) -> Result<(String, String), Failure> {
-    if !adapter.source.is_empty() || !adapter.profiles.is_empty() {
-        return Err((
-            "model_source_unsupported",
-            "provider-source adapters are not taken by this machine yet".into(),
-        ));
-    }
     let model = adapter.model.clone();
     let Some((org, name)) = model.split_once('/') else {
         return Err((
@@ -1192,6 +1194,7 @@ fn apply_adapters(
     choice: &pb::ModelChoice,
     grant: &mut ModelGrant,
     keep: &[String],
+    providers: &Providers,
     job: &Job,
 ) -> Result<(), Failure> {
     let mut keep = keep.to_vec();
@@ -1217,8 +1220,21 @@ fn apply_adapters(
     };
     let mut selections = vec![];
     for adapter in &choice.adapters {
-        let (repository, manifest) = resolve_adapter(catalog, adapter)?;
-        ensure(store, catalog, &repository, &manifest, &keep, job)?;
+        let manifest = if adapter.source.is_empty() {
+            let (repository, manifest) = resolve_adapter(catalog, adapter)?;
+            ensure(store, catalog, &repository, &manifest, &keep, job)?;
+            manifest
+        } else {
+            // A provider-source LoRA (civitai://, hf://) is made here, normalized at ingest.
+            let made = make_source(store, &adapter.source, &adapter.profiles, providers, &|stage, moved, total| {
+                job.set(Progress::Preparing {
+                    stage: format!("{stage} for an adapter of {}", grant.slot),
+                    moved,
+                    total,
+                })
+            })?;
+            format!("sha256:{}", made.manifest.sha256)
+        };
         keep.push(manifest.clone());
         let strength = if adapter.scale.is_empty() {
             1.0
@@ -1545,6 +1561,23 @@ mod tests {
             .source_grant(&installation, "generate.models.unet", &choice, &Providers::default(), &job)
             .unwrap();
         assert_eq!(again.manifest, grant.manifest);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A Civitai SDXL LoRA as an adapter source is normalized at ingest (sdxl.lora/1) into
+    /// the PEFT factors the adapter view composes. Real civitai.com, anonymous.
+    #[test]
+    #[ignore = "real network: civitai.com"]
+    fn a_civitai_lora_adapter_source_becomes_peft_factors() {
+        let root = std::env::temp_dir().join(format!("cm-lora-{}", uuid::Uuid::new_v4()));
+        let store = Store::ensure(&root.join("tensorfs")).unwrap();
+        let made = make_source(&store, "civitai://145907", &[], &Providers::default(), &|_, _, _| {}).unwrap();
+        assert_eq!(made.profiles, ["sdxl/lora-kohya/1"]);
+        let manifest = store.read_manifest(&made.manifest).unwrap();
+        let header = tensorfs_core::checkpoint::load_header(&store, manifest.header().unwrap()).unwrap();
+        let (component, tensors) = &header.components[0];
+        assert_eq!(component, "unet");
+        assert!(tensors.iter().any(|(key, _)| key.ends_with("attn1.to_q.lora_A.weight")));
         let _ = std::fs::remove_dir_all(root);
     }
 }

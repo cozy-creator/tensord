@@ -215,6 +215,8 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
                         lane: a.lane,
                         manifest: a.manifest,
                         scale: a.scale,
+                        source: a.source,
+                        profiles: a.profiles,
                         ..Default::default()
                     })
                     .collect(),
