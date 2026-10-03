@@ -152,12 +152,20 @@ impl Service {
         }
         *current = Some(gpu.clone());
         drop(current);
-        for held in self.catalog.installed() {
+        // Parents of the most recently used generations first, while the host has room.
+        let plans = self.recent_gpu_plans(&gpu);
+        let recent: Vec<_> = plans.iter().map(|(held, _)| held.clone()).collect();
+        let others = self.catalog.installed().into_iter().filter(|held| {
+            !recent
+                .iter()
+                .any(|r| r.record.identity == held.record.identity)
+        });
+        for held in recent.clone().into_iter().chain(others) {
             gpu.prespawn(held);
         }
         // A previous run's executors still exiting fence it, as they fence requests.
         let fence = self.startup_gpu_births.lock().unwrap().clone();
-        gpu.prewarm(&self.engine, self.recent_gpu_plans(&gpu), fence);
+        gpu.prewarm(&self.engine, plans, fence);
         self.changed_environment()
     }
     /// Each installed GPU generation's most recently used construction, newest first.

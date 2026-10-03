@@ -273,11 +273,15 @@ struct Launch {
 }
 
 /// A generation's import-only executor that executors fork from (`fork/1`). Its children
-/// die with it, so it lives as long as the pool.
+/// die with it, so it ends only with the pool or, childless, to give its host memory back.
 #[derive(Default)]
 struct Zygote {
     state: Mutex<ZygoteState>,
     changed: Condvar,
+    /// Executors forked from it that may still live.
+    children: Mutex<Vec<ProcessBirth>>,
+    /// Its last fork (or its start): childless parents end least recently used first.
+    used: Mutex<Option<Instant>>,
 }
 #[derive(Default)]
 enum ZygoteState {
@@ -320,12 +324,45 @@ impl Zygote {
             ));
         };
         let forked = parent.fork(config, on_birth)?;
-        if matches!(forked, Forked::Refused(..)) && process_ended(&parent.birth)? {
-            // Its children ended with it; the next executors spawn.
-            *state = ZygoteState::Off("import-only executor ended".into());
+        match &forked {
+            Forked::Ready(child) => {
+                self.children.lock().unwrap().push(child.birth.clone());
+                *self.used.lock().unwrap() = Some(Instant::now());
+            }
+            Forked::Refused(..) if process_ended(&parent.birth)? => {
+                // Its children ended with it; the next executors spawn.
+                *state = ZygoteState::Off("import-only executor ended".into());
+            }
+            Forked::Refused(..) => {}
         }
         Ok(forked)
     }
+    /// Ready and with no live child: ending it ends nothing else.
+    fn childless(&self) -> bool {
+        if !matches!(*self.state.lock().unwrap(), ZygoteState::Ready(_)) {
+            return false;
+        }
+        let mut children = self.children.lock().unwrap();
+        children.retain(|birth| !process_ended(birth).unwrap_or(true));
+        children.is_empty()
+    }
+    /// Its private host bytes (PSS less shared memory), 0 when not running.
+    fn private_bytes(&self) -> u64 {
+        match &*self.state.lock().unwrap() {
+            ZygoteState::Ready(parent) => crate::host_memory::process(parent.birth.pid)
+                .map_or(0, |memory| memory.pss.saturating_sub(memory.pss_shmem)),
+            _ => 0,
+        }
+    }
+}
+
+/// What a parent costs before any is measured: an import-only SDXL or Anima executor is
+/// 0.78 GiB RSS (J/RESULTS.md).
+const UNMEASURED_PARENT: u64 = 1 << 30;
+
+/// The learned-host key of a generation's import-only executor.
+fn parent_key(generation: &str) -> String {
+    format!("parent:{generation}")
 }
 
 pub struct GpuPool {
@@ -1037,9 +1074,17 @@ impl GpuPool {
     /// Start a generation's import-only executor in the background (machine start, after
     /// an install), so its imports overlap everything before the first request.
     pub fn prespawn(self: &Arc<Self>, held: HeldGeneration) {
+        if !self.parent_fits(&held.record.identity) {
+            eprintln!(
+                "executor prespawn skipped for {}: no host room",
+                held.record.identity
+            );
+            return;
+        }
         let Some((zygote, true)) = self.zygote(&held) else {
             return;
         };
+        *zygote.used.lock().unwrap() = Some(Instant::now());
         let pool = Arc::downgrade(self);
         let started = std::thread::Builder::new()
             .name("executor-prespawn".into())
@@ -1053,6 +1098,52 @@ impl GpuPool {
         if let Err(error) = started {
             eprintln!("executor prespawn: {error}");
         }
+    }
+
+    /// Whether the host has room for `generation`'s parent beside what it holds now: its
+    /// measured private bytes (else the largest any parent measured). A prespawn never
+    /// makes room; a request that needs a parent always gets one.
+    fn parent_fits(&self, generation: &str) -> bool {
+        let need = self.first().with(|gpu| {
+            let learned = |key: &str| gpu.learned.plans.get(key).map(|plan| plan.host_bytes);
+            learned(&parent_key(generation))
+                .or_else(|| {
+                    gpu.learned
+                        .plans
+                        .iter()
+                        .filter(|(key, _)| key.starts_with("parent:"))
+                        .map(|(_, plan)| plan.host_bytes)
+                        .max()
+                })
+                .filter(|bytes| *bytes > 0)
+                .unwrap_or(UNMEASURED_PARENT)
+        });
+        let host = crate::host_memory::read();
+        host.available < 0 || host.available as u64 >= need
+    }
+
+    /// End the least recently used parent with no live child, for host room: the bytes it
+    /// held privately (at least 1 when one ended unmeasured), 0 when there is none to end.
+    fn end_idle_parent(&self) -> u64 {
+        let victim = {
+            let mut zygotes = self.zygotes.lock().unwrap();
+            let chosen = zygotes
+                .iter()
+                .filter(|(_, zygote)| zygote.childless())
+                .min_by_key(|(_, zygote)| *zygote.used.lock().unwrap())
+                .map(|(generation, _)| generation.clone());
+            chosen.and_then(|generation| zygotes.remove(&generation))
+        };
+        let Some(zygote) = victim else {
+            return 0;
+        };
+        let freed = zygote.private_bytes();
+        if let ZygoteState::Ready(parent) = std::mem::take(&mut *zygote.state.lock().unwrap()) {
+            if let Err(error) = parent.shutdown() {
+                eprintln!("ending an idle import-only executor: {error}");
+            }
+        }
+        freed.max(1)
     }
 
     /// The generation's import-only executor, and whether the caller must start it. None
@@ -1107,6 +1198,12 @@ impl GpuPool {
                     "import-only start refused: {}: {}",
                     reply.code, reply.detail
                 )));
+            }
+            if let Ok(memory) = crate::host_memory::process(executor.birth.pid) {
+                self.first().learn_host(
+                    &parent_key(&held.record.identity),
+                    memory.pss.saturating_sub(memory.pss_shmem),
+                );
             }
             io::Result::Ok(ZygoteState::Ready(Box::new(executor)))
         })();
@@ -1940,7 +2037,8 @@ impl GpuPool {
 
     /// Before a spawn: the host has room for the executor's private bytes as measured in
     /// earlier runs, or gives it back in order: unheld sealed layouts (their bytes come from
-    /// the page cache or the store again), then idle executors, least recently used first.
+    /// the page cache or the store again), then import-only parents with no live child, then
+    /// idle executors, least recently used first.
     /// A plan never measured asks nothing; nothing is refused for the room that is left.
     fn host_room(&self, plan: &str, sessions: &mut BTreeMap<String, Session>) {
         let need = self.first().with(|gpu| {
@@ -1960,14 +2058,17 @@ impl GpuPool {
             if available >= need {
                 return;
             }
+            // Unheld sealed layouts, then a parent with no live child (cheaper to recreate
+            // than an executor with its weights), then idle executors.
             let released = self.host.release(need - available);
             let ended = released == 0
-                && match self.first().with(|gpu| gpu.lru_idle(plan)) {
-                    Some(victim) => self
-                        .carry_out(&Step::End(victim), sessions)
-                        .unwrap_or(false),
-                    None => false,
-                };
+                && (self.end_idle_parent() > 0
+                    || match self.first().with(|gpu| gpu.lru_idle(plan)) {
+                        Some(victim) => self
+                            .carry_out(&Step::End(victim), sessions)
+                            .unwrap_or(false),
+                        None => false,
+                    });
             crate::memory::note(serde_json::json!({"event": "host_room", "plan": plan,
                 "need": need, "available": available, "released": released, "ended": ended}));
             if released == 0 && !ended {
