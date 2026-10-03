@@ -57,8 +57,8 @@ pub struct Runs {
     pub local: Option<Arc<LocalSources>>,
     /// On a rental: its own Hub, read with the pod's worker capability.
     pub own_hub: Option<hub::Source>,
-    /// Running jobs' preparation, in memory only (the token is never journaled): their
-    /// children prepare with it.
+    /// Unfinished jobs' preparation: their children prepare with it. The tokens live only
+    /// here; the rest is journaled too (`Durable`), for a paused job resumed after a restart.
     pub jobs: Mutex<HashMap<String, JobContext>>,
 }
 
@@ -73,6 +73,44 @@ pub struct JobContext {
     binding_revision: String,
     attention_kernel: String,
     models: Vec<pb::ModelChoice>,
+}
+
+/// A job context's journaled part: everything but its tokens (choices prost-encoded).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Durable {
+    installation: String,
+    owner: String,
+    binding_revision: String,
+    attention_kernel: String,
+    models: Vec<Vec<u8>>,
+}
+impl Durable {
+    fn of(context: &JobContext) -> Self {
+        Self {
+            installation: context.installation.clone(),
+            owner: context.owner.clone(),
+            binding_revision: context.binding_revision.clone(),
+            attention_kernel: context.attention_kernel.clone(),
+            models: context.models.iter().map(prost::Message::encode_to_vec).collect(),
+        }
+    }
+    /// Without the run's tokens: its children prepare with the machine's own Hub, if any.
+    fn context(self) -> io::Result<JobContext> {
+        Ok(JobContext {
+            installation: self.installation,
+            hub: None,
+            providers: Providers::default(),
+            owner: self.owner,
+            binding_revision: self.binding_revision,
+            attention_kernel: self.attention_kernel,
+            models: self
+                .models
+                .iter()
+                .map(|m| <pb::ModelChoice as prost::Message>::decode(m.as_slice()))
+                .collect::<Result<_, _>>()
+                .map_err(io::Error::other)?,
+        })
+    }
 }
 
 fn refused(code: &'static str, message: impl Into<String>) -> Refused {
@@ -270,18 +308,20 @@ impl Runs {
             }));
         }
         if spec.job {
-            self.jobs.lock().unwrap().insert(
-                id.into(),
-                JobContext {
-                    installation: installation.alias.clone(),
-                    hub,
-                    providers: spec.providers.clone(),
-                    owner: spec.owner.clone(),
-                    binding_revision: spec.binding_revision.clone(),
-                    attention_kernel: spec.attention_kernel.clone(),
-                    models: spec.models.clone(),
-                },
-            );
+            let context = JobContext {
+                installation: installation.alias.clone(),
+                hub,
+                providers: spec.providers.clone(),
+                owner: spec.owner.clone(),
+                binding_revision: spec.binding_revision.clone(),
+                attention_kernel: spec.attention_kernel.clone(),
+                models: spec.models.clone(),
+            };
+            let durable = serde_json::to_vec(&Durable::of(&context)).map_err(io::Error::other)?;
+            self.service
+                .engine
+                .with_journal(|journal| journal.bind_job_context(id, &durable))?;
+            self.jobs.lock().unwrap().insert(id.into(), context);
         }
         self.service.bind_prepared(
             id,
@@ -360,6 +400,18 @@ impl Runs {
         inputs: Vec<InputFile>,
     ) -> Result<Execution, Refused> {
         let actor = parent.submission.as_ref().map(|s| s.actor.clone()).unwrap_or_default();
+        // An earlier attempt's call is already its run (a resumed job): nothing prepares.
+        match self.service.engine.get_public(&actor, request) {
+            Ok(existing) => {
+                let same = existing.submission.as_ref().map(|s| s.invocation_digest.as_str());
+                if same != Some(intent) {
+                    return Err(refused("run_id_conflict", "this run id already names another run spec"));
+                }
+                return Ok(existing);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.into()),
+        }
         let spec = self.child_spec(&parent.id, entrypoint, input, inputs, intent)?;
         self.submit(&actor, request, spec)
     }
@@ -372,9 +424,22 @@ impl Runs {
         inputs: Vec<InputFile>,
         digest: &str,
     ) -> Result<Spec, Refused> {
-        let context = self.jobs.lock().unwrap().get(parent).cloned().ok_or_else(|| {
-            refused("child_call_refused", "the job's preparation context is gone")
-        })?;
+        let held = self.jobs.lock().unwrap().get(parent).cloned();
+        let context = match held {
+            Some(context) => context,
+            None => {
+                let journaled = self
+                    .service
+                    .engine
+                    .with_journal(|journal| journal.job_context(parent))?
+                    .ok_or_else(|| {
+                        refused("child_call_refused", "the job's preparation context is gone")
+                    })?;
+                serde_json::from_slice::<Durable>(&journaled)
+                    .map_err(io::Error::other)?
+                    .context()?
+            }
+        };
         let prefix = format!("{entrypoint}.");
         Ok(Spec {
             warm: false,
@@ -436,6 +501,13 @@ impl Runs {
     /// A job ended: its children prepare no more.
     pub fn end_job(&self, id: &str) {
         self.jobs.lock().unwrap().remove(id);
+        if let Err(error) = self
+            .service
+            .engine
+            .with_journal(|journal| journal.forget_job_context(id))
+        {
+            eprintln!("job {id}: its journaled context remains: {error}");
+        }
     }
 
     /// Without a Hub, held code's models come from the operator's configured grants.

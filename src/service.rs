@@ -117,8 +117,9 @@ impl Service {
         });
         service.engine.reconcile()?;
         service.reclaim();
-        // Keep queued generations alive, including accepted work from a prior boot.
-        for record in service.engine.nonterminal(usize::MAX)? {
+        // Keep queued and paused runs' generations alive, including a prior boot's.
+        let paused = service.engine.paused(usize::MAX)?;
+        for record in service.engine.nonterminal(usize::MAX)?.into_iter().chain(paused) {
             if let Ok(held) = service.catalog.resolve(&record.invocation.generation) {
                 service
                     .retained
@@ -138,6 +139,9 @@ impl Service {
     }
     pub fn gpu(&self) -> Option<Arc<crate::gpu_service::GpuPool>> {
         self.gpu.lock().unwrap().clone()
+    }
+    pub fn jobs(&self) -> Option<Arc<crate::jobs::Jobs>> {
+        self.jobs.lock().unwrap().clone()
     }
     pub fn configure_jobs(&self, jobs: Arc<crate::jobs::Jobs>) {
         *self.jobs.lock().unwrap() = Some(jobs);
@@ -338,7 +342,10 @@ impl Service {
         match bound.and_then(|bound| {
             crate::reclaim::sweep(&self.engine, &self.catalog, &bound, kernels.as_ref())
         }) {
-            Ok(swept) => {
+            Ok(mut swept) => {
+                if let Some(jobs) = self.jobs() {
+                    swept.scratch = jobs.sweep_scratch(&self.engine);
+                }
                 if swept != crate::reclaim::Swept::default() {
                     eprintln!("reclaimed {swept:?}");
                 }

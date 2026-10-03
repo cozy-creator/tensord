@@ -1,6 +1,7 @@
 """H3 long-form's shape without torch: a CPU composition job renders each segment through a
 child call of its own invocable, which takes the reference image and the previous segment's
-context and returns a file; after every segment the parent publishes the film so far."""
+context and returns a file; after every segment the parent publishes the film so far, keeps it
+in its scratch and declares it a checkpoint. A resumed attempt reads its scratch back."""
 from __future__ import annotations
 
 import asyncio
@@ -12,12 +13,14 @@ import msgspec
 from cozy_runtime.author import (
     App,
     AssetBound,
+    Checkpoints,
     ChildCallError,
     Context,
     FileAsset,
     ImageAsset,
     OutputError,
     Outputs,
+    Scratch,
     Telemetry,
     invocable,
     prefetch,
@@ -35,8 +38,10 @@ class SegmentInput(msgspec.Struct):
     prompt: str
     reference: Reference
     context: str = ""
-    #: Seconds a segment takes (a cancel test holds one running).
+    #: Seconds a segment takes (a cancel or pause test holds one running).
     hold: float = 0.0
+    #: The one segment that holds; -1: every segment does.
+    hold_at: int = -1
     #: This segment fails in authored code (a failure test); -1: none does.
     fail_at: int = -1
 
@@ -52,7 +57,8 @@ async def render_segment(ctx: Context, *, payload: SegmentInput, out: Outputs) -
     ctx.raise_if_cancelled()
     if payload.index == payload.fail_at:
         raise ValueError(f"segment {payload.index} cannot be rendered")
-    for _ in range(int(payload.hold * 20)):
+    held = payload.hold if payload.hold_at in (-1, payload.index) else 0.0
+    for _ in range(int(held * 20)):
         await asyncio.sleep(0.05)
         ctx.raise_if_cancelled()
     seen = hashlib.sha256(payload.reference.read_bytes()).hexdigest()
@@ -67,25 +73,45 @@ class LongFormInput(msgspec.Struct):
     reference: Reference
     segments: list[str]
     hold: float = 0.0
+    hold_at: int = -1
     fail_at: int = -1
 
 
 class LongFormOutput(msgspec.Struct):
     video: Video
     segments: int
+    #: This run's attempts so far, counted in its scratch (a resume adds one).
+    attempts: int = 1
+    #: Segment checkpoints an earlier attempt had already declared.
+    replayed: int = 0
 
 
 async def long_form(
-    ctx: Context, payload: LongFormInput, out: Outputs, tel: Telemetry
+    ctx: Context,
+    payload: LongFormInput,
+    out: Outputs,
+    tel: Telemetry,
+    scratch: Scratch,
+    checkpoints: Checkpoints,
 ) -> LongFormOutput:
     prefetch(render_segment)
-    film, context = b"", ""
+    state = scratch.checkpoint_dir(key="long_form")
+    counted = state / "attempts"
+    attempts = int(counted.read_text()) + 1 if counted.exists() else 1
+    counted.write_text(str(attempts))
+    film, context, replayed = b"", "", 0
     for index, prompt in enumerate(payload.segments):
         ctx.raise_if_cancelled()
         try:
             result = await render_segment(
                 payload=SegmentInput(
-                    index, prompt, payload.reference, context, payload.hold, payload.fail_at
+                    index,
+                    prompt,
+                    payload.reference,
+                    context,
+                    payload.hold,
+                    payload.hold_at,
+                    payload.fail_at,
                 )
             )
         except ChildCallError as failure:
@@ -98,11 +124,17 @@ async def long_form(
             ) from failure
         film += result.video.read_bytes()
         context = result.context
+        kept = state / f"film-{index}"
+        kept.write_bytes(film)
+        replayed += checkpoints.declare(f"film-{index}", kept).replayed
         revision = out.save_bytes(film, media_type="video/mp4")
         out.publish("video", revision, label=f"Video (segments 1-{index + 1})")
     ctx.release_gpus()
     return LongFormOutput(
-        video=out.save_bytes(film, media_type="video/mp4"), segments=len(payload.segments)
+        video=out.save_bytes(film, media_type="video/mp4"),
+        segments=len(payload.segments),
+        attempts=attempts,
+        replayed=replayed,
     )
 
 

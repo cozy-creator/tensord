@@ -10,7 +10,8 @@ the owner (`service.rs`) admits work and resolves an immutable environment befor
   committed receipt. The same file holds installations, preparations, public terminal
   projections, native outputs, input intakes and submission closures.
 - `workspace_id()` is a v4 UUID created once and persisted.
-- States: `queued`, `starting`, `running`, `completed`, `failed`, `canceled`.
+- States: `queued`, `starting`, `running`, `paused`, `completed`, `failed`, `canceled`.
+  `paused` is neither terminal nor dispatched: a job at rest between attempts (below).
 - `Invocation`: `package`, `generation`, `module`, `entrypoint`, `input` (JSON).
 
 ## Acceptance
@@ -137,3 +138,23 @@ it does not know is `unknown`: listed, never dispatched, settled or overwritten.
 Runners get the same scope as executors (a cgroup or a token; see device executor).
 
 Not implemented: same-UID isolation (reads detect mutation), cleanup of orphan `*.pending` files.
+
+## Pause and resume (jobs only)
+
+- `pause(id, actor, unstarted_only)` records `pause_actor`. A queued run rests `paused` at once; a
+  preparing one once prepared; a started one when its attempt stops: the job's root is stopped as a
+  cancel stops it, and an end that is `canceled` (or the root's death) settles `Outcome::Paused`.
+  A failed or succeeded attempt keeps its own outcome. `unstarted_only` (a paused job's children)
+  holds only a queued run: started work runs to its end.
+- `resume` queues a paused run for a fresh attempt (`attempt + 1`, progress from zero); a run still
+  pausing does not resume. `cancel` ends a paused run at once.
+- Resume replays only the job's root. Each call it makes again finds its child run by index and
+  intent (`Runs::child`, no preparation): finished children answer with their results, held ones
+  resume. No started work runs twice.
+- A job's scratch (`<cpu>/scratch/<id>`, `RunJob.scratch`) and its checkpoint declarations
+  (`checkpoints` table: run, operation and logical key, digest; a repeat replays its receipt, other
+  content is `checkpoint_conflict`) persist across attempts and restarts. The job context without
+  its tokens (`job_contexts`) lets children prepare after a restart. The scratch goes with the
+  first sweep after the run ends.
+- A paused run is not activity: a rental's idle release applies. A restart leaves it paused, and a
+  root that was pausing when the machine died rests paused.

@@ -58,6 +58,8 @@ pub struct Swept {
     pub results: usize,
     pub kernels: usize,
     pub generations: usize,
+    /// Ended jobs' scratch trees (`jobs::Jobs::sweep_scratch`).
+    pub scratch: usize,
 }
 
 /// The persistent compiled-kernel store (`Seal::prepare`'s `<root>/u<uid>/`). Recompiling is

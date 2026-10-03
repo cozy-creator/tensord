@@ -807,6 +807,83 @@ fn an_authorized_attempt_that_never_reached_a_handler_starts_again_under_its_cla
 }
 
 #[test]
+fn a_pause_holds_unstarted_work_and_a_resume_starts_a_fresh_attempt() {
+    let fixture = Fixture::new();
+    let state = fixture.root.join("pause-state");
+    let mut journal = Journal::open(&state).unwrap();
+    let job = || Invocation {
+        job: true,
+        ..fixture.invocation("infer")
+    };
+    // Unstarted: it rests at once, across a restart, and no dispatcher claims it.
+    let queued = journal.accept("queued", job()).unwrap().id;
+    assert_eq!(journal.pause(&queued, "owner", false).unwrap().state, State::Paused);
+    drop(journal);
+    let mut journal = Journal::open(&state).unwrap();
+    assert!(!journal.claim(&queued).unwrap());
+    assert_eq!(journal.paused(8).unwrap().len(), 1);
+    assert_eq!(journal.resume(&queued).unwrap().state, State::Queued);
+    assert!(journal.claim(&queued).unwrap());
+
+    // Started: it pauses when its attempt stops; the next attempt takes a fresh executor.
+    let mut executor = Command::new("/usr/bin/python3")
+        .args(["-c", "import sys;sys.stdin.read()"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    journal
+        .register_process(&queued, process_birth(executor.id()).unwrap())
+        .unwrap();
+    journal.running(&queued, None).unwrap();
+    // A child's hold leaves started work running; a job's pause marks it for its stop.
+    assert!(journal.pause(&queued, "owner", true).unwrap().pause_actor.is_none());
+    let pausing = journal.pause(&queued, "owner", false).unwrap();
+    assert_eq!((pausing.state, pausing.pause_actor.as_deref()), (State::Running, Some("owner")));
+    assert!(journal.resume(&queued).unwrap().pause_actor.is_some(), "still pausing");
+    drop(executor.stdin.take());
+    executor.wait().unwrap();
+    let paused = journal.finish(&queued, journal::Outcome::Paused).unwrap();
+    assert_eq!((paused.state, paused.process.is_none()), (State::Paused, true));
+    assert_eq!(paused.finished_at_ms, 0);
+    journal.resume(&queued).unwrap();
+    assert!(journal.claim(&queued).unwrap());
+    assert_eq!(journal.get(&queued).unwrap().attempt, 2);
+    journal.defer_unstarted(&queued, "spawn".into()).unwrap();
+
+    // Claimed but never authorized: a pause makes the deferral rest, not queue.
+    assert!(journal.claim(&queued).unwrap());
+    journal.pause(&queued, "owner", false).unwrap();
+    assert_eq!(
+        journal.defer_unstarted(&queued, "spawn".into()).unwrap().state,
+        State::Paused
+    );
+    assert_eq!(journal.cancel(&queued, "owner").unwrap().state, State::Canceled);
+
+    // Preparing: it rests once prepared, never dispatchable in between.
+    let child = Invocation {
+        parent: queued.clone(),
+        ..fixture.invocation("infer")
+    };
+    let (preparing, _) = journal.accept_run("alice", "job/0", "d", child.clone()).unwrap();
+    assert_eq!(journal.pause(&preparing.id, "alice", true).unwrap().state, State::Queued);
+    let ready = journal.bind_prepared(&preparing.id, child, "").unwrap();
+    assert_eq!(ready.state, State::Paused);
+    assert_eq!(journal.children(&queued).unwrap().len(), 1);
+
+    // A checkpoint declaration: new, then replayed; other content under its keys is refused.
+    let declare = |journal: &mut Journal, digest: &str| {
+        journal.declare_checkpoint(&queued, 2, "op", "film-0", digest, 3)
+    };
+    let (receipt, replayed) = declare(&mut journal, "sha256:aa").unwrap();
+    assert!(!replayed);
+    drop(journal);
+    let mut journal = Journal::open(&state).unwrap();
+    assert_eq!(declare(&mut journal, "sha256:aa").unwrap(), (receipt, true));
+    let conflict = declare(&mut journal, "sha256:bb").unwrap_err();
+    assert_eq!(conflict.kind(), std::io::ErrorKind::AlreadyExists);
+}
+
+#[test]
 fn idempotency_compares_semantics_and_additive_runner_fields_are_tolerated() {
     let fixture = Fixture::new();
     fixture

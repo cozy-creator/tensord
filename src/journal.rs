@@ -120,6 +120,8 @@ pub enum State {
     Completed,
     Failed,
     Canceled,
+    /// A job at rest between attempts: neither terminal nor dispatched; `resume` queues it.
+    Paused,
     /// Written by a newer machine: listed, never dispatched, settled or overwritten.
     #[serde(other)]
     Unknown,
@@ -137,6 +139,7 @@ impl State {
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Canceled => "canceled",
+            Self::Paused => "paused",
             Self::Unknown => "unknown",
         }
     }
@@ -212,6 +215,10 @@ pub struct Execution {
     pub waiting_reason: Option<String>,
     pub process: Option<ProcessBirth>,
     pub cancel_actor: Option<String>,
+    /// Who paused it: the run is paused, or pauses once its started attempt stops (or, while
+    /// preparing, once prepared). `resume` clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_actor: Option<String>,
     pub completed_units: u64,
     pub progress: Option<String>,
     /// The cursor at which the attempt started running: its `running` event.
@@ -349,6 +356,8 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS triage(execution INTEGER PRIMARY KEY REFERENCES executions(id),record TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS resolutions(actor TEXT NOT NULL,key TEXT NOT NULL,package TEXT NOT NULL,preparation TEXT NOT NULL,PRIMARY KEY(actor,key));
             CREATE TABLE IF NOT EXISTS objects(actor TEXT NOT NULL,sha256 TEXT NOT NULL,length INTEGER NOT NULL,PRIMARY KEY(actor,sha256));
+            CREATE TABLE IF NOT EXISTS job_contexts(execution INTEGER PRIMARY KEY REFERENCES executions(id),record BLOB NOT NULL);
+            CREATE TABLE IF NOT EXISTS checkpoints(execution INTEGER NOT NULL REFERENCES executions(id),operation_key TEXT NOT NULL,logical_key TEXT NOT NULL,content_digest TEXT NOT NULL,length INTEGER NOT NULL,attempt INTEGER NOT NULL,receipt TEXT NOT NULL,at_ms INTEGER NOT NULL,PRIMARY KEY(execution,operation_key,logical_key));
             CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_request ON executions(actor,request_id) WHERE actor IS NOT NULL;
             CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_submission ON executions(actor,submission_id) WHERE actor IS NOT NULL;
             CREATE INDEX IF NOT EXISTS executions_actor_order ON executions(actor,id) WHERE actor IS NOT NULL; COMMIT;").map_err(db_error)?;
@@ -1088,6 +1097,9 @@ impl Journal {
                     submission.preparation_id = preparation.into();
                 }
                 record.waiting_reason = None;
+                if record.pause_actor.is_some() {
+                    record.state = State::Paused;
+                }
                 Ok(true)
             },
             |tx, record| {
@@ -1118,6 +1130,7 @@ impl Journal {
                     record.failure = Some(reason);
                 }
                 Outcome::Canceled => record.state = State::Canceled,
+                Outcome::Paused => return Err(db_error("a preparation pauses once prepared")),
             }
             record.waiting_reason = None;
             Ok(true)
@@ -1180,6 +1193,7 @@ fn insert(
         waiting_reason: waiting.map(String::from),
         process: None,
         cancel_actor: None,
+        pause_actor: None,
         completed_units: 0,
         progress: None,
         running_revision: 0,
@@ -1614,6 +1628,9 @@ impl Journal {
             record.waiting_reason = Some(reason);
             record.state = if record.cancel_actor.is_some() {
                 State::Canceled
+            } else if record.pause_actor.is_some() {
+                record.waiting_reason = None;
+                State::Paused
             } else {
                 State::Queued
             };
@@ -1634,6 +1651,8 @@ impl Journal {
             record.started_at_ms = 0;
             record.state = if record.cancel_actor.is_some() {
                 State::Canceled
+            } else if record.pause_actor.is_some() {
+                State::Paused
             } else {
                 State::Starting
             };
@@ -1657,10 +1676,10 @@ impl Journal {
             if record.state != State::Starting || record.process.is_none() {
                 return Err(db_error("attempt has no registered executor"));
             }
-            if record.cancel_actor.is_some() {
+            if record.cancel_actor.is_some() || record.pause_actor.is_some() {
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
-                    "canceled before package start authorization",
+                    "stopped before package start authorization",
                 ));
             }
             record.state = State::Running;
@@ -1709,12 +1728,158 @@ impl Journal {
                 return Ok(false);
             }
             record.cancel_actor = Some(actor.into());
-            if record.state == State::Queued {
+            if matches!(record.state, State::Queued | State::Paused) {
                 record.state = State::Canceled;
                 record.finished_at_ms = timestamp().max(0) as u64;
             }
             Ok(true)
         })
+    }
+
+    /// Pause a run: an unstarted attempt rests at once, a preparing one once prepared, a
+    /// started one when it stops (`Outcome::Paused`). `unstarted_only` holds only a queued run
+    /// (a paused job's children: started work runs to its end). Finished, canceled and already
+    /// pausing runs are unchanged.
+    pub fn pause(&mut self, id: &str, actor: &str, unstarted_only: bool) -> io::Result<Execution> {
+        if actor.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a pause requires an actor",
+            ));
+        }
+        self.update(id, |record| {
+            if record.state.terminal()
+                || record.state == State::Paused
+                || record.cancel_actor.is_some()
+                || record.pause_actor.is_some()
+                || (unstarted_only && record.state != State::Queued)
+            {
+                return Ok(false);
+            }
+            record.pause_actor = Some(actor.into());
+            if record.state == State::Queued && record.waiting_reason.as_deref() != Some(PREPARING)
+            {
+                record.state = State::Paused;
+                record.waiting_reason = None;
+            }
+            Ok(true)
+        })
+    }
+
+    /// A paused run queues for a fresh attempt; one paused while preparing only drops the
+    /// pause. A run still stopping, running or finished is unchanged.
+    pub fn resume(&mut self, id: &str) -> io::Result<Execution> {
+        self.update(id, |record| {
+            match record.state {
+                State::Paused => {
+                    record.state = State::Queued;
+                    record.waiting_reason = None;
+                    // A new attempt reports its own progress from zero.
+                    record.completed_units = 0;
+                    record.progress = None;
+                }
+                State::Queued if record.pause_actor.is_some() => (),
+                _ => return Ok(false),
+            }
+            record.pause_actor = None;
+            Ok(true)
+        })
+    }
+
+    /// A job's children that have not finished, paused ones included.
+    pub fn children(&self, parent: &str) -> io::Result<Vec<Execution>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT record FROM executions WHERE state IN ('queued','starting','running','paused') AND json_extract(invocation,'$.parent')=?1 ORDER BY id")
+            .map_err(db_error)?;
+        let records = statement
+            .query_map([parent], |row| row.get::<_, String>(0))
+            .map_err(db_error)?;
+        records
+            .map(|record| record.map_err(db_error))
+            .collect::<io::Result<Vec<_>>>()
+            .map(readable)
+    }
+
+    pub fn paused(&self, limit: usize) -> io::Result<Vec<Execution>> {
+        self.selected(
+            "SELECT record FROM executions WHERE state='paused' ORDER BY id LIMIT ?1",
+            limit,
+        )
+    }
+
+    /// A job's preparation context without its tokens (`runs::JobContext`): what its children
+    /// prepare with after a restart.
+    pub fn bind_job_context(&mut self, id: &str, record: &[u8]) -> io::Result<()> {
+        self.connection
+            .execute(
+                "INSERT OR REPLACE INTO job_contexts(execution,record) VALUES(?1,?2)",
+                params![id, record],
+            )
+            .map(drop)
+            .map_err(db_error)
+    }
+    pub fn job_context(&self, id: &str) -> io::Result<Option<Vec<u8>>> {
+        self.connection
+            .query_row(
+                "SELECT record FROM job_contexts WHERE execution=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)
+    }
+    pub fn forget_job_context(&mut self, id: &str) -> io::Result<()> {
+        self.connection
+            .execute("DELETE FROM job_contexts WHERE execution=?1", [id])
+            .map(drop)
+            .map_err(db_error)
+    }
+
+    /// Record that a job's attempt declared a checkpoint (`Checkpoints.declare`): the same
+    /// keys and content replay its receipt; the same keys with other content are a conflict.
+    /// The run's scratch holds the bytes; only the declaration is journaled.
+    pub fn declare_checkpoint(
+        &mut self,
+        id: &str,
+        attempt: u32,
+        operation_key: &str,
+        logical_key: &str,
+        content_digest: &str,
+        length: u64,
+    ) -> io::Result<(String, bool)> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        let held: Option<(String, String)> = tx
+            .query_row(
+                "SELECT content_digest,receipt FROM checkpoints WHERE execution=?1 AND operation_key=?2 AND logical_key=?3",
+                params![id, operation_key, logical_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(db_error)?;
+        if let Some((digest, receipt)) = held {
+            if digest != content_digest {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "{logical_key}: operation key {operation_key:?} is declared at {digest}; \
+                         a checkpoint is never replaced"
+                    ),
+                ));
+            }
+            return Ok((receipt, true));
+        }
+        let receipt = format!("ckpt-{}", &uuid::Uuid::new_v4().simple().to_string()[..24]);
+        tx.execute(
+            "INSERT INTO checkpoints(execution,operation_key,logical_key,content_digest,length,attempt,receipt,at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![id, operation_key, logical_key, content_digest, length.min(i64::MAX as u64) as i64, attempt, receipt, timestamp()],
+        )
+        .map_err(db_error)?;
+        tx.commit().map_err(db_error)?;
+        Ok((receipt, false))
     }
 
     /// Caller must prove process termination and durable artifact custody first.
@@ -1749,6 +1914,15 @@ impl Journal {
                         return Err(db_error("runner cannot cancel without durable authority"));
                     }
                     record.state = State::Canceled;
+                }
+                // The attempt stopped: the run rests, awaiting `resume` and a fresh attempt.
+                Outcome::Paused => {
+                    if record.pause_actor.is_none() {
+                        return Err(db_error("an attempt pauses only with durable authority"));
+                    }
+                    record.state = State::Paused;
+                    record.process = None;
+                    return Ok(true);
                 }
             }
             record.finished_at_ms = timestamp().max(0) as u64;
@@ -1822,6 +1996,7 @@ pub enum Outcome {
     Completed(ResultRecord),
     Failed(String),
     Canceled,
+    Paused,
 }
 
 fn validate_scope(actor: &str, request_id: &str, submission_id: &str) -> io::Result<()> {

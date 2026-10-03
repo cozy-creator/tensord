@@ -59,7 +59,10 @@ with a self-signed leaf; the CLI does not use it. Caller: the `cozy run play` li
   parent: same records, no number, canceled with the parent, outputs granted to the parent's
   spool. Child outputs reach the parent by the seam, so Read is not used for them.
 
-**Pause/resume** stay as Control actions (lead's decision).
+**Pause/resume** stay as Control actions (lead's decision). Only a job pauses (`pause_unsupported`
+otherwise): its root stops, started children run to their end, unstarted ones wait, and the run
+shows `paused`. Resume replays the root, whose calls find their finished children
+(`DURABLE-EXECUTION.md`); `run_pausing` and `run_not_paused` refuse early or late resumes.
 
 **Activity** (a rental's idle release) is non-terminal runs, preparations and explicit keepalives
 only. Open streams and other calls are not activity: a daemon that holds a stream must not bill

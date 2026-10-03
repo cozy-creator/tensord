@@ -652,6 +652,79 @@ impl Engine {
         Ok(record)
     }
 
+    /// Pause (`Journal::pause`); a started attempt is stopped as a cancel stops it, and the
+    /// journaled pause makes its end `paused`.
+    pub fn pause(&self, id: &str, actor: &str, unstarted_only: bool) -> io::Result<Execution> {
+        let record = {
+            let owned = self.owned.lock().unwrap();
+            let mut progress = self.progress.lock().unwrap();
+            let mut record = self
+                .journal
+                .lock()
+                .unwrap()
+                .pause(id, actor, unstarted_only)?;
+            overlay_observation(&mut record, &owned, &progress);
+            if record.state == State::Paused {
+                progress.remove(id);
+            }
+            record
+        };
+        self.notify_activity();
+        let stopping = matches!(record.state, State::Starting | State::Running)
+            && record.pause_actor.is_some()
+            && record.cancel_actor.is_none();
+        if stopping {
+            if let Some(ActiveRun::Managed(stop)) = self.active.lock().unwrap().get(id).cloned() {
+                let _ = stop();
+            }
+        }
+        Ok(record)
+    }
+
+    pub fn resume(&self, id: &str) -> io::Result<Execution> {
+        let record = self.journal.lock().unwrap().resume(id)?;
+        self.notify_activity();
+        Ok(record)
+    }
+
+    /// An attempt that ends unauthorized or stopped: CANCELED, or PAUSED, as journaled.
+    pub(crate) fn finish_stopped(&self, id: &str) -> io::Result<Execution> {
+        let record = self.get(id)?;
+        let outcome = match (&record.cancel_actor, &record.pause_actor) {
+            (Some(_), _) => Outcome::Canceled,
+            (None, Some(_)) => Outcome::Paused,
+            (None, None) => return Err(io::Error::other("the attempt has no stop authority")),
+        };
+        self.finish(id, outcome)
+    }
+
+    pub fn children(&self, parent: &str) -> io::Result<Vec<Execution>> {
+        self.journal.lock().unwrap().children(parent)
+    }
+
+    pub fn paused(&self, limit: usize) -> io::Result<Vec<Execution>> {
+        self.journal.lock().unwrap().paused(limit)
+    }
+
+    pub fn declare_checkpoint(
+        &self,
+        id: &str,
+        attempt: u32,
+        operation_key: &str,
+        logical_key: &str,
+        content_digest: &str,
+        length: u64,
+    ) -> io::Result<(String, bool)> {
+        self.journal.lock().unwrap().declare_checkpoint(
+            id,
+            attempt,
+            operation_key,
+            logical_key,
+            content_digest,
+            length,
+        )
+    }
+
     pub fn observe_progress(
         &self,
         id: &str,
@@ -712,7 +785,7 @@ impl Engine {
             .lock()
             .unwrap()
             .finish_observed(id, outcome, progress.get(id))?;
-        if record.state.terminal() {
+        if record.state.terminal() || record.state == State::Paused {
             progress.remove(id);
         }
         drop(progress);
@@ -812,7 +885,8 @@ impl Engine {
             .unwrap()
             .insert(id.into(), ActiveRun::Managed(cancel.clone()));
         self.notify_activity();
-        if self.get(id)?.cancel_actor.is_some() {
+        let record = self.get(id)?;
+        if record.cancel_actor.is_some() || record.pause_actor.is_some() {
             let _ = cancel();
         }
         Ok(())
@@ -903,6 +977,9 @@ impl Engine {
                     "owner restarted before start authorization; no authored work dispatched"
                         .into(),
                 )?;
+            } else if record.invocation.job && record.pause_actor.is_some() {
+                // A pausing job's root is replayed by design: it rests paused.
+                journal.finish(&record.id, Outcome::Paused)?;
             } else {
                 journal.finish(&record.id, Outcome::Failed("owner lost before durable result custody; exact executor birth has ended; started work will not be replayed".into()))?;
             }

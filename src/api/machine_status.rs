@@ -11,7 +11,7 @@ pub(super) type Frames = Pin<Box<dyn Stream<Item = Result<v1::StatusFrame, Statu
 /// What this machine serves on `cozy.machine.v1`, for clients that adapt to it.
 pub const CAPABILITIES: &[&str] = &["status/1", "run/1", "control/1", "read/1"];
 
-const LIVE: [&str; 3] = ["queued", "starting", "running"];
+const LIVE: [&str; 4] = ["queued", "starting", "running", "paused"];
 
 pub(super) async fn status<B: MachineBackend>(
     identity: Arc<MachineIdentity>,

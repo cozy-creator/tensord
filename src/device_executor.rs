@@ -297,6 +297,8 @@ pub enum DeviceCommand {
         application: String,
         package_interface: PathBuf,
         spool: PathBuf,
+        /// The run's scratch tree (`Scratch`): the same across its attempts.
+        scratch: PathBuf,
         deadline_s: Option<f64>,
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         inputs: BTreeMap<String, Value>,
@@ -367,6 +369,7 @@ pub enum Kind {
     ChildEvents,
     GpuRelease,
     ModelPrefetch,
+    Checkpoint,
     #[default]
     #[serde(other)]
     Unknown,
@@ -593,6 +596,10 @@ pub struct Frame {
     pub export: String,
     pub payload: String,
     pub progress_label: String,
+    // `checkpoint` (a job's `Checkpoints.declare`): its keys and content (`length` above).
+    pub operation_key: String,
+    pub logical_key: String,
+    pub content_digest: String,
 }
 
 /// One part of a composite product: a spool file and the media time it adds.
@@ -642,6 +649,11 @@ pub struct Answer {
     pub byte_grants: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress: Option<Value>,
+    /// `CheckpointReceipt`: the declaration's id, and whether it was already recorded.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub receipt_id: String,
+    #[serde(skip_serializing_if = "is_false")]
+    pub replayed: bool,
 }
 impl Answer {
     pub fn unavailable(seq: u64) -> Self {
@@ -668,6 +680,8 @@ impl Answer {
             result: String::new(),
             byte_grants: Vec::new(),
             progress: None,
+            receipt_id: String::new(),
+            replayed: false,
         }
     }
     pub fn ok(seq: u64) -> Self {

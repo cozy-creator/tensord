@@ -3,6 +3,12 @@
 //! and becomes a run of its own, `<parent>/<call_index>`, under the parent's signer: same
 //! records, dispatched like any run, canceled with the parent. A child's result and files
 //! reach the parent through the seam (`CallState`), its files copied into the parent's spool.
+//!
+//! Only a job pauses. Its root stops (as a cancel stops it) and the run rests `paused`; its
+//! unstarted children are held, started ones run to their end. Resume replays only the root:
+//! each call it makes again finds its child by index and intent, finished children answer
+//! with their results, held ones go on. The run's scratch and checkpoint declarations persist
+//! across attempts; the self-managing sweep removes the scratch once the run has ended.
 use crate::{
     catalog::HeldGeneration,
     device_executor::{
@@ -19,6 +25,7 @@ use crate::{
     service::Service,
 };
 use serde_json::{json, Value};
+use crate::objects::Refused;
 use std::{
     collections::{BTreeMap, HashMap},
     fs::{self, File},
@@ -104,6 +111,8 @@ impl Jobs {
             runs: Arc::downgrade(runs),
             parents: Mutex::new(HashMap::new()),
         });
+        // The startup sweep ran before jobs were configured: ended runs' scratch goes now.
+        jobs.sweep_scratch(&service.engine);
         let (watching, engine) = (Arc::downgrade(&jobs), service.engine.clone());
         std::thread::Builder::new()
             .name("job-nudges".into())
@@ -132,10 +141,14 @@ impl Jobs {
                 true => jobs.job(&engine, &id, held),
                 false => jobs.child(&engine, &id, held),
             };
-            if let Err(error) = &result {
-                settle(&engine, &id, error)?;
+            let settled = match &result {
+                Err(error) => settle(&engine, &id, error),
+                Ok(()) => Ok(()),
+            };
+            if job {
+                jobs.ended(&id);
             }
-            result
+            settled.and(result)
         })
     }
 
@@ -184,7 +197,7 @@ impl Jobs {
                 Arc::new(move || {
                     let canceled = cancel.cancel(&request);
                     if let Some(jobs) = jobs.upgrade() {
-                        jobs.end_children(&request);
+                        jobs.stop_children(&request);
                     }
                     canceled
                 }),
@@ -198,7 +211,7 @@ impl Jobs {
             tensorfs_version: executor.hello.tensorfs_version.clone(),
         };
         if !engine.authorize_managed(id, Some(facts))? {
-            engine.finish(id, Outcome::Canceled)?;
+            engine.finish_stopped(id)?;
             executor.shutdown()?;
             return Ok(None);
         }
@@ -235,6 +248,7 @@ impl Jobs {
         };
         let interface = self.interface(&executor, &held)?;
         let spool = self.spool(&executor, id)?;
+        let scratch = self.scratch(id)?;
         let inputs = stage_inputs(&self.store, self.identity, &spool, &record.invocation.inputs)?;
         let (call_interfaces, callables) = own_invocables(&held.record.interface, &interface);
         let parent = Arc::new(Parent {
@@ -274,18 +288,14 @@ impl Jobs {
                 application: held.record.application.clone(),
                 package_interface: interface,
                 spool: spool.clone(),
+                scratch,
                 deadline_s: None,
                 inputs,
                 call_interfaces,
             },
             &mut services,
         );
-        // Its children end with it, whatever it returned.
-        self.end_children(id);
         self.parents.lock().unwrap().remove(id);
-        if let Some(runs) = self.runs.upgrade() {
-            runs.end_job(id);
-        }
         conclude(engine, id, &executor, &spool, command_ok(reply?)?)?;
         executor.shutdown()
     }
@@ -398,24 +408,138 @@ impl Jobs {
         executor.shutdown()
     }
 
-    /// Cancels every unfinished child of `parent` (its cancel, or its end).
-    fn end_children(&self, parent: &str) {
+    /// The run's scratch (`<root>/scratch/<id>`), kept across its attempts.
+    fn scratch(&self, id: &str) -> io::Result<PathBuf> {
+        let root = self.root.join("scratch");
+        fs::create_dir_all(&root)?;
+        let scratch = root.join(id);
+        fs::create_dir_all(&scratch)?;
+        if let Some(identity) = self.identity {
+            identity.traverse(&root)?;
+            identity.own(&scratch)?;
+        }
+        Ok(scratch)
+    }
+
+    /// Scratch of runs that have ended (or are unknown); a paused run keeps its own.
+    pub fn sweep_scratch(&self, engine: &Engine) -> usize {
+        let Ok(entries) = fs::read_dir(self.root.join("scratch")) else {
+            return 0;
+        };
+        let mut removed = 0;
+        for entry in entries.flatten() {
+            let id = entry.file_name().to_string_lossy().into_owned();
+            let ended = match engine.get(&id) {
+                Ok(record) => record.state.terminal(),
+                Err(error) => error.kind() == io::ErrorKind::NotFound,
+            };
+            if ended {
+                match fs::remove_dir_all(entry.path()) {
+                    Ok(()) => removed += 1,
+                    Err(error) => eprintln!("scratch of run {id}: {error}"),
+                }
+            }
+        }
+        removed
+    }
+
+    /// Whether `parent` is pausing or paused (not canceled): its children are held, not ended.
+    fn holding(engine: &Engine, parent: &str) -> bool {
+        engine.get(parent).is_ok_and(|record| {
+            record.pause_actor.is_some()
+                && record.cancel_actor.is_none()
+                && !record.state.terminal()
+        })
+    }
+
+    /// One child follows its parent's stop: held while unstarted if the parent pauses (started
+    /// work runs to its end), else canceled.
+    fn stop_child(engine: &Engine, child: &Execution, hold: bool) {
+        let actor = child
+            .submission
+            .as_ref()
+            .map(|s| s.actor.as_str())
+            .unwrap_or_default();
+        let stopped = match hold {
+            true => engine.pause(&child.id, actor, true),
+            false => engine.cancel(&child.id, actor),
+        };
+        if let Err(error) = stopped {
+            eprintln!("child run {} of {} remains: {error}", child.id, child.invocation.parent);
+        }
+    }
+
+    /// Every unfinished child of `parent` follows its stop (cancel, pause, or its end).
+    fn stop_children(&self, parent: &str) {
         let Some(service) = self.service.upgrade() else {
             return;
         };
-        let Ok(records) = service.engine.nonterminal(usize::MAX) else {
+        let hold = Self::holding(&service.engine, parent);
+        let Ok(children) = service.engine.children(parent) else {
             return;
         };
-        for child in records.iter().filter(|r| r.invocation.parent == parent) {
-            let actor = child
-                .submission
-                .as_ref()
-                .map(|s| s.actor.as_str())
-                .unwrap_or_default();
-            if let Err(error) = service.engine.cancel(&child.id, actor) {
-                eprintln!("child run {} of {parent} remains: {error}", child.id);
-            }
+        for child in &children {
+            Self::stop_child(&service.engine, child, hold);
         }
+    }
+
+    /// The job's root has stopped: its children follow, and unless it rests paused its
+    /// children prepare no more. A root deferred before it started runs again: nothing ends.
+    fn ended(&self, id: &str) {
+        let Some(service) = self.service.upgrade() else {
+            return;
+        };
+        if service.engine.get(id).is_ok_and(|r| r.state == State::Queued) {
+            return;
+        }
+        self.stop_children(id);
+        if let (false, Some(runs)) = (Self::holding(&service.engine, id), self.runs.upgrade()) {
+            runs.end_job(id);
+        }
+    }
+
+    /// Control's pause: only a job pauses.
+    pub fn pause(&self, record: &Execution, actor: &str) -> Result<Execution, Refused> {
+        let service = self.service()?;
+        if !record.invocation.job {
+            return Err(refused(
+                "pause_unsupported",
+                "only a job pauses; a call runs to its end or is canceled",
+            ));
+        }
+        let paused = service.engine.pause(&record.id, actor, false)?;
+        self.stop_children(&record.id);
+        Ok(paused)
+    }
+
+    /// Control's resume: a paused job queues for a fresh attempt that replays its root.
+    pub fn resume(&self, record: &Execution) -> Result<Execution, Refused> {
+        let service = self.service()?;
+        let resumed = service.engine.resume(&record.id)?;
+        match resumed.state {
+            _ if resumed.pause_actor.is_some() => Err(refused(
+                "run_pausing",
+                "the run is still pausing; resume it once it is paused",
+            )),
+            state if state.terminal() => Err(refused(
+                "run_not_paused",
+                format!("the run has {} and does not resume", state_name(state)),
+            )),
+            _ => Ok(resumed),
+        }
+    }
+
+    /// A cancel reached a job with no root running (paused or queued): its children end too.
+    pub fn canceled(&self, record: &Execution) {
+        if record.invocation.job && record.state.terminal() {
+            self.ended(&record.id);
+        }
+    }
+
+    fn service(&self) -> Result<Arc<Service>, Refused> {
+        self.service
+            .upgrade()
+            .ok_or_else(|| refused("machine_stopping", "the machine is stopping"))
     }
 
     /// `child_call`: the call's run, accepted once per index (its intent must not change).
@@ -473,6 +597,16 @@ impl Jobs {
                 ),
                 code => (code, refusal.message),
             })?;
+        // A pausing job starts nothing new; a resumed one's held call goes on.
+        let engine = &service.engine;
+        let held = match Self::holding(engine, &parent.id) {
+            true => engine.pause(&record.id, &parent.actor, true),
+            false if record.state == State::Paused || record.pause_actor.is_some() => {
+                engine.resume(&record.id)
+            }
+            false => Ok(record.clone()),
+        };
+        held.map_err(|e| ("child_call_refused", e.to_string()))?;
         calls.by_index.entry(frame.call_index).or_insert(ChildCall {
             child: record.id.clone(),
             request: request.clone(),
@@ -579,6 +713,40 @@ impl Jobs {
         Ok(answer)
     }
 
+    /// `checkpoint`: the declaration is journaled on the run (the bytes stay in its scratch or
+    /// spool); a repeat replays its receipt, other content under the same keys is refused.
+    fn checkpoint(&self, parent: &Parent, frame: &Frame) -> Result<Answer, (&'static str, String)> {
+        if frame.logical_key.is_empty() || !frame.content_digest.starts_with("sha256:") {
+            return Err((
+                "checkpoint_invalid",
+                "a checkpoint names a logical key and a sha256 content digest".into(),
+            ));
+        }
+        let service = self
+            .service
+            .upgrade()
+            .ok_or(("child_call_refused", "machine is stopping".into()))?;
+        let attempt = service.engine.get(&parent.id).map_or(0, |record| record.attempt);
+        let (receipt, replayed) = service
+            .engine
+            .declare_checkpoint(
+                &parent.id,
+                attempt,
+                &frame.operation_key,
+                &frame.logical_key,
+                &frame.content_digest,
+                frame.length,
+            )
+            .map_err(|e| match e.kind() {
+                io::ErrorKind::AlreadyExists => ("checkpoint_conflict", e.to_string()),
+                _ => ("checkpoint_unrecorded", e.to_string()),
+            })?;
+        let mut answer = Answer::ok(frame.seq);
+        answer.receipt_id = receipt;
+        answer.replayed = replayed;
+        Ok(answer)
+    }
+
     fn seam(&self, parent: &Parent, frame: &Frame) -> io::Result<(Answer, Option<File>)> {
         let answered = match frame.kind {
             Kind::ChildCall => self.call(parent, frame),
@@ -592,7 +760,10 @@ impl Jobs {
                     .get(&frame.call_index)
                     .map(|c| c.child.clone());
                 if let (Some(child), Some(service)) = (call, self.service.upgrade()) {
-                    let _ = service.engine.cancel(&child, &parent.actor);
+                    if let Ok(record) = service.engine.get(&child) {
+                        let hold = Self::holding(&service.engine, &parent.id);
+                        Self::stop_child(&service.engine, &record, hold);
+                    }
                 }
                 let mut answer = Answer::ok(frame.seq);
                 answer.state = "pending".into();
@@ -634,6 +805,7 @@ impl Jobs {
             }
             // A deviceless parent holds no GPU.
             Kind::GpuRelease => Ok(Answer::ok(frame.seq)),
+            Kind::Checkpoint => self.checkpoint(parent, frame),
             _ => return Ok((Answer::unavailable(frame.seq), None)),
         };
         Ok((
@@ -722,9 +894,12 @@ fn conclude(
             }
         }
         // A journaled cancel ends it CANCELED, however it stopped (a job may first see its
-        // child canceled with it).
-        _ if engine.get(id)?.cancel_actor.is_some() => {
-            engine.finish(id, Outcome::Canceled)?;
+        // child canceled with it); a pause's stop leaves it PAUSED.
+        terminal if engine.get(id).is_ok_and(|r| {
+            r.cancel_actor.is_some() || (terminal == "canceled" && r.pause_actor.is_some())
+        }) =>
+        {
+            engine.finish_stopped(id)?;
         }
         _ => {
             keep_triage(engine, id, executor, outcome);
@@ -930,5 +1105,20 @@ fn nudge(jobs: Weak<Jobs>, engine: Arc<Engine>) {
                 let _ = watcher.write(&[0]);
             }
         }
+    }
+}
+
+fn refused(code: &'static str, message: impl Into<String>) -> Refused {
+    Refused {
+        code,
+        message: message.into(),
+    }
+}
+
+fn state_name(state: State) -> &'static str {
+    match state {
+        State::Completed => "succeeded",
+        State::Failed => "failed",
+        _ => "been canceled",
     }
 }

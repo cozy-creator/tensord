@@ -137,6 +137,7 @@ impl NativeBackend {
                 // The worker protocol has no "starting": an attempt is queued until it runs.
                 State::Starting => "queued",
                 State::Running => "running",
+                State::Paused => "paused",
                 State::Unknown => "unknown",
             }
             .into(),
@@ -1292,22 +1293,38 @@ impl MachineBackend for NativeBackend {
                 .execution
                 .ok_or_else(|| Status::invalid_argument("execution query absent"))?,
         )?;
-        if request.action != pb::MachineExecutionAction::Cancel as i32 {
-            return Err(Status::unimplemented(
-                "this slice implements explicit cancellation",
-            ));
-        }
         if request.expected_generation != 0 && request.expected_generation != record.attempt as u64
         {
             return Err(Status::aborted("execution generation changed"));
         }
-        self.state(
-            &self
-                .service
-                .engine
-                .cancel(&record.id, &actor_id(actor))
-                .map_err(problem)?,
-        )
+        let actor = actor_id(actor);
+        let jobs = self.service.jobs();
+        let typed = |refused: crate::objects::Refused| {
+            refusal(refused.code, &format!("{}: {}", refused.code, refused.message))
+        };
+        let changed = match pb::MachineExecutionAction::try_from(request.action) {
+            Ok(pb::MachineExecutionAction::Cancel) => {
+                let canceled = self
+                    .service
+                    .engine
+                    .cancel(&record.id, &actor)
+                    .map_err(problem)?;
+                if let Some(jobs) = &jobs {
+                    jobs.canceled(&canceled);
+                }
+                canceled
+            }
+            Ok(pb::MachineExecutionAction::Pause) => jobs
+                .ok_or_else(|| refusal("pause_unsupported", "this machine runs no jobs"))?
+                .pause(&record, &actor)
+                .map_err(typed)?,
+            Ok(pb::MachineExecutionAction::Resume) => jobs
+                .ok_or_else(|| refusal("run_not_paused", "this machine runs no jobs"))?
+                .resume(&record)
+                .map_err(typed)?,
+            _ => return Err(Status::invalid_argument("control names an action")),
+        };
+        self.state(&changed)
     }
     fn list(
         &self,

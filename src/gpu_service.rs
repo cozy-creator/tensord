@@ -1571,7 +1571,7 @@ impl GpuPool {
             tensorfs_version: executor.hello.tensorfs_version.clone(),
         };
         if !engine.authorize_managed(id, Some(facts))? {
-            engine.finish(id, Outcome::Canceled)?;
+            engine.finish_stopped(id)?;
             return Ok(());
         }
         let fresh = plan.clone();
@@ -2581,6 +2581,9 @@ pub(crate) fn settle(engine: &Arc<Engine>, id: &str, error: &io::Error) -> io::R
     }
     let outcome = if record.cancel_actor.is_some() {
         Outcome::Canceled
+    } else if record.invocation.job && record.pause_actor.is_some() {
+        // A pausing job's root, however it stopped, is replayed on resume.
+        Outcome::Paused
     } else if let Some(refusal) = refused(error) {
         // The executor's own reason, typed: a group's first fault names its GPU.
         Outcome::Failed(

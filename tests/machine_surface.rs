@@ -980,7 +980,14 @@ mod v1_api {
             .status()
             .unwrap()
             .success());
-        let wheel = fs::read_dir(&tools)
+        let machine = Machine::start_args(|_, _| (), &installing_args(&tools)).await;
+        (machine, tools)
+    }
+
+    /// `serve`'s installer arguments: the test helper Python and the client wheel in `tools`.
+    fn installing_args(tools: &Path) -> Vec<std::ffi::OsString> {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let wheel = fs::read_dir(tools)
             .unwrap()
             .map(|e| e.unwrap().path())
             .find(|p| p.extension().is_some_and(|e| e == "whl"))
@@ -999,17 +1006,12 @@ mod v1_api {
             .output()
             .unwrap();
         let helper = String::from_utf8(helper.stdout).unwrap().trim().to_string();
-        let machine = Machine::start_args(
-            |_, _| (),
-            &[
-                "--installer-python".into(),
-                helper.into(),
-                "--client-wheel".into(),
-                wheel.into(),
-            ],
-        )
-        .await;
-        (machine, tools)
+        vec![
+            "--installer-python".into(),
+            helper.into(),
+            "--client-wheel".into(),
+            wheel.into(),
+        ]
     }
 
     /// A fixture package written with Write: its manifest's digest.
@@ -1456,6 +1458,286 @@ mod v1_api {
                 .contains("model choices name no declared model slot")),
             "{refused:?}"
         );
+        let _ = fs::remove_dir_all(tools);
+    }
+
+    /// The run's state as Run's first frame (a snapshot); None while it does not exist.
+    async fn snapshot(
+        client: &mut v1::machine_client::MachineClient<Channel>,
+        cap: &str,
+        id: &str,
+    ) -> Option<v1::RunState> {
+        let request = v1::RunRequest {
+            id: id.into(),
+            after: 0,
+            spec: None,
+        };
+        match client.run(authorized(request, cap)).await {
+            Ok(stream) => match stream.into_inner().message().await {
+                Ok(Some(v1::RunEvent {
+                    event: Some(v1::run_event::Event::State(state)),
+                    ..
+                })) => Some(state),
+                _ => None,
+            },
+            Err(_) => None,
+        }
+    }
+
+    /// Polls until the run shows `wanted`.
+    async fn until(
+        client: &mut v1::machine_client::MachineClient<Channel>,
+        cap: &str,
+        id: &str,
+        wanted: &str,
+    ) -> v1::RunState {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let seen = snapshot(client, cap, id).await;
+            if let Some(state) = seen.as_ref().filter(|s| s.state == wanted) {
+                return state.clone();
+            }
+            assert!(Instant::now() < deadline, "{id} never showed {wanted}: {seen:?}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Pause and resume (Control): a job pauses while its second segment runs. Its root stops,
+    /// the started segment runs to its end and the unstarted one waits; the job rests `paused`,
+    /// keeping its scratch and checkpoint declarations, across a machine restart too. Resume
+    /// replays only the root: its calls find the finished segments, so no segment runs twice,
+    /// and the film is whole.
+    #[tokio::test]
+    async fn a_paused_job_resumes_from_its_finished_children() {
+        let (mut machine, tools) = installing_machine().await;
+        let mut client = client(&machine).await;
+        let all = cap(Grant {
+            action: MACHINE.into(),
+            ..Default::default()
+        });
+        let manifest = write_package(
+            &mut client,
+            &all,
+            "cpu_longform",
+            "local/cozy-machine-cpu-longform",
+        )
+        .await;
+        let mut reference = vec![];
+        {
+            let mut encoder = png::Encoder::new(&mut reference, 2, 2);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&[9; 12])
+                .unwrap();
+        }
+        let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&reference));
+        let length = reference.len() as u64;
+        write(&mut client, &all, &digest, length, 0, &reference)
+            .await
+            .unwrap();
+        let segments = ["a dawn", "a storm", "a calm"];
+        let spec = v1::RunSpec {
+            kind: v1::RunKind::Job as i32,
+            source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
+            entrypoint: "long_form".into(),
+            payload: serde_json::to_vec(&serde_json::json!({
+                "reference": digest, "segments": segments, "hold": 4.0, "hold_at": 1}))
+            .unwrap(),
+            inputs: vec![v1::InputFile {
+                field: "reference".into(),
+                digest: digest.clone(),
+                length,
+                media_type: "image/png".into(),
+                order: 0,
+            }],
+            owner: "alice".into(),
+            ..Default::default()
+        };
+        let control = |action: v1::Action, id: &str| {
+            authorized(
+                v1::ControlRequest {
+                    id: id.into(),
+                    action: action as i32,
+                },
+                &all,
+            )
+        };
+        let code = |status: tonic::Status| {
+            status
+                .metadata()
+                .get("cozy-error-code")
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+        client
+            .run(authorized(
+                v1::RunRequest {
+                    id: "film".into(),
+                    after: 0,
+                    spec: Some(spec.clone()),
+                },
+                &all,
+            ))
+            .await
+            .unwrap();
+        until(&mut client, &all, "film/1", "running").await;
+        let paused = client
+            .control(control(v1::Action::Pause, "film"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(["running", "paused"].contains(&paused.state.as_str()), "{paused:?}");
+        let rest = until(&mut client, &all, "film", "paused").await;
+        assert_eq!(rest.attempt, 1);
+        // A call does not pause, and a job still pausing does not resume.
+        let call = client.control(control(v1::Action::Pause, "film/1")).await;
+        assert_eq!(call.err().and_then(code).as_deref(), Some("pause_unsupported"));
+
+        // The started segment runs to its end; the unstarted one never starts while paused.
+        let second = until(&mut client, &all, "film/1", "succeeded").await;
+        assert_eq!(second.attempt, 1);
+        assert!(snapshot(&mut client, &all, "film/2").await.is_none());
+        assert_eq!(snapshot(&mut client, &all, "film").await.unwrap().state, "paused");
+        let scratch = machine
+            .root
+            .join("state/cpu/scratch")
+            .join(rest.number.to_string());
+        assert_eq!(
+            fs::read_to_string(scratch.join("checkpoints/long_form/attempts")).unwrap(),
+            "1"
+        );
+
+        // A paused job survives a machine restart, scratch and all.
+        machine.stop();
+        let extra = installing_args(&tools);
+        let (child, _, _, address) = launch(&machine.root, &extra).await;
+        machine.child = child;
+        machine.address = address;
+        let mut client = self::client(&machine).await;
+        assert_eq!(snapshot(&mut client, &all, "film").await.unwrap().state, "paused");
+        assert!(scratch.join("checkpoints/long_form/film-0").exists());
+
+        let resumed = client
+            .control(control(v1::Action::Resume, "film"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(["queued", "running"].contains(&resumed.state.as_str()), "{resumed:?}");
+        let events = collect(
+            client
+                .run(authorized(
+                    v1::RunRequest {
+                        id: "film".into(),
+                        after: 0,
+                        spec: None,
+                    },
+                    &all,
+                ))
+                .await
+                .unwrap()
+                .into_inner(),
+        )
+        .await
+        .unwrap();
+        let done = outcome(&events);
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        // Two attempts counted in the run's scratch; the first attempt had declared the first
+        // segment's checkpoint (it stopped while the second ran), so that declaration replayed.
+        assert_eq!(
+            (result["segments"].as_u64(), result["attempts"].as_u64(), result["replayed"].as_u64()),
+            (Some(3), Some(2), Some(1)),
+            "{result}"
+        );
+        let states: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.event {
+                Some(v1::run_event::Event::State(s)) => Some((s.state.clone(), s.attempt)),
+                _ => None,
+            })
+            .collect();
+        assert!(states.contains(&("running".into(), 2)), "{states:?}");
+
+        // Each segment ran exactly once, and the film is every segment in order.
+        for index in 0..3 {
+            let child = snapshot(&mut client, &all, &format!("film/{index}"))
+                .await
+                .unwrap();
+            assert_eq!((child.state.as_str(), child.attempt), ("succeeded", 1), "{child:?}");
+        }
+        let seen = tensorfs_core::sha256::hex_digest(&reference);
+        let (mut film, mut context) = (String::new(), String::new());
+        for (index, prompt) in segments.iter().enumerate() {
+            let body = format!("{index}|{prompt}|{seen}|{context}\n");
+            context = tensorfs_core::sha256::hex_digest(body.as_bytes());
+            film.push_str(&body);
+        }
+        let (_, bytes) = read(
+            &mut client,
+            &all,
+            v1::ReadRequest {
+                target: Some(v1::read_request::Target::Output(v1::OutputTarget {
+                    run: "film".into(),
+                    output: "video".into(),
+                    index: 0,
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), film);
+        // The replayed root's identical publishes add nothing to the output log.
+        let labels: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.event {
+                Some(v1::run_event::Event::Product(p)) if p.output == "video" => {
+                    Some(p.label.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            ["Video (segments 1-1)", "Video (segments 1-2)", "Video (segments 1-3)"]
+        );
+        let again = client.control(control(v1::Action::Resume, "film")).await;
+        assert_eq!(again.err().and_then(code).as_deref(), Some("run_not_paused"));
+
+        // A paused job's cancel ends it and every unfinished child, started ones too.
+        let mut dropped = spec.clone();
+        dropped.payload = serde_json::to_vec(&serde_json::json!({
+            "reference": digest, "segments": segments, "hold": 60.0, "hold_at": 0}))
+        .unwrap();
+        client
+            .run(authorized(
+                v1::RunRequest {
+                    id: "dropped".into(),
+                    after: 0,
+                    spec: Some(dropped),
+                },
+                &all,
+            ))
+            .await
+            .unwrap();
+        until(&mut client, &all, "dropped/0", "running").await;
+        client.control(control(v1::Action::Pause, "dropped")).await.unwrap();
+        until(&mut client, &all, "dropped", "paused").await;
+        assert_eq!(snapshot(&mut client, &all, "dropped/0").await.unwrap().state, "running");
+        let canceled = client
+            .control(control(v1::Action::Cancel, "dropped"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(canceled.state, "canceled");
+        until(&mut client, &all, "dropped/0", "canceled").await;
+
+        // The ended run's scratch goes with the next sweep (one runs at start).
+        machine.stop();
+        let (child, _, _, _) = launch(&machine.root, &extra).await;
+        machine.child = child;
+        assert!(!scratch.exists());
         let _ = fs::remove_dir_all(tools);
     }
 
