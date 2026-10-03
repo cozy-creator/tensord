@@ -23,6 +23,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1"
 webpki-roots = "1"
+zip = { version = "7", default-features = false, features = ["deflate-flate2"] }
 tonic = { version = "0.14.6", features = ["tls-ring"] }
 tonic-prost = "0.14.6"
 prost = "0.14"

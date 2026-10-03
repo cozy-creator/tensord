@@ -171,6 +171,7 @@ impl MachineIdentity {
                 .as_millis() as u64,
             lifecycle: None,
             hubs: vec![],
+            updates: None,
         })
     }
 }
@@ -203,6 +204,7 @@ impl MachineIdentity {
                 .as_millis() as u64,
             lifecycle: None,
             hubs: vec![],
+            updates: None,
         })
     }
 }

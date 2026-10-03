@@ -145,6 +145,11 @@ impl Lifecycle {
         Ok((now, deadline))
     }
 
+    /// Calls that may start work, in flight now.
+    pub fn admitted(&self) -> usize {
+        self.admissions.load(Ordering::Acquire)
+    }
+
     pub fn deadline_ms(&self) -> i64 {
         let state = self.state.lock().unwrap();
         state.0.deadline_ms.max(state.1)

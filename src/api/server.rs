@@ -32,6 +32,8 @@ pub struct MachineIdentity {
     pub lifecycle: Option<Arc<crate::machine::lifecycle::Lifecycle>>,
     /// The Hubs this machine is registered with: (origin, worker id there).
     pub hubs: Vec<(String, String)>,
+    /// `runtime-update/1`; None on development front doors.
+    pub updates: Option<Arc<crate::machine::update::Updates>>,
 }
 
 impl MachineIdentity {
@@ -65,6 +67,7 @@ impl MachineIdentity {
             started_at_ms: now_ms(),
             lifecycle: None,
             hubs: vec![],
+            updates: None,
         })
     }
 }
@@ -90,6 +93,7 @@ pub async fn serve<B: MachineBackend>(
     };
     let (post_access, delete_access) = (service.clone(), service.clone());
     let (output, listed) = (service.clone(), service.clone());
+    let (state_api, stage_api, update_api) = (service.clone(), service.clone(), service.clone());
     let mut routes = tonic::service::Routes::new(
         pb::pod_host_server::PodHostServer::new(service.clone())
             .max_decoding_message_size(16 << 20)
@@ -144,6 +148,34 @@ pub async fn serve<B: MachineBackend>(
             ),
         )
         .route(
+            "/v1/machine/runtime",
+            get(move |headers: HeaderMap| {
+                let api = state_api.clone();
+                async move { api.maintenance(headers, Maintenance::State).await }
+            }),
+        )
+        .route(
+            "/v1/machine/runtime/wheels/{file}",
+            axum::routing::put(
+                move |axum::extract::Path(file): axum::extract::Path<String>,
+                      headers: HeaderMap,
+                      body: axum::body::Body| {
+                    let api = stage_api.clone();
+                    async move {
+                        api.maintenance(headers, Maintenance::Stage(file, body))
+                            .await
+                    }
+                },
+            ),
+        )
+        .route(
+            "/v1/machine/runtime/update",
+            axum::routing::post(move |headers: HeaderMap, body: Bytes| {
+                let api = update_api.clone();
+                async move { api.maintenance(headers, Maintenance::Update(body)).await }
+            }),
+        )
+        .route(
             "/v1/bootstrap/receipt",
             get(move || {
                 let envelope = readiness.envelope();
@@ -167,6 +199,12 @@ pub async fn serve<B: MachineBackend>(
         .serve_with_incoming(TcpListenerStream::new(listener))
         .await?;
     Ok(())
+}
+
+enum Maintenance {
+    State,
+    Stage(String, axum::body::Body),
+    Update(Bytes),
 }
 
 struct MeasuredIdentity {
@@ -445,6 +483,93 @@ impl<B: MachineBackend> Api<B> {
             ))
             .unwrap_or_default()
     }
+    /// The owner's maintenance routes (`runtime-update` capability), as `cozy rental update`
+    /// drives them.
+    async fn maintenance(&self, headers: HeaderMap, call: Maintenance) -> HttpResponse {
+        let text = |status: u16, message: String| {
+            (
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+                message,
+            )
+                .into_response()
+        };
+        let token = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Cozy-Cap "))
+            .unwrap_or_default();
+        let authority = &self.identity.authority;
+        let keys = authority.keys.admitted();
+        let now = now_ms() as i64 / 1000;
+        if crate::hub::verify_capability(token, &authority.worker_id, &keys, now, "runtime-update")
+            .is_none()
+        {
+            return text(403, "a runtime-update capability is required".into());
+        }
+        let Some(updates) = self.identity.updates.clone() else {
+            return text(404, "this machine does not update its own Runtime".into());
+        };
+        let starting = || {
+            let body = serde_json::json!({"code":"runtime_starting","message":"this machine has not proved readiness; observe GET /v1/machine/runtime"});
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [("content-type", "application/json")],
+                body.to_string(),
+            )
+                .into_response()
+        };
+        let json = |status: StatusCode, value: serde_json::Value| {
+            (
+                status,
+                [("content-type", "application/json")],
+                value.to_string(),
+            )
+                .into_response()
+        };
+        match call {
+            Maintenance::State => json(StatusCode::OK, updates.state(crate::machine::CAPABILITIES)),
+            Maintenance::Stage(_, _) | Maintenance::Update(_)
+                if !self.identity.readiness.proved() =>
+            {
+                starting()
+            }
+            Maintenance::Stage(file, body) => {
+                let body = match axum::body::to_bytes(body, 256 << 20).await {
+                    Ok(body) => body,
+                    Err(error) => return text(400, format!("the wheel upload broke: {error}")),
+                };
+                let staged = tokio::task::spawn_blocking(move || {
+                    let length = body.len() as u64;
+                    updates
+                        .stage(&file, &mut body.as_ref())
+                        .map(|(sha, _)| (file, sha, length))
+                })
+                .await;
+                match staged {
+                    Ok(Ok((file, sha256, length))) => json(
+                        StatusCode::OK,
+                        serde_json::json!({"file": file, "sha256": sha256, "length": length}),
+                    ),
+                    Ok(Err((status, message))) => text(status, message),
+                    Err(_) => text(500, "staging stopped".into()),
+                }
+            }
+            Maintenance::Update(body) => {
+                let request: crate::machine::update::Request = match serde_json::from_slice(&body) {
+                    Ok(request) => request,
+                    Err(error) => return text(400, format!("an update requires operation, valid agent selection, and a Runtime or TensorFS: {error}")),
+                };
+                match updates.request(request, |code| std::process::exit(code)) {
+                    Ok(status) => json(
+                        StatusCode::ACCEPTED,
+                        serde_json::to_value(status).unwrap_or_default(),
+                    ),
+                    Err((status, message)) => text(status, message),
+                }
+            }
+        }
+    }
+
     async fn hub_access(&self, headers: HeaderMap, body: Bytes, forget: bool) -> HttpResponse {
         let refuse = |status: u16, code: &str, message: &str| {
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST);

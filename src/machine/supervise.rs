@@ -2,6 +2,9 @@
 //! PID 1 must), forwards stop signals and starts the service again after an abnormal exit, as
 //! the Go guardian restarts its request plane. A clean exit (a stop or an accepted release)
 //! ends it, and so does a second consecutive exit before readiness: measured progress, no timer.
+//! The parent is never replaced: an activated Runtime update runs as the service child
+//! (`cozy-machine service`, readiness pipe on fd 3), and a candidate that never proves
+//! readiness is rolled back by this same parent.
 use nix::{
     errno::Errno,
     fcntl::OFlag,
@@ -14,11 +17,15 @@ use nix::{
 use std::{
     fs::File,
     io::{self, Read, Write},
+    os::fd::{AsRawFd, FromRawFd},
 };
 
-/// Forks the service. Returns only in the service child, with the pipe it reports readiness
-/// on; the parent exits with the service's final status.
-pub fn supervise() -> io::Result<Ready> {
+/// The fd an exec'd service reports readiness on.
+const READY_FD: i32 = 3;
+
+/// Forks the service. Returns only in a service child that runs this executable, with the pipe
+/// it reports readiness on; the parent exits with the service's final status.
+pub fn supervise(paths: &super::update::Paths) -> io::Result<Ready> {
     let mut signals = SigSet::empty();
     for signal in [Signal::SIGTERM, Signal::SIGINT, Signal::SIGCHLD] {
         signals.add(signal);
@@ -29,6 +36,7 @@ pub fn supervise() -> io::Result<Ready> {
     let parent = nix::unistd::getpid();
     let mut failures_before_ready = 0;
     loop {
+        let activated = super::update::activated_binary(paths);
         let (read, write) = pipe2(OFlag::O_CLOEXEC).map_err(io::Error::from)?;
         // SAFETY: no thread exists yet in this process; the child continues single-threaded.
         let child = match unsafe { fork() }.map_err(io::Error::from)? {
@@ -40,7 +48,10 @@ pub fn supervise() -> io::Result<Ready> {
                     std::process::exit(1);
                 }
                 SigSet::empty().thread_set_mask().map_err(io::Error::from)?;
-                return Ok(Ready(Some(File::from(write))));
+                let Some(binary) = activated else {
+                    return Ok(Ready(Some(File::from(write))));
+                };
+                exec_service(&binary, write);
             }
             ForkResult::Parent { child } => child,
         };
@@ -56,13 +67,50 @@ pub fn supervise() -> io::Result<Ready> {
         if stopping || code == 0 {
             std::process::exit(code);
         }
+        if code == super::update::REPLACE_EXIT {
+            eprintln!("cozy-machine: starting the service on its updated software");
+            failures_before_ready = 0;
+            continue;
+        }
         failures_before_ready = if ready { 0 } else { failures_before_ready + 1 };
         if failures_before_ready >= 2 {
-            eprintln!("cozy-machine: the service exited twice before readiness ({code}); stopping");
+            let cause = format!("the service exited twice before readiness ({code})");
+            if super::update::rollback_pending(paths, &cause)? {
+                eprintln!("cozy-machine: {cause}; Runtime update rolled back");
+                failures_before_ready = 0;
+                continue;
+            }
+            eprintln!("cozy-machine: {cause}; stopping");
             std::process::exit(code);
         }
         eprintln!("cozy-machine: the service exited ({code}); starting it again");
     }
+}
+
+/// Runs an activated machine binary as this service child; never returns.
+fn exec_service(binary: &std::path::Path, ready: std::os::fd::OwnedFd) -> ! {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: plain fd calls in a single-threaded child; dup2 clears close-on-exec on the copy.
+    let placed = unsafe {
+        if ready.as_raw_fd() == READY_FD {
+            libc::fcntl(READY_FD, libc::F_SETFD, 0)
+        } else {
+            libc::dup2(ready.as_raw_fd(), READY_FD)
+        }
+    };
+    if placed < 0 {
+        std::process::exit(1);
+    }
+    std::mem::forget(ready);
+    let error = std::process::Command::new(binary).arg("service").exec();
+    eprintln!("cozy-machine: cannot run {}: {error}", binary.display());
+    std::process::exit(1)
+}
+
+/// The readiness pipe an exec'd service inherited from its parent.
+pub fn inherited() -> Ready {
+    // SAFETY: the parent placed the pipe's write end at READY_FD before exec.
+    Ready(Some(unsafe { File::from_raw_fd(READY_FD) }))
 }
 
 /// Waits for the service to end, reaping every orphan meanwhile and forwarding stop signals.

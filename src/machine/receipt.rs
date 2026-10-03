@@ -152,6 +152,10 @@ impl Readiness {
         Ok(true)
     }
 
+    pub fn proved(&self) -> bool {
+        self.state.lock().unwrap().proved
+    }
+
     /// Blocks until this process has proved readiness (sealed, or matched the retained seal).
     pub fn wait_proved(&self) {
         let state = self.state.lock().unwrap();

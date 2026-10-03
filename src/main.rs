@@ -28,20 +28,29 @@ fn run() -> io::Result<()> {
     match args.next().as_deref() {
         // The image entrypoint and the CLI's machine launcher: no arguments, a grant in the
         // environment (read before any thread starts; the one-shot key leaves the environment).
+        // An activated Runtime update's service, started by the machine's stable parent.
+        Some("service") if args.len() == 0 => match cozy_machine::machine::grant::from_process()? {
+            Some(grant) => run_machine(grant, cozy_machine::machine::supervise::inherited()),
+            None => Err(io::Error::other("this process has no machine grant")),
+        },
         None | Some("run") if args.len() == 0 => match cozy_machine::machine::grant::from_process()? {
             Some(grant) => {
                 if let Some(key) = grant.developer_key.as_deref().filter(|_| nix::unistd::geteuid().is_root()) {
                     cozy_machine::machine::ssh::start(key)?;
                 }
-                let ready = cozy_machine::machine::supervise::supervise()?;
+                let paths = cozy_machine::machine::update::Paths::new(&grant.layout.engine(), &grant.layout.root);
+                let ready = cozy_machine::machine::supervise::supervise(&paths)?;
                 run_machine(grant, ready)
             }
             None => Err(io::Error::other("this process has no machine grant (COZY_WORKER_ID and the rest of a pod's environment)")),
         },
         Some("version") => {
             #[derive(serde::Serialize)]
-            struct Version { name: &'static str, version: &'static str, tensorfs: &'static str, capabilities: &'static [&'static str] }
-            let record = Version { name: "cozy-machine", version: env!("CARGO_PKG_VERSION"), tensorfs: tensorfs_core::VERSION, capabilities: CAPS };
+            struct Version { name: &'static str, implementation: &'static str, version: &'static str, tensorfs: &'static str, wire_minor: u32, minimum_wire_minor: u32, capabilities: Vec<&'static str> }
+            // Machine contracts beside the private socket's: clients choose by capability.
+            let capabilities = cozy_machine::machine::CAPABILITIES.iter().chain(CAPS).copied().collect();
+            let record = Version { name: "cozy-machine", implementation: "rust", version: env!("CARGO_PKG_VERSION"), tensorfs: tensorfs_core::VERSION,
+                wire_minor: cozy_machine::api::WIRE_MINOR, minimum_wire_minor: cozy_machine::api::WIRE_MINIMUM, capabilities };
             println!("{}", serde_json::to_string(&record)?); Ok(())
         }
         Some("host-memory") => {
@@ -135,17 +144,32 @@ fn run_machine(
         fresh,
     )?;
     identity.lifecycle = Some(lifecycle.clone());
+    let engine = layout.engine();
+    let generations = engine.join("generations");
+    let owner = Owner::new(&engine, 16 * 1024 * 1024, Duration::from_secs(300))?;
+    let service = cozy_machine::service::Service::open(&engine, &generations, 1)?;
+    let paths = cozy_machine::machine::update::Paths::new(&engine, &layout.root);
+    let updates = {
+        let (service, lifecycle) = (service.clone(), lifecycle.clone());
+        let idle = move || service.idle().unwrap_or(false) && lifecycle.admitted() == 0;
+        cozy_machine::machine::update::Updates::open(
+            paths.clone(),
+            identity.readiness.clone(),
+            Box::new(idle),
+        )?
+    };
+    identity.updates = Some(updates.clone());
     let readiness = identity.readiness.clone();
     std::thread::Builder::new()
         .name("readiness-report".into())
         .spawn(move || {
             readiness.wait_proved();
+            // A Runtime update this process started on is now committed.
+            if let Err(error) = updates.commit() {
+                eprintln!("cozy-machine: Runtime update commit: {error}");
+            }
             ready.report();
         })?;
-    let engine = layout.engine();
-    let generations = engine.join("generations");
-    let owner = Owner::new(&engine, 16 * 1024 * 1024, Duration::from_secs(300))?;
-    let service = cozy_machine::service::Service::open(&engine, &generations, 1)?;
     // A machine with GPUs serves published GPU packages on all of them (the envelope, sorted
     // by index; a degree-K plan uses the first K), with the executor environment the pod
     // proofs used.
@@ -215,7 +239,7 @@ fn run_machine(
         installer.0,
         installer.1,
         "3.12".into(),
-        image_sdk(&layout.root.join("opt/cozy/wheels")),
+        image_sdk(&paths.sdk()),
         // A run naming no Hub reads this rental's own Hub as the pod (Go agent parity).
         grant.hub.clone().filter(|_| rental).map(|hub| {
             cozy_machine::hub::Source::pod(&hub.origin, &hub.worker_id, &hub.worker_token, hub.ca_der, hub.object_hosts)
