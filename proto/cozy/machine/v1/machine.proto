@@ -140,6 +140,7 @@ message Progress {
   uint64 total = 4;
   uint64 bytes_done = 5;
   uint64 bytes_total = 6;
+  double step_ms = 7;   // the latest step's time, while a stage steps
 }
 // One revision of an output: a single output is replaced by each, a list output grows.
 message Product {
@@ -162,6 +163,11 @@ message Outcome {
   bytes result = 3;   // the result's canonical JSON, assets as digests
   repeated Product outputs = 4;
   bool triage = 5;    // Read{triage} answers its bundle
+  // What its executor measured, as canonical JSON: `attribution` (stage and step tracks),
+  // `execution` (degree, ranks with the GPU and attention each served, executor boot,
+  // construction load and warm) and `observations` (attention rows, Sol's dense and sparse
+  // calls among them). Empty for a run that ran on no device.
+  bytes measurements = 6;
 }
 message Reason {
   string code = 1;

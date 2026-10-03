@@ -350,6 +350,7 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS preparations(actor TEXT NOT NULL,id TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,id));
             CREATE TABLE IF NOT EXISTS public_terminals(execution INTEGER PRIMARY KEY REFERENCES executions(id),outcome BLOB NOT NULL,events BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS run_products(execution INTEGER NOT NULL REFERENCES executions(id),sequence INTEGER NOT NULL,at_ms INTEGER NOT NULL,product BLOB NOT NULL,PRIMARY KEY(execution,sequence));
+            CREATE TABLE IF NOT EXISTS run_measurements(execution INTEGER PRIMARY KEY REFERENCES executions(id),measurements BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS native_outputs(actor TEXT NOT NULL,owner TEXT NOT NULL,source BLOB NOT NULL,PRIMARY KEY(actor,owner));
             CREATE TABLE IF NOT EXISTS input_intakes(actor TEXT NOT NULL,retention TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,retention));
             CREATE TABLE IF NOT EXISTS hub_access(actor TEXT NOT NULL,origin TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,origin));
@@ -1564,6 +1565,28 @@ impl Journal {
             },
         )?;
         Ok(record.revision)
+    }
+
+    /// What the execution's executor measured of its latest attempt (`run show`).
+    pub fn record_measurements(&mut self, id: &str, measurements: &[u8]) -> io::Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO run_measurements(execution,measurements) VALUES(?1,?2)
+                 ON CONFLICT(execution) DO UPDATE SET measurements=excluded.measurements",
+                params![id, measurements],
+            )
+            .map(drop)
+            .map_err(db_error)
+    }
+    pub fn measurements(&self, id: &str) -> io::Result<Option<Vec<u8>>> {
+        self.connection
+            .query_row(
+                "SELECT measurements FROM run_measurements WHERE execution=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)
     }
 
     /// The execution's output log, oldest first.

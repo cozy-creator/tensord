@@ -101,6 +101,14 @@ pub trait MachineBackend: Send + Sync + 'static {
     ) -> Result<pb::MachineExecutionEventPage, Status> {
         unsupported()
     }
+    /// What a run's executor measured (canonical JSON), when it ran on a device.
+    fn measurements(
+        &self,
+        _: VerifiedActor,
+        _: pb::MachineExecutionQuery,
+    ) -> Result<Option<Vec<u8>>, Status> {
+        Ok(None)
+    }
     fn events_observed(
         &self,
         actor: VerifiedActor,

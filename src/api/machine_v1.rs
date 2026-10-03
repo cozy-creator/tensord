@@ -346,6 +346,7 @@ impl Log {
             "progress" => {
                 let payload = &body["payload"];
                 v1::run_event::Event::Progress(v1::Progress {
+                    step_ms: payload["step_ms"].as_f64().unwrap_or(0.0),
                     stage: payload["stage"].as_str().unwrap_or_default().into(),
                     fraction: payload["overall_fraction"].as_f64().unwrap_or(-1.0),
                     completed: payload["position"].as_u64().unwrap_or(0),
@@ -729,8 +730,17 @@ async fn stream_run<B: MachineBackend>(
         let mut ended = false;
         for event in page.events {
             after = after.max(event.sequence);
-            if let Some(converted) = log.event(event) {
-                ended |= matches!(converted.event, Some(v1::run_event::Event::Outcome(_)));
+            if let Some(mut converted) = log.event(event) {
+                if let Some(v1::run_event::Event::Outcome(outcome)) = &mut converted.event {
+                    ended = true;
+                    let (kept_backend, kept_id) = (backend.clone(), id.clone());
+                    outcome.measurements = tokio::task::spawn_blocking(move || {
+                        kept_backend.measurements(actor, query(&*kept_backend, actor, &kept_id)?)
+                    })
+                    .await
+                    .map_err(|_| Status::internal("machine operation stopped"))??
+                    .unwrap_or_default();
+                }
                 if sender.send(Ok(converted)).await.is_err() {
                     return Ok(());
                 }

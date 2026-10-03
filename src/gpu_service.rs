@@ -2058,6 +2058,7 @@ impl GpuPool {
             session.executor.birth.pid,
         );
         self.record_invoke(&plan.id, first, invoked.elapsed(), &reply);
+        record_measurements(engine, id, &reply);
         let mut facts = plane_facts(reply.plane.as_ref());
         facts.activation = facts.activation.or_else(|| {
             reply
@@ -3094,5 +3095,30 @@ mod tests {
         // A slot without a declaration runs on one GPU only, so the group is one.
         let mixed = [h3[0].clone(), json!({"path":"e.models.vae"})];
         assert_eq!(group_degree(&mixed, 0, 4).unwrap(), 1);
+    }
+}
+
+/// What the call's executor measured, kept as the run's (`run show`): its stage and step
+/// tracks, its ranks' execution records, and its attention observations (the kernels that
+/// served, Sol's dense and sparse calls).
+fn record_measurements(engine: &Engine, id: &str, reply: &Frame) {
+    let attention: Vec<&serde_json::Value> = reply
+        .observations
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|row| {
+            row["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("attention."))
+        })
+        .collect();
+    let measurements = serde_json::json!({"attribution": reply.attribution,
+        "execution": reply.execution, "observations": attention});
+    let recorded = serde_json::to_vec(&measurements)
+        .map_err(io::Error::other)
+        .and_then(|bytes| engine.with_journal(|journal| journal.record_measurements(id, &bytes)));
+    if let Err(error) = recorded {
+        eprintln!("run {id}: measurements not kept: {error}");
     }
 }

@@ -1186,6 +1186,17 @@ impl MachineBackend for NativeBackend {
     ) -> Result<pb::MachineExecutionState, Status> {
         self.state(&self.query(actor, query)?)
     }
+    fn measurements(
+        &self,
+        actor: VerifiedActor,
+        query: pb::MachineExecutionQuery,
+    ) -> Result<Option<Vec<u8>>, Status> {
+        let record = self.query(actor, query)?;
+        Ok(self
+            .service
+            .engine
+            .with_journal(|journal| journal.measurements(&record.id))?)
+    }
     fn events(
         &self,
         actor: VerifiedActor,
