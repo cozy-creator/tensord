@@ -1395,6 +1395,66 @@ mod v1_api {
         .await
         .unwrap();
         assert_eq!(outcome(&child).status, "canceled", "{child:?}");
+
+        // A job's model choices address its callables (`<entrypoint>.models.<parameter>`), and
+        // each child prepares with the ones addressed to it.
+        let chose = |id: &str, parameter: &str| {
+            let mut chosen = spec.clone();
+            chosen.models = vec![v1::ModelChoice {
+                parameter: parameter.into(),
+                repository: "alice/model".into(),
+                ..Default::default()
+            }];
+            v1::RunRequest {
+                id: id.into(),
+                after: 0,
+                spec: Some(chosen),
+            }
+        };
+        let stray = collect(
+            client
+                .run(authorized(chose("stray", "nope.models.base"), &all))
+                .await
+                .unwrap()
+                .into_inner(),
+        )
+        .await
+        .unwrap();
+        let stray = outcome(&stray);
+        assert_eq!(
+            stray.reason.as_ref().map(|r| r.code.as_str()),
+            Some("invalid_request"),
+            "{stray:?}"
+        );
+        collect(
+            client
+                .run(authorized(
+                    chose("chosen", "render_segment.models.base"),
+                    &all,
+                ))
+                .await
+                .unwrap()
+                .into_inner(),
+        )
+        .await
+        .unwrap();
+        let child = collect(
+            client
+                .run(authorized(watch("chosen/0"), &all))
+                .await
+                .unwrap()
+                .into_inner(),
+        )
+        .await
+        .unwrap();
+        // render_segment declares no model slot, so the choice it was handed is refused there.
+        let refused = outcome(&child);
+        assert!(
+            refused.reason.as_ref().is_some_and(|r| r
+                .message
+                .contains("model choices name no declared model slot")),
+            "{refused:?}"
+        );
         let _ = fs::remove_dir_all(tools);
     }
 

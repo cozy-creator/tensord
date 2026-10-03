@@ -1,7 +1,8 @@
 //! Run sources and preparation inside a run (`cozy.machine.v1` Run). A run is accepted at
 //! once and prepares inside itself: its code installs, its models resolve at the run's Hub and
-//! download, and each stage is the run's progress. The Hub token lives only in memory for that
-//! preparation; a restart before it completes ends the run FAILED (`journal::PREPARING`).
+//! download, and each stage is the run's progress. The Hub token lives only in memory, for that
+//! preparation (and a job's life, which its children prepare with); a restart before it
+//! completes ends the run FAILED (`journal::PREPARING`).
 use crate::{
     api::pb,
     hub,
@@ -12,7 +13,11 @@ use crate::{
     service::{Call, Service},
 };
 use serde_json::{json, Value};
-use std::{io, sync::Arc};
+use std::{
+    collections::HashMap,
+    io,
+    sync::{Arc, Mutex},
+};
 
 pub enum Source {
     Release { package: String, release: String },
@@ -27,6 +32,8 @@ pub struct Spec {
     pub warm: bool,
     /// `kind: job`: `entrypoint` names an `@app.job`, run in a deviceless executor.
     pub job: bool,
+    /// A child run's parent execution (a job's call through its seam).
+    pub parent: String,
     pub source: Source,
     pub entrypoint: String,
     pub input: Value,
@@ -50,6 +57,22 @@ pub struct Runs {
     pub local: Option<Arc<LocalSources>>,
     /// On a rental: its own Hub, read with the pod's worker capability.
     pub own_hub: Option<hub::Source>,
+    /// Running jobs' preparation, in memory only (the token is never journaled): their
+    /// children prepare with it.
+    pub jobs: Mutex<HashMap<String, JobContext>>,
+}
+
+/// What a job's children prepare with: its installation, Hub access, owner, binding revision,
+/// attention pin and the model choices addressed to its callables (`<entrypoint>.models.<p>`).
+#[derive(Clone)]
+pub struct JobContext {
+    installation: String,
+    hub: Option<hub::Source>,
+    providers: Providers,
+    owner: String,
+    binding_revision: String,
+    attention_kernel: String,
+    models: Vec<pb::ModelChoice>,
 }
 
 fn refused(code: &'static str, message: impl Into<String>) -> Refused {
@@ -93,7 +116,7 @@ impl Runs {
             attention_kernel: spec.attention_kernel.clone(),
             inputs: spec.inputs.clone(),
             job: spec.job,
-            ..Default::default()
+            parent: spec.parent.clone(),
         };
         let (record, new) = self
             .service
@@ -182,43 +205,22 @@ impl Runs {
                 Some(local.install(&self.service, actor, digest)?)
             }
         };
-        let hub = spec.hub.clone().or_else(|| self.own_hub.clone());
-        let needs_hub = held
-            .as_ref()
-            .is_none_or(|installed| declares_models(installed, &spec.entrypoint));
-        let (installation, plan) = match (hub, &self.publisher) {
-            (Some(source), Some(publisher)) if needs_hub => {
-                let (package, release) = match &spec.source {
-                    Source::Release { package, release } => (package.clone(), release.clone()),
-                    _ => Default::default(),
-                };
-                let request = Request {
-                    source,
-                    package,
-                    release,
-                    installed: held,
-                    owner: spec.owner.clone(),
-                    binding_revision: spec.binding_revision.clone(),
-                    providers: spec.providers.clone(),
-                    entrypoint: spec.entrypoint.clone(),
-                    choices: spec.models.clone(),
-                };
-                let prepared = publisher
-                    .prepare_now(&self.service, actor, &request, Box::new(observe))
-                    .map_err(|(code, message)| refused(code, message))?;
-                (prepared.installation.clone(), prepared.plan.clone())
-            }
-            _ => {
-                let installed = held.ok_or_else(|| {
-                    refused(
-                        "hub_access_absent",
-                        "a release runs with the run's Hub access, and this run carries none",
-                    )
-                })?;
-                let plan = self.configured(actor, &installed, &spec)?;
-                (installed, plan)
-            }
+        let release = match &spec.source {
+            Source::Release { package, release } => Some((package.clone(), release.clone())),
+            _ => None,
         };
+        // A job's choices address its callables; its children resolve them.
+        let choices = if spec.job { &[][..] } else { &spec.models[..] };
+        let hub = spec.hub.clone().or_else(|| self.own_hub.clone());
+        let (installation, plan) = self.resolve(
+            actor,
+            held,
+            release,
+            hub.clone(),
+            &spec,
+            choices,
+            Box::new(observe),
+        )?;
         let interface: Value = serde_json::from_slice(&installation.interface)
             .map_err(|_| refused("package_interface_invalid", "held interface is corrupt"))?;
         let (rows, noun) = match spec.job {
@@ -234,7 +236,27 @@ impl Runs {
                 format!("{} declares no {noun} {:?}", installation.package, spec.entrypoint),
             ));
         }
-        if !spec.inputs.is_empty() && plan.is_none() && !spec.job {
+        if spec.job {
+            for choice in &spec.models {
+                let callable = choice.parameter.split_once(".models.").map(|(name, _)| name);
+                let declared = interface["entrypoints"].as_array().is_some_and(|rows| {
+                    rows.iter()
+                        .any(|row| Some(row["name"].as_str().unwrap_or_default()) == callable)
+                });
+                if !declared {
+                    return Err(refused(
+                        "invalid_request",
+                        format!(
+                            "model choice {:?} names no callable of this job's package \
+                             (<entrypoint>.models.<parameter>)",
+                            choice.parameter
+                        ),
+                    ));
+                }
+            }
+        }
+        // Device executors take file inputs; a job and its children run in them.
+        if !spec.inputs.is_empty() && plan.is_none() && !spec.job && spec.parent.is_empty() {
             return Err(refused(
                 "invalid_request",
                 "file inputs reach device executors only; this CPU callable takes none",
@@ -247,6 +269,20 @@ impl Runs {
                 asset_bindings: vec![],
             }));
         }
+        if spec.job {
+            self.jobs.lock().unwrap().insert(
+                id.into(),
+                JobContext {
+                    installation: installation.alias.clone(),
+                    hub,
+                    providers: spec.providers.clone(),
+                    owner: spec.owner.clone(),
+                    binding_revision: spec.binding_revision.clone(),
+                    attention_kernel: spec.attention_kernel.clone(),
+                    models: spec.models.clone(),
+                },
+            );
+        }
         self.service.bind_prepared(
             id,
             &installation.generation,
@@ -256,11 +292,150 @@ impl Runs {
                 attention_kernel: spec.attention_kernel,
                 inputs: spec.inputs,
                 job: spec.job,
-                parent: String::new(),
+                parent: spec.parent,
             },
             plan.as_ref().map(|plan| plan.id.as_str()).unwrap_or_default(),
         )?;
         Ok(None)
+    }
+
+    /// The run's installation and model plan: through the Hub when it needs one (a release,
+    /// or held code declaring models), else held code with the operator's configured grants.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve(
+        &self,
+        actor: &str,
+        held: Option<Installation>,
+        release: Option<(String, String)>,
+        hub: Option<hub::Source>,
+        spec: &Spec,
+        choices: &[pb::ModelChoice],
+        observe: crate::published::Observer,
+    ) -> Result<(Installation, Option<crate::gpu_service::GpuPlan>), Refused> {
+        let needs_hub = held
+            .as_ref()
+            .is_none_or(|installed| declares_models(installed, &spec.entrypoint));
+        match (hub, &self.publisher) {
+            (Some(source), Some(publisher)) if needs_hub => {
+                let (package, release) = release.unwrap_or_default();
+                let request = Request {
+                    source,
+                    package,
+                    release,
+                    installed: held,
+                    owner: spec.owner.clone(),
+                    binding_revision: spec.binding_revision.clone(),
+                    providers: spec.providers.clone(),
+                    entrypoint: spec.entrypoint.clone(),
+                    choices: choices.to_vec(),
+                };
+                let prepared = publisher
+                    .prepare_now(&self.service, actor, &request, observe)
+                    .map_err(|(code, message)| refused(code, message))?;
+                Ok((prepared.installation.clone(), prepared.plan.clone()))
+            }
+            _ => {
+                let installed = held.ok_or_else(|| {
+                    refused(
+                        "hub_access_absent",
+                        "a release runs with the run's Hub access, and this run carries none",
+                    )
+                })?;
+                let plan = self.configured(actor, &installed, &spec.entrypoint, choices)?;
+                Ok((installed, plan))
+            }
+        }
+    }
+
+    /// A child call of a running job: a run `<request>` under the job's signer, idempotent on
+    /// `intent`, preparing inside itself with the job's context and the choices addressed to
+    /// its callable.
+    pub fn child(
+        self: &Arc<Self>,
+        parent: &Execution,
+        request: &str,
+        intent: &str,
+        entrypoint: &str,
+        input: Value,
+        inputs: Vec<InputFile>,
+    ) -> Result<Execution, Refused> {
+        let actor = parent.submission.as_ref().map(|s| s.actor.clone()).unwrap_or_default();
+        let spec = self.child_spec(&parent.id, entrypoint, input, inputs, intent)?;
+        self.submit(&actor, request, spec)
+    }
+
+    fn child_spec(
+        &self,
+        parent: &str,
+        entrypoint: &str,
+        input: Value,
+        inputs: Vec<InputFile>,
+        digest: &str,
+    ) -> Result<Spec, Refused> {
+        let context = self.jobs.lock().unwrap().get(parent).cloned().ok_or_else(|| {
+            refused("child_call_refused", "the job's preparation context is gone")
+        })?;
+        let prefix = format!("{entrypoint}.");
+        Ok(Spec {
+            warm: false,
+            job: false,
+            parent: parent.into(),
+            source: Source::Installation(context.installation),
+            entrypoint: entrypoint.into(),
+            input,
+            inputs,
+            models: context
+                .models
+                .into_iter()
+                .filter(|choice| choice.parameter.starts_with(&prefix))
+                .collect(),
+            binding_revision: context.binding_revision,
+            attention_kernel: context.attention_kernel,
+            hub: context.hub,
+            providers: context.providers,
+            owner: context.owner,
+            digest: digest.into(),
+        })
+    }
+
+    /// `model_prefetch`: the job will call `entrypoint` next, so its models prepare and load
+    /// now, beside whatever the GPU already holds.
+    pub fn prefetch(self: &Arc<Self>, parent: &Execution, entrypoint: &str) {
+        let Some(gpu) = self.service.gpu() else {
+            return;
+        };
+        let actor = parent.submission.as_ref().map(|s| s.actor.clone()).unwrap_or_default();
+        let (runs, parent, entrypoint) = (self.clone(), parent.id.clone(), entrypoint.to_string());
+        let started = std::thread::Builder::new().name("child-prefetch".into()).spawn(move || {
+            let prepared = runs
+                .child_spec(&parent, &entrypoint, json!({}), vec![], "")
+                .and_then(|spec| {
+                    let Source::Installation(alias) = &spec.source else { unreachable!() };
+                    let held = runs.service.engine.installation(&actor, alias)?;
+                    let (hub, models) = (spec.hub.clone(), spec.models.clone());
+                    runs.resolve(&actor, held, None, hub, &spec, &models, Box::new(|_, _, _| ()))
+                });
+            match prepared {
+                Ok((installation, Some(plan))) => {
+                    match runs.service.catalog.resolve(&installation.generation) {
+                        Ok(held) => gpu.prefetch(&runs.service.engine, held, plan),
+                        Err(error) => eprintln!("prefetch of {entrypoint}: {error}"),
+                    }
+                }
+                Ok(_) => (),
+                Err(refusal) => {
+                    eprintln!("prefetch of {entrypoint}: {}: {}", refusal.code, refusal.message)
+                }
+            }
+        });
+        if let Err(error) = started {
+            eprintln!("prefetch of a child: {error}");
+        }
+    }
+
+    /// A job ended: its children prepare no more.
+    pub fn end_job(&self, id: &str) {
+        self.jobs.lock().unwrap().remove(id);
     }
 
     /// Without a Hub, held code's models come from the operator's configured grants.
@@ -268,10 +443,11 @@ impl Runs {
         &self,
         actor: &str,
         installed: &Installation,
-        spec: &Spec,
+        entrypoint: &str,
+        choices: &[pb::ModelChoice],
     ) -> Result<Option<crate::gpu_service::GpuPlan>, Refused> {
-        if !declares_models(installed, &spec.entrypoint) {
-            if !spec.models.is_empty() {
+        if !declares_models(installed, entrypoint) {
+            if !choices.is_empty() {
                 return Err(refused(
                     "invalid_request",
                     "model choices name no declared model slot",
@@ -286,7 +462,7 @@ impl Runs {
             )
         })?;
         let plan = gpu
-            .prepare_root(actor, installed, &spec.entrypoint, &spec.models, &[], 0)
+            .prepare_root(actor, installed, entrypoint, choices, &[], 0)
             .map_err(|e| refused("model_preparation_failed", e.to_string()))?;
         self.service.engine.bind_preparation(Preparation {
             actor: actor.into(),
@@ -328,6 +504,7 @@ mod tests {
         Spec {
             warm,
             job: false,
+            parent: String::new(),
             source,
             entrypoint: "steps".into(),
             input: json!({"steps": 2, "seconds": 0.01}),
@@ -388,6 +565,7 @@ mod tests {
             publisher: None,
             local: Some(Arc::new(local)),
             own_hub: None,
+            jobs: Default::default(),
         });
         let mut archive = tar::Builder::new(Vec::new());
         let fixture = repo.join("tests/fixtures/cpu_lifecycle");

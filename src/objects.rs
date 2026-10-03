@@ -69,6 +69,18 @@ impl Objects {
         Ok(path.is_file().then_some((path, length)))
     }
 
+    /// A file this machine produced for the signer (a child run's result) as its object, so a
+    /// later run of that signer may be handed it.
+    pub fn adopt(&self, actor: &str, file: &Path, object: &ObjectRef) -> io::Result<()> {
+        if self.path(actor, &format!("sha256:{}", object.sha256))?.is_none() {
+            self.store
+                .put_file(file, Some(object), &Fault::default())
+                .map_err(io::Error::other)?;
+            self.engine.with_journal(|j| j.bind_object(actor, object))?;
+        }
+        Ok(())
+    }
+
     /// Opens `digest` (`sha256:<hex>`) of `length` for this signer, its bytes continuing at
     /// `offset`. Bytes before the held length are skipped; a gap beyond it is refused.
     pub fn begin(

@@ -11,11 +11,12 @@ use crate::{
     },
     execution::Engine,
     gpu_service::{
-        command_ok, keep_triage, output_bindings, settle, stage_inputs_with, WakeOnExit,
+        command_ok, keep_triage, output_bindings, settle, stage_inputs, WakeOnExit,
     },
     journal::{Execution, ExecutorFacts, Failure, InputFile, Outcome, State},
     launch_identity::{LaunchIdentity, Seal},
-    service::{Call, Service},
+    runs::Runs,
+    service::Service,
 };
 use serde_json::{json, Value};
 use std::{
@@ -38,16 +39,17 @@ pub struct Jobs {
     identity: Option<LaunchIdentity>,
     store: Arc<Store>,
     service: Weak<Service>,
+    /// Children prepare as runs do, with their job's context.
+    runs: Weak<Runs>,
     /// Running jobs by execution id: what their child calls need.
     parents: Mutex<HashMap<String, Arc<Parent>>>,
 }
 
-/// A running job: its signer, generation, spool and calls.
+/// A running job: its signer, spool, callables and calls.
 struct Parent {
     id: String,
     request: String,
     actor: String,
-    generation: String,
     spool: PathBuf,
     /// `(module, export)` of each own invocable, and the entrypoint it is registered as.
     callables: HashMap<(String, String), String>,
@@ -75,7 +77,6 @@ struct ChildCall {
 
 #[derive(Clone)]
 struct Received {
-    local: PathBuf,
     length: u64,
     media_type: String,
 }
@@ -87,6 +88,7 @@ impl Jobs {
         environment: BTreeMap<String, String>,
         identity: Option<LaunchIdentity>,
         service: &Arc<Service>,
+        runs: &Arc<Runs>,
     ) -> io::Result<Arc<Self>> {
         fs::create_dir_all(root)?;
         let incarnation = uuid::Uuid::new_v4().simple().to_string();
@@ -99,6 +101,7 @@ impl Jobs {
             identity,
             store,
             service: Arc::downgrade(service),
+            runs: Arc::downgrade(runs),
             parents: Mutex::new(HashMap::new()),
         });
         let (watching, engine) = (Arc::downgrade(&jobs), service.engine.clone());
@@ -232,10 +235,7 @@ impl Jobs {
         };
         let interface = self.interface(&executor, &held)?;
         let spool = self.spool(&executor, id)?;
-        let inputs =
-            stage_inputs_with(self.identity, &spool, &record.invocation.inputs, |input| {
-                open_stored(&self.store, &input.digest)
-            })?;
+        let inputs = stage_inputs(&self.store, self.identity, &spool, &record.invocation.inputs)?;
         let (call_interfaces, callables) = own_invocables(&held.record.interface, &interface);
         let parent = Arc::new(Parent {
             id: id.into(),
@@ -248,7 +248,6 @@ impl Jobs {
                 .as_ref()
                 .map(|s| s.actor.clone())
                 .unwrap_or_default(),
-            generation: held.record.identity.clone(),
             spool: spool.clone(),
             callables,
             inputs: record.invocation.inputs.clone(),
@@ -284,6 +283,9 @@ impl Jobs {
         // Its children end with it, whatever it returned.
         self.end_children(id);
         self.parents.lock().unwrap().remove(id);
+        if let Some(runs) = self.runs.upgrade() {
+            runs.end_job(id);
+        }
         conclude(engine, id, &executor, &spool, command_ok(reply?)?)?;
         executor.shutdown()
     }
@@ -374,21 +376,7 @@ impl Jobs {
             engine.finish(id, Outcome::Failed(failure.encode()))?;
             return executor.shutdown();
         }
-        let parent = self
-            .parents
-            .lock()
-            .unwrap()
-            .get(&invocation.parent)
-            .cloned();
-        let inputs = stage_inputs_with(self.identity, &spool, &invocation.inputs, |input| {
-            let received = parent
-                .as_ref()
-                .and_then(|p| p.calls.lock().unwrap().received.get(&input.digest).cloned());
-            match received {
-                Some(received) => File::open(received.local),
-                None => open_stored(&self.store, &input.digest),
-            }
-        })?;
+        let inputs = stage_inputs(&self.store, self.identity, &spool, &invocation.inputs)?;
         let reply = executor.command(
             &DeviceCommand::Invoke {
                 request_id: id.into(),
@@ -458,6 +446,10 @@ impl Jobs {
                 "call request must be an object".into(),
             ));
         }
+        let runs = self
+            .runs
+            .upgrade()
+            .ok_or(("child_call_refused", "machine is stopping".into()))?;
         let mut calls = parent.calls.lock().unwrap();
         let inputs = child_inputs(&input, parent, &calls.received);
         let request = format!("{}/{}", parent.request, frame.call_index);
@@ -468,48 +460,19 @@ impl Jobs {
                     .map_err(|e| ("child_call_refused", e.to_string()))?
             )
         );
-        let draft = crate::journal::Invocation {
-            entrypoint: entrypoint.clone(),
-            input: input.clone(),
-            parent: parent.id.clone(),
-            ..Default::default()
-        };
-        let (record, new) = service
+        let job = service
             .engine
-            .accept_run(&parent.actor, &request, &intent, draft)
-            .map_err(|e| match e.kind() {
-                io::ErrorKind::AlreadyExists => (
+            .get(&parent.id)
+            .map_err(|e| ("child_call_refused", e.to_string()))?;
+        let record = runs
+            .child(&job, &request, &intent, entrypoint, input, inputs)
+            .map_err(|refusal| match refusal.code {
+                "run_id_conflict" => (
                     "child_call_refused",
                     "an existing call index changed its exact intent".to_string(),
                 ),
-                _ => ("child_call_refused", e.to_string()),
+                code => (code, refusal.message),
             })?;
-        if new {
-            let bound = service.bind_prepared(
-                &record.id,
-                &parent.generation,
-                Call {
-                    entrypoint: entrypoint.clone(),
-                    input,
-                    attention_kernel: String::new(),
-                    inputs,
-                    job: false,
-                    parent: parent.id.clone(),
-                },
-                "",
-            );
-            if let Err(error) = bound {
-                let failure = Failure::executor(
-                    "refused",
-                    "runtime",
-                    "child_call_refused",
-                    &error.to_string(),
-                );
-                let _ = service
-                    .engine
-                    .end_preparation(&record.id, Outcome::Failed(failure.encode()));
-            }
-        }
         calls.by_index.entry(frame.call_index).or_insert(ChildCall {
             child: record.id.clone(),
             request: request.clone(),
@@ -564,12 +527,26 @@ impl Jobs {
                         .join(frame.call_index.to_string());
                     let settled = grant(&service.engine.root, result, &directory, self.identity)
                         .map_err(|e| ("child_result_unavailable", e.to_string()))?;
+                    // Each file is the signer's object too: a later child may be handed it.
+                    let runs = self
+                        .runs
+                        .upgrade()
+                        .ok_or(("child_call_refused", "machine is stopping".into()))?;
                     for row in &settled.1 {
+                        let digest = row["digest"].as_str().unwrap_or_default();
+                        let length = row["length"].as_u64().unwrap_or_default();
+                        let object = tensorfs_core::ids::ObjectRef {
+                            sha256: digest.trim_start_matches("sha256:").into(),
+                            length,
+                        };
+                        let local = Path::new(row["local"].as_str().unwrap_or_default());
+                        runs.objects
+                            .adopt(&parent.actor, local, &object)
+                            .map_err(|e| ("child_result_unavailable", e.to_string()))?;
                         received.insert(
-                            row["digest"].as_str().unwrap_or_default().into(),
+                            digest.into(),
                             Received {
-                                local: PathBuf::from(row["local"].as_str().unwrap_or_default()),
-                                length: row["length"].as_u64().unwrap_or_default(),
+                                length,
                                 media_type: row["media_type"].as_str().unwrap_or_default().into(),
                             },
                         );
@@ -641,8 +618,22 @@ impl Jobs {
                     Some(File::from(std::os::fd::OwnedFd::from(theirs))),
                 ));
             }
-            // A deviceless parent holds no GPU; its children's plans load when they run.
-            Kind::GpuRelease | Kind::ModelPrefetch => Ok(Answer::ok(frame.seq)),
+            // The job will call it next: its models prepare and load now.
+            Kind::ModelPrefetch => {
+                let callable = (frame.module.clone(), frame.export.clone());
+                if let (Some(entrypoint), Some(runs), Some(service)) = (
+                    parent.callables.get(&callable),
+                    self.runs.upgrade(),
+                    self.service.upgrade(),
+                ) {
+                    if let Ok(job) = service.engine.get(&parent.id) {
+                        runs.prefetch(&job, entrypoint);
+                    }
+                }
+                Ok(Answer::ok(frame.seq))
+            }
+            // A deviceless parent holds no GPU.
+            Kind::GpuRelease => Ok(Answer::ok(frame.seq)),
             _ => return Ok((Answer::unavailable(frame.seq), None)),
         };
         Ok((
@@ -919,13 +910,6 @@ fn grant(
     Ok((canonical, grants))
 }
 
-fn open_stored(store: &Store, digest: &str) -> io::Result<File> {
-    let sha = digest.strip_prefix("sha256:").unwrap_or(digest);
-    Ok(store
-        .open_verified(sha)
-        .map_err(io::Error::other)?
-        .into_file())
-}
 
 /// One byte to every running job's nudge socket each time anything moved: its calls re-poll.
 fn nudge(jobs: Weak<Jobs>, engine: Arc<Engine>) {

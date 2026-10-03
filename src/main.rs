@@ -359,6 +359,7 @@ fn start_api(
             ))
         }),
         own_hub: backend.own_hub.clone(),
+        jobs: Default::default(),
     }));
     // Jobs run where GPU executors run, with their environment; a machine without a GPU
     // gives its deviceless executors a minimal one.
@@ -388,6 +389,7 @@ fn start_api(
         environment,
         launch_identity,
         service,
+        backend.runs.as_ref().expect("runs are configured above"),
     )?);
     listener.set_nonblocking(true)?;
     #[derive(serde::Serialize)]

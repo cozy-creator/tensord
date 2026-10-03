@@ -224,6 +224,7 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
     Ok(crate::runs::Spec {
         warm,
         job,
+        parent: String::new(),
         source,
         entrypoint: spec.entrypoint,
         input,

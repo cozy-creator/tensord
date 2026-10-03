@@ -2630,25 +2630,6 @@ pub(crate) fn stage_inputs(
     spool: &Path,
     inputs: &[crate::journal::InputFile],
 ) -> io::Result<BTreeMap<String, serde_json::Value>> {
-    stage_inputs_with(identity, spool, inputs, |input| {
-        let sha = input
-            .digest
-            .strip_prefix("sha256:")
-            .unwrap_or(&input.digest);
-        Ok(store
-            .open_verified(sha)
-            .map_err(io::Error::other)?
-            .into_file())
-    })
-}
-
-/// Read-only copies of `inputs` in `spool`, each read from `open`, by field path.
-pub(crate) fn stage_inputs_with(
-    identity: Option<crate::launch_identity::LaunchIdentity>,
-    spool: &Path,
-    inputs: &[crate::journal::InputFile],
-    open: impl Fn(&crate::journal::InputFile) -> io::Result<File>,
-) -> io::Result<BTreeMap<String, serde_json::Value>> {
     let mut granted = BTreeMap::new();
     if inputs.is_empty() {
         return Ok(granted);
@@ -2669,7 +2650,14 @@ pub(crate) fn stage_inputs_with(
             .take(96)
             .collect();
         let local = directory.join(format!("{position:03}-{field}"));
-        let mut source = open(input)?;
+        let sha = input
+            .digest
+            .strip_prefix("sha256:")
+            .unwrap_or(&input.digest);
+        let mut source = store
+            .open_verified(sha)
+            .map_err(io::Error::other)?
+            .into_file();
         let mut copy = std::os::unix::fs::OpenOptionsExt::mode(
             fs::OpenOptions::new().write(true).create_new(true),
             0o444,
