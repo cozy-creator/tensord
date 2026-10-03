@@ -60,6 +60,8 @@ pub struct Grant {
     pub listen_host: IpAddr,
     pub worker_id: String,
     pub worker_port: u16,
+    /// A launcher that still grants a media port reads the receipt there.
+    pub media_port: Option<u16>,
     pub webrtc_port: Option<u16>,
     pub hub: Option<HubGrant>,
     pub repo_cache_root: Option<PathBuf>,
@@ -232,6 +234,7 @@ impl Grant {
             listen_host,
             worker_id,
             worker_port,
+            media_port,
             webrtc_port,
             hub,
             repo_cache_root: get("COZY_REPO_CACHE_ROOT").map(PathBuf::from),

@@ -217,6 +217,9 @@ fn run_machine(
     }
     let control = bind_control(&owner)?;
     let api = std::net::TcpListener::bind((grant.listen_host, grant.worker_port))?;
+    if let Some(port) = grant.media_port {
+        identity.media = Some(std::net::TcpListener::bind((grant.listen_host, port))?);
+    }
     // The image's installer helper: an environment over its interpreter with the client wheel.
     let python = layout.root.join("opt/cozy/machine/helper/bin/python");
     let wheel = std::fs::read_dir(layout.root.join("opt/cozy/machine"))
@@ -242,7 +245,13 @@ fn run_machine(
         image_sdk(&paths.sdk()),
         // A run naming no Hub reads this rental's own Hub as the pod (Go agent parity).
         grant.hub.clone().filter(|_| rental).map(|hub| {
-            cozy_machine::hub::Source::pod(&hub.origin, &hub.worker_id, &hub.worker_token, hub.ca_der, hub.object_hosts)
+            cozy_machine::hub::Source::pod(
+                &hub.origin,
+                &hub.worker_id,
+                &hub.worker_token,
+                hub.ca_der,
+                hub.object_hosts,
+            )
         }),
     )?;
     serve(owner, service, control)

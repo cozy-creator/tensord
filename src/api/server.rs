@@ -34,6 +34,8 @@ pub struct MachineIdentity {
     pub hubs: Vec<(String, String)>,
     /// `runtime-update/1`; None on development front doors.
     pub updates: Option<Arc<crate::machine::update::Updates>>,
+    /// A granted media port: the CLI's machine launcher reads the receipt there.
+    pub media: Option<std::net::TcpListener>,
 }
 
 impl MachineIdentity {
@@ -68,17 +70,48 @@ impl MachineIdentity {
             lifecycle: None,
             hubs: vec![],
             updates: None,
+            media: None,
         })
     }
 }
 
 pub async fn serve<B: MachineBackend>(
     listener: tokio::net::TcpListener,
-    identity: MachineIdentity,
+    mut identity: MachineIdentity,
     backend: Arc<B>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let port = listener.local_addr()?.port();
     let readiness = identity.readiness.clone();
+    if let Some(media) = identity.media.take() {
+        media.set_nonblocking(true)?;
+        let media = tokio::net::TcpListener::from_std(media)?;
+        let tls = ServerTlsConfig::new()
+            .identity(Identity::from_pem(&identity.cert_pem, &identity.key_pem));
+        let readiness = readiness.clone();
+        let mut routes = tonic::service::Routes::default();
+        *routes.axum_router_mut() = axum::Router::new().route(
+            "/v1/bootstrap/receipt",
+            get(move || {
+                let envelope = readiness.envelope();
+                async move {
+                    match envelope {
+                        Some(body) => (StatusCode::OK, body),
+                        None => (StatusCode::SERVICE_UNAVAILABLE, vec![]),
+                    }
+                }
+            }),
+        );
+        let server = Server::builder()
+            .accept_http1(true)
+            .tls_config(tls)?
+            .add_routes(routes)
+            .serve_with_incoming(TcpListenerStream::new(media));
+        tokio::spawn(async move {
+            if let Err(error) = server.await {
+                eprintln!("cozy-machine: the receipt listener stopped: {error}");
+            }
+        });
+    }
     tokio::spawn(prove_readiness(
         port,
         readiness.clone(),

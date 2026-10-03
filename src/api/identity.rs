@@ -172,6 +172,7 @@ impl MachineIdentity {
             lifecycle: None,
             hubs: vec![],
             updates: None,
+            media: None,
         })
     }
 }
@@ -205,6 +206,7 @@ impl MachineIdentity {
             lifecycle: None,
             hubs: vec![],
             updates: None,
+            media: None,
         })
     }
 }
