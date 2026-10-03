@@ -108,7 +108,7 @@ pub async fn serve<B: MachineBackend>(
             .accept_http1(true)
             .tls_config(tls)?
             .add_routes(routes)
-            .serve_with_incoming(TcpListenerStream::new(media));
+            .serve_with_incoming(no_delay(media));
         tokio::spawn(async move {
             if let Err(error) = server.await {
                 eprintln!("cozy-machine: the receipt listener stopped: {error}");
@@ -245,7 +245,7 @@ pub async fn serve<B: MachineBackend>(
         .initial_connection_window_size(Some(32 << 20))
         .tls_config(tls)?
         .add_routes(routes)
-        .serve_with_incoming(TcpListenerStream::new(listener))
+        .serve_with_incoming(no_delay(listener))
         .await?;
     Ok(())
 }
@@ -1460,4 +1460,18 @@ fn send_range(
         }
         start = 0;
     }
+}
+
+/// Accepted connections with Nagle off, as Go's net package sets every TCP connection: a
+/// response's small trailing frames otherwise wait for the ACK of the frames before them, one
+/// round trip each on a far link.
+fn no_delay(
+    listener: tokio::net::TcpListener,
+) -> impl Stream<Item = std::io::Result<tokio::net::TcpStream>> {
+    use tokio_stream::StreamExt;
+    TcpListenerStream::new(listener).map(|accepted| {
+        accepted.inspect(|stream| {
+            let _ = stream.set_nodelay(true);
+        })
+    })
 }
