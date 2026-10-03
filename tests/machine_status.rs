@@ -29,7 +29,7 @@ impl Drop for Machine {
     }
 }
 
-fn boot(root: &Path, port: u16) -> Machine {
+fn boot(root: &Path, port: u16, lifetime: &str) -> Machine {
     let owner = SigningKey::from_bytes(&OWNER).verifying_key();
     Machine(
         Command::new(env!("CARGO_BIN_EXE_cozy-machine"))
@@ -50,6 +50,7 @@ fn boot(root: &Path, port: u16) -> Machine {
             )
             .env("TENSORHUB_ORIGIN", "https://hub.invalid")
             .env("CUDA_VISIBLE_DEVICES", "")
+            .env("COZY_MACHINE_LIFETIME", lifetime)
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
@@ -132,7 +133,7 @@ async fn status_answers_identity_to_anyone_and_the_machine_to_its_owner() {
         .local_addr()
         .unwrap()
         .port();
-    let mut machine = boot(&root, port);
+    let mut machine = boot(&root, port, "rental");
     let sealed = receipt(&mut machine, &root, port);
     let pem = std::fs::read(root.join("run/cozy/bootstrap/tls.crt")).unwrap();
     let channel: Channel = Endpoint::from_shared(format!("https://127.0.0.1:{port}"))
@@ -228,6 +229,51 @@ async fn status_answers_identity_to_anyone_and_the_machine_to_its_owner() {
         .unwrap();
     assert_eq!(changed.idle_deadline_unix_ms, reset.idle_deadline_unix_ms);
     drop((held, renewed));
+    drop(machine);
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// A persistent machine (this computer's) never releases itself: Status names no deadline.
+#[tokio::test]
+async fn a_persistent_machine_reports_no_idle_deadline() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target/machine-status-persistent")
+        .join(std::process::id().to_string());
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut machine = boot(&root, port, "persistent");
+    receipt(&mut machine, &root, port);
+    let pem = std::fs::read(root.join("run/cozy/bootstrap/tls.crt")).unwrap();
+    let channel = Endpoint::from_shared(format!("https://127.0.0.1:{port}"))
+        .unwrap()
+        .tls_config(
+            ClientTlsConfig::new()
+                .ca_certificate(Certificate::from_pem(pem))
+                .domain_name("cozy-worker"),
+        )
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client = MachineClient::new(channel);
+    let owner = cap("");
+    for keepalive in [false, true] {
+        let mut frames = client
+            .status(status(keepalive, Some(&owner)))
+            .await
+            .unwrap()
+            .into_inner();
+        let frame = frames.message().await.unwrap().unwrap();
+        assert_eq!(
+            (frame.phase.as_str(), frame.idle_deadline_unix_ms),
+            ("ready", 0)
+        );
+    }
     drop(machine);
     std::fs::remove_dir_all(&root).unwrap();
 }

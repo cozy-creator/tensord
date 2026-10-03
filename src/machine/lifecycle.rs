@@ -161,6 +161,11 @@ impl Lifecycle {
         self.admissions.load(Ordering::Acquire)
     }
 
+    /// A rental releases itself at its idle deadline; a persistent machine never does.
+    pub fn releases(&self) -> bool {
+        self.rental
+    }
+
     pub fn deadline_ms(&self) -> i64 {
         let state = self.state.lock().unwrap();
         state.0.deadline_ms.max(state.1)
