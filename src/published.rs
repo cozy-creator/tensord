@@ -130,6 +130,16 @@ impl Job {
 
 type Failure = (&'static str, String);
 
+/// What one environment generation is built from: the release's locked requirements, its
+/// Python, its package interface and its version.
+#[derive(Clone, Copy)]
+struct Environment<'a> {
+    split: &'a Lock,
+    python: &'a str,
+    interface: &'a Value,
+    release: &'a str,
+}
+
 pub struct Publisher {
     root: PathBuf,
     sdk: PackageSdk,
@@ -602,14 +612,13 @@ impl Publisher {
             !self.sdk.requirements.is_empty(),
         )?;
         let identity = sha256::hex_digest(json!({"lock":lock,"python":python,"sdk":self.sdk.requirements,"links":self.sdk.find_links,"client":self.sdk.client_wheel}).to_string().as_bytes())[..32].to_string();
-        self.generation(
-            service.catalog.root(),
-            &identity,
-            &split,
-            &python,
-            &interface,
-            &request.release,
-        )?;
+        let wanted = Environment {
+            split: &split,
+            python: &python,
+            interface: &interface,
+            release: &request.release,
+        };
+        self.generation(service.catalog.root(), &identity, &wanted, job)?;
         let held = service.catalog.resolve(&identity).map_err(io_failure)?;
         if let Some(gpu) = service.gpu() {
             // Its kernel compiles and its imports overlap the model download.
@@ -637,11 +646,15 @@ impl Publisher {
         &self,
         generations: &Path,
         identity: &str,
-        split: &Lock,
-        python: &str,
-        interface: &Value,
-        release: &str,
+        wanted: &Environment,
+        job: &Job,
     ) -> Result<(), Failure> {
+        let Environment {
+            split,
+            python,
+            interface,
+            release,
+        } = *wanted;
         let locks = generations.join(".locks");
         fs::create_dir_all(&locks).map_err(io_failure)?;
         let lock = File::create(locks.join(format!("{identity}.lock"))).map_err(io_failure)?;
@@ -665,6 +678,7 @@ impl Publisher {
         let env = dir.join("env");
         let interpreter = env.join("bin/python");
         let py = interpreter.to_string_lossy().to_string();
+        job.stage(format!("creating its Python {python} environment"));
         self.uv(&[
             "venv",
             "--no-project",
@@ -686,19 +700,29 @@ impl Publisher {
                 "--no-compile-bytecode"
             }
         };
-        self.uv(&[
-            "pip",
-            "install",
-            "--no-config",
-            "--python",
-            &py,
-            compile(!sdk && !client),
-            "--require-hashes",
-            "--no-deps",
-            "--requirements",
-            &requirements,
-        ])?;
+        let packages = split
+            .exact
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with([' ', '\t', '#', '-']))
+            .count();
+        job.stage(format!("installing {packages} locked packages"));
+        self.uv_observed(
+            &[
+                "pip",
+                "install",
+                "--no-config",
+                "--python",
+                &py,
+                compile(!sdk && !client),
+                "--require-hashes",
+                "--no-deps",
+                "--requirements",
+                &requirements,
+            ],
+            &|read| job.bytes(read, 0),
+        )?;
         if sdk {
+            job.stage("installing the machine's Runtime and TensorFS".into());
             let constraints = dir.join("constraints.txt").to_string_lossy().to_string();
             let mut args = vec![
                 "pip",
@@ -792,6 +816,12 @@ impl Publisher {
     }
 
     fn uv(&self, args: &[&str]) -> Result<(), Failure> {
+        self.uv_observed(args, &|_| ())
+    }
+
+    /// `uv` with `read` told, about once a second, how many bytes the process has read so far
+    /// (its downloads and the cache it copies from), so a long install shows it moves.
+    fn uv_observed(&self, args: &[&str], read: &(dyn Fn(u64) + Sync)) -> Result<(), Failure> {
         let mut command = Command::new(&self.sdk.uv);
         command.args(args).env_clear().stdin(Stdio::null());
         for name in ["PATH", "SSL_CERT_FILE", "SSL_CERT_DIR", "LANG"] {
@@ -810,12 +840,40 @@ impl Publisher {
                 .env("UV_LINK_MODE", "symlink"),
             None => command.env("UV_CACHE_DIR", self.root.join("uv-cache")),
         };
-        let output = command.output().map_err(|e| {
-            (
-                "package_installation_uv_absent",
-                format!("cannot run uv: {e}"),
-            )
-        })?;
+        let child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                (
+                    "package_installation_uv_absent",
+                    format!("cannot run uv: {e}"),
+                )
+            })?;
+        let io = format!("/proc/{}/io", child.id());
+        let ended = std::sync::atomic::AtomicBool::new(false);
+        let output = std::thread::scope(|scope| {
+            let sampler = scope.spawn(|| {
+                while !ended.load(std::sync::atomic::Ordering::Acquire) {
+                    std::thread::park_timeout(std::time::Duration::from_secs(1));
+                    let rchar = fs::read_to_string(&io).ok().and_then(|text| {
+                        text.lines()
+                            .find_map(|l| l.strip_prefix("rchar: "))
+                            .and_then(|v| v.trim().parse().ok())
+                    });
+                    if let (Some(rchar), false) =
+                        (rchar, ended.load(std::sync::atomic::Ordering::Acquire))
+                    {
+                        read(rchar);
+                    }
+                }
+            });
+            let output = child.wait_with_output();
+            ended.store(true, std::sync::atomic::Ordering::Release);
+            sampler.thread().unpark();
+            output
+        })
+        .map_err(|e| ("package_installation_uv_failed", format!("uv: {e}")))?;
         if output.status.success() {
             return Ok(());
         }
