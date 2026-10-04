@@ -138,14 +138,27 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
             ))
         }
     };
+    let input: Value = if spec.payload.is_empty() {
+        serde_json::json!({})
+    } else {
+        crate::boundary_json::parse(&spec.payload)
+            .map_err(|_| Status::invalid_argument("the payload is not JSON"))?
+    };
     let hub = spec.hub.take();
     let providers = spec.providers.take();
     let identity_digest = {
         let mut identity = spec.clone();
-        identity.hub = hub.clone().map(|hub| v1::HubAccess {
-            token: String::new(),
-            ..hub
-        });
+        identity.payload = crate::boundary_json::intent_bytes(&input)
+            .map_err(|_| Status::invalid_argument("the payload cannot be serialized"))?;
+        identity.hub = hub
+            .as_ref()
+            .filter(|hub| !hub.token.is_empty())
+            .map(|hub| v1::HubAccess {
+                origin: hub.origin.trim_end_matches('/').to_string(),
+                ..Default::default()
+            });
+        identity.binding_revision.clear();
+        identity.known_results.clear();
         identity.publication.clear();
         format!(
             "sha256:{}",
@@ -157,12 +170,6 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
         Some(hub) => {
             if !crate::hub::valid_origin(&hub.origin) {
                 return Err(Status::invalid_argument("the run's Hub origin is invalid"));
-            }
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |since| since.as_secs() as i64);
-            if hub.expires_at != 0 && hub.expires_at <= now {
-                return Err(refused("hub_access_expired", "the run's Hub access has expired"));
             }
             Some(crate::hub::Source {
                 origin: hub.origin.trim_end_matches('/').to_string(),
@@ -182,12 +189,6 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
         // A warm run of model choices alone makes them (and uploads to its destination).
         None if warm => crate::runs::Source::Models,
         None => return Err(Status::invalid_argument("a run spec names its source")),
-    };
-    let input: Value = if spec.payload.is_empty() {
-        serde_json::json!({})
-    } else {
-        crate::boundary_json::parse(&spec.payload)
-            .map_err(|_| Status::invalid_argument("the payload is not JSON"))?
     };
     let models = spec
         .models
@@ -259,6 +260,36 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
         owner: spec.owner,
         digest: identity_digest,
     })
+}
+
+/// Old experimental records held a raw protobuf-spec digest. Only an unchanged old intent
+/// can use this fallback; missing authored model/source history must not weaken conflicts.
+fn legacy_intent_digest(spec: &v1::RunSpec) -> String {
+    let mut identity = spec.clone();
+    identity.providers = None;
+    if let Some(hub) = &mut identity.hub {
+        hub.token.clear();
+    }
+    identity.publication.clear();
+    format!(
+        "sha256:{}",
+        tensorfs_core::sha256::hex_digest(&prost::Message::encode_to_vec(&identity))
+    )
+}
+
+fn validate_fresh_access(spec: &v1::RunSpec) -> Result<(), Status> {
+    if let Some(hub) = spec.hub.as_ref().filter(|hub| !hub.token.is_empty()) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs() as i64);
+        if hub.expires_at != 0 && hub.expires_at <= now {
+            return Err(refused(
+                "hub_access_expired",
+                "the run's Hub access has expired",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A typed refusal: the status carries its code as `cozy-error-code`, its message as text.
@@ -717,13 +748,26 @@ pub(super) async fn stream_run<B: MachineBackend>(
         let runs = backend
             .runs()
             .ok_or_else(|| Status::unimplemented("this machine takes no runs"))?;
-        let (id, spec) = (id.clone(), spec_of(spec)?);
+        let intent = spec_of(spec.clone())?;
+        let legacy = legacy_intent_digest(&spec);
+        let id = id.clone();
         tokio::task::spawn_blocking(move || {
-            runs.submit(&crate::machine_api::actor_id(actor), &id, spec)
+            let actor = crate::machine_api::actor_id(actor);
+            let prior = match runs.existing(&actor, &id, &intent.digest) {
+                Err(error) if error.code == "run_id_conflict" => {
+                    runs.existing(&actor, &id, &legacy)
+                }
+                other => other,
+            }
+            .map_err(refusal)?;
+            if let Some(prior) = prior {
+                return Ok(prior);
+            }
+            validate_fresh_access(&spec)?;
+            runs.submit(&actor, &id, intent).map_err(refusal)
         })
         .await
-        .map_err(|_| Status::internal("machine operation stopped"))?
-        .map_err(refusal)?;
+        .map_err(|_| Status::internal("machine operation stopped"))??;
     }
     let mut log = Log::default();
     let mut after = request.after;
@@ -782,5 +826,139 @@ pub(super) async fn stream_run<B: MachineBackend>(
             return Ok(());
         }
         after = after.max(page.next_after);
+    }
+}
+
+#[cfg(test)]
+mod intent_tests {
+    use super::*;
+
+    fn authored() -> v1::RunSpec {
+        v1::RunSpec {
+            source: Some(v1::run_spec::Source::Release(v1::Release {
+                package: "org/package".into(),
+                release: "1.0.0".into(),
+            })),
+            entrypoint: "render".into(),
+            payload: br#" { "seed":9007199254740993, "nested":{"b":2,"a":1} } "#.to_vec(),
+            inputs: vec![
+                v1::InputFile {
+                    field: "reference".into(),
+                    digest: format!("sha256:{}", "a".repeat(64)),
+                    length: 4,
+                    order: 0,
+                    ..Default::default()
+                },
+                v1::InputFile {
+                    field: "reference".into(),
+                    digest: format!("sha256:{}", "b".repeat(64)),
+                    length: 5,
+                    order: 1,
+                    ..Default::default()
+                },
+            ],
+            models: vec![
+                v1::ModelChoice {
+                    parameter: "model".into(),
+                    repository: "org/first".into(),
+                    release: "1".into(),
+                    ..Default::default()
+                },
+                v1::ModelChoice {
+                    parameter: "other".into(),
+                    repository: "org/second".into(),
+                    release: "2".into(),
+                    ..Default::default()
+                },
+            ],
+            owner: "org".into(),
+            attention_kernel: "sdpa".into(),
+            binding_revision: "old-hint".into(),
+            known_results: vec![v1::MemoResult::default()],
+            publication: "publication-old".into(),
+            hub: Some(v1::HubAccess {
+                origin: "https://hub.example.test/".into(),
+                token: "token-old".into(),
+                expires_at: i64::MAX,
+                ca_der: vec![1],
+                object_hosts: vec!["objects-old.example.test".into()],
+            }),
+            providers: Some(v1::ProviderAccess {
+                huggingface: "provider-old".into(),
+                civitai: "civitai-old".into(),
+            }),
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn refreshed_access_and_advisory_hints_do_not_change_run_intent() {
+        let original = authored();
+        let expected = spec_of(original.clone()).unwrap().digest;
+        let mut refreshed = original;
+        refreshed.payload = br#"{"nested":{"a":1,"b":2},"seed":9007199254740993}"#.to_vec();
+        let hub = refreshed.hub.as_mut().unwrap();
+        hub.token = "token-new".into();
+        hub.expires_at = 1;
+        hub.origin = "https://hub.example.test".into();
+        hub.ca_der = vec![2];
+        hub.object_hosts = vec!["objects-new.example.test".into()];
+        refreshed.binding_revision = "new-hint".into();
+        refreshed.known_results.clear();
+        refreshed.publication = "publication-new".into();
+        refreshed.providers = Some(v1::ProviderAccess {
+            huggingface: "provider-new".into(),
+            civitai: "civitai-new".into(),
+        });
+        assert_eq!(spec_of(refreshed.clone()).unwrap().digest, expected);
+        assert_eq!(
+            validate_fresh_access(&refreshed)
+                .unwrap_err()
+                .metadata()
+                .get("cozy-error-code")
+                .unwrap(),
+            "hub_access_expired"
+        );
+    }
+    #[test]
+    fn authored_source_payload_input_order_and_models_remain_true_intent() {
+        let original = authored();
+        let expected = spec_of(original.clone()).unwrap().digest;
+        let mut variants = vec![];
+        let mut changed = original.clone();
+        changed.payload = br#"{"seed":9007199254740992,"nested":{"a":1,"b":2}}"#.to_vec();
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.payload = br#"{"seed":9007199254740993.0,"nested":{"a":1,"b":2}}"#.to_vec();
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.inputs.reverse();
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.models.reverse();
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.models[0].release = "3".into();
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.source = Some(v1::run_spec::Source::Installation("other-source".into()));
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.entrypoint = "other".into();
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.owner = "other-owner".into();
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.hub.as_mut().unwrap().origin = "https://other.example.test".into();
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.attention_kernel = "math".into();
+        variants.push(changed);
+        let mut changed = original;
+        changed.weights_destination = "org/weights".into();
+        variants.push(changed);
+        for changed in variants {
+            assert_ne!(spec_of(changed).unwrap().digest, expected);
+        }
     }
 }

@@ -677,26 +677,25 @@ impl Jobs {
         let mut calls = parent.calls.lock().unwrap();
         let inputs = child_inputs(&input, parent, &calls.received);
         let request = format!("{}/{}", parent.request, frame.call_index);
-        let intent = format!(
-            "sha256:{}",
-            tensorfs_core::sha256::hex_digest(
-                &serde_json_canonicalizer::to_vec(&json!([frame.module, frame.export, input]))
-                    .map_err(|e| ("child_call_refused", e.to_string()))?
-            )
-        );
+        let intent = child_intent(&frame.module, &frame.export, &input)
+            .map_err(|e| ("child_call_refused", e.to_string()))?;
         let job = service
             .engine
             .get(&parent.id)
             .map_err(|e| ("child_call_refused", e.to_string()))?;
-        let record = runs
-            .child(&job, &request, &intent, entrypoint, input, inputs)
-            .map_err(|refusal| match refusal.code {
-                "run_id_conflict" => (
-                    "child_call_refused",
-                    "an existing call index changed its exact intent".to_string(),
-                ),
-                code => (code, refusal.message),
-            })?;
+        let record = match runs.child(&job, &request, &intent, entrypoint, input.clone(), inputs.clone()) {
+            Ok(record) => record,
+            Err(refusal) if refusal.code == "run_id_conflict" => {
+                let existing = service.engine.get_public(&parent.actor, &request)
+                    .map_err(|e| ("child_call_refused", e.to_string()))?;
+                if !legacy_child_matches(&existing, &parent.id, &frame.module, &frame.export, entrypoint, &input, &inputs)
+                    .map_err(|e| ("child_call_refused", e.to_string()))? {
+                    return Err(("child_call_refused", "an existing call index changed its exact intent".into()));
+                }
+                existing
+            }
+            Err(refusal) => return Err((refusal.code, refusal.message)),
+        };
         // A pausing job starts nothing new; a resumed one's held call goes on.
         let engine = &service.engine;
         let held = match Self::holding(engine, &parent.id) {
@@ -1205,7 +1204,7 @@ fn grant(
             "media_type": binding.media_type,
         }));
     }
-    let canonical = serde_json_canonicalizer::to_string(&value).map_err(io::Error::other)?;
+    let canonical = serde_json::to_string(&value).map_err(io::Error::other)?;
     Ok((canonical, grants))
 }
 
@@ -1232,6 +1231,22 @@ fn nudge(jobs: Weak<Jobs>, engine: Arc<Engine>) {
     }
 }
 
+fn legacy_child_matches(existing: &Execution, parent: &str, module: &str, export: &str,
+    entrypoint: &str, input: &Value, inputs: &[InputFile]) -> io::Result<bool> {
+    let old = serde_json_canonicalizer::to_vec(&json!([module, export, input])).map_err(io::Error::other)?;
+    let old = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&old));
+    Ok(existing.submission.as_ref().is_some_and(|s| s.invocation_digest == old)
+        && existing.invocation.parent == parent && existing.invocation.entrypoint == entrypoint
+        && existing.invocation.inputs == inputs
+        && crate::boundary_json::intent_bytes(&existing.invocation.input).map_err(io::Error::other)?
+            == crate::boundary_json::intent_bytes(input).map_err(io::Error::other)?)
+}
+
+fn child_intent(module: &str, export: &str, input: &Value) -> io::Result<String> {
+    let semantic = crate::boundary_json::intent_bytes(&json!([module, export, input])).map_err(io::Error::other)?;
+    Ok(format!("sha256:{}", tensorfs_core::sha256::hex_digest(&semantic)))
+}
+
 fn refused(code: &'static str, message: impl Into<String>) -> Refused {
     Refused {
         code,
@@ -1244,5 +1259,69 @@ fn state_name(state: State) -> &'static str {
         State::Completed => "succeeded",
         State::Failed => "failed",
         _ => "been canceled",
+    }
+}
+
+
+#[cfg(test)]
+mod intent_tests {
+    use super::*;
+
+    #[test]
+    fn distinct_large_seeds_cannot_replay_a_finished_child() {
+        let root = std::env::temp_dir().join(format!("cm-child-intent-{}", uuid::Uuid::new_v4()));
+        let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
+        let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
+        let objects = Arc::new(crate::objects::Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap());
+        let runs = Arc::new(crate::runs::Runs { service: service.clone(), objects, publisher: None,
+            local: None, own_hub: None, jobs: Default::default() });
+        let first = crate::boundary_json::parse(br#"{"seed":9007199254740992,"nested":{"b":2,"a":1}}"#).unwrap();
+        let formatted = crate::boundary_json::parse(br#" { "nested": {"a":1,"b":2}, "seed":9007199254740992 } "#).unwrap();
+        let changed = crate::boundary_json::parse(br#"{"seed":9007199254740993,"nested":{"b":2,"a":1}}"#).unwrap();
+        let first_intent = child_intent("package", "call", &first).unwrap();
+        let formatted_intent = child_intent("package", "call", &formatted).unwrap();
+        let changed_intent = child_intent("package", "call", &changed).unwrap();
+        assert_eq!(first_intent, formatted_intent);
+        assert_ne!(first_intent, changed_intent);
+        // This is the old red arm: JCS merged those distinct valid integer seeds.
+        assert_eq!(serde_json_canonicalizer::to_vec(&first).unwrap(), serde_json_canonicalizer::to_vec(&changed).unwrap());
+        let parent = service.engine.accept_run("actor", "parent", "parent-intent", crate::journal::Invocation {
+            package: "local/intent".into(), input: json!({}), job: true, ..Default::default()
+        }).unwrap().0;
+        let child = service.engine.accept_run("actor", "parent/0", &first_intent, crate::journal::Invocation {
+            package: "local/intent".into(), entrypoint: "call".into(), input: first.clone(), ..Default::default()
+        }).unwrap().0;
+        service.engine.end_preparation(&child.id, Outcome::Completed(crate::journal::ResultRecord {
+            value: json!({"seed":9007199254740992u64}), artifacts: vec![], asset_bindings: vec![],
+        })).unwrap();
+        let attached = runs.child(&parent, "parent/0", &formatted_intent, "call", formatted, vec![]).unwrap();
+        assert_eq!(attached.id, child.id);
+        assert_eq!(attached.result.unwrap().value["seed"], 9007199254740992u64);
+        let refused = runs.child(&parent, "parent/0", &changed_intent, "call", changed, vec![]).unwrap_err();
+        assert_eq!(refused.code, "run_id_conflict");
+        let old_bytes = serde_json_canonicalizer::to_vec(&json!(["package", "call", first])).unwrap();
+        let old_intent = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&old_bytes));
+        let legacy = service.engine.accept_run("actor", "parent/legacy", &old_intent, crate::journal::Invocation {
+            package: "local/intent".into(), parent: parent.id.clone(), entrypoint: "call".into(),
+            input: first.clone(), ..Default::default()
+        }).unwrap().0;
+        assert!(legacy_child_matches(&legacy, &parent.id, "package", "call", "call", &first, &[]).unwrap());
+        let changed = crate::boundary_json::parse(br#"{"seed":9007199254740993,"nested":{"b":2,"a":1}}"#).unwrap();
+        assert!(!legacy_child_matches(&legacy, &parent.id, "package", "call", "call", &changed, &[]).unwrap());
+        service.engine.cancel(&legacy.id, "actor").unwrap();
+        service.engine.cancel(&parent.id, "actor").unwrap();
+        assert!(service.stop().unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn child_result_transfer_preserves_exact_uint64_values() {
+        let result = crate::journal::ResultRecord { value: json!({"seed":u64::MAX,"float":1.0}),
+            artifacts: vec![], asset_bindings: vec![] };
+        let (serialized, granted) = grant(Path::new("unused"), &result, Path::new("unused"), None).unwrap();
+        let received = crate::boundary_json::parse(serialized.as_bytes()).unwrap();
+        assert_eq!(received["seed"].as_u64(), Some(u64::MAX));
+        assert!(received["float"].as_number().unwrap().is_f64());
+        assert!(granted.is_empty());
     }
 }
