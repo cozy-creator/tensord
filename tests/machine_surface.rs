@@ -1362,6 +1362,84 @@ mod v1_api {
         (origin, held)
     }
 
+    /// `cozy model quantize`'s shape on CPU: a job writes its declared weights output through
+    /// the machine's native writer channel and adopts it; the output is a product of its log
+    /// (the manifest), and `cozy run upload` puts that held checkpoint in a destination.
+    #[tokio::test]
+    async fn a_job_writes_a_weights_output_and_a_warm_run_publishes_it() {
+        let (origin, hub) = publication_hub().await;
+        let (machine, tools) = installing_machine().await;
+        let mut client = client(&machine).await;
+        let all = cap(Grant {
+            action: MACHINE.into(),
+            ..Default::default()
+        });
+        let manifest = write_package(&mut client, &all, "cpu_weights", "local/cozy-machine-cpu-weights").await;
+        let job = v1::RunSpec {
+            kind: v1::RunKind::Job as i32,
+            source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
+            entrypoint: "table".into(),
+            payload: br#"{"size":64}"#.to_vec(),
+            owner: "alice".into(),
+            ..Default::default()
+        };
+        let run = |id: &str, spec: v1::RunSpec| v1::RunRequest {
+            id: id.into(),
+            after: 0,
+            spec: Some(spec),
+        };
+        let events = collect(client.run(authorized(run("weights", job), &all)).await.unwrap().into_inner())
+            .await
+            .unwrap();
+        let done = outcome(&events);
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        let written = done
+            .outputs
+            .iter()
+            .find(|p| p.output == "model")
+            .unwrap_or_else(|| panic!("{done:?}"));
+        assert_eq!(written.media_type, "application/vnd.cozy.model-manifest");
+        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        assert!(result.to_string().contains(&written.digest), "{result} names {written:?}");
+        let held = tensorfs_core::store::Store::open(&machine.store()).unwrap();
+        let reference = tensorfs_core::ids::ObjectRef {
+            sha256: written.digest.trim_start_matches("sha256:").into(),
+            length: written.length,
+        };
+        held.read_manifest(&reference).unwrap();
+
+        // `cozy run upload <run>#model acme/tiny`: the held checkpoint, published.
+        let upload = v1::RunSpec {
+            kind: v1::RunKind::Warm as i32,
+            models: vec![v1::ModelChoice {
+                parameter: "model".into(),
+                manifest: written.digest.clone(),
+                manifest_length: written.length,
+                ..Default::default()
+            }],
+            weights_destination: "acme/tiny".into(),
+            hub: Some(v1::HubAccess {
+                origin,
+                token: EXECUTION_ACCESS.into(),
+                ..Default::default()
+            }),
+            publication: "grant-1".into(),
+            owner: "alice".into(),
+            ..Default::default()
+        };
+        let events = collect(client.run(authorized(run("upload", upload), &all)).await.unwrap().into_inner())
+            .await
+            .unwrap();
+        let done = outcome(&events);
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        assert_eq!(result["models"][0]["published"]["checkpoint"], written.digest, "{result}");
+        let held = hub.lock().unwrap();
+        assert_eq!(held.finalized.as_deref(), Some(written.digest.as_str()));
+        assert_eq!(held.refused, 0);
+        let _ = fs::remove_dir_all(tools);
+    }
+
     /// `cozy model upload` on the serve process: a warm run of one provider source makes it
     /// with TensorFS and puts its checkpoint in the destination under the run's
     /// machine-publication authorization. The machine renews the bearer with the run's
