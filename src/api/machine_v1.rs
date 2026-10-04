@@ -31,6 +31,16 @@ pub(super) struct MachineV1<B> {
 
 /// Who may do what: a machine-scope cap does everything as its signer; a run-scope cap may only
 /// attach to and read that run.
+fn expired_capability() -> Status {
+    let mut status = Status::unauthenticated(
+        "capability_expired: the capability that opened this stream has expired",
+    );
+    status
+        .metadata_mut()
+        .insert("cozy-error-code", "capability_expired".parse().unwrap());
+    status
+}
+
 #[derive(Clone)]
 struct Caller {
     actor: VerifiedActor,
@@ -57,7 +67,7 @@ impl Caller {
             };
             tokio::select! {
                 _ = keys.revoked(key) => Status::unauthenticated("the key that opened this stream no longer authorizes it"),
-                _ = expiry => Status::unauthenticated("the capability that opened this stream has expired"),
+                _ = expiry => expired_capability(),
             }
         });
         Box::pin(AuthorizedStream {
@@ -72,9 +82,7 @@ impl Caller {
             .unwrap_or_default()
             .as_secs() as i64;
         if now >= self.grant.expires {
-            return Err(Status::unauthenticated(
-                "the capability that opened this stream has expired",
-            ));
+            return Err(expired_capability());
         }
         if !keys
             .admitted()
@@ -152,7 +160,7 @@ struct AuthorizedStream<T> {
     ended: Pin<Box<dyn Future<Output = Status> + Send>>,
     closed: bool,
 }
-impl<T> Stream for AuthorizedStream<T> {
+impl<T: 'static> Stream for AuthorizedStream<T> {
     type Item = Result<T, Status>;
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if self.closed {
@@ -661,7 +669,7 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
                 }
             }
             // A detached or unauthorized upload keeps only its resumable staging bytes.
-            Err(Status::canceled("the write stream closed before its end"))
+            Err(Status::cancelled("the write stream closed before its end"))
         });
         let mut data = first.data;
         loop {
