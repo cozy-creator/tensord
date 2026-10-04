@@ -360,6 +360,8 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS object_uses(sha256 TEXT PRIMARY KEY,length INTEGER NOT NULL,used_ms INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS run_objects(execution INTEGER NOT NULL REFERENCES executions(id),sha256 TEXT NOT NULL,length INTEGER NOT NULL,PRIMARY KEY(execution,sha256));
             CREATE INDEX IF NOT EXISTS run_objects_digest ON run_objects(sha256);
+            CREATE TABLE IF NOT EXISTS model_roots(sha256 TEXT PRIMARY KEY,length INTEGER NOT NULL,owner TEXT NOT NULL,repository TEXT NOT NULL,used_ms INTEGER NOT NULL,released INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS run_models(execution INTEGER NOT NULL REFERENCES executions(id),sha256 TEXT NOT NULL REFERENCES model_roots(sha256),PRIMARY KEY(execution,sha256));
             CREATE TABLE IF NOT EXISTS job_contexts(execution INTEGER PRIMARY KEY REFERENCES executions(id),record BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS checkpoints(execution INTEGER NOT NULL REFERENCES executions(id),operation_key TEXT NOT NULL,logical_key TEXT NOT NULL,content_digest TEXT NOT NULL,length INTEGER NOT NULL,attempt INTEGER NOT NULL,receipt TEXT NOT NULL,at_ms INTEGER NOT NULL,PRIMARY KEY(execution,operation_key,logical_key));
             CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_request ON executions(actor,request_id) WHERE actor IS NOT NULL;
@@ -1156,6 +1158,9 @@ impl Journal {
                     params![encoded_invocation, record.id],
                 )
                 .map_err(db_error)?;
+                if let Some(submission)=&record.submission {
+                    reference_prepared_models(tx,&record.id,&submission.actor,preparation)?;
+                }
                 Ok(())
             },
         )
@@ -1210,6 +1215,57 @@ impl Journal {
             self.end_preparation(&id, Outcome::Failed(failure.encode()))?;
         }
         Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct ModelRoot { pub sha256:String,pub length:u64,pub owner:String,pub repository:String }
+
+impl Journal {
+    pub fn reserve_model(&mut self, repository:&str, manifest:&tensorfs_core::ids::ObjectRef) -> io::Result<ModelRoot> {
+        tensorfs_core::ids::hex64("model root",&manifest.sha256).map_err(db_error)?;
+        let existing:Option<(ModelRoot,bool)>=self.connection.query_row("SELECT sha256,length,owner,repository,released FROM model_roots WHERE sha256=?1",[&manifest.sha256],|r| Ok((ModelRoot {sha256:r.get(0)?,length:r.get(1)?,owner:r.get(2)?,repository:r.get(3)?},r.get(4)?))).optional().map_err(db_error)?;
+        let standing=existing.as_ref().is_some_and(|(_,released)| !released);
+        let root=match existing {
+            Some((root,false)) if root.length==manifest.length => root,
+            Some((root,_)) if root.length!=manifest.length => return Err(db_error("model root length differs")),
+            _ => ModelRoot {sha256:manifest.sha256.clone(),length:manifest.length,
+                owner:format!("sha256:{}",tensorfs_core::sha256::hex_digest(uuid::Uuid::new_v4().as_bytes())),repository:repository.into()},
+        };
+        let active:bool=self.connection.query_row("SELECT EXISTS(SELECT 1 FROM run_models r JOIN executions e ON e.id=r.execution WHERE r.sha256=?1 AND e.state NOT IN ('completed','failed','canceled'))",[&manifest.sha256],|r|r.get(0)).map_err(db_error)?;
+        if active && standing { return Ok(root); }
+        self.connection.execute("INSERT INTO model_roots(sha256,length,owner,repository,used_ms,released) VALUES(?1,?2,?3,?4,?5,0)
+            ON CONFLICT(sha256) DO UPDATE SET owner=excluded.owner,repository=excluded.repository,used_ms=excluded.used_ms,released=0",
+            params![root.sha256,root.length,root.owner,root.repository,timestamp()]).map_err(db_error)?;
+        Ok(root)
+    }
+    pub fn reference_model(&mut self, execution:&str, sha256:&str) -> io::Result<()> {
+        self.connection.execute("INSERT OR IGNORE INTO run_models(execution,sha256) VALUES(?1,?2)",params![execution,sha256]).map_err(db_error)?; Ok(())
+    }
+    pub fn release_model(&mut self, sha256:&str) -> io::Result<()> {
+        self.connection.execute("UPDATE model_roots SET released=1 WHERE sha256=?1",[sha256]).map_err(db_error)?; Ok(())
+    }
+    pub fn unused_models(&self, grace:std::time::Duration) -> io::Result<Vec<ModelRoot>> {
+        let before=timestamp().saturating_sub(grace.as_millis().min(i64::MAX as u128) as i64);
+        let mut statement=self.connection.prepare("SELECT sha256,length,owner,repository FROM model_roots m
+            WHERE released=0 AND used_ms<?1 AND NOT EXISTS(SELECT 1 FROM run_models r JOIN executions e ON e.id=r.execution
+                WHERE r.sha256=m.sha256 AND e.state NOT IN ('completed','failed','canceled'))").map_err(db_error)?;
+        let rows=statement.query_map([before],|r| Ok(ModelRoot {sha256:r.get(0)?,length:r.get(1)?,owner:r.get(2)?,repository:r.get(3)?})).map_err(db_error)?;
+        rows.collect::<Result<_,_>>().map_err(db_error)
+    }
+    pub fn model_preparations(&self) -> io::Result<Vec<(String,Preparation)>> {
+        let mut statement=self.connection.prepare("SELECT e.id,p.record FROM executions e LEFT JOIN preparations p
+            ON p.actor=json_extract(e.record,'$.submission.actor') AND p.id=json_extract(e.record,'$.submission.preparation_id')
+            WHERE e.state NOT IN ('completed','failed','canceled') AND COALESCE(json_extract(e.record,'$.submission.preparation_id'),'')!=''").map_err(db_error)?;
+        let rows=statement.query_map([],|r| Ok((r.get::<_,i64>(0)?,r.get::<_,Option<String>>(1)?))).map_err(db_error)?;
+        rows.map(|row| { let (id,record)=row.map_err(db_error)?;
+            let record=record.ok_or_else(||db_error("unfinished model preparation is absent"))?;
+            Ok((id.to_string(),serde_json::from_str(&record).map_err(db_error)?)) }).collect()
+    }
+    pub fn model_job_inputs(&self) -> io::Result<Vec<(String,Vec<u8>)>> {
+        let mut statement=self.connection.prepare("SELECT e.id,c.record FROM job_contexts c JOIN executions e ON e.id=c.execution WHERE e.state NOT IN ('completed','failed','canceled')").map_err(db_error)?;
+        let rows=statement.query_map([],|r| Ok((r.get::<_,i64>(0)?.to_string(),r.get(1)?))).map_err(db_error)?;
+        rows.collect::<Result<_,_>>().map_err(db_error)
     }
 }
 
@@ -1274,7 +1330,26 @@ fn insert(
     )
     .map_err(db_error)?;
     reference_objects(tx, &execution.id, &objects)?;
+    if let Some(submission)=&execution.submission {
+        reference_prepared_models(tx,&execution.id,&submission.actor,&submission.preparation_id)?;
+    }
     Ok(execution)
+}
+
+/// Native custody is installed by Engine before acceptance. Attach the matching policy
+/// references in the same transaction as its durable execution record.
+fn reference_prepared_models(tx:&rusqlite::Transaction<'_>, execution:&str, actor:&str, preparation:&str) -> io::Result<()> {
+    if preparation.is_empty() { return Ok(()); }
+    let record:Option<String>=tx.query_row("SELECT record FROM preparations WHERE actor=?1 AND id=?2",params![actor,preparation],|r|r.get(0)).optional().map_err(db_error)?;
+    let Some(record)=record else { return Ok(()); };
+    let preparation:Preparation=serde_json::from_str(&record).map_err(db_error)?;
+    let document:serde_json::Value=serde_json::from_slice(&preparation.document).map_err(db_error)?;
+    for slot in document["slots"].as_array().into_iter().flatten() {
+        let Some(snapshot)=slot["binding"]["snapshot"].as_str() else { return Err(db_error("model slot has no checkpoint")); };
+        let sha256=snapshot.strip_prefix("sha256:").unwrap_or(snapshot);
+        tx.execute("INSERT OR IGNORE INTO run_models(execution,sha256) SELECT ?1,sha256 FROM model_roots WHERE sha256=?2 AND released=0",params![execution,sha256]).map_err(db_error)?;
+    }
+    Ok(())
 }
 
 impl Journal {

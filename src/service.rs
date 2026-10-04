@@ -339,6 +339,9 @@ impl Service {
     /// Caches manage themselves (`reclaim`): TTL and storage pressure, never a purge verb.
     pub fn reclaim(&self) -> crate::reclaim::Swept {
         *self.swept.lock().unwrap() = std::time::Instant::now();
+        if let Err(error)=self.engine.sweep_models() {
+            eprintln!("reclaim native model roots: {error}");
+        }
         if let Some(jobs) = self.jobs() {
             if let Err(error) = jobs.sweep_objects(crate::reclaim::TTL) {
                 eprintln!("reclaim object roots: {error}");

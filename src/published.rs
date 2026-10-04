@@ -190,7 +190,7 @@ impl Publisher {
         submission: &str,
         request: Request,
     ) -> Progress {
-        if let Ok(Some(prepared)) = self.held(service, actor, &request) {
+        if let Ok(Some(prepared)) = self.held(service, actor, &request, None) {
             return Progress::Ready(Arc::new(prepared));
         }
         let key = format!("{actor}\0{submission}");
@@ -218,7 +218,7 @@ impl Publisher {
                     std::thread::spawn(move || {
                         // A rental is not idle while it installs or downloads for a run.
                         let _preparing = service.preparing();
-                        let result = this.work(&service, &actor, &request, &worker);
+                        let result = this.work(&service, &actor, &request, &worker, None);
                         worker.set(match result {
                             Ok(prepared) => Progress::Ready(Arc::new(prepared)),
                             Err((code, detail)) => Progress::Failed(code, detail),
@@ -257,15 +257,16 @@ impl Publisher {
         actor: &str,
         request: &Request,
         observe: Observer,
+        execution: &str,
     ) -> Result<Prepared, Failure> {
-        if let Ok(Some(prepared)) = self.held(service, actor, request) {
+        if let Ok(Some(prepared)) = self.held(service, actor, request, Some(execution)) {
             return Ok(prepared);
         }
         let job = Job {
             observer: Some(observe),
             ..Default::default()
         };
-        self.work(service, actor, request, &job)
+        self.work(service, actor, request, &job, Some(execution))
     }
 
     /// A slot's model made from its provider source (TensorFS `source_model`), kept as the
@@ -339,6 +340,7 @@ impl Publisher {
         repository: &str,
         manifest: &str,
         bytes: &(dyn Fn(u64, u64) + Sync),
+        execution: &str,
     ) -> Result<(), Refused> {
         let catalog = Catalog::new(source).map_err(|e| Refused {
             code: "catalog_read_failed",
@@ -349,7 +351,7 @@ impl Publisher {
             Some(gpu) => self.protected(service, &gpu),
             None => self.fetching.lock().unwrap().keys().cloned().collect(),
         };
-        ensure(&self.store, &catalog, repository, manifest, &keep, bytes)
+        ensure(&self.store, &catalog, repository, manifest, &keep, bytes, Some((&service.engine,Some(execution))))
             .map_err(|(code, message)| Refused { code, message })
     }
 
@@ -465,6 +467,7 @@ impl Publisher {
         service: &Service,
         actor: &str,
         request: &Request,
+        execution: Option<&str>,
     ) -> io::Result<Option<Prepared>> {
         let held = match &request.installed {
             Some(installed) => Some(installed.clone()),
@@ -497,6 +500,9 @@ impl Publisher {
             return Ok(None);
         };
         let plan = gpu.plan(&preparation)?;
+        if service.engine.retain_preparation(execution,&preparation).is_err() {
+            return Ok(None); // an evicted cache is made present by the normal cold path
+        }
         // The bytes may have been reclaimed since; then the model is fetched again.
         if gpu.source_facts(&plan.selections()).is_err() {
             return Ok(None);
@@ -513,6 +519,7 @@ impl Publisher {
         actor: &str,
         request: &Request,
         job: &Job,
+        execution: Option<&str>,
     ) -> Result<Prepared, Failure> {
         let catalog = Catalog::new(&request.source).map_err(|e| ("catalog_read_failed", e.0))?;
         let held = match &request.installed {
@@ -542,7 +549,7 @@ impl Publisher {
             "capability_unavailable",
             "this callable needs a GPU and this machine has none configured".to_string(),
         ))?;
-        let plan = self.model(service, &gpu, actor, &installation, request, &catalog, job)?;
+        let plan = self.model(service, &gpu, actor, &installation, request, &catalog, job, execution)?;
         Ok(Prepared {
             installation,
             plan: Some(plan),
@@ -906,6 +913,7 @@ impl Publisher {
         request: &Request,
         catalog: &Catalog,
         job: &Job,
+        execution: Option<&str>,
     ) -> Result<GpuPlan, Failure> {
         let interface: Value = serde_json::from_slice(&installation.interface).map_err(|_| {
             (
@@ -945,7 +953,11 @@ impl Publisher {
                 .cloned()
                 .unwrap_or_default();
             if !choice.source.is_empty() {
-                grants.push(self.source_grant(installation, &path, &choice, &request.providers, job)?);
+                let grant=self.source_grant(installation, &path, &choice, &request.providers, job)?;
+                let sha256=grant.manifest.trim_start_matches("sha256:");
+                let manifest=tensorfs_core::ids::ObjectRef {sha256:sha256.into(),length:fs::metadata(self.store.manifest_path(sha256)).map_err(io_failure)?.len()};
+                service.engine.retain_model(execution,&grant.repository,&manifest).map_err(io_failure)?;
+                grants.push(grant);
                 continue;
             }
             let (model, release, lane, manifest) = if let Some(reference) =
@@ -1081,7 +1093,7 @@ impl Publisher {
                 "downloading {}@{} {}",
                 grant.repository, grant.release, grant.lane
             ));
-            ensure(&self.store, catalog, &grant.repository, &grant.manifest, &keep, &|d, t| job.bytes(d, t))?;
+            ensure(&self.store, catalog, &grant.repository, &grant.manifest, &keep, &|d, t| job.bytes(d, t), Some((&service.engine,execution)))?;
         }
         for grant in &mut grants {
             let parameter = grant
@@ -1095,7 +1107,7 @@ impl Publisher {
                 .iter()
                 .find(|c| c.parameter == grant.slot || c.parameter == parameter)
             {
-                apply_adapters(&self.store, catalog, choice, grant, &keep, &request.providers, job)?;
+                apply_adapters(&self.store, catalog, choice, grant, &keep, &request.providers, job, Some((&service.engine,execution)))?;
             }
         }
         job.stage(format!("preparing {}", request.package));
@@ -1181,6 +1193,7 @@ fn ensure(
     manifest: &str,
     keep: &[String],
     bytes: &(dyn Fn(u64, u64) + Sync),
+    custody: Option<(&crate::execution::Engine,Option<&str>)>,
 ) -> Result<(), Failure> {
     let credential = catalog.credential();
     let refspec = format!("{repository}@{manifest}");
@@ -1196,6 +1209,15 @@ fn ensure(
     );
     request.keep = &keep;
     request.on_event = Some(&on_event);
+    let on_ready=|ensured:&tensorfs_core::ensure::Ensured| {
+        if let Some((engine,execution))=custody {
+            engine.retain_model(execution,repository,&ensured.manifest).map_err(|error|tensorfs_core::err::Refusal {
+                code:tensorfs_core::err::Code::DURABILITY_UNPROVEN,detail:format!("model custody was not accepted: {error}"),
+            })?;
+        }
+        Ok(())
+    };
+    request.on_ready=Some(&on_ready);
     tensorfs_core::ensure::ensure(&request)
         .map(drop)
         .map_err(|e| ("model_download_failed", e.to_string()))
@@ -1314,6 +1336,7 @@ fn apply_adapters(
     keep: &[String],
     providers: &Providers,
     job: &Job,
+    custody: Option<(&crate::execution::Engine,Option<&str>)>,
 ) -> Result<(), Failure> {
     let mut keep = keep.to_vec();
     if choice.adapters.is_empty() {
@@ -1340,7 +1363,7 @@ fn apply_adapters(
     for adapter in &choice.adapters {
         let manifest = if adapter.source.is_empty() {
             let (repository, manifest) = resolve_adapter(catalog, adapter)?;
-            ensure(store, catalog, &repository, &manifest, &keep, &|d, t| job.bytes(d, t))?;
+            ensure(store, catalog, &repository, &manifest, &keep, &|d, t| job.bytes(d, t), custody)?;
             manifest
         } else {
             // A provider-source LoRA (civitai://, hf://) is made here, normalized at ingest.

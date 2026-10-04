@@ -335,6 +335,7 @@ fn start_api(
     let objects = Arc::new(cozy_machine::objects::Objects::new(
         &root.join("writes"), store.clone(), service.engine.clone(),
     )?);
+    service.engine.configure_model_custody(store.clone())?;
     let publisher =
         cozy_machine::published::Publisher::new(&root.join("published"), sdk, store.clone())?;
     service.configure_publisher(publisher.clone());
