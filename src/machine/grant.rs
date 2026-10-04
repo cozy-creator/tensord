@@ -82,8 +82,9 @@ pub struct Layout {
     pub root: PathBuf,
     pub bootstrap: PathBuf,
     pub state: PathBuf,
-    /// The TensorFS store this machine reads and fills: the box's one store when the launcher
-    /// names it (`COZY_TENSORFS_ROOT`, an owned computer), else the engine's own.
+    /// The TensorFS store this machine reads and fills: the one `COZY_TENSORFS_ROOT` names (an
+    /// owned computer's box store; a worker image sets it), else the root's standard
+    /// `var/lib/tensorfs`.
     pub store: PathBuf,
 }
 impl Layout {
@@ -92,7 +93,7 @@ impl Layout {
             root: root.into(),
             bootstrap: root.join("run/cozy/bootstrap"),
             state: root.join("var/lib/cozy/machine"),
-            store: store.unwrap_or_else(|| root.join("var/lib/cozy/rust-machine/tensorfs")),
+            store: store.unwrap_or_else(|| root.join("var/lib/tensorfs")),
         }
     }
     /// This service's execution journal and package generations: outside

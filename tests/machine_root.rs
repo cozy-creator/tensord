@@ -230,9 +230,7 @@ async fn the_named_store_is_the_machines_store() {
     assert_eq!(std::fs::read(&blob).unwrap(), kept);
     assert_eq!(std::fs::metadata(&blob).unwrap().ino(), inode);
     assert!(
-        !machine_root
-            .join("var/lib/cozy/rust-machine/tensorfs")
-            .exists(),
+        !machine_root.join("var/lib/tensorfs").exists(),
         "the machine made a second store"
     );
     drop(machine);
