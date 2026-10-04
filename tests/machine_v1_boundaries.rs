@@ -391,11 +391,20 @@ async fn expiry_ends_a_quiet_status_stream_and_a_run_observer() {
         .unwrap()
         .into_inner();
     assert!(run.message().await.unwrap().is_some());
-    let refusal = tokio::time::timeout(Duration::from_secs(3), status.message())
-        .await
-        .unwrap()
-        .unwrap_err();
-    assert_eq!(refusal.code(), tonic::Code::Unauthenticated);
+    let until = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match tokio::time::timeout_at(until, status.message())
+            .await
+            .unwrap()
+        {
+            Err(refusal) => {
+                assert_eq!(refusal.code(), tonic::Code::Unauthenticated);
+                break;
+            }
+            Ok(Some(_)) => (), // Readiness may finish after the first identity snapshot.
+            Ok(None) => panic!("expiry ended Status without an authorization refusal"),
+        }
+    }
     loop {
         match tokio::time::timeout(Duration::from_secs(2), run.message())
             .await
