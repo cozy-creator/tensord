@@ -618,6 +618,33 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
             Some(_) => caller.machine()?,
             None => caller.run(&request.id, None)?,
         }
+        let mut request = request;
+        if let Some(spec) = request.spec.take() {
+            // Count root admission under the same mutex that closes for update activation.
+            // Once accepted, the durable engine holds activity; the observer holds none.
+            let _admitted = self
+                .identity
+                .lifecycle
+                .as_ref()
+                .map(|l| l.admit())
+                .transpose()?;
+            let runs = self
+                .backend
+                .runs()
+                .ok_or_else(|| Status::unimplemented("this machine takes no runs"))?;
+            let (id, spec, actor) = (request.id.clone(), spec_of(spec)?, caller.actor);
+            tokio::task::spawn_blocking(move || {
+                runs.submit(&crate::machine_api::actor_id(actor), &id, spec)
+            })
+            .await
+            .map_err(|_| Status::internal("machine operation stopped"))?
+            .map_err(refusal)?;
+            if let Some(lifecycle) = &self.identity.lifecycle {
+                if let Err(error) = lifecycle.work() {
+                    eprintln!("cozy-machine: idle ledger: {error}");
+                }
+            }
+        }
         let (sender, receiver) = tokio::sync::mpsc::channel(16);
         let backend = self.backend.clone();
         let actor = caller.actor;
@@ -642,6 +669,12 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
     ) -> Result<Response<v1::WriteResult>, Status> {
         let caller = self.caller(request.metadata())?;
         caller.machine()?;
+        let _admitted = self
+            .identity
+            .lifecycle
+            .as_ref()
+            .map(|l| l.admit())
+            .transpose()?;
         let runs = self
             .backend
             .runs()
@@ -655,6 +688,13 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
             .await
             .transpose()?
             .ok_or_else(|| Status::invalid_argument("a write names its object first"))?;
+        if let Some(lifecycle) = &self.identity.lifecycle {
+            // Each authenticated upload attempt renews activity, including a partial
+            // attempt that ends on its short capability and resumes with a fresh one.
+            if let Err(error) = lifecycle.work() {
+                eprintln!("cozy-machine: idle ledger: {error}");
+            }
+        }
         let (digest, length, offset) = (first.digest.clone(), first.length, first.offset);
         let (sender, mut receiver) = tokio::sync::mpsc::channel::<Option<Vec<u8>>>(4);
         let object = digest.clone();
@@ -692,6 +732,11 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
         let held = writer
             .await
             .map_err(|_| Status::internal("machine operation stopped"))??;
+        if let Some(lifecycle) = &self.identity.lifecycle {
+            if let Err(error) = lifecycle.work() {
+                eprintln!("cozy-machine: idle ledger: {error}");
+            }
+        }
         Ok(Response::new(v1::WriteResult { digest, held }))
     }
 
@@ -708,6 +753,15 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
             Ok(v1::Action::Resume) => pb::MachineExecutionAction::Resume,
             _ => return Err(Status::invalid_argument("control names an action")),
         };
+        let _admitted = if action == pb::MachineExecutionAction::Resume {
+            self.identity
+                .lifecycle
+                .as_ref()
+                .map(|l| l.admit())
+                .transpose()?
+        } else {
+            None
+        };
         let actor = caller.actor;
         let id = request.id.clone();
         let changed = Self::call(&self.backend, move |backend| {
@@ -722,6 +776,13 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
             )
         })
         .await?;
+        if action == pb::MachineExecutionAction::Resume {
+            if let Some(lifecycle) = &self.identity.lifecycle {
+                if let Err(error) = lifecycle.work() {
+                    eprintln!("cozy-machine: idle ledger: {error}");
+                }
+            }
+        }
         Ok(Response::new(state(&request.id, &changed)))
     }
 
@@ -871,7 +932,7 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
     }
 }
 
-/// Submit when asked, then follow the log until the outcome or the caller leaves.
+/// Follow accepted work until the outcome or the observer leaves. This holds no admission.
 pub(super) async fn stream_run<B: MachineBackend>(
     backend: Arc<B>,
     actor: VerifiedActor,
@@ -889,18 +950,10 @@ async fn stream_run_scoped<B: MachineBackend>(
     scope: Option<Caller>,
 ) -> Result<(), Status> {
     let id = request.id.clone();
-    if let Some(spec) = request.spec {
-        let runs = backend
-            .runs()
-            .ok_or_else(|| Status::unimplemented("this machine takes no runs"))?;
-        let (id, spec) = (id.clone(), spec_of(spec)?);
-        tokio::task::spawn_blocking(move || {
-            runs.submit(&crate::machine_api::actor_id(actor), &id, spec)
-        })
-        .await
-        .map_err(|_| Status::internal("machine operation stopped"))?
-        .map_err(refusal)?;
-    }
+    debug_assert!(
+        request.spec.is_none(),
+        "root admission precedes observation"
+    );
     let mut log = Log::default();
     let cursor = request.after;
     let mut after = 0;
