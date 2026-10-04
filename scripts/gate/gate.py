@@ -184,10 +184,12 @@ def marks(events: str) -> dict:
     """First time of each event type. Machine events carry the pod's clock, client events the controller's."""
     out = {}
     for line in events.splitlines():
-        if line.startswith("{"):
+        try:
             event = json.loads(line)
             at = re.sub(r"(\.\d{6})\d*", r"\1", event["at"].rstrip("Z"))
             out.setdefault(event["type"], datetime.datetime.fromisoformat(at).replace(tzinfo=datetime.timezone.utc).timestamp())
+        except (ValueError, KeyError, TypeError, AttributeError):
+            continue   # not an event line
     return out
 
 
@@ -538,11 +540,11 @@ class Gate:
                 time.sleep(0.5)   # the rental's machine answers: ready
         cli = spec.get("cli", "cozy")
         place = spec.get("run_args", [f"--rental={self.m.get('rental')}", f"--tensorhub={self.m.get('hub')}"])
-        on_gpu = ("machine.gpu.grant", "machine.executor", "run.in_progress", "machine.stage.turn")
+        on_gpu = re.compile(r'"type":\s*"(machine\.gpu\.grant|machine\.executor|run\.in_progress|machine\.stage\.turn)"')
         procs, first = [], None
         for k, item in enumerate(requests):
             if procs:
-                while procs[-1]["proc"].poll() is None and not any(f'"type":"{t}"' in procs[-1]["err"].read_text() for t in on_gpu):
+                while procs[-1]["proc"].poll() is None and not on_gpu.search(procs[-1]["err"].read_text()):
                     time.sleep(0.1)
             if isinstance(item, str):
                 prompt, seed = self.unique()
