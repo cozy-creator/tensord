@@ -6,6 +6,7 @@ pub mod install;
 mod machine_status;
 mod machine_update;
 mod machine_v1;
+pub mod retired;
 mod server;
 pub mod workspaces;
 
