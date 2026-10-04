@@ -28,6 +28,7 @@ pub mod published;
 pub mod reclaim;
 pub mod resident_custody;
 pub mod runs;
+pub mod weights;
 pub mod scope;
 pub mod service;
 pub mod triage;

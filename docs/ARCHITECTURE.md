@@ -65,6 +65,7 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 | `published.rs` | Package and model preparation: releases and models from the Hub, provider-source models via TensorFS `source_model`, held per release and resolution; downloads keep the serving set out of GC | `Publisher`, `Request`, `Prepared` | D1 |
 | `adapter_views.rs` | Caller LoRA adapters as a zero-copy TensorFS derivation | — | D1 |
 | `runs.rs` | Run sources and preparation inside a run: accepted at once, install/resolve/download as its progress, Hub token in memory only. A warm run with no entrypoint installs and fetches its choices; one with no code makes provider sources and uploads to its weights destination | `Runs`, `Spec`, `Source` | D1 |
+| `weights.rs` | A job's weights: `weights_writer` sources and outputs over TensorFS's native channels; an adopted output kept in a local repository, recorded as a manifest product, published to the run's weights destination | `Weights`, `Grant` | D1 |
 | `objects.rs` | Write: resumable content-addressed objects into the store, recorded per signer | `Objects`, `Writer` | D1 |
 | `local_source.rs` | A run's local source: install written unpublished code once per manifest | `LocalSources`, `Manifest` | D1 |
 | `machine/` | Launch grant, lifetime identity, readiness receipt, rental lifecycle, supervision, SSH, runtime update, the embedded Python client and installer helper (`client.rs`) | `Grant`, `Readiness`, `Lifecycle` | D2 |

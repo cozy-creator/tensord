@@ -310,6 +310,12 @@ pub enum DeviceCommand {
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         inputs: BTreeMap<String, Value>,
         call_interfaces: Vec<CallInterface>,
+        /// The job's model inputs: `{parameter: {class, manifest, length}}`.
+        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+        models: BTreeMap<String, Value>,
+        /// This owner answers `weights_writer`: the job reads and writes weights through it.
+        #[serde(skip_serializing_if = "is_false")]
+        weights: bool,
     },
 }
 
@@ -378,6 +384,8 @@ pub enum Kind {
     GpuRelease,
     ModelPrefetch,
     Checkpoint,
+    /// A job's weights: one source read, one output written, or an output adopted.
+    WeightsWriter,
     #[default]
     #[serde(other)]
     Unknown,
@@ -614,6 +622,10 @@ pub struct Frame {
     pub progress_label: String,
     // `checkpoint` (a job's `Checkpoints.declare`): its keys and content (`length` above).
     pub operation_key: String,
+    /// `weights_writer`: `source`, `output` or `adopt`, its output and its transaction.
+    pub operation: String,
+    pub output_slot: String,
+    pub transaction: String,
     pub logical_key: String,
     pub content_digest: String,
 }
@@ -676,6 +688,17 @@ pub struct Answer {
     pub receipt_id: String,
     #[serde(skip_serializing_if = "is_false")]
     pub replayed: bool,
+    /// `Opened` (a weights output) and `Adopted`: its transaction, run and manifest.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub transaction: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub request_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub manifest: String,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub manifest_length: u64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub receipt_digest: String,
 }
 impl Answer {
     pub fn unavailable(seq: u64) -> Self {
@@ -706,6 +729,11 @@ impl Answer {
             progress: None,
             receipt_id: String::new(),
             replayed: false,
+            transaction: String::new(),
+            request_id: String::new(),
+            manifest: String::new(),
+            manifest_length: 0,
+            receipt_digest: String::new(),
         }
     }
     pub fn ok(seq: u64) -> Self {
