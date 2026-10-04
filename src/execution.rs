@@ -1,8 +1,8 @@
 //! CPU runner supervision. Scheduling policy remains with the machine owner.
 use crate::{
     journal::{
-        Artifact, Execution, Invocation, Journal, Outcome, ProcessBirth, ProgressSnapshot,
-        ResultRecord, State, SubmissionContext,
+        Artifact, Execution, Invocation, Journal, Outcome, ProcessBirth, ProgressSample,
+        ProgressSnapshot, ResultRecord, State, SubmissionContext,
     },
     launch_identity::Seal,
     process::Liveness,
@@ -26,7 +26,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process::{Child, Stdio},
     sync::{Arc, Condvar, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 pub const MAX_RUNNER_FRAME: usize = 1024 * 1024;
@@ -479,18 +479,23 @@ impl Engine {
                 roots.preparation(self,Some(id),&prepared)?;
             }
         }
+        let progress = self.progress.lock().unwrap();
         let record = self
             .journal
             .lock()
             .unwrap()
-            .bind_prepared(id, invocation, preparation);
+            .bind_prepared_observed(id, invocation, preparation, progress.get(id));
+        drop(progress);
         self.end_observation(id);
         record
     }
 
     /// The preparing run ends undispatched (warm success or preparation failure).
     pub fn end_preparation(&self, id: &str, outcome: Outcome) -> io::Result<Execution> {
-        let record = self.journal.lock().unwrap().end_preparation(id, outcome);
+        let progress = self.progress.lock().unwrap();
+        let record = self.journal.lock().unwrap()
+            .end_preparation_observed(id, outcome, progress.get(id));
+        drop(progress);
         self.end_observation(id);
         record
     }
@@ -802,7 +807,7 @@ impl Engine {
         completed_units: u64,
         mut detail: String,
     ) -> io::Result<()> {
-        // This map has at most one entry per supervised execution, never an event history.
+        // One bounded projection per supervised execution, never a per-frame history.
         if !self.owned.lock().unwrap().contains(id) {
             return Ok(());
         }
@@ -833,15 +838,35 @@ impl Engine {
         if record.revision >= record.revision_ceiling {
             record = journal.reserve_observations(id, progress.get(id))?;
         }
+        let revision = record
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("execution observation cursor exhausted"))?;
+        let sample = ProgressSample {
+            completed_units,
+            detail: detail.clone(),
+            revision,
+            at_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|at| at.as_millis() as u64)
+                .unwrap_or(0),
+        };
+        let mut samples = record.progress_samples;
+        if samples.last().is_some_and(|last| last.stage() == sample.stage()) {
+            samples.pop(); // A same-stage burst retains only its actual latest frame.
+        }
+        samples.push(sample);
+        let excess = samples.len().saturating_sub(crate::journal::MAX_PROGRESS_STAGE_EDGES + 1);
+        if excess > 0 {
+            samples.drain(..excess);
+        }
         progress.insert(
             id.into(),
             ProgressSnapshot {
                 completed_units,
                 detail,
-                revision: record
-                    .revision
-                    .checked_add(1)
-                    .ok_or_else(|| io::Error::other("execution observation cursor exhausted"))?,
+                revision,
+                samples,
             },
         );
         drop((progress, journal));

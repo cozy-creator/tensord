@@ -182,6 +182,25 @@ impl NativeBackend {
             })
             .collect()
     }
+    fn progress_events(&self, record: &Execution) -> Result<Vec<pb::MachineExecutionEvent>, Status> {
+        record.progress_samples.iter()
+            .skip(record.progress_samples.len()
+                .saturating_sub(crate::journal::MAX_PROGRESS_STAGE_EDGES + 1))
+            .map(|sample| {
+                let payload = serde_json::from_str::<Value>(&sample.detail)
+                    .ok().filter(Value::is_object)
+                    .unwrap_or_else(|| json!({"stage":sample.detail,"step_ms":0.0}));
+                Ok(pb::MachineExecutionEvent {
+                    sequence: sample.revision,
+                    attempt_ordinal: record.attempt.max(1) as u64,
+                    at_ms: sample.at_ms,
+                    kind: "progress".into(),
+                    body_canonical_bytes: canonical(&json!({"type":"progress","payload":payload}))?,
+                    ..Default::default()
+                })
+            })
+            .collect()
+    }
     fn terminal(&self, record: &Execution) -> Result<pb::MachineExecutionEventPage, Status> {
         let _guard = self.projection.lock().unwrap();
         if let Some(held) = self
@@ -277,6 +296,8 @@ impl NativeBackend {
         // the log does not already show, after them.
         let mut events = self.product_events(record)?;
         let shown: Vec<_> = events.iter().filter_map(|e| e.product.clone()).collect();
+        events.extend(self.progress_events(record)?);
+        events.sort_by_key(|event| event.sequence);
         let first_sequence = record
             .revision
             .checked_add(1)
@@ -1265,7 +1286,7 @@ impl MachineBackend for NativeBackend {
                 .unwrap_or(request.after);
             return Ok(page);
         }
-        // The Python worker's live kinds: `running` once, then the latest `progress`.
+        // `running` once, bounded genuine stage endpoints, and the latest progress.
         let attempt = record.attempt.max(1) as u64;
         let event = |sequence: u64,
                      kind: &str,
@@ -1292,14 +1313,19 @@ impl MachineBackend for NativeBackend {
                 &json!({"generation":attempt}),
             )?);
         }
+        events.extend(self.progress_events(&record)?.into_iter()
+            .filter(|event| event.sequence > request.after));
         let floor = request
             .after
             .max(if running { record.running_revision } else { 0 });
-        if record.revision > floor && record.revision > published {
+        if record.revision > floor && record.revision > published
+            && !events.iter().any(|event| event.sequence == record.revision) {
             // A run preparing inside itself (`runs`) shows its stage and bytes as progress.
             let preparing = record.state == State::Queued
                 && record.waiting_reason.as_deref() == Some(crate::journal::PREPARING);
-            if let Some(progress) = record.progress.as_ref().filter(|_| running || preparing) {
+            if let Some(progress) = record.progress.as_ref().filter(|_| {
+                record.progress_samples.is_empty() && (running || preparing)
+            }) {
                 let payload = serde_json::from_str::<Value>(progress)
                     .ok()
                     .filter(Value::is_object)

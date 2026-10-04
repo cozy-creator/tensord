@@ -221,6 +221,10 @@ pub struct Execution {
     pub pause_actor: Option<String>,
     pub completed_units: u64,
     pub progress: Option<String>,
+    /// Bounded genuine stage endpoints plus the latest sample. Authoritative transitions
+    /// persist this projection with the record; progress itself never begins a write.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub progress_samples: Vec<ProgressSample>,
     /// The cursor at which the attempt started running: its `running` event.
     #[serde(default)]
     pub running_revision: u64,
@@ -255,6 +259,28 @@ pub struct ProgressSnapshot {
     pub completed_units: u64,
     pub detail: String,
     pub revision: u64,
+    pub samples: Vec<ProgressSample>,
+}
+
+/// One received sample, with its original observation cursor and observation time.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ProgressSample {
+    pub completed_units: u64,
+    pub detail: String,
+    pub revision: u64,
+    pub at_ms: u64,
+}
+
+pub const MAX_PROGRESS_STAGE_EDGES: usize = 8;
+
+impl ProgressSample {
+    pub fn stage(&self) -> Option<String> {
+        serde_json::from_str::<serde_json::Value>(&self.detail)
+            .ok()?
+            .get("stage")?
+            .as_str()
+            .map(String::from)
+    }
 }
 
 impl ProgressSnapshot {
@@ -264,6 +290,7 @@ impl ProgressSnapshot {
         }
         record.completed_units = self.completed_units;
         record.progress = Some(self.detail.clone());
+        record.progress_samples.clone_from(&self.samples);
         record.revision = record.revision.max(self.revision);
         true
     }
@@ -1134,6 +1161,16 @@ impl Journal {
         invocation: Invocation,
         preparation: &str,
     ) -> io::Result<Execution> {
+        self.bind_prepared_observed(id, invocation, preparation, None)
+    }
+
+    pub fn bind_prepared_observed(
+        &mut self,
+        id: &str,
+        invocation: Invocation,
+        preparation: &str,
+        progress: Option<&ProgressSnapshot>,
+    ) -> io::Result<Execution> {
         let encoded_invocation = encoded(&invocation)?;
         self.update_with(
             id,
@@ -1145,6 +1182,12 @@ impl Journal {
                     return Ok(false);
                 }
                 record.invocation = invocation;
+                if let Some(progress) = progress {
+                    record.progress_samples.clone_from(&progress.samples);
+                }
+                // Preparation's units are not inference's work counter.
+                record.completed_units = 0;
+                record.progress = None;
                 if let Some(submission) = record.submission.as_mut() {
                     submission.preparation_id = preparation.into();
                 }
@@ -1170,7 +1213,16 @@ impl Journal {
 
     /// A preparing run ends without dispatch: a warm run's success or a preparation failure.
     pub fn end_preparation(&mut self, id: &str, outcome: Outcome) -> io::Result<Execution> {
-        self.update(id, |record| {
+        self.end_preparation_observed(id, outcome, None)
+    }
+
+    pub fn end_preparation_observed(
+        &mut self,
+        id: &str,
+        outcome: Outcome,
+        progress: Option<&ProgressSnapshot>,
+    ) -> io::Result<Execution> {
+        self.update_observed(id, progress, |record| {
             if record.state != State::Queued || record.waiting_reason.as_deref() != Some(PREPARING)
             {
                 return Ok(false);
@@ -1320,6 +1372,7 @@ fn insert(
         pause_actor: None,
         completed_units: 0,
         progress: None,
+        progress_samples: vec![],
         running_revision: 0,
         started_at_ms: 0,
         executor: None,
@@ -1943,6 +1996,7 @@ impl Journal {
                     // A new attempt reports its own progress from zero.
                     record.completed_units = 0;
                     record.progress = None;
+                    record.progress_samples.clear();
                 }
                 State::Queued if record.pause_actor.is_some() => (),
                 _ => return Ok(false),
