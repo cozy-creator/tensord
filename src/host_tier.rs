@@ -533,10 +533,7 @@ impl HostTier {
             };
             if fallback {
                 let (read_plan,layout)=Self::layout(&plan,grants)?;
-                let state=self.state.lock().unwrap();
-                let staging=self.limit.staging(&crate::host_memory::read(),state.charged());
-                drop(state);
-                key=self.stream(format!("{}.whole",layout.digest),&plan,read_plan,layout,staging)?;
+                key=self.stream(format!("{}.whole",layout.digest),&plan,read_plan,layout)?;
             }
         }
         let mut state = self.state.lock().unwrap();
@@ -613,9 +610,8 @@ impl HostTier {
                             let host=crate::host_memory::read();
                             let charged=state.charged();
                             if charged.saturating_add(missing)>self.limit.limit(&host,charged) {
-                                let room=self.limit.staging(&host,charged);
                                 drop(state);
-                                return self.stream(format!("{key}.whole"),plan,read_plan,layout,room);
+                                return self.stream(format!("{key}.whole"),plan,read_plan,layout);
                             }
                         }
                     }
@@ -660,12 +656,11 @@ impl HostTier {
                     need = 0;
                     break;
                 }
-                let staging = self.limit.staging(&host, charged);
                 drop(state);
                 if let Some(fd) = reserved {
                     drop(fd); // the component's reservation: a window is smaller
                 }
-                return self.stream(key, plan, read_plan, layout, staging);
+                return self.stream(key, plan, read_plan, layout);
             }
         }
         state.ledger.reserved_used += u64::from(reserved.is_some());
@@ -727,8 +722,20 @@ impl HostTier {
         plan: &SealedPlan,
         read_plan: read::ReadPlan,
         layout: Layout,
-        staging: u64,
     ) -> io::Result<String> {
+        // Room and the complete future footprint are reserved under the same books lock.
+        // No other opener can spend these bytes while allocation happens outside the lock.
+        let mut state = self.state.lock().unwrap();
+        loop {
+            self.reap(&mut state);
+            match state.slots.get(&key) {
+                Some(Slot::Open(_)) => return Ok(key),
+                Some(Slot::Opening(_)) => state = self.filled.wait(state).unwrap(),
+                None => break,
+            }
+        }
+        let host = crate::host_memory::read();
+        let room = self.limit.staging(&host, state.charged());
         let span = layout
             .regions
             .iter()
@@ -736,21 +743,55 @@ impl HostTier {
             .max()
             .unwrap_or(1)
             .max(1);
-        let slots = ((staging / span) as usize).clamp(1, layout.regions.len().max(1));
-        let (fd, open) = window::open_window(&plan.name, &layout, slots).map_err(failure)?;
+        let mut slots = ((room / span) as usize).clamp(1, layout.regions.len().max(1));
+        while slots > 1 && window::footprint(&layout, slots).map_err(failure)? > room {
+            slots -= 1;
+        }
+        let charged = window::footprint(&layout, slots).map_err(failure)?;
+        state.slots.insert(key.clone(), Slot::Opening(charged));
+        drop(state);
+        let opened = window::open_window(&plan.name, &layout, slots).map_err(failure);
+        let (fd, open) = match opened {
+            Ok(opened) => opened,
+            Err(error) => {
+                self.state.lock().unwrap().slots.remove(&key);
+                self.filled.notify_all();
+                return Err(error);
+            }
+        };
+        if open.bytes() != charged {
+            self.state.lock().unwrap().slots.remove(&key);
+            self.filled.notify_all();
+            return Err(failure(
+                "window allocation differs from its reserved footprint",
+            ));
+        }
         let streamer = Streamer {
             stop: Arc::new(AtomicBool::new(false)),
             tally: Arc::new(IoTally::default()),
         };
         let (stop, tally) = (streamer.stop.clone(), streamer.tally.clone());
-        let charged = open.bytes();
-        let mut state = self.state.lock().unwrap();
-        if matches!(
-            state.slots.get(&key),
-            Some(Slot::Open(_)) | Some(Slot::Opening(_))
-        ) {
-            return Ok(key); // another ask opened it meanwhile; ours goes unused
+        let (store, meta, threads) = (
+            self.store.clone(),
+            self.meta.clone(),
+            self.config.fill_threads,
+        );
+        let manifest = hex(&plan.manifest).to_string();
+        let served = std::thread::Builder::new()
+            .name("host-window".into())
+            .spawn(move || {
+                if let Err(error) = serve(
+                    &store, &meta, &manifest, &read_plan, &layout, open, threads, &tally, &stop,
+                ) {
+                    eprintln!("host tier window stopped: {error}");
+                }
+            });
+        if let Err(error) = served {
+            self.state.lock().unwrap().slots.remove(&key);
+            self.filled.notify_all();
+            return Err(error);
         }
+        let mut state = self.state.lock().unwrap();
         state.slots.insert(
             key.clone(),
             Slot::Open(Entry {
@@ -767,20 +808,6 @@ impl HostTier {
         state.ledger.windows_opened += 1;
         drop(state);
         self.filled.notify_all();
-        let (store, meta, threads) = (
-            self.store.clone(),
-            self.meta.clone(),
-            self.config.fill_threads,
-        );
-        let manifest = hex(&plan.manifest).to_string();
-        std::thread::spawn(move || {
-            if let Err(error) = serve(
-                &store, &meta, &manifest, &read_plan, &layout, open, threads, &tally, &stop,
-            ) {
-                // Dropping the window failed every region: its readers get the error.
-                eprintln!("host tier window stopped: {error}");
-            }
-        });
         Ok(key)
     }
 

@@ -2056,7 +2056,7 @@ dependencies = [
 [[package]]
 name = "tensorfs-core"
 version = "0.3.93"
-source = "git+https://github.com/cozy-creator/tensorfs.git?rev=3fc31b3814e35e5c79033ddf2b820219c0fe7acd#3fc31b3814e35e5c79033ddf2b820219c0fe7acd"
+source = "git+https://github.com/cozy-creator/tensorfs.git?rev=3770c92333adf5899c133e9257aa29f58d9f887f#3770c92333adf5899c133e9257aa29f58d9f887f"
 dependencies = [
  "base64 0.22.1",
  "fs2",
@@ -2075,7 +2075,7 @@ dependencies = [
 [[package]]
 name = "tensorfs-plane"
 version = "0.3.93"
-source = "git+https://github.com/cozy-creator/tensorfs.git?rev=3fc31b3814e35e5c79033ddf2b820219c0fe7acd#3fc31b3814e35e5c79033ddf2b820219c0fe7acd"
+source = "git+https://github.com/cozy-creator/tensorfs.git?rev=3770c92333adf5899c133e9257aa29f58d9f887f#3770c92333adf5899c133e9257aa29f58d9f887f"
 dependencies = [
  "libc",
  "libloading",
