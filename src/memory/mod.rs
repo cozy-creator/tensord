@@ -207,26 +207,32 @@ impl GpuMemory {
         }
     }
 
-    /// Whether `plan`'s whole construction and its activations fit beside the other tenants,
-    /// counting holdings no live executor reads (they are reclaimable, or its own to attach).
-    /// False when its facts were never measured or NVML cannot say.
+    /// Whether `plan` takes Degree 2 now (`Gpu::fits_resident`). False when NVML cannot say.
     pub fn fits_resident(&self, plan: &str, holdings: impl Fn() -> Vec<Holding>) -> bool {
         let Some(sample) = self.sample() else {
             return false;
         };
         let held = holdings();
         let fits = self.with(|gpu| {
-            let unread: u64 = held
-                .iter()
-                .filter(|h| h.readers.is_empty())
-                .map(|h| h.bytes)
-                .sum();
             gpu.holdings = held;
-            gpu.want(plan)
-                .is_some_and(|want| gpu.room(plan, &sample) + unread >= want)
+            gpu.fits_resident(plan, &sample)
         });
         note(serde_json::json!({"event": "degree2", "plan": plan, "fits": fits}));
         fits
+    }
+
+    /// `plan`'s executor asked custody for holding `id` or offered it: kept so its next
+    /// executor's fit counts that weight set once when another tenant reads it.
+    pub fn learn_holding(&self, plan: &str, id: &str) {
+        self.with(|gpu| {
+            if gpu.learned.holding(plan, policy::holding_name(id)) {
+                if let Err(error) = gpu.learned.save() {
+                    note(
+                        serde_json::json!({"event": "learned_unsaved", "error": error.to_string()}),
+                    );
+                }
+            }
+        });
     }
 
     /// Whether `plan`'s executor and first working set fit in the room there is now, with no

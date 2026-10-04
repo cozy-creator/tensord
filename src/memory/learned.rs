@@ -4,7 +4,7 @@
 //! `TTL` is forgotten.
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -37,6 +37,9 @@ pub struct Plan {
     /// Its weights as stages count them at load (decoded copies included) and their floor.
     pub weights: u64,
     pub weights_floor: u64,
+    /// Custody's names (without the generation) of the weight sets its executor asked the
+    /// machine for or offered it: what a new executor of it attaches when they are held.
+    pub holdings: BTreeSet<String>,
     pub used_ms: u64,
 }
 
@@ -124,6 +127,13 @@ impl Learned {
         let row = self.plans.entry(plan.into()).or_default();
         row.used_ms = now_ms();
         (row.weights, row.weights_floor) = (weights, floor);
+    }
+
+    /// `plan`'s executor named weight set `holding` to custody; whether that is news.
+    pub fn holding(&mut self, plan: &str, holding: &str) -> bool {
+        let row = self.plans.entry(plan.into()).or_default();
+        row.used_ms = now_ms();
+        row.holdings.insert(holding.into())
     }
 
     /// The largest activation growth any shape of `plan` measured.

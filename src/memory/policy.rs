@@ -85,6 +85,11 @@ pub struct Holding {
     pub revoking: bool,
 }
 
+/// A holding's name without its generation (`<name>#<generation>`): one weight set on one GPU.
+pub fn holding_name(id: &str) -> &str {
+    id.rsplit_once('#').map_or(id, |(name, _)| name)
+}
+
 /// What the caller does next.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Step {
@@ -347,6 +352,46 @@ impl Gpu {
             .filter(|h| h.readers.contains(&pid))
             .map(|h| h.bytes)
             .sum()
+    }
+
+    /// Holdings `plan`'s next executor attaches although another tenant reads them: named by
+    /// an earlier executor of it (learned), held now, and not mapped by its own process. They
+    /// are resident already, so its load adds none of their bytes.
+    fn shared(&self, plan: &str) -> u64 {
+        let Some(names) = self
+            .learned
+            .plans
+            .get(plan)
+            .map(|learned| &learned.holdings)
+        else {
+            return 0;
+        };
+        let own = self.tenant(plan).map_or(0, |t| t.pid);
+        self.holdings
+            .iter()
+            .filter(|h| {
+                !h.revoking
+                    && !h.readers.is_empty()
+                    && !h.readers.contains(&own)
+                    && names.contains(holding_name(&h.id))
+            })
+            .map(|h| h.bytes)
+            .sum()
+    }
+
+    /// Whether `plan`'s whole construction and its activations fit beside the other tenants
+    /// (Degree 2 keeps every component resident). Holdings nobody reads are reclaimable or its
+    /// own to attach, and those another tenant reads of its own weight sets it attaches too.
+    /// False while its weights or activations were never measured.
+    pub fn fits_resident(&self, plan: &str, sample: &Sample) -> bool {
+        let unread: u64 = self
+            .holdings
+            .iter()
+            .filter(|h| h.readers.is_empty())
+            .map(|h| h.bytes)
+            .sum();
+        self.want(plan)
+            .is_some_and(|want| self.room(plan, sample) + unread + self.shared(plan) >= want)
     }
 
     /// Everything resident beside what it already maps: context, every weight byte,
@@ -707,6 +752,43 @@ mod tests {
         );
         // Its cap still leaves every holding in place: room counts them all.
         assert_eq!(room, 24 * GIB - HEADLESS_FLOOR - GIB / 2 - 13 * GIB);
+    }
+
+    #[test]
+    fn a_weight_set_another_tenant_reads_is_not_counted_again_at_the_fit() {
+        // 16 GiB card: an SDXL checkpoint (7 GiB) held and read by one package's idle executor.
+        // A second package binds the same checkpoint; its earlier executor named that set.
+        let mut gpu = Gpu::default();
+        loaded(&mut gpu, "txt2img", 10, 7 * GIB, 3 * GIB);
+        gpu.holdings = vec![Holding {
+            id: "GPU-1/sha256:sdxl#4".into(),
+            bytes: 7 * GIB,
+            readers: vec![10],
+            idle_ms: 1_000,
+            revoking: false,
+        }];
+        gpu.learned.load("img2img", 7 * GIB, GIB);
+        gpu.learned.call(
+            "img2img",
+            "height=1024,width=1024",
+            3 * GIB,
+            &BTreeMap::new(),
+        );
+        let s = sample(16 * GIB, 16 * GIB - 7 * GIB - GIB / 2, &[(10, GIB / 2)]);
+        // 8.25 GiB of room; context, 7 GiB of weights and 3 GiB of activations would not fit.
+        assert!(gpu.want("img2img").unwrap() > gpu.room("img2img", &s));
+        assert!(!gpu.fits_resident("img2img", &s));
+        // It attaches the held set: only its context and activations are new bytes.
+        assert!(gpu
+            .learned
+            .holding("img2img", holding_name("GPU-1/sha256:sdxl#3")));
+        assert!(gpu.fits_resident("img2img", &s));
+        // A set being revoked, or one of another checkpoint, is no help.
+        gpu.holdings[0].revoking = true;
+        assert!(!gpu.fits_resident("img2img", &s));
+        gpu.holdings[0].revoking = false;
+        gpu.holdings[0].id = "GPU-1/sha256:other#1".into();
+        assert!(!gpu.fits_resident("img2img", &s));
     }
 
     #[test]
