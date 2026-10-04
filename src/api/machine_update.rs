@@ -179,6 +179,7 @@ fn refusal(code: u16, message: String) -> Status {
     match code {
         400 => Status::invalid_argument(message),
         409 => Status::failed_precondition(message),
+        503 => Status::unavailable(message),
         _ => Status::internal(message),
     }
 }
