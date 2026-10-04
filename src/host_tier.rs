@@ -567,7 +567,7 @@ impl HostTier {
         state.slots.insert(key.clone(), Slot::Opening(need));
         drop(state);
         // Sealed now, filled by the filler: adopters wait per region, never for the whole.
-        let opened = host::open_sealed(&plan.name, &layout, reserved).map_err(failure);
+        let opened = host::open_sealed(&plan.name, &layout, reserved, None).map_err(failure);
         let mut state = self.state.lock().unwrap();
         let result = match opened {
             Ok((fd, open)) => {
