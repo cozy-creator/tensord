@@ -166,7 +166,7 @@ impl GpuMemory {
                     let need = gpu.spawn_need(plan);
                     (Some(need), need)
                 } else {
-                    (gpu.want(plan), gpu.need(plan))
+                    (gpu.grant_want(plan), gpu.need(plan))
                 };
                 let decision = gpu.decide(plan, want, need, &sample, &mut round);
                 note(

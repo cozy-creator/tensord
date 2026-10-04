@@ -416,6 +416,29 @@ impl Gpu {
         )
     }
 
+    /// What a grant makes room for: `want`, or for a plan whose activations were never
+    /// measured, its weights and the largest activations any plan measured on this GPU. An
+    /// unmeasured call never empties a card that has room for it (C, A40: a second package's
+    /// first call revoked every holding with 38.7 GB free).
+    pub fn grant_want(&self, plan: &str) -> Option<u64> {
+        self.want(plan).or_else(|| {
+            let facts = self.facts(plan);
+            let largest = self
+                .learned
+                .plans
+                .keys()
+                .filter_map(|other| self.learned.peak(other))
+                .chain(self.facts.values().filter_map(|f| f.activation))
+                .max()?;
+            Some(
+                facts.context.unwrap_or(self.context_estimate())
+                    + facts.weights?.saturating_sub(self.attached(plan))
+                    + largest
+                    + MARGIN,
+            )
+        })
+    }
+
     /// The lowest rung: context, the weights' floor beside what it maps, activations.
     pub fn need(&self, plan: &str) -> u64 {
         let facts = self.facts(plan);
@@ -807,8 +830,12 @@ mod tests {
         // Anima (5.4 GiB of weights, 1.4 GiB of activations) was measured in an earlier run.
         let mut gpu = Gpu::default();
         gpu.learned.load("anima", 5 * GIB + 2 * GIB / 5, 300 * MIB);
-        gpu.learned
-            .call("anima", "height=1024,width=1024", 7 * GIB / 5, &BTreeMap::new());
+        gpu.learned.call(
+            "anima",
+            "height=1024,width=1024",
+            7 * GIB / 5,
+            &BTreeMap::new(),
+        );
         let reserved = gpu.spawn_need("anima");
         gpu.starting("anima", reserved);
         let s = Sample {
@@ -823,6 +850,37 @@ mod tests {
         assert!(!gpu.fits_resident("anima", &s));
         // Another tenant still sees the spawn's reservation as taken.
         assert_eq!(gpu.room("sdxl", &s), 6 * GIB - HEADLESS_FLOOR - reserved);
+    }
+
+    #[test]
+    fn an_unmeasured_call_leaves_a_card_with_room_for_it_alone() {
+        // A40: package A's SDXL idle with 7 GiB held; package B's first call, loaded, its
+        // activations never measured. 38 GiB free: nothing of A's needs to leave.
+        let mut gpu = Gpu::default();
+        loaded(&mut gpu, "a", 10, 7 * GIB, 3 * GIB);
+        gpu.learned
+            .call("a", "height=1024,width=1024", 3 * GIB, &BTreeMap::new());
+        gpu.starting("b", 0);
+        gpu.spawned("b", 11);
+        gpu.observe(
+            "b",
+            Facts {
+                context: Some(GIB / 4),
+                weights: Some(7 * GIB),
+                ..Facts::default()
+            },
+            Some(false),
+        );
+        let s = sample(46 * GIB, 38 * GIB, &[(10, 8 * GIB)]);
+        assert_eq!(gpu.want("b"), None);
+        let want = gpu.grant_want("b");
+        assert_eq!(want, Some(GIB / 4 + 7 * GIB + 3 * GIB + MARGIN));
+        let mut round = Round::default();
+        let room = gpu.room("b", &s);
+        assert_eq!(
+            gpu.decide("b", want, gpu.need("b"), &s, &mut round),
+            Decision::Go(room)
+        );
     }
 
     #[test]
