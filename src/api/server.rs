@@ -457,17 +457,22 @@ impl<B: MachineBackend> Api<B> {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| since.as_secs() as i64);
         let authority = &self.identity.authority;
-        let keys = authority.keys.admitted();
+        let holders = authority.keys.holders();
+        let keys: Vec<_> = holders.iter().map(|h| h.key).collect();
         let granted = super::capability::verify_signer(token, &authority.worker_id, &keys, now, "")
             .and_then(|(grant, signer)| match grant.allows(&run, &name, index) {
                 true => Ok(signer),
                 false => Err(super::capability::Refusal::Scope),
             });
-        // A capability grants its signer's own runs: another actor's run is absent.
-        let actor = match granted {
-            Ok(signer) => super::auth::VerifiedActor {
-                public_key: signer.to_bytes(),
-            },
+        // A capability grants its signer's actor's own runs: another actor's run is absent.
+        let actor = match granted.map(|signer| super::auth::VerifiedActor::of(&holders, &signer)) {
+            Ok(Some(actor)) => actor,
+            Ok(None) => {
+                return text(
+                    StatusCode::FORBIDDEN,
+                    "the capability's key is not authorized".into(),
+                )
+            }
             Err(refusal) => return text(StatusCode::FORBIDDEN, refusal.to_string()),
         };
         let backend = self.backend.clone();

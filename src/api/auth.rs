@@ -34,6 +34,15 @@ pub struct Holder {
     pub owner: bool,
 }
 impl Holder {
+    /// A key that is its own actor and an owner: keys a test or a development front door
+    /// names (`keys.json`), each a submitter of its own.
+    pub fn own(key: VerifyingKey) -> Self {
+        Self {
+            key,
+            actor: key.to_bytes(),
+            owner: true,
+        }
+    }
     /// A key of the machine's owner: every key in a computer's authorized_keys, a rental's boot
     /// keys and its renter's leased keys. They are one actor, so the owner's work stays its own
     /// across its devices, a new key after logout, and a rental's boot keys becoming its lease.
@@ -61,9 +70,17 @@ struct KeyState {
     leased: bool,
 }
 impl Keys {
+    /// Keys that are each their own actor ([`Holder::own`]).
     pub fn fixed(keys: Vec<VerifyingKey>) -> Self {
+        Self::held(keys.into_iter().map(Holder::own).collect())
+    }
+    /// The machine owner's keys ([`Holder::owner`]): a rental's boot keys.
+    pub fn owner(keys: Vec<VerifyingKey>) -> Self {
+        Self::held(keys.into_iter().map(Holder::owner).collect())
+    }
+    fn held(keys: Vec<Holder>) -> Self {
         let state = KeyState {
-            keys: keys.into_iter().map(Holder::owner).collect(),
+            keys,
             until: None,
             leased: false,
         };

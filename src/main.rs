@@ -136,7 +136,7 @@ fn run_machine(
     }
     let fresh = readiness.attested().is_none();
     let keys = match rental {
-        true => cozy_machine::api::auth::Keys::fixed(grant.authorized.clone()),
+        true => cozy_machine::api::auth::Keys::owner(grant.authorized.clone()),
         false => {
             cozy_machine::machine::authorized_keys::grant(&layout.root, &grant.authorized)?;
             cozy_machine::machine::authorized_keys::watch(&layout.root)?

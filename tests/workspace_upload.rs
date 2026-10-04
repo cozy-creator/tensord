@@ -183,7 +183,7 @@ fn source_archive_is_statically_inspected_and_imported_into_tensorfs() {
     assert!(!area
         .0
         .join("uploads")
-        .join(tensorfs_core::sha256::hex(&actor(1).public_key))
+        .join(tensorfs_core::sha256::hex(&actor(1).actor))
         .join("static-source")
         .exists());
 }

@@ -100,7 +100,7 @@ pub fn grant(root: &Path, keys: &[VerifyingKey]) -> io::Result<()> {
 /// The keys `<root>/authorized_keys` admits now, kept current by a watcher thread. An absent
 /// file admits nobody, as with sshd.
 pub fn watch(root: &Path) -> io::Result<Keys> {
-    let (path, keys) = (root.join(FILE), Keys::fixed(vec![]));
+    let (path, keys) = (root.join(FILE), Keys::owner(vec![]));
     let seen = read(&path, None, &keys)?;
     std::thread::Builder::new()
         .name("authorized-keys".into())

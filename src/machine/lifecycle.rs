@@ -459,7 +459,7 @@ mod hub_tests {
             worker_id: "ra-1".into(),
             boot_id: "boot".into(),
             leaf_digest: [9; 32],
-            keys: Keys::fixed(vec![renter.verifying_key()]),
+            keys: Keys::owner(vec![renter.verifying_key()]),
         };
         let claim = |key: &SigningKey| crate::api::pb::Claim {
             record_owner_epoch: 1,

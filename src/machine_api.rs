@@ -758,9 +758,15 @@ impl MachineBackend for NativeBackend {
     }
     fn read_machine_log(
         &self,
-        _: VerifiedActor,
+        actor: VerifiedActor,
         request: pb::MachineLogQuery,
     ) -> Result<Vec<u8>, Status> {
+        // The transport log names every user's downloads: on a shared rental only its renter reads it.
+        if !actor.owner {
+            return Err(Status::permission_denied(
+                "only the machine's owner reads its logs",
+            ));
+        }
         if request.log != pb::MachineLog::TensorfsTransport as i32 {
             return Err(Status::not_found(format!(
                 "this machine keeps no log {}",
