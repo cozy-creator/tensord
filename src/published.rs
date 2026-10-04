@@ -375,14 +375,17 @@ impl Publisher {
             Some(gpu) => self.protected(service, &gpu),
             None => self.fetching.lock().unwrap().keys().cloned().collect(),
         };
-        let pressure = crate::reclaim::Disk::measure(self.store.root())?.pressure();
-        let views = crate::adapter_views::evict(&self.store, &keep, pressure)?;
+        // Thin aliases share their tensor closure; dropping one does not prove disk relief.
+        // Apply their ordinary TTL, leaving pressure planning to native managed roots.
+        let views = crate::adapter_views::evict(&self.store, &keep, false)?;
+        let expired = tensorfs_core::gc::collect_idle(self.store.root(), &keep, crate::reclaim::TTL)
+            .map_err(io::Error::other)?;
         let relief =
             tensorfs_core::ensure::relieve(&self.store, &keep).map_err(io::Error::other)?;
         if let Some(unable) = relief.unable {
             eprintln!("store relief: a GC tier could not run: {unable}");
         }
-        Ok((views, relief.collected_bytes))
+        Ok((views, relief.collected_bytes.saturating_add(expired.reclaimed_bytes)))
     }
 
     /// What a download's GC must never evict: what live executors read, every unfinished
