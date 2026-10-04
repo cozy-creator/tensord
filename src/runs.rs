@@ -247,7 +247,7 @@ impl Runs {
         drop(custody);
         if new {
             let (this, actor, run) = (self.clone(), actor.to_string(), record.id.clone());
-            std::thread::Builder::new()
+            let launched = std::thread::Builder::new()
                 .name(format!("prepare-{run}"))
                 .spawn(move || {
                     let outcome = this.prepare(&actor, &run, spec);
@@ -281,7 +281,8 @@ impl Runs {
                         eprintln!("run {run} preparation: {error}");
                     }
                 })
-                .map_err(Refused::from)?;
+                .map(drop);
+            preparation_launched(&self.service.engine, &record.id, launched)?;
         }
         Ok(record)
     }
@@ -827,9 +828,38 @@ impl Runs {
     }
 }
 
+/// Acceptance already committed: a failed launcher must settle that durable obligation
+/// before answering a refusal. Reattachment observes the failure and never silently waits.
+fn preparation_launched(engine: &crate::execution::Engine, id: &str, launched: io::Result<()>) -> Result<(), Refused> {
+    if let Err(error) = launched {
+        let message = format!("preparation_launch_failed: {error}");
+        engine.end_preparation(id, Outcome::Failed(Failure {
+            status: 3, cause: 7, origin: 3, message: message.clone(),
+        }.encode()))?;
+        return Err(refused("preparation_launch_failed", message));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_preparation_launcher_settles_acceptance_and_reattach_observes_failure() {
+        let root = std::env::temp_dir().join(format!("cm-prepare-launch-{}", uuid::Uuid::new_v4()));
+        let engine = crate::execution::Engine::open(&root).unwrap();
+        let invocation = crate::journal::Invocation { package: "audit/package".into(), input: json!({}), ..Default::default() };
+        let (run, new) = engine.accept_run("alice", "same-request", "same-intent", invocation.clone()).unwrap();
+        assert!(new);
+        let error = io::Error::new(io::ErrorKind::WouldBlock, "process resources exhausted");
+        assert_eq!(preparation_launched(&engine, &run.id, Err(error)).unwrap_err().code, "preparation_launch_failed");
+        let (reattached, new) = engine.accept_run("alice", "same-request", "same-intent", invocation).unwrap();
+        assert!(!new);
+        assert_eq!(reattached.state, crate::journal::State::Failed);
+        assert!(reattached.failure.unwrap().contains("preparation_launch_failed"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
     use crate::{api::install::InstallerConfig, execution::Engine, journal::State};
     use std::{fs, path::Path, process::Command, time::Duration};
     use tensorfs_core::{sha256, store::Store};
