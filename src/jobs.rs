@@ -150,7 +150,7 @@ impl Jobs {
             incarnation,
             environment,
             identity,
-            store,
+            store: store.clone(),
             service: Arc::downgrade(service),
             runs: runs.map_or_else(Weak::new, Arc::downgrade),
             parents: Mutex::new(HashMap::new()),

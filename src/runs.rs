@@ -252,9 +252,10 @@ impl Runs {
     }
 
     /// A warm run's model choices made present when it names no entrypoint (`cozy package
-    /// install`, `cozy model download`) or no code (`cozy model upload`): a Hub checkpoint
-    /// downloaded, a provider source made, and with a weights destination that source's
-    /// checkpoint put there under the run's publication authorization.
+    /// install`, `cozy model download`) or no code (`cozy model upload`, `cozy run upload`): a
+    /// Hub checkpoint downloaded, a provider source made, a checkpoint this machine holds (a
+    /// run's weights output) found; with a weights destination, the one choice is put there
+    /// under the run's machine-publication authorization.
     fn warm_models(
         &self,
         actor: &str,
@@ -263,11 +264,8 @@ impl Runs {
         observe: &(dyn Fn(&str, u64, u64) + Sync),
     ) -> Result<Vec<Value>, Refused> {
         let destination = spec.weights_destination.trim_start_matches("model://");
-        if !destination.is_empty() && (spec.models.len() != 1 || spec.models[0].source.is_empty()) {
-            return Err(refused(
-                "invalid_request",
-                "a weights destination takes one provider-source model",
-            ));
+        if !destination.is_empty() && spec.models.len() != 1 {
+            return Err(refused("invalid_request", "a weights destination takes one model"));
         }
         if spec.models.is_empty() {
             return Ok(vec![]);
@@ -283,32 +281,35 @@ impl Runs {
         };
         let mut models = vec![];
         for choice in &spec.models {
-            if choice.source.is_empty() {
-                let manifest = choice
-                    .manifest
-                    .as_ref()
-                    .map(|m| format!("sha256:{}", tensorfs_core::sha256::hex(&m.digest)))
-                    .ok_or_else(|| {
-                        refused(
-                            "invalid_request",
-                            format!(
-                                "model choice {:?} names no exact manifest or provider source",
-                                choice.parameter
-                            ),
-                        )
-                    })?;
-                let stage = format!("downloading {}", choice.repository);
-                publisher.download(&self.service, hub_access()?, &choice.repository, &manifest, &|done, total| {
-                    observe(&stage, done, total)
+            let (manifest, mut row) = if !choice.source.is_empty() {
+                let made = publisher.make_source(&choice.source, &choice.profiles, &spec.providers, observe)?;
+                let row = json!({"parameter": choice.parameter, "source": choice.source,
+                    "resolved": made.resolved, "profiles": made.profiles,
+                    "repository": made.repository, "manifest": made.manifest.id()});
+                (made.manifest, row)
+            } else {
+                let digest = choice.manifest.as_ref().ok_or_else(|| {
+                    refused(
+                        "invalid_request",
+                        format!("model choice {:?} names no exact manifest or provider source", choice.parameter),
+                    )
                 })?;
-                models.push(json!({"parameter": choice.parameter,
-                    "repository": choice.repository, "manifest": manifest}));
-                continue;
-            }
-            let made = publisher.make_source(&choice.source, &choice.profiles, &spec.providers, observe)?;
-            let mut row = json!({"parameter": choice.parameter, "source": choice.source,
-                "resolved": made.resolved, "profiles": made.profiles,
-                "repository": made.repository, "manifest": made.manifest.id()});
+                let sha256 = tensorfs_core::sha256::hex(&digest.digest);
+                let manifest = format!("sha256:{sha256}");
+                if !choice.repository.is_empty() {
+                    let stage = format!("downloading {}", choice.repository);
+                    publisher.download(&self.service, hub_access()?, &choice.repository, &manifest, &|done, total| {
+                        observe(&stage, done, total)
+                    })?;
+                }
+                // No repository: a checkpoint this machine already holds (a run's output).
+                let length = std::fs::metadata(publisher.store().manifest_path(&sha256)).map_err(|_| {
+                    refused("checkpoint_absent", format!("this machine holds no checkpoint {manifest}"))
+                })?;
+                let row = json!({"parameter": choice.parameter,
+                    "repository": choice.repository, "manifest": manifest});
+                (ObjectRef { sha256, length: length.len() }, row)
+            };
             if !destination.is_empty() {
                 if spec.publication.is_empty() {
                     return Err(refused(
@@ -327,7 +328,7 @@ impl Runs {
                     store: publisher.store(),
                     hub: publishing.origin(),
                     destination,
-                    manifest: &made.manifest,
+                    manifest: &manifest,
                     operation: &operation,
                     credential: &publishing,
                     policy: publishing.policy(),
