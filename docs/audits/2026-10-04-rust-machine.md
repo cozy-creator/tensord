@@ -238,14 +238,17 @@ path, not the machine delivered by the current Linux-wheel recipe. The initial a
 incorrectly described that source tree as the bundled executable. The private SDK wheel
 also contains neither an agent binary nor the removed worker entrypoint until `task machine`
 adds Rust. Prepare a freshly versioned, qualified cohort before publication; do not reuse
-an immutable published0.18.102 identity. Missing deploy-key secrets remain a release prerequisite.
+an immutable published0.18.102 identity. The two read-only deploy-key secrets were prepared and their repository reads verified on October 4. Publication still requires the remaining qualification gates.
 
 The Hub public owner still calls DescribeMachine, WorkerControl, PodHost preparation and
 SubmitMachineExecution (`tensorhub/internal/publicowner/session.go:128`,
-`serving.go:91`, `execution.go:147`). The Rust server retires those operations. Its image
-smoke script also exercises old RPCs. Public serving was excluded by the inherited plan;
+`serving.go:91`, `execution.go:147`). The actual Rust listener registers PodHost and WorkerControl alongside Machine
+(`src/api/server.rs:153`); the earlier claim that those services were retired was incorrect.
+The native backend implementations and a real-listener consumer check determine which
+operations remain supported. Its image smoke script also exercises old RPCs. Public serving was excluded by the inherited plan;
 that exclusion is not proof that global image activation cannot select Rust for this
-consumer. Migrate the consumer or explicitly isolate incompatible image selection.
+consumer. Preserve the public owner's acceptance ambiguity, workspace, authority and custody contracts
+when reducing or migrating this surface. Registered service names alone do not prove support.
 
 Base image Dockerfiles still name `cozy daemon`; the release override lives on an
 unmerged image branch. The promotion hold is not on the audited Hub master. Preserve
@@ -457,3 +460,37 @@ ComfyUI timing wins,1.25/1GiB pools, the1.5GiB fidelity repair, actual idle GPU 
 plane-only follower/source proof, H3/group qualification, LoRA, final composition and release
 consumers remain open. No implementation has been promoted to production or the personal
 machine. Tracker319–324 and the component PRs record the current source and evidence.
+
+
+## Qualification checkpoint, 2026-10-04 18:20 UTC
+
+The same-latent decoder diagnostic isolated stock tiling as the main fidelity loss.
+On one RTX 5080, the independent untiled decode scores 48.588 dB against the preserved
+control; tiled512 scores 30.362 dB, and the two decodes score 30.366 dB against each
+other. Both use the captured 128 KiB latent from the constrained RTX 3070 run.
+The cross-device limit remains explicit. Full CPU decoding is being assessed as a
+simpler degraded path; it has not yet been qualified.
+
+The final combined machine CPU suite passed 161 cases with seven ignored entries,
+plus clippy and binary build. Real source-channel and plane-only leader/follower
+checks passed, including readonly selected bytes, refusal of unselected data and
+retention after leader death. H3 inference and NCCL remain hardware gates.
+The current integration includes that reviewed test without a production change.
+
+The latest Rust artifact, source946a03e, builds with Rust1.91.1 in a glibc2.28
+environment and its ELF symbol floor is2.28. This is portability proof, not final
+inference proof. Runtime77c6acff removes the retired Go source and its CI job;
+its source-archive/private-file/portable-wheel check passes, with zero Go agent
+files in the resulting archive. Creator's raw FileAsset fix passes an ordinary
+CPU CLI input/result/restart check while oversized and wrong-MIME inputs are refused.
+
+Matched benchmark preparation found real noise, timestep and text-encoder precision
+differences between the current packages and stock ComfyUI. A separately versioned
+production numerical policy and source/CPU checks are in progress. No timing win
+has been claimed. The three-GPU matrix is estimated at $26–53 additional; the
+inherited $40 total cap remains in force pending the user's budget clarification.
+
+All owned rentals have ended, with a zero-rental Hub readback. The two missing
+read-only release credentials are configured and SSH reads pass; no release, tag,
+production activation or personal-machine replacement occurred. The current
+implementation candidates remain reviewable drafts linked from tracker319–324.
