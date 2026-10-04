@@ -144,6 +144,36 @@ fn prepared_binding_retains_samples_without_reusing_preparation_work_units() {
     assert_eq!(bound.progress_samples[0].completed_units, 1000);
 }
 
+#[test]
+fn unreadable_advisory_samples_do_not_hide_an_accepted_run() {
+    let fixture = Fixture::open();
+    fixture.progress(30, "denoise", 30);
+    let original = fixture.service.engine.get(&fixture.id).unwrap();
+    for unsupported in [
+        json!(null),
+        json!({"future":"projection"}),
+        json!([{"detail":"unknown shape"}]),
+    ] {
+        let mut value = serde_json::to_value(&original).unwrap();
+        value["progress_samples"] = unsupported;
+        let decoded: cozy_machine::journal::Execution = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.id, original.id);
+        assert_eq!(decoded.state, original.state);
+        assert!(decoded.progress_samples.is_empty());
+    }
+    let mut value = serde_json::to_value(&original).unwrap();
+    value["progress_samples"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"future":"sample"}));
+    let decoded: cozy_machine::journal::Execution = serde_json::from_value(value).unwrap();
+    assert_eq!(decoded.progress_samples.len(), 1);
+    assert_eq!(
+        decoded.progress_samples[0].revision,
+        original.progress_samples[0].revision
+    );
+}
+
 #[tokio::test]
 async fn burst_stage_endpoint_survives_real_tls_observer_and_terminal_journal_reopen() {
     let fixture = Fixture::open();

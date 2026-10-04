@@ -17,7 +17,8 @@ The same-stage flood remains latest-only, and count/byte caps bound arbitrary st
 A CPU burst must emit denoise29/30/decoding before the observer gets a turn, then prove both
 actual machine and CLI/record consumers preserve emitted30 without per-event writes. Native
 completion remains the work evidence; advisory delivery never becomes a success gate.
-The additive `Execution.progress_samples` field defaults empty for older journals. Each
+The additive `Execution.progress_samples` field defaults empty for older journals, and
+unsupported advisory samples are dropped without making an accepted run unreadable. Each
 sample carries its actual allocated observation revision, units, bounded detail and the time
 the machine received it. A source timestamp absent from the incoming frame is not invented.
 The current stage replaces only its own last sample; changing stage preserves that sample.
