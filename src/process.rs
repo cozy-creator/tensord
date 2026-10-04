@@ -121,6 +121,11 @@ impl Exact {
         self
     }
 
+    /// Stable recovery facts for the exact receiver's owned containment scope.
+    pub fn scope_recovery(&self, uid:u32)->Option<crate::scope::Recovery> {
+        self.scope.as_ref().map(|scope|scope.recovery(uid))
+    }
+
     pub fn as_file(&self) -> &File {
         &self.pidfd
     }
