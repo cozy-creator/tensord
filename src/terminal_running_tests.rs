@@ -46,7 +46,11 @@ impl MachineBackend for HeldPage {
         query: pb::MachineExecutionQuery,
     ) -> Result<pb::MachineExecutionState, Status> {
         let state = self.native.get(actor, query)?;
-        assert_eq!(state.state, "starting"); // This is the actual durable state, not a fake snapshot.
+        assert_eq!(state.state, "queued"); // Actual Starting maps to queued on the public API.
+        assert_eq!(
+            self.native.service.engine.get(&self.id).unwrap().state,
+            crate::journal::State::Starting
+        );
         self.first_snapshot.wait(); // Work starts only after this real queued snapshot was read.
         Ok(state)
     }
