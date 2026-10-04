@@ -26,6 +26,10 @@ pub struct HoldingKey {
     pub device: String,
     /// TensorFS plane layout digest: the same bytes at the same offsets.
     pub layout: String,
+    /// What the regions hold beside the layout's stored bytes: empty (nothing), or the digest
+    /// of the LoRA deltas an executor baked into them (Runtime `weights._variant`). A baked
+    /// holding is its own allocation, kept and revoked like any other.
+    pub variant: String,
 }
 
 /// One plane region: its chunks' bytes in address order (one fd each).
@@ -262,6 +266,20 @@ impl ResidentCustody {
             .collect()
     }
 
+    /// The baked variant of `layout` on `device` offered last and still attachable.
+    pub fn latest_variant(&self, device: &str, layout: &str) -> Option<String> {
+        self.holdings
+            .iter()
+            .filter(|(k, h)| {
+                k.device == device
+                    && k.layout == layout
+                    && !k.variant.is_empty()
+                    && h.phase == Phase::Ready
+            })
+            .max_by_key(|(_, h)| h.generation)
+            .map(|(k, _)| k.variant.clone())
+    }
+
     /// Every holding on `device`, Ready or Revoking: counted once, until released.
     pub fn charged_bytes(&self, device: &str) -> u64 {
         self.holdings
@@ -306,6 +324,9 @@ fn validate(key: &HoldingKey, regions: &[SharedRegion], fds: &[OwnedFd]) -> io::
         return Err(invalid(
             "a holding needs a GPU, a layout digest and regions",
         ));
+    }
+    if !(key.variant.is_empty() || key.variant.starts_with("sha256:")) {
+        return Err(invalid("a holding's variant is a digest"));
     }
     let mut seen = std::collections::BTreeSet::new();
     let mut chunks = 0;
@@ -375,6 +396,7 @@ mod tests {
         HoldingKey {
             device: "GPU-1".into(),
             layout: digit.repeat(64),
+            variant: String::new(),
         }
     }
     fn region(index: u32, chunks: Vec<u64>) -> SharedRegion {
@@ -435,7 +457,16 @@ mod tests {
         assert!(custody.collect().is_empty());
         assert_eq!(custody.charged_bytes("GPU-1"), total);
         drop(end);
-        assert_eq!(custody.collect(), vec![(key("a"), total)]);
+        // Another test's spawn holds a copy of the end between its fork and exec: the close
+        // is seen once that child has exec'd.
+        let collected = (0..500).find_map(|_| {
+            let ended = custody.collect();
+            if ended.is_empty() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Some(ended).filter(|ended| !ended.is_empty())
+        });
+        assert_eq!(collected, Some(vec![(key("a"), total)]));
         assert_eq!(custody.charged_bytes("GPU-1"), 0);
     }
 
@@ -480,6 +511,39 @@ mod tests {
         assert_eq!(shared.readers.len(), 1);
         package_b.kill().unwrap();
         package_b.wait().unwrap();
+    }
+
+    #[test]
+    fn a_baked_variant_is_a_holding_of_its_own_beside_the_stored_bytes() {
+        let mut custody = ResidentCustody::default();
+        let baked = |digit: &str| HoldingKey {
+            variant: format!("sha256:{}", digit.repeat(64)),
+            ..key("a")
+        };
+        let one = || vec![region(1, vec![GRANULE])];
+        // The stored bytes and two baked variants of one layout: three holdings, charged apart.
+        for holding in [key("a"), baked("1"), baked("2")] {
+            let kept = custody.offer(holding, "h3/dit", one(), fds(1), mine().0);
+            assert!(matches!(kept, Ok(Offered::Kept { .. })));
+        }
+        assert_eq!(custody.holdings().len(), 3);
+        assert_eq!(custody.charged_bytes("GPU-1"), 3 * GRANULE);
+        // A replacement asks for the layout's latest baked variant, and maps exactly that one.
+        let latest = custody.latest_variant("GPU-1", &key("a").layout).unwrap();
+        assert_eq!(latest, baked("2").variant);
+        let attached = custody.attach(&baked("2"), mine().0).unwrap().unwrap();
+        assert_eq!(attached.fds.len(), 1);
+        // A variant never answers for the stored bytes, nor another variant, nor another layout.
+        assert!(custody.attach(&baked("3"), mine().0).unwrap().is_none());
+        assert!(custody.latest_variant("GPU-1", &key("b").layout).is_none());
+        assert!(custody.latest_variant("GPU-2", &key("a").layout).is_none());
+        // A variant that is not a digest is refused before custody.
+        let named = HoldingKey {
+            variant: "*".into(),
+            ..key("a")
+        };
+        let refused = custody.offer(named, "h3/dit", one(), fds(1), mine().0);
+        assert!(refused.is_err());
     }
 
     #[test]

@@ -2533,7 +2533,11 @@ fn rank_grant(caps: &[Option<u64>]) -> (Option<u64>, Group) {
 }
 
 fn holding_id(key: &HoldingKey, generation: u64) -> String {
-    format!("{}/{}#{generation}", key.device, key.layout)
+    let variant = match key.variant.as_str() {
+        "" => String::new(),
+        variant => format!("+{variant}"),
+    };
+    format!("{}/{}{variant}#{generation}", key.device, key.layout)
 }
 
 fn known(value: Option<i64>) -> Option<u64> {
@@ -3183,15 +3187,27 @@ impl Services for Callbacks<'_> {
         let Some(custody) = self.custody else {
             return Ok((answer, Vec::new()));
         };
+        let mut custody = custody.lock().unwrap();
+        // An ask for "*" is for the layout's latest baked variant: the executor learns which
+        // from the answer, and reads its bytes only if its own bake would be the same.
+        let variant = match frame.variant.as_str() {
+            "*" if !frame.offer => custody
+                .latest_variant(&frame.device, &frame.layout)
+                .unwrap_or_else(|| "*".into()),
+            named => named.to_string(),
+        };
         let key = HoldingKey {
             device: frame.device.clone(),
             layout: frame.layout.clone(),
+            variant,
         };
         // This plan names this weight set: its next executor's Degree 2 fit counts it once
         // when another tenant holds and reads it.
-        self.pool
-            .first()
-            .learn_holding(self.plan, &holding_id(&key, 0));
+        if key.variant != "*" {
+            self.pool
+                .first()
+                .learn_holding(self.plan, &holding_id(&key, 0));
+        }
         // The reader's lease is a connection: the executor keeps one end while it maps the
         // holding, and its close (release or death) ends the lease.
         let (reader, lease) = Reader::lease(self.birth.clone(), self.exit.try_clone()?)?;
@@ -3199,7 +3215,7 @@ impl Services for Callbacks<'_> {
         answer.code.clear();
         answer.detail.clear();
         answer.layout = key.layout.clone();
-        let mut custody = custody.lock().unwrap();
+        answer.variants = true;
         if frame.offer {
             match custody.offer(key, &frame.name, frame.regions.clone(), fds, reader) {
                 Ok(Offered::Kept { generation }) => {
@@ -3221,6 +3237,7 @@ impl Services for Callbacks<'_> {
             Some(mut attached) => {
                 answer.held = true;
                 answer.lease = true;
+                answer.variant = key.variant.clone();
                 answer.generation = attached.generation;
                 answer.regions = attached.regions;
                 attached.fds.push(lease);

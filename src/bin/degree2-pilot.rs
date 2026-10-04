@@ -79,6 +79,7 @@ impl Services for Pilot {
         let key = HoldingKey {
             device: frame.device.clone(),
             layout: frame.layout.clone(),
+            variant: frame.variant.clone(),
         };
         let (reader, lease) = Reader::lease(birth.clone(), exit.try_clone()?)?;
         answer.ok = true;
