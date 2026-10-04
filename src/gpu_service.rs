@@ -539,7 +539,12 @@ impl GpuPool {
         }
         if let Some(custody) = &self.custody {
             let mut custody = custody.lock().unwrap();
-            let released = custody.collect();
+            // An unproved family exit is not authority to collect its root exports.
+            let released = if receipt.executors_unconfirmed == 0 {
+                custody.collect()
+            } else {
+                vec![]
+            };
             receipt.holdings_released = released.len();
             receipt.root_export_bytes_released = released.iter().map(|(_, bytes)| bytes).sum();
             let remaining = custody.holdings();
