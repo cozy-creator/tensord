@@ -230,11 +230,15 @@ native CPU cache-identity red arm and a correction based on artifact bytes, not 
 client or server source revision equality check. Both fixes are tracked in the existing
 component issues.
 
-**P1, CONFIRMED SOURCE.** Runtime master is still version 0.18.102 and bundles the old
-Go agent, while its `cozy-runtime-worker` entrypoint has been deleted. That agent launches
-the missing worker. Its bundled Rust pin is 1b57a88, behind the audit baseline and fixes.
-No 0.18.x release from this tree is safe; the candidate cohort must be built and qualified
-before publication. Missing deploy-key secrets remain a release prerequisite.
+**P1, CONFIRMED SOURCE; release composition finding corrected after direct recipe review.**
+Runtime master is still version0.18.102. Its current `task machine` recipe bundles Rust,
+with pin1b57a88 behind the audit baseline and fixes. The old Go agent remains in the source
+archive and still launches a deleted `cozy-runtime-worker`; it is a legacy source/consumer
+path, not the machine delivered by the current Linux-wheel recipe. The initial audit
+incorrectly described that source tree as the bundled executable. The private SDK wheel
+also contains neither an agent binary nor the removed worker entrypoint until `task machine`
+adds Rust. Prepare a freshly versioned, qualified cohort before publication; do not reuse
+an immutable published0.18.102 identity. Missing deploy-key secrets remain a release prerequisite.
 
 The Hub public owner still calls DescribeMachine, WorkerControl, PodHost preparation and
 SubmitMachineExecution (`tensorhub/internal/publicowner/session.go:128`,
@@ -365,3 +369,11 @@ The earlier possibility of global image selection silently moving this consumer 
 unproven. Its legacy API dependency is confirmed: it cannot execute on the Rust server and
 needs migration or explicit operation-specific isolation before replacing that public worker.
 No production or personal machine has been changed.
+
+Direct benchmark source review found the inherited Anima Comfy graph uses Euler/simple while
+the actual package uses a shifted Diffusers FlowMatchEulerDiscreteScheduler. Equal step count
+alone is insufficient: compare the actual sigma grids and record a matching graph before
+scoring. Comfy generates CPU fp32 noise while Cozy uses device generators, so same-seed
+cross-engine pixel equality is unsupported. Same-engine unconstrained controls will establish
+constrained output preservation; model tensors and scheduler equations remain separate parity
+gates. These observations are being implemented in the new matched adapters.
