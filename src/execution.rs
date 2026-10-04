@@ -1176,6 +1176,7 @@ impl Engine {
             crate::process::Meter::Frames,
             Liveness::default(),
             Duration::ZERO,
+            None,
             "invocation",
         )?;
         let watch = watching.watch();

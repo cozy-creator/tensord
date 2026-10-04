@@ -751,6 +751,9 @@ pub struct DeviceExecutor {
     pub hello: Hello,
     /// Sampling resolution of the wedge rule. Tests shorten it; nothing else changes it.
     pub liveness: Liveness,
+    /// Stillness while this answers true is not this executor's: it waits on runs watched
+    /// by their own executors (a job's unfinished children).
+    pub waits: Option<crate::process::Waits>,
     root: PathBuf,
     socket: PathBuf,
     _generation_hold: Option<Arc<File>>,
@@ -1425,6 +1428,7 @@ impl DeviceExecutor {
             birth,
             hello: Hello::default(),
             liveness: Liveness::default(),
+            waits: None,
             root: config.root,
             socket: config.socket,
             _generation_hold: config.generation_hold,
@@ -1586,6 +1590,7 @@ impl DeviceExecutor {
             meter,
             self.liveness,
             self.worst_gap,
+            self.waits.clone(),
             command.name(),
         )?;
         *self.watched.lock().unwrap() = Some(watching.watch());

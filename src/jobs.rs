@@ -65,6 +65,18 @@ struct Parent {
     calls: Mutex<Calls>,
 }
 
+impl Parent {
+    /// A call of this job has not ended: its executor is watched, and the root waits on it.
+    fn unfinished(&self, engine: &Engine) -> bool {
+        let calls = self.calls.lock().unwrap();
+        calls.by_index.values().any(|call| {
+            engine
+                .get(&call.child)
+                .is_ok_and(|record| !record.state.terminal())
+        })
+    }
+}
+
 #[derive(Default)]
 struct Calls {
     /// The parent's nudge socket (`child_events`): a byte when one of its calls may have moved.
@@ -300,6 +312,8 @@ impl Jobs {
             .lock()
             .unwrap()
             .insert(id.into(), parent.clone());
+        let (waiting, journal) = (parent.clone(), engine.clone());
+        executor.waits = Some(Arc::new(move || waiting.unfinished(&journal)));
         let mut services = Seam {
             engine,
             id,

@@ -369,11 +369,15 @@ struct WatchState {
     worst_gap: Duration,
 }
 
+/// Whether the subject is waiting on work watched elsewhere (a job's unfinished child runs).
+pub type Waits = Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// One exchange's progress observer, shared with whoever may cancel it. It kills the exact
 /// process (and its group) only on a measured wedge; the kill closes the channel, so the
 /// blocked exchange returns.
 pub struct Watch {
     meter: Meter,
+    waits: Option<Waits>,
     state: Mutex<WatchState>,
     changed: Condvar,
 }
@@ -393,7 +397,7 @@ impl Watch {
                 Meter::Frames => Some(state.frames),
             };
             pace.observe(reading, now);
-            if state.serving {
+            if state.serving || self.waits.as_ref().is_some_and(|waits| waits()) {
                 pace.excuse(now);
             }
             state.worst_gap = pace.worst_pause;
@@ -442,10 +446,12 @@ impl Watching {
         meter: Meter,
         liveness: Liveness,
         worst_gap: Duration,
+        waits: Option<Waits>,
         what: &'static str,
     ) -> io::Result<Self> {
         let watch = Arc::new(Watch {
             meter,
+            waits,
             state: Mutex::new(WatchState::default()),
             changed: Condvar::new(),
         });
@@ -692,6 +698,42 @@ mod tests {
             assert!(process_ended(&member).unwrap(), "{member:?}");
         }
         assert!(group_members(&birth).is_empty());
+    }
+
+    #[test]
+    fn a_subject_waiting_on_watched_work_is_still_only_once_that_work_ends() {
+        // A job root sleeps while its child runs on the GPU (run 3858 was ended there).
+        let mut child = Command::new("/bin/sleep")
+            .arg("1000")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let birth = process_birth(child.id()).unwrap();
+        let exact = Exact::open(&birth).unwrap().unwrap();
+        let liveness = Liveness {
+            sample: Duration::from_millis(20),
+        };
+        let waiting = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let waits = waiting.clone();
+        let watching = Watching::start(
+            exact,
+            Meter::Burn,
+            liveness,
+            Duration::ZERO,
+            Some(Arc::new(move || {
+                waits.load(std::sync::atomic::Ordering::Acquire)
+            })),
+            "run_job",
+        )
+        .unwrap();
+        std::thread::sleep(liveness.floor() * 4);
+        assert!(!process_ended(&birth).unwrap());
+        waiting.store(false, std::sync::atomic::Ordering::Release);
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
+        let killed = watching.finish().0.unwrap();
+        assert!(killed.contains("wedged during run_job"), "{killed}");
     }
 
     #[test]

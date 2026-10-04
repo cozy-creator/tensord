@@ -1755,6 +1755,79 @@ mod v1_api {
         let _ = fs::remove_dir_all(tools);
     }
 
+    /// A job's root sleeps while a segment runs; H3's take minutes on a GPU and say nothing
+    /// between denoise steps. That stillness is its child's work, so the job is not ended as
+    /// wedged (run 3858 was, 85 s into its first segment; here the root's patience is 40 s).
+    #[tokio::test]
+    async fn a_job_waits_through_a_segment_longer_than_its_own_patience() {
+        let (machine, tools) = installing_machine().await;
+        let mut client = client(&machine).await;
+        let all = cap(Grant {
+            action: MACHINE.into(),
+            ..Default::default()
+        });
+        let manifest = write_package(
+            &mut client,
+            &all,
+            "cpu_longform",
+            "local/cozy-machine-cpu-longform",
+        )
+        .await;
+        let mut reference = vec![];
+        {
+            let mut encoder = png::Encoder::new(&mut reference, 2, 2);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&[9; 12])
+                .unwrap();
+        }
+        let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&reference));
+        let length = reference.len() as u64;
+        write(&mut client, &all, &digest, length, 0, &reference)
+            .await
+            .unwrap();
+        let spec = v1::RunSpec {
+            kind: v1::RunKind::Job as i32,
+            source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
+            entrypoint: "long_form".into(),
+            payload: serde_json::to_vec(
+                &serde_json::json!({"reference": digest, "segments": ["a long night"], "hold": 50.0}),
+            )
+            .unwrap(),
+            inputs: vec![v1::InputFile {
+                field: "reference".into(),
+                digest: digest.clone(),
+                length,
+                media_type: "image/png".into(),
+                order: 0,
+            }],
+            owner: "alice".into(),
+            ..Default::default()
+        };
+        let events = collect(
+            client
+                .run(authorized(
+                    v1::RunRequest {
+                        id: "patient".into(),
+                        after: 0,
+                        spec: Some(spec),
+                    },
+                    &all,
+                ))
+                .await
+                .unwrap()
+                .into_inner(),
+        )
+        .await
+        .unwrap();
+        let done = outcome(&events);
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        drop(machine);
+        let _ = fs::remove_dir_all(tools);
+    }
+
     /// H3 long-form's failure contract on CPU: a segment that fails in authored code fails its
     /// child run with that reason, the job fails with `segment_failed` naming the segment, and
     /// the film it published before the failure stays readable.
