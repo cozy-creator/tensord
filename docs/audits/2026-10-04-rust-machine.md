@@ -377,3 +377,44 @@ scoring. Comfy generates CPU fp32 noise while Cozy uses device generators, so sa
 cross-engine pixel equality is unsupported. Same-engine unconstrained controls will establish
 constrained output preservation; model tensors and scheduler equations remain separate parity
 gates. These observations are being implemented in the new matched adapters.
+
+## Ordinary rented control proof and newly exposed gaps
+
+The owned Rust-only RunPod david (pr-aad2b9805cfd0b52cf86), image095c06e6,
+completed all48 unchanged SDXL/Anima control requests and four fresh variance repeats.
+Every output is1024²; the repeats match their references exactly. Actual executor versions
+are RuntimeH870/plane3fc, Torch2.14.0+cu130, Diffusers0.40 and Transformers5.16.1.
+Native logs contain2loads/52invokes. One original observer joined after denoise steps1–10;
+its final20-step result and current invocation prove fresh sampling, but not observation of
+every step event. The actual installed SDXL/Anima distributions report2.4/.2.16 rather than
+the catalog's latest2.5/.3 names. Benchmark provenance uses those installed bytes.
+
+These are unconstrained controls. No constrained pool or ComfyUI timing result is claimed.
+Physical ballast cannot start after large idle weight caches consume the card; owner-only
+quiescent reclaim is implemented with CPU authority/admission controls, while its reader
+fence remains a separate GPU gate. Process-tree token census silently skips unreadable
+/proc data in the inherited implementation. Strict recovery must retain resources on
+unknown membership; a process-group exit alone does not prove that setsid descendants ended.
+A fresh pool allocation before first inference remains a valid physical-pressure test if
+this provider cannot supply a complete idle-reclamation proof.
+
+A second replay path was reproduced on actual Diffusers AutoencoderKL: a subclass increments
+Python state and raises raw CUDA OOM before any leaf; the inherited adaptive decoder calls
+it again with different tiles, yielding counter2 and incorrect output while poison remains
+empty. RuntimePR1166 removes whole-decode retries, chooses measured/cap-seeded tiles before
+first execution, and poisons uncontracted capacity failures. Seven relevant native/subclass/
+hook CPU cases pass; numerical quality and actual constrained inference still need proof.
+
+The complete typed parent/managed-child64-bit consumer check also exposed a real captured
+job defect after JSON transport was repaired: `Runs::child` hardcoded serving kind for an
+authored internal job. MachinePR47 resolves kind from the trusted held installation; its
+focused source/CPU cases pass. The full consumer check is being rerun against that candidate.
+
+Idle ModelSources/ObjectFiles can outlive the terminal run roots' expiry. Their native cache
+custody must follow exact reader/scope lifetime, including crash recovery and unknown exits.
+A scoped materialized-checkpoint primitive and consumer-specific recovery records are being
+proved; no timer-based release or permanent opaque crash pin is accepted as a solution.
+
+Logs and output references are in `memory/qualification/` beneath the audit evidence folder.
+The current source candidates, component proofs and remaining gates are recorded in tracker
+319–324 and the associated draft PRs.
