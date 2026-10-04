@@ -432,18 +432,39 @@ fn two_plane_only_ranks_relay_native_sources_and_keep_a_scope_after_leader_exit(
     drop(release);
     wait_for(&fixture.root.join("follower-completed.json"));
     let deadline = Instant::now() + Duration::from_secs(30);
-    while !recovery.empty().unwrap() {
+    loop {
+        match recovery.empty() {
+            Ok(true) => break,
+            Ok(false) => (),
+            // Exit can race a strict /proc read. Unknown is not release authority;
+            // the fixture keeps the native record until a later complete proof.
+            Err(error) => eprintln!("source scope exit remains unproved: {error}"),
+        }
         assert!(
             Instant::now() < deadline,
             "test observation deadline: reader scope still live"
         );
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert_eq!(
-        ModelSources::recover_sessions(fixture.store.clone(), &fixture.root.join("source-holds"))
-            .unwrap(),
-        1
-    );
+    loop {
+        match ModelSources::recover_sessions(
+            fixture.store.clone(),
+            &fixture.root.join("source-holds"),
+        ) {
+            Ok(released) => {
+                assert_eq!(released, 1);
+                break;
+            }
+            Err(error) => {
+                eprintln!("source recovery exit remains unproved: {error}");
+                assert!(
+                    Instant::now() < deadline,
+                    "test observation deadline: source recovery unavailable"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
     fixture.gc();
     assert!(!fixture
         .store
