@@ -78,77 +78,12 @@ pub struct Swept {
     pub memo: usize,
 }
 
-/// The persistent compiled-kernel store (`Seal::prepare`'s `<root>/u<uid>/`). Recompiling is
-/// more valuable than inactive environments: pressure takes it after eligible generations.
-/// TTL expiration still applies independently of pressure.
+/// The persistent compiled-kernel store (`Seal::prepare`'s `<root>/u<uid>/`).
+/// A busy snapshot is conservative status only, not held deletion authority.
 pub struct KernelCaches {
     pub root: PathBuf,
     /// Namespaces (`u<uid>`) a live executor uses: never touched.
     pub busy: HashSet<String>,
-}
-
-/// Newest modification anywhere inside: an entry's last use.
-fn last_use(path: &Path) -> SystemTime {
-    let own = fs::symlink_metadata(path)
-        .and_then(|m| m.modified())
-        .unwrap_or(SystemTime::UNIX_EPOCH);
-    if !fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
-        return own;
-    }
-    match fs::read_dir(path) {
-        Ok(entries) => entries
-            .flatten()
-            .map(|entry| last_use(&entry.path()))
-            .fold(own, SystemTime::max),
-        Err(_) => own,
-    }
-}
-
-/// Kernel entries least recently used first: one compiled kernel (a `triton` or `flash-attn4`
-/// entry) or one generation's torch kernels.
-fn kernel_entries(caches: &KernelCaches) -> Vec<PathBuf> {
-    let mut entries = vec![];
-    let Ok(namespaces) = fs::read_dir(&caches.root) else {
-        return entries;
-    };
-    for namespace in namespaces.flatten() {
-        if !namespace.file_type().is_ok_and(|kind| kind.is_dir()) {
-            continue;
-        }
-        if caches
-            .busy
-            .contains(&*namespace.file_name().to_string_lossy())
-        {
-            continue;
-        }
-        for child in fs::read_dir(namespace.path())
-            .into_iter()
-            .flatten()
-            .flatten()
-        {
-            let name = child.file_name();
-            if matches!(name.to_str(), Some("triton" | "flash-attn4")) {
-                if !child.file_type().is_ok_and(|kind| kind.is_dir()) {
-                    continue;
-                }
-                entries.extend(
-                    fs::read_dir(child.path())
-                        .into_iter()
-                        .flatten()
-                        .flatten()
-                        .map(|e| e.path()),
-                );
-            } else {
-                entries.push(child.path());
-            }
-        }
-    }
-    let mut dated: Vec<_> = entries
-        .into_iter()
-        .map(|path| (last_use(&path), path))
-        .collect();
-    dated.sort();
-    dated.into_iter().map(|(_, path)| path).collect()
 }
 
 fn remove(path: &Path) -> bool {
@@ -233,17 +168,14 @@ pub fn sweep_with_disk(
             candidates.push((Kind::Generation, entry.path()));
         }
     }
-    if let Some(kernels) = kernels {
-        candidates.extend(
-            kernel_entries(kernels)
-                .into_iter()
-                .map(|path| (Kind::Kernel, path)),
-        );
-    }
-    // Last use of a generation is its .hold; kernel entries consider all their files.
+    // Kernel namespace snapshots are not deletion leases. Keep compiled caches until
+    // an owner provides held exclusion through deletion; no pressure/TTL false eligibility.
+    let _ = kernels;
+    // A generation last use is its held eligibility marker; other copies expire by TTL.
     let used = |kind: Kind, path: &Path| match kind {
-        Kind::Generation => last_use(&path.join(".hold")),
-        Kind::Kernel => last_use(path),
+        Kind::Generation => fs::symlink_metadata(path.join(".hold"))
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH),
         _ => fs::metadata(path)
             .and_then(|m| m.modified())
             .unwrap_or(SystemTime::UNIX_EPOCH),
@@ -263,6 +195,11 @@ pub fn sweep_with_disk(
                 .duration_since(used(kind, &path))
                 .is_ok_and(|age| age <= IDLE)
         {
+            continue;
+        }
+        // Raw body readers can retain log/result inodes after collection. Their copies
+        // expire by TTL but cannot cover pressure without an active-reader exclusion.
+        if kind != Kind::Generation {
             continue;
         }
         // Generation locks are eligibility evidence and stay held through plan/deletion.
@@ -304,7 +241,6 @@ enum Kind {
     Result,
     Log,
     Generation,
-    Kernel,
 }
 impl Kind {
     fn count(self, swept: &mut Swept) {
@@ -312,7 +248,6 @@ impl Kind {
             Self::Result => &mut swept.results,
             Self::Log => &mut swept.logs,
             Self::Generation => &mut swept.generations,
-            Self::Kernel => &mut swept.kernels,
         } += 1;
     }
     fn remove(self, path: &Path, hold: Option<&File>) -> io::Result<bool> {

@@ -1266,10 +1266,10 @@ fn caches_expire_but_held_named_and_uncollected_work_stays() {
     };
     let swept = reclaim::sweep(&fixture.engine, &catalog, &bound, Some(&caches)).unwrap();
     assert_eq!((swept.staging, swept.results, swept.generations), (1, 1, 1), "{swept:?}");
-    // Kernels expire by TTL independently of pressure, never a live executor's namespace.
+    // A busy snapshot is not held kernel-deletion authority. Keep kernel namespaces.
     assert!(kernels.join("u2/triton/busy").exists());
-    assert_eq!(swept.kernels, 1);
-    assert!(!kernels.join("u1/triton/old").exists(), "{swept:?}");
+    assert_eq!(swept.kernels, 0);
+    assert!(kernels.join("u1/triton/old").exists(), "{swept:?}");
     assert!(kernels.join("u1/triton/new").exists());
     assert!(!state.join("staging").join(&collected).exists());
     assert!(state.join("staging").join(&queued).exists());
