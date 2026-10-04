@@ -25,6 +25,7 @@ const NAMES: &[&str] = &[
     "COZY_RECORD_OWNER_AUTH_JSON",
     "COZY_AUTHORIZED_KEYS",
     "COZY_REPO_CACHE_ROOT",
+    "COZY_SSH_PUBLIC_KEY",
     RECEIPT_KEY,
     RECEIPT_KEY_FILE,
     "TENSORHUB_ORIGIN",
@@ -68,7 +69,8 @@ pub struct Grant {
     pub authorized: Vec<VerifyingKey>,
     /// The one-shot readiness key; taken by the receipt and never kept elsewhere.
     pub receipt_key: Option<Vec<u8>>,
-    /// WORKER_MODE=development with PUBLIC_KEY: serve SSH maintenance.
+    /// WORKER_MODE=development with COZY_SSH_PUBLIC_KEY (else PUBLIC_KEY, which a provider such as
+    /// vast may own): serve SSH maintenance.
     pub developer_key: Option<String>,
     pub ignored: Vec<String>,
 }
@@ -227,7 +229,11 @@ impl Grant {
             },
         };
         let developer_key = (env.get("WORKER_MODE").map(String::as_str) == Some("development"))
-            .then(|| get("PUBLIC_KEY").map(str::to_owned))
+            .then(|| {
+                get("COZY_SSH_PUBLIC_KEY")
+                    .or_else(|| get("PUBLIC_KEY"))
+                    .map(str::to_owned)
+            })
             .flatten();
         Ok(Self {
             lifetime,
@@ -364,6 +370,23 @@ mod tests {
         assert_eq!(grant.hub.unwrap().origin, "https://hub.example");
         assert_eq!(grant.ignored, ["COZY_FUTURE_SETTING"]);
         assert_eq!(grant.developer_key.as_deref(), Some("ssh-ed25519 AAAA"));
+    }
+
+    #[test]
+    fn the_cozy_ssh_key_wins_over_a_providers_public_key() {
+        let grant = Grant::read(&env(&[
+            ("COZY_WORKER_ID", "ra-1"),
+            ("COZY_WORKER_AUTH_TOKEN", TOKEN),
+            ("COZY_WORKER_INTERNAL_PORT", "8443"),
+            ("COZY_AUTHORIZED_KEYS", KEY),
+            ("TENSORHUB_ORIGIN", "https://hub.example"),
+            ("WORKER_MODE", "development"),
+            ("PUBLIC_KEY", "ssh-ed25519 PROVIDER"),
+            ("COZY_SSH_PUBLIC_KEY", "ssh-ed25519 RENTER"),
+        ]))
+        .unwrap();
+        assert_eq!(grant.developer_key.as_deref(), Some("ssh-ed25519 RENTER"));
+        assert!(grant.ignored.is_empty());
     }
 
     #[test]

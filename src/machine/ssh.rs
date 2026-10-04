@@ -10,7 +10,7 @@ use std::{
 pub fn start(public_key: &str) -> io::Result<()> {
     if public_key.len() > 8192 || public_key.contains(['\0', '\r', '\n']) {
         return Err(io::Error::other(
-            "PUBLIC_KEY must be one SSH public key of at most 8192 bytes",
+            "the SSH key must be one public key of at most 8192 bytes",
         ));
     }
     fs::create_dir_all("/root/.ssh")?;
