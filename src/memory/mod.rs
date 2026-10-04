@@ -288,7 +288,8 @@ impl GpuMemory {
                     return Ok(Some(self.with(|gpu| {
                         let cap = gpu
                             .room(plan, &sample)
-                            .max(gpu.tenant(plan).map_or(0, |t| t.cap));
+                            .max(gpu.tenant(plan).map_or(0, |t| t.cap))
+                            .max(gpu.physical_cap(plan, &sample));
                         gpu.set_cap(plan, cap);
                         cap
                     })));

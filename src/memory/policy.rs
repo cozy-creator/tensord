@@ -292,6 +292,16 @@ impl Gpu {
         (sample.total.saturating_sub(sample.free)).saturating_sub(ours)
     }
 
+    /// What `plan`'s process holds now plus everything free above the floor: what a running
+    /// call that asked for room may grow into although the ledger's charges for idle tenants
+    /// (their last reports) say less is free. The floor watchdog still guards the card.
+    pub fn physical_cap(&self, plan: &str, sample: &Sample) -> u64 {
+        let held = self
+            .tenant(plan)
+            .map_or(0, |tenant| self.actual(plan, tenant, sample));
+        held + sample.free.saturating_sub(self.floor(sample))
+    }
+
     /// What `plan`'s process may hold: the card less the floor, everything external, every
     /// other tenant's charge and the resident allocations.
     pub fn room(&self, plan: &str, sample: &Sample) -> u64 {
@@ -881,6 +891,33 @@ mod tests {
             gpu.decide("b", want, gpu.need("b"), &s, &mut round),
             Decision::Go(room)
         );
+    }
+
+    #[test]
+    fn a_running_call_that_asks_for_room_may_take_what_is_physically_free() {
+        // An idle tenant last reported 2 GiB (a decode's cache, since given back); the driver
+        // shows the card freer than the ledger's charges say.
+        let mut gpu = Gpu::default();
+        loaded(&mut gpu, "sdxl", 10, 7 * GIB, GIB / 2);
+        gpu.observe(
+            "sdxl",
+            Facts {
+                process: Some(2 * GIB),
+                ..Facts::default()
+            },
+            None,
+        );
+        gpu.idle("sdxl");
+        loaded(&mut gpu, "anima", 11, 6 * GIB, GIB);
+        gpu.active("anima", GIB);
+        let s = Sample {
+            total: 4 * GIB,
+            free: 2 * GIB,
+            display: false,
+            processes: None,
+        };
+        assert!(gpu.room("anima", &s) < gpu.physical_cap("anima", &s));
+        assert_eq!(gpu.physical_cap("anima", &s), GIB / 2 + 2 * GIB - HEADLESS_FLOOR);
     }
 
     #[test]
