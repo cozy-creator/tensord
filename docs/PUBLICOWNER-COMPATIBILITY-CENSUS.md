@@ -34,3 +34,53 @@ actual consumer proof, rather than speculative wire extensions or deployment equ
 
 Production Hub configuration/use, real published serving preparation and media custody,
 provider identity and cross-boot replacement recovery remain unqualified by this CPU census.
+
+## Confirmed source and CPU boundary
+
+On source946, server.rs842–1338 implements23 PodHost handlers and1340–1496
+implements14 WorkerControl handlers (mostly forwarding). Both services are registered;
+zero implemented handlers are proved unreachable by listener registration. Shared backend
+workspace/get/events/control/read/output projections and worker-protocol products/outcomes
+are called by machine/v1, HTTP outputs and executor/storage code. Removing the service
+wrappers is not permission to remove those shared data types or the journal's workspace.
+
+Two actual `cozy-machine serve` process/TLS tests pass in0.59s:
+`actual_listener_legacy_discovery_preserves_workspace_but_publicowner_capture_is_unsupported`
+and `actual_listener_legacy_control_and_collection_preserve_actor_and_exact_outcome`.
+The first checks authorized/foreign/stale-boot discovery, both legacy services, real
+unsupported preparation/captured submission with no accepted work, restart persistence,
+and typed refusal after replacement of this owned fixture's journal. The second authors
+one queued journal record, then uses actual API read/events/explicit cancel/collect/ACK;
+another admitted actor cannot read it, changed outcome ACK is rejected, and collection
+replays the identical terminal. These are transport/journal controls, not model inference
+or a real PostgreSQL/public HTTP/media-provider qualification. Focused clippy passes.
+Evidence: outputs/codex-machine-audit-20261004/api/publicowner-real-listener{,-clippy}.log.
+
+Tensorhub42b publicrequests.OpenWorker checks Open plus Workspace and sets healthy; Ready
+renews the public-owner lease. Rust passes those calls. PrepareServing later calls the
+missing PreparePackageSet; its gRPC error is not a PreparationRefusal. Reconcile retains
+worker_preparing, and succeeding Workspace probes retain healthy. An enabled operator
+configuration can therefore advertise a queue whose selected Rust worker cannot prepare
+that offering. Actual production use/configuration remains unverified.
+
+A separate registered legacy-submit source defect needs its own red/green increment:
+NativeBackend.submit returns accepted_public(actor, request OR submission) before comparing
+both IDs or authored intent. Different IDs or changed release/payload can receive the old
+receipt. The new machine/v1 semantic-intent proof does not cover this path.
+
+## Minimal next sequence
+
+Keep the working wrappers and shared records while proving/fixing legacy semantic replay.
+Before enabling Rust public serving, prove an actual configured Hub owner and published
+callable over the production listener, including definitive unsupported-operation admission,
+ambiguous acceptance, journal replacement, cancellation and terminal/media custody.
+
+A machine/v1 port should submit the retained authored release/model/input intent to the
+existing machine engine, not create another execution owner in the Hub. Retain the Hub's
+assignment before dispatch and preserve caller-observed workspace identity atomically with
+new acceptance; v1 currently lacks that boundary. Reads and collection must use the accepted
+identity, never refresh it to make an ambiguous request executable on a replacement journal.
+Only propose a narrow contract change after review of the concrete consumer proof. Preserve
+Hub lease fencing and adopt verified output bytes before collection acknowledgment. Delete
+old wrapper RPCs only after real consumer/provisioned-identity census and a qualified port;
+no new exact-source/version gate belongs to this decision.
