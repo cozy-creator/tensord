@@ -1,25 +1,25 @@
-# Matched gate: old stack vs Rust machine
+# Matched gate: ComfyUI vs the Rust machine
 
-`gate.py` drives ordinary `cozy run --rental=<pod> --await` from the controller against one rented
-pod, alternating two machine arms on the same GPU, and writes one row per request. Nothing private:
-the CLI, the daemon and the pod's published packages are the ones the owner uses.
+`gate.py` drives ordinary `cozy run --rental=<pod> --await` from the controller (or this computer's machine) and writes
+one row per request. Nothing private: the CLI, the daemon and the published packages are the ones the owner uses.
 
 ```
-python3 gate.py run manifest.json OUT     # alternate arms; append OUT/results.jsonl, OUT/runs/*
-python3 gate.py report OUT                # OUT/summary.json with medians, spread and the verdict
+python3 gate.py run manifest.json OUT     # cells (and cycles) per the manifest; append OUT/results.jsonl, OUT/runs/*
+python3 gate.py report OUT                # OUT/summary.json; with an `r1` key in the manifest, the R1 verdict
 ```
 
-## Threshold, declared before the run
+## R1 verdict (CUTOVER.md section 4), per Rust cell
 
-The Rust machine passes when, with every output correct, at least one of these holds and warm
-per-image is no more than 2% slower (median):
+`"r1": {"candidate": "rust", "reference": "comfy", "baseline": {"cold-sdxl": 22.2, "cold-anima": 60.8}}` and
+`"control": "rust"` in the manifest. A cell passes with:
+- zero failed requests and no NVRM Xid (a failed cell counts; nothing is left out);
+- disk reads at most 1.5× the reference engine's in the same cell on the same pod;
+- a cold cell's submit → CLI exit with the image saved at most 10% over the previous candidate's (`baseline`),
+  reported beside the reference's (server start included).
 
-- stopped-machine first image (warm page cache) median at least 20% lower, or
-- SDXL→Anima→SDXL switch (sum of the two switch requests) median at least 20% lower, or
-- host peak at least 25% lower.
-
-Reported whichever way it lands. Gains that come from shared Runtime/TensorFS fixes both arms run are
-not Rust-machine gains: every row records the Runtime/TensorFS versions the run reports.
+Each low-memory (`budget`) request is run again, untimed, on the full card after every timed cell (`control`); its
+output's PSNR to that control is reported, and anything under 30 dB goes to `review` for a person to look at. A flag,
+not a failure: diffusion amplifies rounding differences, and lossy is fine when the image is good (owner).
 
 ## One cycle (per arm, order from the manifest, e.g. old, rust, old, rust, ...)
 

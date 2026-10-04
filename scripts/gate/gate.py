@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -23,7 +24,7 @@ import threading
 import time
 from pathlib import Path
 
-from PIL import Image, ImageStat
+from PIL import Image, ImageChops, ImageStat
 
 POD_DIR = "/root/gate"
 SCENARIOS = ("cold_first", "warm_first", "warm", "to_anima", "to_sdxl", "kill_next", "kill_proof")
@@ -508,7 +509,7 @@ class Gate:
                     done = json.loads(self.pod.sh(spec["command"].format(cell=name, budget=budget or "uncapped")))
                     row = {"total_s": done["total_s"], "t_first": done["t_first"] - self.offset, "t_end": done["t_end"] - self.offset,
                            "ok": done["ok"], "requests": done["requests"], "startup_s": done.get("startup_s"),
-                           "engine": done.get("engine"), "engine_pss_peak": done.get("engine_pss_peak")}
+                           "engine": done.get("engine"), "engine_rss_peak": done.get("engine_rss_peak")}
                 except (RuntimeError, ValueError, KeyError) as error:   # the engine's driver failed: a failed cell
                     row = {"total_s": 0.0, "t_first": time.time(), "t_end": time.time(), "ok": False, "requests": [],
                            "error": str(error)[-3000:]}
@@ -606,6 +607,11 @@ class Gate:
                 self.prime(arm)
             for arm, name in self.m.get("cell_order", []):
                 self.cell(arm, name, self.m["cells"][name])
+            if self.m.get("control"):   # untimed: each low-memory request again on the full card, for PSNR
+                arm = self.m["control"]
+                same = [r for a, name in self.m["cell_order"] if a == arm and self.m["cells"][name].get("budget")
+                        for r in self.m["cells"][name]["requests"]]
+                self.cell(arm, "control", {"requests": same})
             for cycle, arm in enumerate(self.m["order"]):
                 self.cycle(arm, cycle)
             if self.m.get("kill_proof"):
@@ -626,6 +632,56 @@ def spread(values: list[float]) -> dict | None:
             "max": round(max(values), 3), "n": len(values)}
 
 
+def psnr(a: str, b: str) -> float:
+    with Image.open(a) as x, Image.open(b) as y:
+        rms = ImageStat.Stat(ImageChops.difference(x.convert("RGB"), y.convert("RGB"))).rms
+    mse = sum(v * v for v in rms) / len(rms)
+    return math.inf if mse == 0 else 10 * math.log10(255 ** 2 / mse)
+
+
+def r1(out: Path, rows: list[dict]) -> dict:
+    """R1 per cell (CUTOVER.md section 4): zero failures; disk reads at most 1.5x the reference engine's; a cold start,
+    submit to the CLI's exit with the image saved, at most 10% over the previous candidate's and shown beside the
+    reference's (server start included); each low-memory output's PSNR to the unconstrained control on the same pod,
+    under 30 dB flagged for a person to look at (diffusion amplifies rounding: a flag, not a failure); no Xid."""
+    m = json.loads((out / "manifest.json").read_text())
+    plan, cells = m["r1"], {(r["arm"], r["cell"]): r for r in rows if r.get("event") == "cell"}
+    cand, ref, baseline = plan.get("candidate", "rust"), plan.get("reference", "comfy"), plan.get("baseline", {})
+    control = {(q["prompt"], q["seed"]): q for q in (cells.get((cand, "control")) or {}).get("requests", []) if q.get("images")}
+    verdict: dict = {"pass": True, "cells": [], "review": []}
+    for (arm, name), c in cells.items():
+        if arm != cand or name == "control":
+            continue
+        spec, other = m["cells"][name], cells.get((ref, name))
+        row = {"cell": name, "budget": spec.get("budget"),
+               "failed": max(len(spec["requests"]) - sum(bool(q.get("ok")) for q in c["requests"]), 0 if c["ok"] else 1),
+               "xid": int((re.search(r"xid-events=(\d+)", c.get("facts") or "") or ["", "0"])[1]) or "NVRM: Xid" in (c.get("facts") or "")}
+        if other and other["ok"]:
+            row["disk_ratio"] = round(c["disk_read_bytes"] / max(other["disk_read_bytes"], 1), 2)
+            row["disk_gib"] = [round(c["disk_read_bytes"] / 2**30, 2), round(other["disk_read_bytes"] / 2**30, 2)]
+        if spec.get("cold") and c["requests"] and c["requests"][0].get("ok"):
+            q = c["requests"][0]
+            row["cold_s"] = round(q["done"] - q["submit"], 2)   # what the user sees
+            row["reference_cold_s"] = round(other["total_s"] + (other.get("startup_s") or 0), 2) if other and other["ok"] else None
+            if name in baseline:
+                row["cold_vs_previous"] = round(row["cold_s"] / baseline[name] - 1, 4)
+        if spec.get("budget"):
+            row["psnr_db"] = []
+            for q in c["requests"]:
+                twin = control.get((q["prompt"], q["seed"]))
+                if q.get("images") and twin:
+                    db = round(psnr(q["images"][0]["path"], twin["images"][0]["path"]), 2)
+                    row["psnr_db"].append(db)
+                    if db < 30:
+                        verdict["review"].append({"cell": name, "seed": q["seed"], "psnr_db": db, "image": q["images"][0]["path"],
+                                                  "control": twin["images"][0]["path"]})
+        row["pass"] = (row["failed"] == 0 and not row["xid"] and row.get("disk_ratio", 0) <= 1.5
+                       and row.get("cold_vs_previous", 0) <= 0.10)
+        verdict["pass"] &= row["pass"]
+        verdict["cells"].append(row)
+    return verdict
+
+
 def report(out: Path) -> dict:
     rows = [json.loads(line) for line in (out / "results.jsonl").read_text().splitlines()]
     samples = [json.loads(line) for line in (out / "samples.jsonl").read_text().splitlines() if line.strip()]
@@ -637,7 +693,8 @@ def report(out: Path) -> dict:
     summary: dict = {"kill_proof": {a: {"cycles": sum(r["arm"] == a for r in proof), "failed": sum(r["arm"] == a and not r["ok"] for r in proof)}
                                     for a in sorted({r["arm"] for r in proof})},
                      "failed": {a: [(r["scenario"], r["run"], r.get("error")) for r in requests if r["arm"] == a and not r["ok"]]
-                                for a in sorted({r["arm"] for r in requests})}, "arms": {}}
+                                   + [("cell", r["cell"], r.get("error")) for r in rows if r.get("event") == "cell" and r["arm"] == a and not r["ok"]]
+                                for a in sorted({r["arm"] for r in rows if "arm" in r})}, "arms": {}}
     for arm in sorted({r["arm"] for r in requests}):
         mine = [r for r in requests if r["arm"] == arm and r["ok"] and (r["cycle"] < 1000 or r["scenario"] == "kill_proof")]
         cycles = sorted({r["cycle"] for r in mine if 0 <= r["cycle"] < 1000})
@@ -677,7 +734,7 @@ def report(out: Path) -> dict:
         done = sorted(q.get("outcome_pod") or q.get("done") for q in r["requests"] if q.get("outcome_pod") or q.get("done"))
         summary["cells"].append({
             "arm": r["arm"], "cell": r["cell"], "budget": r.get("budget"), "cold": r.get("cold"), "ok": r["ok"],
-            "total_s": round(r["total_s"], 2), "startup_s": r.get("startup_s"), "engine_pss_peak_gib": round(r["engine_pss_peak"] / 2**30, 2) if r.get("engine_pss_peak") else None,
+            "total_s": round(r["total_s"], 2), "startup_s": r.get("startup_s"), "engine_rss_peak_gib": round(r["engine_rss_peak"] / 2**30, 2) if r.get("engine_rss_peak") else None,
             "machine_total_s": round(r["machine_total_s"], 2) if r.get("machine_total_s") else None,
             "spans_s": [round(b - a, 2) for a, b in zip(done, done[1:])],
             "host_peak_gib": round(max(x["cg"]["host"] for x in window) / 2**30, 2) if window else None,
@@ -687,19 +744,8 @@ def report(out: Path) -> dict:
             "max_temp_c": max((x["gpu"]["temp_c"] or 0) for x in window) if window else None,
             "throttled": sorted({x["gpu"]["throttle"] for x in window}) if window else None,
             "disk_read_gib": round(r["disk_read_bytes"] / 2**30, 2), "controller_load": r.get("controller_load")})
-    old, new = summary["arms"].get("old"), summary["arms"].get("rust")
-    if old and new:
-        def gain(key: str) -> float | None:
-            return round(1 - new[key]["median"] / old[key]["median"], 4) if old.get(key) and new.get(key) else None
-        v = {"first_image_gain": gain("warm_first"), "cold_first_gain": gain("cold_first"),
-             "switch_gain": gain("switch_pair"), "host_peak_gain": gain("host_peak_gib"),
-             "kill_next_gain": gain("kill_next"), "gpu_peak_gain": gain("gpu_peak_gib")}
-        v["warm_gain"] = gain("warm")
-        v["warm_regression"] = -v["warm_gain"] if v["warm_gain"] is not None else None
-        benefit = (v["first_image_gain"] or 0) >= .20 or (v["switch_gain"] or 0) >= .20 or (v["host_peak_gain"] or 0) >= .25
-        v["pass"] = bool(benefit and v["warm_regression"] is not None and v["warm_regression"] <= .02
-                         and not summary["failed"].get("rust"))
-        summary["verdict"] = v
+    if json.loads((out / "manifest.json").read_text()).get("r1"):
+        summary["r1"] = r1(out, rows)
     (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     return summary
 
