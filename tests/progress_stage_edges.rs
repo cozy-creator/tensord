@@ -88,6 +88,13 @@ fn stage_projection_is_bounded_and_only_flushes_with_a_real_transition() {
     for index in 0..100 {
         fixture.progress(2000, &format!("phase-{index}"), index);
     }
+    engine
+        .observe_progress(
+            &fixture.id,
+            2000,
+            json!({"stage":"🙂".repeat(2000)}).to_string(),
+        )
+        .unwrap();
     let live = engine.get(&fixture.id).unwrap();
     assert_eq!(live.progress_samples.len(), MAX_PROGRESS_STAGE_EDGES + 1);
     assert!(live
