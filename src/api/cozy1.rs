@@ -42,12 +42,10 @@ const HEADER: usize = 12;
 const MAX_MESSAGE: usize = 64 << 10;
 const MAX_HELLO: usize = 8 << 10;
 const MAX_STREAMS: usize = 8;
-// Limits are by capacity, never by timer: an arrival over a limit evicts the oldest session
-// still pending (before a valid hello), its own IP's first. An authenticated session ends
-// only on its own key's limit, a revocation, or the peer.
+// Only unauthenticated handshakes are bounded by capacity. Authenticated viewers have no
+// viewer cap; each session still bounds its own buffered output and open requests.
 const MAX_CONNS: usize = 64;
 const MAX_CONNS_PER_IP: usize = 8;
-const MAX_PER_KEY: usize = 16;
 /// Ended ufrags kept so a reconnect cannot resume a session no state remains for.
 const ENDED_UFRAGS: usize = 4096;
 const MIN_WINDOW: usize = 256 << 10;
@@ -115,8 +113,15 @@ impl<B: MachineBackend> Media<B> {
     ) -> Option<Admission<B>> {
         let mut admitted = self.admitted.lock().unwrap();
         loop {
-            let own = admitted.seats.iter().filter(|s| s.ip == ip).count();
-            if own < MAX_CONNS_PER_IP && admitted.seats.len() < MAX_CONNS {
+            let pending = |seat: &&Arc<Seat>| seat.key.lock().unwrap().is_none();
+            let own = admitted
+                .seats
+                .iter()
+                .filter(pending)
+                .filter(|s| s.ip == ip)
+                .count();
+            let total = admitted.seats.iter().filter(pending).count();
+            if own < MAX_CONNS_PER_IP && total < MAX_CONNS {
                 let seat = Arc::new(Seat {
                     ip,
                     key: Mutex::default(),
@@ -170,19 +175,6 @@ impl<B: MachineBackend> Admission<B> {
     /// Seats the session under the key that opened it, and ends that key's oldest session
     /// beyond its limit.
     fn authenticate(&self, key: &str) {
-        let admitted = self.media.admitted.lock().unwrap();
-        let same: Vec<&Arc<Seat>> = admitted
-            .seats
-            .iter()
-            .filter(|s| s.key.lock().unwrap().as_deref() == Some(key))
-            .collect();
-        if same.len() >= MAX_PER_KEY {
-            *same[0].key.lock().unwrap() = None;
-            let _ = same[0].work.send(Work::Bye {
-                code: "evicted",
-                message: "this key opened more sessions than a machine keeps",
-            });
-        }
         *self.seat.key.lock().unwrap() = Some(key.into());
     }
 }
@@ -357,10 +349,23 @@ async fn session<B: MachineBackend>(
         }
     });
     let mut cozy = Cozy::new(media.clone(), work_tx);
-    // Set once the hello verifies: resolves when the key that opened the session is revoked.
-    let mut revoked: Option<Pin<Box<dyn Future<Output = ()> + Send>>> = None;
+    let mut authority: Option<super::auth::StreamAuthority> = None;
+    let mut ended: Option<Pin<Box<dyn Future<Output = tonic::Status> + Send>>> = None;
     let mut seated = false;
     loop {
+        // Check before pumping/transmitting: sustained output cannot starve revocation.
+        if !cozy.ending {
+            if let Some(ref authority) = authority {
+                if let Err(status) = authority.check() {
+                    let code = if status.metadata().get("cozy-error-code").is_some() {
+                        "expired"
+                    } else {
+                        "revoked"
+                    };
+                    cozy.bye(code, status.message());
+                }
+            }
+        }
         let deadline = loop {
             match rtc.poll_output().map_err(io::Error::other)? {
                 Output::Timeout(at) => break at,
@@ -380,10 +385,13 @@ async fn session<B: MachineBackend>(
         if let (Some((grant, actor)), false) = (&cozy.grant, seated) {
             seated = true;
             admission.authenticate(&grant.key);
-            let (media, key) = (media.clone(), actor.public_key);
-            revoked = Some(Box::pin(async move {
-                media.identity.authority.keys.revoked(key).await
-            }));
+            let permit = super::auth::StreamAuthority::new(
+                media.identity.authority.keys.clone(),
+                *actor,
+                Some(grant.expires),
+            );
+            ended = Some(Box::pin(permit.clone().ended()));
+            authority = Some(permit);
         }
         if cozy.pump(&mut rtc) {
             continue; // what it wrote is transmitted first
@@ -394,9 +402,9 @@ async fn session<B: MachineBackend>(
             return Ok(());
         }
         let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
-        let key_revoked = async {
-            match revoked.as_mut() {
-                Some(revoked) => revoked.await,
+        let authority_ended = async {
+            match ended.as_mut() {
+                Some(ended) => ended.await,
                 None => std::future::pending().await,
             }
         };
@@ -407,9 +415,10 @@ async fn session<B: MachineBackend>(
             },
             _ = sleep => rtc.handle_input(Input::Timeout(Instant::now())).map_err(io::Error::other)?,
             Some(done) = work.recv() => cozy.work(done),
-            _ = key_revoked => {
-                revoked = None;
-                cozy.bye("revoked", "the key that opened this session was revoked");
+            status = authority_ended => {
+                ended = None;
+                let code = if status.metadata().get("cozy-error-code").is_some() { "expired" } else { "revoked" };
+                cozy.bye(code, status.message());
             }
         }
     }
@@ -573,6 +582,12 @@ impl<B: MachineBackend> Cozy<B> {
     fn bye(&mut self, code: &str, message: &str) {
         if !self.ending {
             self.ending = true;
+            self.out.clear();
+            for stream in self.streams.drain(..) {
+                if let Some(task) = stream.task {
+                    task.abort();
+                }
+            }
             self.out
                 .push_back(json!({"t": "bye", "code": code, "message": message}));
         }
@@ -1146,5 +1161,45 @@ mod tests {
         );
         frame[8 + 12 + 4] = b'x'; // another prefix
         assert_eq!(binding_username(&frame), None);
+    }
+}
+
+#[cfg(test)]
+mod authority_tests {
+    use super::*;
+    use crate::api::pb;
+    struct Backend;
+    impl MachineBackend for Backend {
+        fn workspace(
+            &self,
+            _: VerifiedActor,
+            _: pb::MachineExecutionWorkspaceQuery,
+        ) -> Result<pb::MachineExecutionWorkspace, tonic::Status> {
+            Ok(pb::MachineExecutionWorkspace::default())
+        }
+    }
+    #[test]
+    fn authenticated_viewers_do_not_consume_unauthenticated_handshake_limits() {
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[84; 32]);
+        let identity = MachineIdentity::ephemeral(
+            "media-test".into(),
+            vec![signer.verifying_key()],
+            vec![7; 32],
+        )
+        .unwrap();
+        let media = Media::new(Arc::new(identity), Arc::new(Backend)).unwrap();
+        let address = "127.0.0.1".parse().unwrap();
+        let mut viewers = vec![];
+        for _ in 0..(MAX_CONNS + 1) {
+            let (work, _) = mpsc::unbounded_channel();
+            let mut viewer = media
+                .admit(address, work)
+                .expect("an authenticated viewer was capped");
+            viewer.authenticate("one-owner-key");
+            viewers.push(viewer);
+        }
+        assert_eq!(media.admitted.lock().unwrap().seats.len(), MAX_CONNS + 1);
+        drop(viewers);
+        assert!(media.admitted.lock().unwrap().seats.is_empty());
     }
 }

@@ -390,29 +390,8 @@ impl<B: MachineBackend> Api<B> {
         stream: ResponseStream<T>,
         actor: super::auth::VerifiedActor,
     ) -> ResponseStream<T> {
-        use tokio_stream::StreamExt;
-        let keys = self.identity.authority.keys.clone();
-        let (sender, receiver) = tokio::sync::mpsc::channel(2);
-        tokio::spawn(async move {
-            let mut stream = stream;
-            let revoked = keys.revoked(actor.public_key);
-            tokio::pin!(revoked);
-            loop {
-                tokio::select! {
-                    _ = &mut revoked => {
-                        let _ = sender.send(Err(Status::unauthenticated("the key that opened this stream no longer authorizes it"))).await;
-                        return;
-                    }
-                    item = stream.next() => {
-                        let Some(item) = item else { return };
-                        if sender.send(item).await.is_err() {
-                            return;
-                        }
-                    }
-                }
-            }
-        });
-        Box::pin(tokio_stream::wrappers::ReceiverStream::new(receiver))
+        super::auth::StreamAuthority::new(self.identity.authority.keys.clone(), actor, None)
+            .wrap(stream)
     }
     /// Holds a rental's idle release while a call that may start work runs.
     fn admit(&self) -> Result<Option<crate::machine::lifecycle::Admission>, Status> {
@@ -482,16 +461,21 @@ impl<B: MachineBackend> Api<B> {
         let keys = authority.keys.admitted();
         let granted = super::capability::verify_signer(token, &authority.worker_id, &keys, now, "")
             .and_then(|(grant, signer)| match grant.allows(&run, &name, index) {
-                true => Ok(signer),
+                true => Ok((grant, signer)),
                 false => Err(super::capability::Refusal::Scope),
             });
         // A capability grants its signer's own runs: another actor's run is absent.
-        let actor = match granted {
-            Ok(signer) => super::auth::VerifiedActor {
-                public_key: signer.to_bytes(),
-            },
+        let (actor, expires) = match granted {
+            Ok((grant, signer)) => (
+                super::auth::VerifiedActor {
+                    public_key: signer.to_bytes(),
+                },
+                grant.expires,
+            ),
             Err(refusal) => return text(StatusCode::FORBIDDEN, refusal.to_string()),
         };
+        let authority =
+            super::auth::StreamAuthority::new(authority.keys.clone(), actor, Some(expires));
         let backend = self.backend.clone();
         let snapshot = match tokio::task::spawn_blocking(move || {
             backend.open_output(actor, number, &name, index)
@@ -515,6 +499,9 @@ impl<B: MachineBackend> Api<B> {
                 )
             }
         };
+        if let Err(refusal) = authority.check() {
+            return text(StatusCode::FORBIDDEN, refusal.message().into());
+        }
         let etag = format!("\"r{}\"", snapshot.rev);
         let mut response = axum::http::Response::builder()
             .header("etag", &etag)
@@ -578,9 +565,12 @@ impl<B: MachineBackend> Api<B> {
         response
             .status(status)
             .header("content-length", count)
-            .body(axum::body::Body::from_stream(
-                tokio_stream::wrappers::ReceiverStream::new(receiver),
-            ))
+            .body(axum::body::Body::from_stream(authority.wrap(Box::pin(
+                tokio_stream::StreamExt::map(
+                    tokio_stream::wrappers::ReceiverStream::new(receiver),
+                    |item| item.map_err(|error| Status::data_loss(error.to_string())),
+                ),
+            ))))
             .unwrap_or_default()
     }
     /// The owner's maintenance routes (`runtime-update` capability), as `cozy rental update`
