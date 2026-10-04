@@ -138,6 +138,7 @@ impl Learned {
 
     pub fn host(&mut self, plan: &str, bytes: u64) {
         let row = self.plans.entry(plan.into()).or_default();
+        row.used_ms = now_ms();
         row.host_bytes = row.host_bytes.max(bytes);
     }
 
@@ -177,8 +178,11 @@ mod tests {
         learned.call("anima", "height=2048,width=2048", 5 << 30, &methods);
         learned.context("GPU-1/580", 220 << 20);
         learned.load("anima", 6 << 30, 2 << 30);
+        // A row that only ever measured host bytes (an import-only parent) is kept too.
+        learned.host("parent:abc", 600 << 20);
         learned.save().unwrap();
         let learned = Learned::open(&path);
+        assert_eq!(learned.plans["parent:abc"].host_bytes, 600 << 20);
         let anima = &learned.plans["anima"];
         assert_eq!((anima.weights, anima.weights_floor), (6 << 30, 2 << 30));
         assert_eq!(learned.peak("anima"), Some(5 << 30));
