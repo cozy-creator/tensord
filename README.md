@@ -22,11 +22,11 @@ uv run --locked --extra test pytest -q
 
 ## Release
 
-The version is `Cargo.toml`'s; a release is the tag `v<version>` on master. This repository
-publishes nothing: cozy-runtime pins the tag in `cozy-machine.tag`, its release builds it with
-`task release` (manylinux_2_28 container: glibc 2.28 floor, `version --json` names the commit)
-and bundles it into the Linux x86_64 wheel as `cozy-machine`. Worker images and
-`cozy machine install` take it from that wheel.
+The version is `Cargo.toml`'s; a release is the tag `v<version>`, cut on the commit the gates ran
+on. This repository publishes nothing: cozy-runtime's `cozy-machine.pin` names that commit for
+candidates and the tag at publish. The Runtime build runs `task release` (manylinux_2_28
+container: glibc 2.28 floor, `version --json` names the commit) and bundles the binary into its
+Linux x86_64 wheel as `cozy-machine`. Worker images and `cozy machine install` take it from there.
 
 ## Run
 
