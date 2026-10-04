@@ -357,6 +357,9 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS triage(execution INTEGER PRIMARY KEY REFERENCES executions(id),record TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS resolutions(actor TEXT NOT NULL,key TEXT NOT NULL,package TEXT NOT NULL,preparation TEXT NOT NULL,PRIMARY KEY(actor,key));
             CREATE TABLE IF NOT EXISTS objects(actor TEXT NOT NULL,sha256 TEXT NOT NULL,length INTEGER NOT NULL,PRIMARY KEY(actor,sha256));
+            CREATE TABLE IF NOT EXISTS object_uses(sha256 TEXT PRIMARY KEY,length INTEGER NOT NULL,used_ms INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS run_objects(execution INTEGER NOT NULL REFERENCES executions(id),sha256 TEXT NOT NULL,length INTEGER NOT NULL,PRIMARY KEY(execution,sha256));
+            CREATE INDEX IF NOT EXISTS run_objects_digest ON run_objects(sha256);
             CREATE TABLE IF NOT EXISTS job_contexts(execution INTEGER PRIMARY KEY REFERENCES executions(id),record BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS checkpoints(execution INTEGER NOT NULL REFERENCES executions(id),operation_key TEXT NOT NULL,logical_key TEXT NOT NULL,content_digest TEXT NOT NULL,length INTEGER NOT NULL,attempt INTEGER NOT NULL,receipt TEXT NOT NULL,at_ms INTEGER NOT NULL,PRIMARY KEY(execution,operation_key,logical_key));
             CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_request ON executions(actor,request_id) WHERE actor IS NOT NULL;
@@ -706,13 +709,54 @@ impl Journal {
         actor: &str,
         object: &tensorfs_core::ids::ObjectRef,
     ) -> io::Result<()> {
-        self.connection
-            .execute(
-                "INSERT OR REPLACE INTO objects(actor,sha256,length) VALUES(?1,?2,?3)",
-                params![actor, object.sha256, object.length],
-            )
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_error)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO objects(actor,sha256,length) VALUES(?1,?2,?3)",
+            params![actor, object.sha256, object.length],
+        )
+        .map_err(db_error)?;
+        touch_object(&tx, object)?;
+        tx.commit().map_err(db_error)?;
         Ok(())
+    }
+
+    /// A child's result becomes its parent's dependency before the parent is handed it.
+    pub fn adopt_object(
+        &mut self,
+        actor: &str,
+        parent: &str,
+        object: &tensorfs_core::ids::ObjectRef,
+    ) -> io::Result<()> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO objects(actor,sha256,length) VALUES(?1,?2,?3)",
+            params![actor, object.sha256, object.length],
+        )
+        .map_err(db_error)?;
+        reference_objects(&tx, parent, std::slice::from_ref(object))?;
+        tx.commit().map_err(db_error)
+    }
+
+    /// Whether nothing needs this object's root: no use (a Write, a new run) since
+    /// `before_ms`, and no run naming it that is unfinished (any state but the three
+    /// terminal ones) or ended since then.
+    pub fn object_releasable(&self, sha256: &str, before_ms: i64) -> io::Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM object_uses WHERE sha256=?1 AND used_ms>=?2)
+                 AND NOT EXISTS(SELECT 1 FROM run_objects r JOIN executions e ON e.id=r.execution
+                     WHERE r.sha256=?1 AND (e.updated_ms>=?2
+                         OR e.state NOT IN ('completed','failed','canceled')))",
+                params![sha256, before_ms],
+                |row| row.get(0),
+            )
+            .map_err(db_error)
     }
     /// The failed attempt's triage bundle reference; written before the run settles.
     pub fn bind_triage(&mut self, id: &str, triage: &crate::triage::TriageRef) -> io::Result<()> {
@@ -1031,6 +1075,18 @@ impl Journal {
         digest: &str,
         invocation: Invocation,
     ) -> io::Result<(Execution, bool)> {
+        self.accept_run_objects(actor, id, digest, invocation, &[])
+    }
+
+    /// `accept_run`, also referencing `objects` (tree members, a local source) the run needs.
+    pub fn accept_run_objects(
+        &mut self,
+        actor: &str,
+        id: &str,
+        digest: &str,
+        invocation: Invocation,
+        objects: &[tensorfs_core::ids::ObjectRef],
+    ) -> io::Result<(Execution, bool)> {
         validate_scope(actor, id, id)?;
         let key = format!("run:{}", encoded(&(actor, id))?);
         let tx = self
@@ -1072,6 +1128,7 @@ impl Journal {
             preparation_id: String::new(),
         };
         let execution = insert(&tx, &key, invocation, Some(context), "", Some(PREPARING))?;
+        reference_objects(&tx, &execution.id, objects)?;
         tx.commit().map_err(db_error)?;
         Ok((execution, true))
     }
@@ -1166,6 +1223,35 @@ impl Journal {
     }
 }
 
+fn touch_object(
+    tx: &rusqlite::Transaction<'_>,
+    object: &tensorfs_core::ids::ObjectRef,
+) -> io::Result<()> {
+    tensorfs_core::ids::hex64("run object", &object.sha256).map_err(db_error)?;
+    tx.execute(
+        "INSERT INTO object_uses(sha256,length,used_ms) VALUES(?1,?2,?3)
+        ON CONFLICT(sha256) DO UPDATE SET used_ms=excluded.used_ms",
+        params![object.sha256, object.length, timestamp()],
+    )
+    .map_err(db_error)?;
+    Ok(())
+}
+fn reference_objects(
+    tx: &rusqlite::Transaction<'_>,
+    execution: &str,
+    objects: &[tensorfs_core::ids::ObjectRef],
+) -> io::Result<()> {
+    for object in objects {
+        touch_object(tx, object)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO run_objects(execution,sha256,length) VALUES(?1,?2,?3)",
+            params![execution, object.sha256, object.length],
+        )
+        .map_err(db_error)?;
+    }
+    Ok(())
+}
+
 /// The waiting reason of a run accepted before its preparation completes.
 pub const PREPARING: &str = "preparing";
 
@@ -1177,6 +1263,16 @@ fn insert(
     boot: &str,
     waiting: Option<&str>,
 ) -> io::Result<Execution> {
+    let objects: Vec<_> = invocation
+        .inputs
+        .iter()
+        .filter_map(|input| {
+            Some(tensorfs_core::ids::ObjectRef {
+                sha256: input.digest.strip_prefix("sha256:")?.into(),
+                length: input.length,
+            })
+        })
+        .collect();
     tx.execute("INSERT INTO executions(idempotency_key,invocation,record,state,updated_ms,actor,request_id,submission_id) VALUES(?1,?2,'{}','queued',?3,?4,?5,?6)", params![key, encoded(&invocation)?, timestamp(),context.as_ref().map(|context|context.actor.as_str()),context.as_ref().map(|context|context.request_id.as_str()),context.as_ref().map(|context|context.submission_id.as_str())]).map_err(db_error)?;
     let execution = Execution {
         id: tx.last_insert_rowid().to_string(),
@@ -1208,6 +1304,7 @@ fn insert(
         params![encoded(&execution)?, execution.id],
     )
     .map_err(db_error)?;
+    reference_objects(tx, &execution.id, &objects)?;
     Ok(execution)
 }
 

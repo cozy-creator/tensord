@@ -127,6 +127,13 @@ used first (one compiled kernel, or one generation's torch kernels), before gene
 while an executor of that identity is alive. Below the reserve, max(1 GiB, 1/50), an executor's
 compiled kernels go to its run-scoped JIT directory instead of the persistent store.
 
+Write objects: each verified object gets a TensorFS object root (`roots/objects/<sha>.json`)
+before its Write is acknowledged, and a run's references (`run_objects`: its inputs, tree members
+and local source; a parent's adopted child results) commit with its acceptance. `Objects::sweep`
+releases a root once no unfinished run (any state but completed, failed or canceled) names it and
+nothing used it for the 7-day TTL, or for 10 minutes while the store's disk is low; the store's GC
+then takes the bytes. A root written just before a crash ages from its own mtime.
+
 Triage: every failed CPU run, and every GPU run whose executor ended, failed to start or was killed
 without writing its own terminal, keeps a bundle (`triage.rs`) before it settles: the reason, which
 carries any kill measurement, the process id and the end of its stderr. `Read{triage}` serves it.
