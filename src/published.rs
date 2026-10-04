@@ -1002,7 +1002,6 @@ impl Publisher {
         job.stage(format!("preparing {}", request.package));
         let plan = gpu
             .prepare_root(
-                actor,
                 installation,
                 &request.entrypoint,
                 &request.choices,

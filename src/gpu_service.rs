@@ -151,9 +151,11 @@ pub struct PlanSlot {
     pub selected_encoded_bytes: u64,
 }
 
+/// One executor's identity: the package's generation, entrypoint, bound models and group. Not
+/// who submitted: every submitter of the same construction is served by the one executor, a
+/// request at a time. What an actor may run is its own journal rows (installation, preparation).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GpuPlan {
-    pub actor: String,
     pub id: String,
     pub installation: String,
     pub generation: String,
@@ -237,7 +239,6 @@ struct Session {
     budget_cells: BTreeMap<u32, File>,
     /// Its selected models' headers and assets, served on `model_source`.
     sources: Arc<ModelSources>,
-    actor: String,
     /// This executor in the host tier and the layouts it may adopt.
     peer: u64,
     grants: Vec<HostGrant>,
@@ -692,7 +693,6 @@ impl GpuPool {
     /// declares on this machine. No model code executes during description/preparation.
     pub fn prepare_root(
         &self,
-        actor: &str,
         installed: &crate::journal::Installation,
         entrypoint: &str,
         choices: &[crate::api::pb::ModelChoice],
@@ -867,10 +867,9 @@ impl GpuPool {
                 selected_encoded_bytes,
             });
         }
-        let semantic = serde_json::json!({"actor":actor,"generation":installed.generation,"entrypoint":entrypoint,"slots":planned,"degree":degree});
+        let semantic = serde_json::json!({"generation":installed.generation,"entrypoint":entrypoint,"slots":planned,"degree":degree});
         let canonical = serde_json_canonicalizer::to_vec(&semantic).map_err(io::Error::other)?;
         Ok(GpuPlan {
-            actor: actor.into(),
             id: format!("gpu-{}", tensorfs_core::sha256::hex_digest(&canonical)),
             installation: installed.alias.clone(),
             generation: installed.generation.clone(),
@@ -882,10 +881,7 @@ impl GpuPool {
     pub fn plan(&self, preparation: &Preparation) -> io::Result<GpuPlan> {
         let plan: GpuPlan =
             serde_json::from_slice(&preparation.document).map_err(io::Error::other)?;
-        if plan.actor != preparation.actor
-            || plan.id != preparation.id
-            || plan.installation != preparation.installation
-        {
+        if plan.id != preparation.id || plan.installation != preparation.installation {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "GPU preparation differs from owned journal binding",
@@ -1874,7 +1870,6 @@ impl GpuPool {
             executor,
             budget_cells: BTreeMap::new(),
             sources,
-            actor: plan.actor.clone(),
             peer,
             grants,
             sharing: false,
@@ -1899,6 +1894,9 @@ impl GpuPool {
         load_only: bool,
     ) -> io::Result<bool> {
         let retained = session.loaded;
+        if retained {
+            session.executor.begin_request();
+        }
         // Every rank of a group reads its own GPU's cap and cell (`rank_cells/1`).
         let ranked = plan.degree > 1;
         if !session.loaded {
@@ -1915,7 +1913,6 @@ impl GpuPool {
             sources: &session.sources,
             peer: session.peer,
             grants: &session.grants,
-            actor: &session.actor,
             birth: session.executor.birth.clone(),
             custody: self.custody.as_ref().filter(|_| sharing),
             exit: session.executor.observer_pidfd()?,
@@ -2515,7 +2512,7 @@ fn rank_grant(caps: &[Option<u64>]) -> (Option<u64>, Group) {
 }
 
 fn holding_id(key: &HoldingKey, generation: u64) -> String {
-    format!("{}/{}/{}#{generation}", key.actor, key.device, key.layout)
+    format!("{}/{}#{generation}", key.device, key.layout)
 }
 
 fn known(value: Option<i64>) -> Option<u64> {
@@ -2717,10 +2714,7 @@ fn raise_fd_limit() {
 /// An error ends its executor; the exact exit is observed before the run settles, and a
 /// kill's measurement joins the reason.
 fn ended_with(engine: &Engine, id: &str, error: io::Error, executor: DeviceExecutor) -> io::Error {
-    let (pid, stderr_tail) = (
-        executor.birth.pid,
-        crate::process::tail(&executor.root_path().join("stderr.log")),
-    );
+    let (pid, stderr_tail) = (executor.birth.pid, executor.stderr_tail());
     let error = ending(error, executor);
     keep_lifecycle_triage(engine, id, pid, &error.to_string(), &stderr_tail);
     error
@@ -2932,7 +2926,7 @@ pub(crate) fn keep_triage(
             message: &outcome.message,
             traceback: &outcome.traceback,
             executor_pid: executor.birth.pid,
-            stderr_tail: &crate::process::tail(&executor.root_path().join("stderr.log")),
+            stderr_tail: &executor.stderr_tail(),
         },
     );
 }
@@ -3043,7 +3037,6 @@ struct Callbacks<'a> {
     sources: &'a Arc<ModelSources>,
     peer: u64,
     grants: &'a [HostGrant],
-    actor: &'a str,
     birth: ProcessBirth,
     custody: Option<&'a Mutex<ResidentCustody>>,
     /// The executor's pidfd: a reader lease ends when it does.
@@ -3067,7 +3060,6 @@ impl Services for Callbacks<'_> {
             return Ok((answer, Vec::new()));
         };
         let key = HoldingKey {
-            actor: self.actor.to_string(),
             device: frame.device.clone(),
             layout: frame.layout.clone(),
         };

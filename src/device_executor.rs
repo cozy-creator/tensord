@@ -772,6 +772,8 @@ pub struct DeviceExecutor {
     watched: Watched,
     /// Longest gap between frames this executor has shown during invocations.
     worst_gap: Duration,
+    /// Where its stderr stood when the request it serves began.
+    log_from: u64,
 }
 
 /// Cooperative first: the executor stops at its next safe point. The running invocation's
@@ -1446,6 +1448,7 @@ impl DeviceExecutor {
             identity: config.identity,
             watched,
             worst_gap: Duration::ZERO,
+            log_from: 0,
         };
         let hello = executor.command(&DeviceCommand::Hello, &mut Baseline)?;
         let mismatched = config.seal.mismatches(&hello.hello.sealed);
@@ -1479,6 +1482,15 @@ impl DeviceExecutor {
     }
     pub fn root_path(&self) -> &Path {
         &self.root
+    }
+    /// A request begins: an executor serves many submitters, so a failure quotes only the
+    /// stderr written from here on.
+    pub fn begin_request(&mut self) {
+        self.log_from = fs::metadata(self.root.join("stderr.log")).map_or(0, |m| m.len());
+    }
+    /// The end of the stderr of the request it serves (its whole life before the first).
+    pub fn stderr_tail(&self) -> String {
+        crate::process::tail_from(&self.root.join("stderr.log"), self.log_from)
     }
     pub fn cancellation(&self) -> Cancellation {
         Cancellation {

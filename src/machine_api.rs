@@ -645,13 +645,15 @@ impl MachineBackend for NativeBackend {
     }
     fn open_output(
         &self,
+        actor: VerifiedActor,
         run: u64,
         output: &str,
         index: Option<u32>,
     ) -> Result<crate::api::backend::OutputSnapshot, Status> {
         let absent = || Status::not_found("this machine has no such run or output");
+        let actor = actor_id(actor);
         let record = match self.service.engine.get(&run.to_string()) {
-            Ok(record) if record.submission.is_some() => record,
+            Ok(record) if record.submission.as_ref().is_some_and(|s| s.actor == actor) => record,
             Ok(_) => return Err(absent()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(absent()),
             Err(error) => return Err(problem(error)),
@@ -1097,7 +1099,7 @@ impl MachineBackend for NativeBackend {
         {
             let gpu = self.service.gpu().ok_or_else(|| Status::unimplemented("this installed callable needs the GPU execution operation; CPU peers remain usable"))?;
             let plan = gpu
-                .prepare_root(&actor, &installed, &root.entrypoint, &root.models, &[], 0)
+                .prepare_root(&installed, &root.entrypoint, &root.models, &[], 0)
                 .map_err(problem)?;
             self.service
                 .engine

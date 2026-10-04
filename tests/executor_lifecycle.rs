@@ -210,6 +210,29 @@ fn cooperative_cancel_stops_at_a_safe_point_and_keeps_the_executor() {
 
 #[test]
 #[ignore = "needs installed cpu_lifecycle generations"]
+fn a_failure_quotes_only_its_own_requests_stderr() {
+    let (generation, hold) = generations().remove(0);
+    let (mut executor, root, _) = launch(&generation, &hold);
+    // One submitter's request, then another's on the same executor.
+    let first = json!({"text": "first submitter's words"});
+    let reply = invoke(&mut executor, &root, "first", "note", first).unwrap();
+    assert_eq!(terminal(&reply), "succeeded", "{reply:?}");
+    executor.begin_request();
+    let second = json!({"text": "second submitter's words", "fail": true});
+    let reply = invoke(&mut executor, &root, "second", "note", second).unwrap();
+    assert_eq!(terminal(&reply), "failed", "{reply:?}");
+    let quoted = executor.stderr_tail();
+    assert!(quoted.contains("second submitter's words"), "{quoted}");
+    assert!(!quoted.contains("first submitter's words"), "{quoted}");
+    // The log itself holds both: only the quote is bounded.
+    let log = fs::read_to_string(executor.root_path().join("stderr.log")).unwrap();
+    assert!(log.contains("first submitter's words"), "{log}");
+    executor.shutdown().unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[ignore = "needs installed cpu_lifecycle generations"]
 fn slow_steady_work_is_never_killed_without_a_cancel() {
     let (generation, hold) = generations().remove(0);
     let (mut executor, root, _) = launch(&generation, &hold);

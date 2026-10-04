@@ -9,9 +9,10 @@ references. Later executors on the GPU get duplicates and map them read-only
 
 ## Model
 
-- A holding is one weight-set layout on one GPU for one actor: `HoldingKey {actor, device
-  (GPU UUID), layout (plane digest)}`, a generation, regions (chunk sizes), one fd per chunk,
-  readers, phase `Ready` or `Revoking`.
+- A holding is one weight-set layout on one GPU: `HoldingKey {device (GPU UUID), layout (plane
+  digest)}`, a generation, regions (chunk sizes), one fd per chunk, readers, phase `Ready` or
+  `Revoking`. Every executor on the pod whose layout matches shares it, whoever submitted the
+  request and whichever package it runs.
 - A reader is a **lease**: one end of a socket pair the executor keeps while it maps the holding
   (sent after the chunk fds, `lease: true`). Its close ends the lease with no message: the executor
   closes it once its regions are unmapped and released (revoke, close, a duplicate replaced), and
@@ -33,8 +34,11 @@ references. Later executors on the GPU get duplicates and map them read-only
   (the driver tore its references down); a Revoking holding with no leases is removed and its fds
   closed.
 - Read-only is the reader's own mapping and cannot be imposed by the holder: CUDA exports take no
-  access flags and any fd holder can map writable (rental probe, `C/SAFEGUARDS.md`). Holdings are
-  shared only within one actor.
+  access flags and any fd holder can map writable (rental probe, `C/SAFEGUARDS.md`). So a holding
+  is as trustworthy as every package on the pod: one that writes into a mapping, or offers wrong
+  bytes under a layout, reaches every package sharing it. A pod has one owner, who chooses its
+  packages, and nothing else separates them either. A pod-level policy isolating publishers would
+  add its domain to `HoldingKey`; the package is on the plan (`slots[].binding.package`).
 - No adoption across machine restarts: custody is in memory; a restart drops the fds and the
   executors' own references keep whatever they map.
 

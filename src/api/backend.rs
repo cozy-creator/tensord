@@ -188,9 +188,11 @@ pub trait MachineBackend: Send + Sync + 'static {
         unsupported()
     }
     /// One run output's current bytes (`GET /v1/runs/{run}/outputs/{output}[/{index}]`).
-    /// `index` is a list item's 1-based index. The caller has verified a capability.
+    /// `index` is a list item's 1-based index. The caller has verified `actor`'s capability;
+    /// a run another actor submitted is absent.
     fn open_output(
         &self,
+        _: VerifiedActor,
         _run: u64,
         _output: &str,
         _index: Option<u32>,

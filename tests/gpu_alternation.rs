@@ -75,7 +75,7 @@ fn published_models_alternate_on_one_gpu_under_the_memory_policy() {
             .unwrap()
             .expect("published package mapped in the GPU config");
         let prepared = gpu
-            .prepare_root(&plan.actor, &installed, &model.entrypoint, &[], &[], 1)
+            .prepare_root(&installed, &model.entrypoint, &[], &[], 1)
             .unwrap();
         service
             .engine

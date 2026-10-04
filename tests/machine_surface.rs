@@ -25,6 +25,8 @@ struct Machine {
 }
 
 const SIGNER: [u8; 32] = [33; 32];
+/// A second admitted key: another submitter on the same machine.
+const OTHER: [u8; 32] = [44; 32];
 const WORKER: &str = "surface-test";
 
 impl Machine {
@@ -41,7 +43,9 @@ impl Machine {
         let config = root.join("config");
         fs::create_dir_all(&config).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
-        let signer = SigningKey::from_bytes(&SIGNER);
+        let keys = [SIGNER, OTHER].map(|key| {
+            URL_SAFE_NO_PAD.encode(SigningKey::from_bytes(&key).verifying_key().to_bytes())
+        });
         let write = |name: &str, value: serde_json::Value| {
             let path = config.join(name);
             fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
@@ -49,7 +53,7 @@ impl Machine {
         };
         write(
             "keys.json",
-            serde_json::json!({"keys":[URL_SAFE_NO_PAD.encode(signer.verifying_key().to_bytes())]}),
+            serde_json::json!({ "keys": keys }),
         );
         write(
             "readiness.json",
@@ -155,7 +159,36 @@ impl Drop for Machine {
 }
 
 fn actor() -> String {
-    tensorfs_core::sha256::hex(&SigningKey::from_bytes(&SIGNER).verifying_key().to_bytes())
+    actor_of(&SIGNER)
+}
+fn actor_of(key: &[u8; 32]) -> String {
+    tensorfs_core::sha256::hex(&SigningKey::from_bytes(key).verifying_key().to_bytes())
+}
+
+/// `key`'s Claim on the machine that published `ready` (its `api-ready.json`).
+fn claim_by(ready: &serde_json::Value, key: &[u8; 32]) -> pb::Claim {
+    let der = rustls_pemfile::certs(&mut BufReader::new(
+        ready["cert_pem"].as_str().unwrap().as_bytes(),
+    ))
+    .next()
+    .unwrap()
+    .unwrap();
+    let authority = Authority {
+        worker_id: ready["worker_id"].as_str().unwrap().into(),
+        boot_id: ready["boot_id"].as_str().unwrap().into(),
+        leaf_digest: tensorfs_core::sha256::digest(der.as_ref()),
+        keys: vec![].into(),
+    };
+    pb::Claim {
+        worker_id: authority.worker_id.clone(),
+        worker_boot_id: authority.boot_id.clone(),
+        record_owner_epoch: 1,
+        proof: SigningKey::from_bytes(key)
+            .sign(&authority.transcript(1).unwrap())
+            .to_bytes()
+            .to_vec(),
+        ..Default::default()
+    }
 }
 
 async fn launch(
@@ -192,26 +225,7 @@ async fn launch(
         std::thread::sleep(Duration::from_millis(50));
     };
     let pem = ready["cert_pem"].as_str().unwrap().to_owned();
-    let der = rustls_pemfile::certs(&mut BufReader::new(pem.as_bytes()))
-        .next()
-        .unwrap()
-        .unwrap();
-    let authority = Authority {
-        worker_id: ready["worker_id"].as_str().unwrap().into(),
-        boot_id: ready["boot_id"].as_str().unwrap().into(),
-        leaf_digest: tensorfs_core::sha256::digest(der.as_ref()),
-        keys: vec![].into(),
-    };
-    let claim = pb::Claim {
-        worker_id: authority.worker_id.clone(),
-        worker_boot_id: authority.boot_id.clone(),
-        record_owner_epoch: 1,
-        proof: SigningKey::from_bytes(&SIGNER)
-            .sign(&authority.transcript(1).unwrap())
-            .to_bytes()
-            .to_vec(),
-        ..Default::default()
-    };
+    let claim = claim_by(&ready, &SIGNER);
     let address = ready["address"].as_str().unwrap().to_owned();
     let channel = Endpoint::from_shared(format!("https://{address}"))
         .unwrap()
@@ -590,12 +604,15 @@ mod v1_api {
     use tonic::metadata::MetadataValue;
 
     fn cap(scope: Grant) -> String {
+        cap_by(&SIGNER, scope)
+    }
+    fn cap_by(key: &[u8; 32], scope: Grant) -> String {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
         mint(
-            &SigningKey::from_bytes(&SIGNER),
+            &SigningKey::from_bytes(key),
             Grant {
                 machine: WORKER.into(),
                 expires: now + 600,
@@ -824,6 +841,159 @@ mod v1_api {
             .await
             .unwrap_err();
         assert_eq!(bare.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn submitters_of_one_package_see_only_their_own_runs() {
+        let machine = Machine::start_with(|state, actor| {
+            hold_classifier(state, actor);
+            // The other submitter holds the same package: a row of its own, the same generation.
+            let mut journal = Journal::open(&state.join("execution")).unwrap();
+            let held = journal.installations(actor).unwrap().remove(0);
+            journal
+                .bind_installation(cozy_machine::journal::Installation {
+                    actor: actor_of(&OTHER),
+                    ..held
+                })
+                .unwrap();
+        })
+        .await;
+        let mut client = client(&machine).await;
+        let whole = |key| {
+            cap_by(
+                key,
+                Grant {
+                    action: MACHINE.into(),
+                    ..Default::default()
+                },
+            )
+        };
+        let (ours, theirs) = (whole(&SIGNER), whole(&OTHER));
+        let request = |id: &str, spec| v1::RunRequest {
+            id: id.into(),
+            after: 0,
+            spec,
+        };
+        // Both name their run "run-1": an id is its submitter's own.
+        let mut settled = vec![];
+        for (cap, iterations) in [(&ours, 3), (&theirs, 4)] {
+            let run = request("run-1", Some(spec(iterations)));
+            let events = collect(client.run(authorized(run, cap)).await.unwrap().into_inner())
+                .await
+                .unwrap();
+            let Some(v1::run_event::Event::State(state)) = &events[0].event else {
+                panic!("{events:?}")
+            };
+            let Some(v1::run_event::Event::Outcome(outcome)) = &events.last().unwrap().event else {
+                panic!("{events:?}")
+            };
+            assert_eq!(outcome.status, "succeeded", "{outcome:?}");
+            let result: serde_json::Value = serde_json::from_slice(&outcome.result).unwrap();
+            assert_eq!(result["iterations"], iterations);
+            settled.push(state.number);
+        }
+        let (our_run, their_run) = (settled[0], settled[1]);
+        assert_ne!(our_run, their_run, "two runs, not one shared record");
+        // Reading "run-1" answers each submitter with its own run's output.
+        let target = v1::ReadRequest {
+            target: Some(v1::read_request::Target::Output(v1::OutputTarget {
+                run: "run-1".into(),
+                output: "report".into(),
+                index: 0,
+            })),
+            ..Default::default()
+        };
+        for (cap, iterations) in [(&ours, 3), (&theirs, 4)] {
+            let (_, bytes) = read(&mut client, cap, target.clone()).await.unwrap();
+            let report: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(report["iterations"], iterations);
+        }
+        // A run only one of them submitted does not exist for the other: attach, read, control.
+        let only_ours = request("only-ours", Some(spec(2)));
+        collect(
+            client
+                .run(authorized(only_ours, &ours))
+                .await
+                .unwrap()
+                .into_inner(),
+        )
+        .await
+        .unwrap();
+        let attach = client
+            .run(authorized(request("only-ours", None), &theirs))
+            .await;
+        let attached = match attach {
+            Ok(stream) => collect(stream.into_inner()).await.map(drop),
+            Err(status) => Err(status),
+        };
+        assert_eq!(attached.unwrap_err().code(), tonic::Code::NotFound);
+        let other = v1::ReadRequest {
+            target: Some(v1::read_request::Target::Output(v1::OutputTarget {
+                run: "only-ours".into(),
+                output: "report".into(),
+                index: 0,
+            })),
+            ..Default::default()
+        };
+        let refused = read(&mut client, &theirs, other).await.unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::NotFound);
+        let cancel = v1::ControlRequest {
+            id: "only-ours".into(),
+            action: v1::Action::Cancel as i32,
+        };
+        let refused = client
+            .control(authorized(cancel, &theirs))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::NotFound);
+        // Over HTTPS a capability reads its signer's runs: the other's run number is absent,
+        // whichever key signed a grant naming it.
+        let output = |key, run: u64| {
+            let token = cap_by(
+                key,
+                Grant {
+                    run: run.to_string(),
+                    ..Default::default()
+                },
+            );
+            let header = format!("Authorization: Cozy-Cap {token}");
+            machine.get(
+                &format!("/v1/runs/{run}/outputs/report"),
+                &[header.as_str()],
+            )
+        };
+        let (status, _, body) = output(&SIGNER, our_run);
+        let report: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            (status, &report["iterations"]),
+            (200, &serde_json::json!(3))
+        );
+        assert_eq!(output(&OTHER, our_run).0, 404);
+        assert_eq!(output(&SIGNER, their_run).0, 404);
+        assert_eq!(output(&OTHER, their_run).0, 200);
+        // A listing is its caller's own runs.
+        let ready: serde_json::Value =
+            serde_json::from_slice(&fs::read(machine.root.join("state/api-ready.json")).unwrap())
+                .unwrap();
+        let mut host = machine.client.clone();
+        let mut listed = vec![];
+        for key in [&SIGNER, &OTHER] {
+            let query = pb::MachineExecutionListQuery {
+                claim: Some(claim_by(&ready, key)),
+                ..Default::default()
+            };
+            let list = host.list_machine_executions(query).await.unwrap();
+            let numbers: Vec<u64> = list
+                .into_inner()
+                .executions
+                .iter()
+                .map(|e| e.number)
+                .collect();
+            listed.push(numbers);
+        }
+        assert_eq!(listed[0].len(), 2, "{listed:?}");
+        assert!(listed[0].contains(&our_run) && !listed[0].contains(&their_run));
+        assert_eq!(listed[1], [their_run]);
     }
 
     #[tokio::test]

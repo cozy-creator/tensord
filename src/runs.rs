@@ -534,7 +534,7 @@ impl Runs {
             )
         })?;
         let plan = gpu
-            .prepare_root(actor, installed, entrypoint, choices, &[], 0)
+            .prepare_root(installed, entrypoint, choices, &[], 0)
             .map_err(|e| refused("model_preparation_failed", e.to_string()))?;
         self.service.engine.bind_preparation(Preparation {
             actor: actor.into(),

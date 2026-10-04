@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import time
 
@@ -44,6 +45,20 @@ def wedge(payload: Steps, ctx: Context, tel: Telemetry) -> Done:
 def exit_now(payload: Steps, ctx: Context) -> Done:
     """The process ends in the middle of a request."""
     os._exit(17)
+
+
+class Note(msgspec.Struct):
+    text: str = ""
+    fail: bool = False
+
+
+@app.entrypoint
+def note(payload: Note, ctx: Context) -> Done:
+    """Writes its request's text to stderr; fails when asked."""
+    print(payload.text, file=sys.stderr, flush=True)
+    if payload.fail:
+        raise RuntimeError("asked to fail")
+    return Done(0)
 
 
 class Probe(msgspec.Struct):

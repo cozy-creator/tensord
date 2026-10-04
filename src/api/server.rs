@@ -458,39 +458,41 @@ impl<B: MachineBackend> Api<B> {
             .map_or(0, |since| since.as_secs() as i64);
         let authority = &self.identity.authority;
         let keys = authority.keys.admitted();
-        let granted = super::capability::verify(token, &authority.worker_id, &keys, now, "")
-            .and_then(|grant| {
-                if grant.allows(&run, &name, index) {
-                    Ok(grant)
-                } else {
-                    Err(super::capability::Refusal::Scope)
-                }
+        let granted = super::capability::verify_signer(token, &authority.worker_id, &keys, now, "")
+            .and_then(|(grant, signer)| match grant.allows(&run, &name, index) {
+                true => Ok(signer),
+                false => Err(super::capability::Refusal::Scope),
             });
-        if let Err(refusal) = granted {
-            return text(StatusCode::FORBIDDEN, refusal.to_string());
-        }
+        // A capability grants its signer's own runs: another actor's run is absent.
+        let actor = match granted {
+            Ok(signer) => super::auth::VerifiedActor {
+                public_key: signer.to_bytes(),
+            },
+            Err(refusal) => return text(StatusCode::FORBIDDEN, refusal.to_string()),
+        };
         let backend = self.backend.clone();
-        let snapshot =
-            match tokio::task::spawn_blocking(move || backend.open_output(number, &name, index))
-                .await
-            {
-                Ok(Ok(snapshot)) => snapshot,
-                Ok(Err(status)) => {
-                    let code = match status.code() {
-                        tonic::Code::NotFound => StatusCode::NOT_FOUND,
-                        tonic::Code::Unimplemented => StatusCode::NOT_IMPLEMENTED,
-                        tonic::Code::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
-                        _ => StatusCode::BAD_GATEWAY,
-                    };
-                    return text(code, status.message().into());
-                }
-                Err(_) => {
-                    return text(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "output read stopped".into(),
-                    )
-                }
-            };
+        let snapshot = match tokio::task::spawn_blocking(move || {
+            backend.open_output(actor, number, &name, index)
+        })
+        .await
+        {
+            Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(status)) => {
+                let code = match status.code() {
+                    tonic::Code::NotFound => StatusCode::NOT_FOUND,
+                    tonic::Code::Unimplemented => StatusCode::NOT_IMPLEMENTED,
+                    tonic::Code::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+                    _ => StatusCode::BAD_GATEWAY,
+                };
+                return text(code, status.message().into());
+            }
+            Err(_) => {
+                return text(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "output read stopped".into(),
+                )
+            }
+        };
         let etag = format!("\"r{}\"", snapshot.rev);
         let mut response = axum::http::Response::builder()
             .header("etag", &etag)

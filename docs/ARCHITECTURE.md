@@ -30,6 +30,14 @@ its immutable generation (`catalog`) and starts it: CPU work through the runner,
 the single retained executor slot in `GpuPool`. Progress, outputs and terminal state are written
 by `Engine`; outputs are kept in native custody until the client acknowledges collection.
 
+Tenancy: a pod has one owner, a package one publisher, and many users submit. A GPU plan (and so
+its executor and its memory-policy tenant) is the package's generation, entrypoint, bound models
+and group, never the submitter: every submitter of a construction is served by one executor, one
+request at a time. Degree 2 holdings are per GPU and layout, shared by every executor on the pod.
+What belongs to a submitter is in the journal and the API: installations, preparations, runs,
+inputs, outputs, triage and controls are read by actor; a run's spool lives only for its call,
+and a failure quotes only the stderr its own request wrote.
+
 Local sockets, both 0600 and announced on start as `READY <machine.sock>` then
 `ADMIN <admin.sock>`: `machine.sock` serves weight peers (hello, import, attach, release, stats);
 `admin.sock` serves the owner (submit, executions, cancel, results, shutdown) and refuses any peer

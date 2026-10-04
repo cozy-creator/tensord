@@ -77,7 +77,6 @@ impl Services for Pilot {
             .as_ref()
             .ok_or_else(|| io::Error::other("no reader"))?;
         let key = HoldingKey {
-            actor: "pilot".into(),
             device: frame.device.clone(),
             layout: frame.layout.clone(),
         };

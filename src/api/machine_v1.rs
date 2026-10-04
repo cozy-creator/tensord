@@ -562,7 +562,7 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
                 caller.run(&target.run, Some((&target.output, index)))?;
                 let snapshot = Self::call(&self.backend, move |backend| {
                     let run = backend.get(actor, query(backend, actor, &target.run)?)?;
-                    backend.open_output(run.number, &target.output, index)
+                    backend.open_output(actor, run.number, &target.output, index)
                 })
                 .await?;
                 if if_rev != 0 && if_rev != snapshot.rev {

@@ -17,10 +17,11 @@ use std::time::Instant;
 /// Region spans are multiples of the VMM granularity every supported GPU divides.
 const GRANULE: u64 = 2 << 20;
 
-/// One holding: one weight-set layout on one GPU, shared only within one actor.
+/// One holding: one weight-set layout on one GPU, shared by every executor of the pod whose
+/// layout matches, whoever submitted and whichever package it runs. A pod-level isolation
+/// policy (per publisher) would add its domain as a field here.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct HoldingKey {
-    pub actor: String,
     /// GPU UUID.
     pub device: String,
     /// TensorFS plane layout digest: the same bytes at the same offsets.
@@ -301,9 +302,9 @@ fn validate(key: &HoldingKey, regions: &[SharedRegion], fds: &[OwnedFd]) -> io::
             .layout
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-    if key.actor.is_empty() || key.device.is_empty() || !hex || regions.is_empty() {
+    if key.device.is_empty() || !hex || regions.is_empty() {
         return Err(invalid(
-            "a holding needs an actor, a GPU, a layout digest and regions",
+            "a holding needs a GPU, a layout digest and regions",
         ));
     }
     let mut seen = std::collections::BTreeSet::new();
@@ -362,11 +363,18 @@ mod tests {
             .unwrap();
         (reader, child)
     }
-    fn key(actor: &str) -> HoldingKey {
+    /// An executor of its own: a real process whose birth and exit are the lease's.
+    fn executor() -> (Reader, OwnedFd, Child) {
+        let child = Command::new("sleep").arg("60").spawn().unwrap();
+        let (reader, end) =
+            Reader::lease(process_birth(child.id()).unwrap(), pidfd(child.id())).unwrap();
+        (reader, end, child)
+    }
+    /// The layout whose digest repeats `digit`, on GPU-1.
+    fn key(digit: &str) -> HoldingKey {
         HoldingKey {
-            actor: actor.into(),
             device: "GPU-1".into(),
-            layout: "a".repeat(64),
+            layout: digit.repeat(64),
         }
     }
     fn region(index: u32, chunks: Vec<u64>) -> SharedRegion {
@@ -390,7 +398,7 @@ mod tests {
         let mut custody = ResidentCustody::default();
         let (offerer, mut child) = held_by_child();
         let kept = custody
-            .offer(key("x"), "sdxl/unet", regions(), fds(3), offerer)
+            .offer(key("a"), "sdxl/unet", regions(), fds(3), offerer)
             .unwrap();
         assert_eq!(kept, Offered::Kept { generation: 1 });
         let total = GRANULE + (64 << 20) + 2 * GRANULE;
@@ -413,22 +421,65 @@ mod tests {
 
         // A replacement attaches duplicates under a lease of its own.
         let (reader, end) = mine();
-        let a = custody.attach(&key("x"), reader).unwrap().unwrap();
+        let a = custody.attach(&key("a"), reader).unwrap().unwrap();
         assert_eq!((a.generation, a.fds.len(), a.regions), (1, 3, regions()));
         assert!(
-            custody.attach(&key("y"), mine().0).unwrap().is_none(),
-            "actors never share"
+            custody.attach(&key("b"), mine().0).unwrap().is_none(),
+            "another layout is another holding"
         );
 
         // Revoke fences new attachments; the bytes stay charged until the lease ends, which
         // the reader does by closing its end once it let the bytes go (still alive here).
-        custody.begin_revoke(&key("x"), 1).unwrap();
-        assert!(custody.attach(&key("x"), mine().0).unwrap().is_none());
+        custody.begin_revoke(&key("a"), 1).unwrap();
+        assert!(custody.attach(&key("a"), mine().0).unwrap().is_none());
         assert!(custody.collect().is_empty());
         assert_eq!(custody.charged_bytes("GPU-1"), total);
         drop(end);
-        assert_eq!(custody.collect(), vec![(key("x"), total)]);
+        assert_eq!(custody.collect(), vec![(key("a"), total)]);
         assert_eq!(custody.charged_bytes("GPU-1"), 0);
+    }
+
+    #[test]
+    fn every_executor_of_the_pod_shares_a_matching_layout_once_per_gpu() {
+        let mut custody = ResidentCustody::default();
+        let one = || vec![region(0, vec![GRANULE])];
+        // Two packages' executors (real processes) bind the same checkpoint: the first offers,
+        // the second attaches, and the GPU is charged the bytes once.
+        let (first, _a_end, mut package_a) = executor();
+        custody
+            .offer(key("a"), "sdxl", one(), fds(1), first)
+            .unwrap();
+        let (second, _b_end, mut package_b) = executor();
+        let attached = custody.attach(&key("a"), second).unwrap().unwrap();
+        assert_eq!((attached.generation, attached.fds.len()), (1, 1));
+        assert_eq!(custody.holdings().len(), 1);
+        assert_eq!(custody.holdings()[0].readers.len(), 2);
+        assert_eq!(custody.charged_bytes("GPU-1"), GRANULE);
+        // Another layout, and the same layout on another GPU, are holdings of their own.
+        assert!(custody.attach(&key("b"), mine().0).unwrap().is_none());
+        let (other, _other_end) = mine();
+        custody
+            .offer(key("b"), "anima", one(), fds(1), other)
+            .unwrap();
+        let elsewhere = HoldingKey {
+            device: "GPU-2".into(),
+            ..key("a")
+        };
+        assert!(custody.attach(&elsewhere, mine().0).unwrap().is_none());
+        assert_eq!(custody.holdings().len(), 2);
+        assert_eq!(custody.charged_bytes("GPU-1"), 2 * GRANULE);
+        // Either executor's end leaves the other's lease and the holding as they were.
+        package_a.kill().unwrap();
+        package_a.wait().unwrap();
+        assert!(custody.collect().is_empty());
+        let shared = custody
+            .holdings()
+            .into_iter()
+            .find(|h| h.key == key("a"))
+            .unwrap();
+        assert_eq!(shared.readers.len(), 1);
+        package_b.kill().unwrap();
+        package_b.wait().unwrap();
     }
 
     #[test]
@@ -437,23 +488,23 @@ mod tests {
         let (first, _end) = mine();
         let one = vec![region(0, vec![GRANULE])];
         assert_eq!(
-            custody.offer(key("x"), "n", one, fds(1), first).unwrap(),
+            custody.offer(key("a"), "n", one, fds(1), first).unwrap(),
             Offered::Kept { generation: 1 }
         );
         let (more, _more_end) = mine();
         let two = vec![region(1, vec![2 * GRANULE])];
         assert_eq!(
-            custody.offer(key("x"), "n", two, fds(1), more).unwrap(),
+            custody.offer(key("a"), "n", two, fds(1), more).unwrap(),
             Offered::Kept { generation: 1 }
         );
         assert_eq!(custody.charged_bytes("GPU-1"), 3 * GRANULE);
         let (dup, _) = mine();
         let again = vec![region(1, vec![2 * GRANULE])];
         assert_eq!(
-            custody.offer(key("x"), "n", again, fds(1), dup).unwrap(),
+            custody.offer(key("a"), "n", again, fds(1), dup).unwrap(),
             Offered::Duplicate
         );
-        let a = custody.attach(&key("x"), mine().0).unwrap().unwrap();
+        let a = custody.attach(&key("a"), mine().0).unwrap().unwrap();
         assert_eq!((a.regions.len(), a.fds.len()), (2, 2));
         assert_eq!(
             custody.holdings()[0].readers.len(),
@@ -465,20 +516,20 @@ mod tests {
     #[test]
     fn offers_are_validated_before_custody() {
         let mut custody = ResidentCustody::default();
-        let mut bad = key("x");
+        let mut bad = key("a");
         bad.layout = "not-a-digest".into();
         assert!(custody
             .offer(bad, "n", regions(), fds(3), mine().0)
             .is_err());
         assert!(custody
-            .offer(key("x"), "n", regions(), fds(2), mine().0)
+            .offer(key("a"), "n", regions(), fds(2), mine().0)
             .is_err());
         let odd = vec![region(0, vec![GRANULE + 1])];
-        assert!(custody.offer(key("x"), "n", odd, fds(1), mine().0).is_err());
+        assert!(custody.offer(key("a"), "n", odd, fds(1), mine().0).is_err());
         let file: OwnedFd = File::open("/proc/self/stat").unwrap().into();
         let one = vec![region(0, vec![GRANULE])];
         assert!(custody
-            .offer(key("x"), "n", one, vec![file], mine().0)
+            .offer(key("a"), "n", one, vec![file], mine().0)
             .is_err());
         assert_eq!(custody.charged_bytes("GPU-1"), 0);
     }
