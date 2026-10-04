@@ -28,3 +28,25 @@ offers `model_sources.descriptors/1`. Descriptors outlive the broker.
 - Cooperative same-user contract, not a sandbox.
 - The lease keeps one fd per selected object and can hit the hard fd limit.
 - Assets are buffered whole in memory.
+
+
+Live session custody is independent of accepted-request cache grace. `open_session_shared`
+records the captured receiver birth, supported scope facts and exact native checkpoint-root
+owners before installing roots under the same native writer/GC fence. The return value is
+retained in DeviceExecutor's opt-in source exit/quarantine resources before exposing headers
+or ObjectFiles. Losing a Session handle does not release while receiver/scope exit is live
+or unknown. Native roots use the already-materialized runtime closure, no object descriptors
+and no extra unselected downloads; ordinary metadata-only source facts retain their existing
+short lifetime under accepted/preparing custody.
+
+Startup and maintenance recover recorded partial constructor handoffs and release only after
+exact receiver/group AND supported whole-scope exit. Original source repository metadata can
+expire first; native materialized reader retention remains valid. A corrupt/unreadable record
+or unknown scope removes destructive native-GC authority; fitting work remains possible.
+No TTL is exit evidence. Boot change proves every old-boot receiver gone. Cgroups use their
+exact inode and search a complete directory census after a rename/disappearance. Tree tokens
+are supported same-UID/token-preserving lifecycle containment, not a sandbox: UID-changing or
+token-scrubbing descendants are outside that boundary. Unrelated unreadable same-UID processes
+can make strict Tree emptiness unavailable; keep custody/charge and visibly refuse reclamation.
+Scoped pressure qualification therefore requires delegated cgroups or an isolated readable
+provider PID/UID scope. Group exit alone does not prove setsid descendants gone.

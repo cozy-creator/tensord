@@ -339,6 +339,11 @@ impl Service {
     /// Caches manage themselves (`reclaim`): TTL and storage pressure, never a purge verb.
     pub fn reclaim(&self) -> crate::reclaim::Swept {
         *self.swept.lock().unwrap() = std::time::Instant::now();
+        if let Some(gpu)=self.gpu() {
+            if let Err(error)=gpu.recover_source_readers() {
+                eprintln!("reclaim source readers remains unavailable: {error}");
+            }
+        }
         if let Err(error)=self.engine.sweep_models() {
             eprintln!("reclaim native model roots: {error}");
         }
