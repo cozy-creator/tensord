@@ -56,18 +56,23 @@ fn mapped(port: u16, env: &HashMap<String, String>) -> io::Result<Option<String>
         ("RUNPOD_PUBLIC_IP", format!("RUNPOD_TCP_PORT_{port}")),
         ("PUBLIC_IPADDR", format!("VAST_TCP_PORT_{port}")),
     ] {
-        if let (Some(host), Some(port)) = (env.get(host), env.get(&key)) {
-            if let (Ok(host), Ok(port)) = (host.parse::<IpAddr>(), port.parse::<u16>()) {
-                if port > 0 {
-                    if !host.is_ipv4() {
-                        return Err(io::Error::other(
-                            "the provider playback mapping must be IPv4",
-                        ));
-                    }
-                    return Ok(Some(SocketAddr::new(host, port).to_string()));
-                }
-            }
+        let Some(external_port) = env.get(&key) else {
+            continue;
+        };
+        let host = env
+            .get(host)
+            .ok_or_else(|| io::Error::other(format!("{key} requires its provider public IP")))?
+            .parse::<IpAddr>()
+            .map_err(|_| io::Error::other(format!("{key} requires a valid provider public IP")))?;
+        let port = external_port
+            .parse::<u16>()
+            .map_err(|_| io::Error::other(format!("{key} must be a nonzero IPv4 port")))?;
+        if !host.is_ipv4() || port == 0 {
+            return Err(io::Error::other(format!(
+                "{key} must name a nonzero port with an IPv4 provider public IP"
+            )));
         }
+        return Ok(Some(SocketAddr::new(host, port).to_string()));
     }
     Ok(None)
 }
@@ -153,6 +158,23 @@ mod tests {
             Some("203.0.113.7:30001")
         );
         assert!(mapped(8086, &env).unwrap().is_none());
+        for (host, port) in [
+            ("invalid", "30001"),
+            ("203.0.113.7", "invalid"),
+            ("203.0.113.7", "0"),
+            ("::1", "30001"),
+        ] {
+            let invalid = HashMap::from([
+                ("PUBLIC_IPADDR".into(), host.into()),
+                ("VAST_TCP_PORT_8085".into(), port.into()),
+            ]);
+            assert!(mapped(8085, &invalid).is_err());
+        }
+        assert!(mapped(
+            8085,
+            &HashMap::from([("VAST_TCP_PORT_8085".into(), "30001".into())])
+        )
+        .is_err());
     }
     #[test]
     fn advertised_ipv4_addresses_accept_real_connections_and_bad_config_is_explicit() {
