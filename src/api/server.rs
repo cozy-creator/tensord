@@ -396,8 +396,13 @@ impl<B: MachineBackend> Api<B> {
         };
         let authorization =
             super::auth::StreamAuthority::new(authority.keys.clone(), actor, Some(grant.expires));
+        let admission = match self.admit() {
+            Ok(admission) => admission,
+            Err(error) => return reply(StatusCode::CONFLICT, serde_json::json!({"code":"memory_reclaim_busy","message":error.message()})),
+        };
         let backend = self.backend.clone();
         let answer = tokio::task::spawn_blocking(move || {
+            let _admission = admission;
             authorization.check()?;
             backend.reclaim_idle_memory(actor, grant.expires)
         })
