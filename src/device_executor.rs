@@ -1875,6 +1875,12 @@ impl DeviceExecutor {
         Ok(())
     }
 
+    /// Retire an already quiescent retained executor through its exact exit fence.
+    pub fn retire_quiescent(mut self) -> io::Result<Ended> {
+        let _ = self.command(&DeviceCommand::Shutdown, &mut Baseline);
+        self.terminate()
+    }
+
     /// Close the channel, let the executor stop at its next exchange, kill it only on a
     /// measured wedge, then reap it and release what it held. Blocks until it is gone.
     pub fn terminate(mut self) -> io::Result<Ended> {
@@ -1883,6 +1889,7 @@ impl DeviceExecutor {
     }
 
     fn parts(&mut self) -> Ending {
+        retain_generation(&mut self._generation_hold, &mut self.retained);
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
         Ending {
             exact: self.exact.try_clone(),
@@ -2180,5 +2187,44 @@ mod codec_tests {
         codec.encode(&spool, &reply(4, 24)).unwrap();
         drop(codec);
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+fn retain_generation(hold: &mut Option<Arc<File>>, retained: &mut Vec<Box<dyn Send>>) {
+    if let Some(held) = hold.take() {
+        retained.push(Box::new(held));
+    }
+}
+
+#[cfg(test)]
+mod generation_custody_tests {
+    use super::*;
+    #[test]
+    fn generation_hold_stays_quarantined_when_exact_exit_is_unobservable() {
+        use fs2::FileExt;
+        let path =
+            std::env::temp_dir().join(format!("cm-generation-fence-{}", uuid::Uuid::new_v4()));
+        let file = Arc::new(File::create(&path).unwrap());
+        file.lock_exclusive().unwrap();
+        let mut generation = Some(file);
+        let mut retained: Vec<Box<dyn Send>> = vec![];
+        retain_generation(&mut generation, &mut retained);
+        assert!(generation.is_none());
+        let observer = File::open(&path).unwrap();
+        assert!(observer.try_lock_exclusive().is_err());
+        let ending = Ending {
+            exact: Err(io::Error::other("unknown exact process birth")),
+            child: None,
+            forked: false,
+            retained,
+            socket: path.with_extension("socket"),
+            liveness: Liveness::default(),
+        };
+        assert!(ending.end().is_err());
+        assert!(
+            observer.try_lock_exclusive().is_err(),
+            "unknown process exit freed generation custody"
+        );
+        std::fs::remove_file(path).unwrap();
     }
 }

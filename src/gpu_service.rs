@@ -410,6 +410,21 @@ pub struct GpuPool {
     // Drop session/resource custody before ending the actual spawning thread.
     launcher: crate::child_launcher::ChildLauncher,
 }
+/// Root-export custody receipts, not physical CUDA free-memory estimates.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct IdleReclaim {
+    pub executors_before: usize,
+    pub executors_ended: usize,
+    pub executors_unconfirmed: usize,
+    pub holdings_before: usize,
+    pub holdings_revoked: usize,
+    pub holdings_released: usize,
+    pub root_export_bytes_released: u64,
+    pub root_export_bytes_remaining: u64,
+    pub readers_remaining: usize,
+    pub warnings: Vec<String>,
+}
+
 struct Device {
     entry: String,
     memory: GpuMemory,
@@ -437,6 +452,116 @@ impl Drop for WakeOnExit {
 }
 
 impl GpuPool {
+    /// Explicit owner maintenance under the dispatch/prewarm/prefetch reservation.
+    pub fn reclaim_idle(
+        self: &Arc<Self>,
+        engine: &Arc<Engine>,
+        authorized: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<IdleReclaim> {
+        if self
+            .reserved
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "a GPU call or preparation owns the reservation",
+            ));
+        }
+        let _permit = Permit {
+            pool: self.clone(),
+            engine: Arc::downgrade(engine),
+        };
+        if engine.active(usize::MAX)?.iter().any(|record| {
+            record
+                .submission
+                .as_ref()
+                .is_some_and(|s| !s.preparation_id.is_empty())
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "an active GPU execution has not released its reservation",
+            ));
+        }
+        let mut held = self.sessions.lock().unwrap();
+        // Recheck after reservation and mutex acquisition, immediately before mutation.
+        authorized()?;
+        let mut receipt = IdleReclaim {
+            executors_before: held.len(),
+            ..Default::default()
+        };
+        if let Some(custody) = &self.custody {
+            let mut custody = custody.lock().unwrap();
+            receipt.holdings_before = custody.holdings().len();
+            receipt.holdings_revoked = custody.invalidate_all().len();
+        }
+        let sessions = std::mem::take(&mut *held);
+        drop(held);
+        for (plan, mut session) in sessions {
+            if let Some(custody) = &self.custody {
+                if let Err(error) = release_revoked(custody, &mut session.executor)
+                    .and_then(|_| detach(custody, &mut session.executor))
+                {
+                    receipt
+                        .warnings
+                        .push(format!("idle reader release: {error}"));
+                }
+            }
+            // Every resource formerly held by the session follows the exact exit fence.
+            // An unobservable exit leaks custody conservatively rather than freeing it.
+            let Session {
+                mut executor,
+                followers,
+                budget_cells,
+                sources,
+                grants,
+                _serving,
+                ..
+            } = session;
+            executor.retain_until_exit((followers, budget_cells, sources, grants, _serving));
+            match executor.retire_quiescent() {
+                Ok(ended) => {
+                    self.ended(&plan);
+                    receipt.executors_ended += 1;
+                    if !ended.status.success() {
+                        receipt
+                            .warnings
+                            .push(format!("idle executor exited {}", ended.status));
+                    }
+                }
+                Err(error) => {
+                    receipt.executors_unconfirmed += 1;
+                    receipt
+                        .warnings
+                        .push(format!("idle executor exit unconfirmed: {error}"));
+                }
+            }
+        }
+        if let Some(custody) = &self.custody {
+            let mut custody = custody.lock().unwrap();
+            let released = custody.collect();
+            receipt.holdings_released = released.len();
+            receipt.root_export_bytes_released = released.iter().map(|(_, bytes)| bytes).sum();
+            let remaining = custody.holdings();
+            receipt.root_export_bytes_remaining =
+                remaining.iter().map(|holding| holding.bytes).sum();
+            receipt.readers_remaining = remaining.iter().map(|holding| holding.readers.len()).sum();
+            log_released(released);
+        }
+        receipt.warnings.truncate(8);
+        for warning in &mut receipt.warnings {
+            if warning.len() > 1024 {
+                let mut boundary = 1024;
+                while !warning.is_char_boundary(boundary) {
+                    boundary -= 1;
+                }
+                warning.truncate(boundary);
+                warning.push_str("…");
+            }
+        }
+        Ok(receipt)
+    }
+
     pub fn new(root: &Path, config: GpuConfig, store: Arc<Store>) -> io::Result<Arc<Self>> {
         fs::create_dir_all(root)?;
         if let Some(identity) = config.identity {
@@ -3430,6 +3555,79 @@ impl Services for Callbacks<'_> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn owner_reclaim_reservation_authority_and_queued_work_are_preserved_on_cpu() {
+        // No CUDA or NVML initialization: exercise the real reservation/Engine/host
+        // custody owners with zero physical devices. This is not GPU reclaim proof.
+        let root = std::env::temp_dir().join(format!("cm-reclaim-{}", uuid::Uuid::new_v4()));
+        let store = Arc::new(Store::init(&root.join("store")).unwrap());
+        let ledger = Arc::new(crate::memory::host::HostLedger::default());
+        let host = HostTier::new(
+            store.clone(),
+            HostTierConfig::default(),
+            Box::new(crate::memory::host::TierPolicy(ledger.clone())),
+        )
+        .unwrap();
+        let engine = Engine::open(&root.join("engine")).unwrap();
+        let run = engine
+            .submit(
+                "accepted",
+                crate::journal::Invocation {
+                    package: "cpu".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let pool = Arc::new(GpuPool {
+            root: root.clone(),
+            serving: Arc::default(),
+            incarnation: "cpu-test".into(),
+            config: serde_json::from_value(
+                json!({"devices":"cpu-test","authorized_device_limit_bytes":null}),
+            )
+            .unwrap(),
+            store,
+            reserved: AtomicBool::new(true),
+            sessions: Mutex::default(),
+            zygotes: Mutex::default(),
+            kernel_boots: Mutex::default(),
+            devices: vec![],
+            host,
+            host_ledger: ledger,
+            custody: Some(Mutex::default()),
+            memo: Arc::new(crate::memo::Memo::open(root.join("memo")).unwrap()),
+            launcher: crate::child_launcher::ChildLauncher::new().unwrap(),
+        });
+        assert_eq!(
+            pool.reclaim_idle(&engine, || panic!("busy cannot reach mutation"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        pool.reserved.store(false, Ordering::Release);
+        let epoch = engine.activity_epoch();
+        assert_eq!(
+            pool.reclaim_idle(&engine, || Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "revoked"
+            )))
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(!pool.reserved.load(Ordering::Acquire));
+        assert!(engine.activity_epoch() > epoch);
+        let receipt = pool.reclaim_idle(&engine, || Ok(())).unwrap();
+        assert_eq!(receipt.executors_ended, 0);
+        assert_eq!(receipt.root_export_bytes_released, 0);
+        let after = engine.get(&run.id).unwrap();
+        assert_eq!(after.state, crate::journal::State::Queued);
+        assert!(after.cancel_actor.is_none());
+        drop(pool);
+        drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn only_attributable_contexts_are_learned_for_the_rank_that_measured_them() {

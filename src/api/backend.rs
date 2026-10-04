@@ -14,6 +14,13 @@ use tonic::Status;
 pub type HubAccessRefusal = (u16, &'static str, String);
 
 pub trait MachineBackend: Send + Sync + 'static {
+    fn reclaim_idle_memory(
+        &self,
+        _: VerifiedActor,
+        _: i64,
+    ) -> Result<crate::gpu_service::IdleReclaim, Status> {
+        unsupported()
+    }
     /// `cozy.machine.v1` Run sources and Write (`runs`).
     fn runs(&self) -> Option<std::sync::Arc<crate::runs::Runs>> {
         None
