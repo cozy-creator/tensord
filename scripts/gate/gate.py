@@ -460,6 +460,13 @@ class Gate:
             warm = self.pod.helper("warm", self.cache)
         ballast = None
         if budget:   # a fixed real allocation made before the engine starts: the free pool is what is left
+            if self.m["ballast"].get("park"):   # no engine may hold the card while the pool is sized
+                self.pod.sh(self.m["ballast"]["park"])
+                while True:
+                    now = self.pod.helper("now")
+                    if not now["executors"] and now["gpu"]["mem_mib"] <= self.m["ballast"].get("idle_mib", 400):
+                        break
+                    time.sleep(0.5)
             ballast = json.loads(self.pod.sh(self.m["ballast"]["start"].format(gib=budget)))
         try:
             old = (self.pod.sh(spec["root"]).split() or ["none"])[0]
