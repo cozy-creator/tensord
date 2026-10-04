@@ -8,10 +8,10 @@
 set -eu
 kind=$1; push=${2:-}; own_wheels=${3:-}; case $kind in cpu) tag=cpu-linux-x86 ;; cuda) tag=torch2.14.0-cu130-linux-x86 ;; *) echo "usage: $0 cpu|cuda" >&2; exit 2 ;; esac
 repo=$(cd "$(dirname "$0")/.." && pwd); commit=$(git -C "$repo" rev-parse HEAD); base=$(crane digest "tensorhub/worker:$tag")
-target=$HOME/cozy/.cargo-target/cozy-machine-bookworm; stage=$(mktemp -d); mkdir -p "$target" "$stage/opt/cozy/machine" "$stage/usr/local/bin" "$stage/etc/cozy"
+target=${CARGO_TARGET_DIR:-$repo/target}/bookworm; stage=$(mktemp -d); mkdir -p "$target" "$stage/opt/cozy/machine" "$stage/usr/local/bin" "$stage/etc/cozy"
 
 # The base is glibc 2.36 (bookworm); a host build needs newer symbols.
-nice -n 19 docker run --rm --runtime=runc --user "$(id -u):$(id -g)" -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR=/target -v "$HOME/.cargo:/cargo" -v "$target:/target" -v "$repo:/src" -w /src \
+nice -n 19 docker run --rm --runtime=runc --user "$(id -u):$(id -g)" -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR=/target -e CARGO_INCREMENTAL=0 -v "$HOME/.cargo:/cargo" -v "$target:/target" -v "$repo:/src" -w /src \
   rust:1.91-bookworm cargo build --release --locked --offline -j 2 --bin cozy-machine
 install -m 0755 "$target/release/cozy-machine" "$stage/opt/cozy/machine/cozy-machine"
 
