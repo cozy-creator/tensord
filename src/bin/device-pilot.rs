@@ -438,6 +438,7 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
                 stages,
                 cap_bytes: None,
                 inputs: Default::default(),
+                trees: Default::default(),
                 floor_bytes: None,
                 activation_bytes: Default::default(),
                 device_weights: None,

@@ -260,6 +260,9 @@ pub enum DeviceCommand {
         /// File inputs by field path: read-only copies in this call's spool.
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         inputs: BTreeMap<String, Value>,
+        /// Input trees by reference: (read-only directory, manifest digest).
+        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+        trees: BTreeMap<String, (PathBuf, String)>,
         /// The machine's physical free floor on this GPU.
         #[serde(skip_serializing_if = "Option::is_none")]
         floor_bytes: Option<u64>,
@@ -311,6 +314,8 @@ pub enum DeviceCommand {
         deadline_s: Option<f64>,
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         inputs: BTreeMap<String, Value>,
+        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+        trees: BTreeMap<String, (PathBuf, String)>,
         call_interfaces: Vec<CallInterface>,
         /// The job's model inputs: `{parameter: {class, manifest, length}}`.
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]

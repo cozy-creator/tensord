@@ -174,14 +174,24 @@ impl Runs {
                 "the payload is a JSON object of the function's parameters",
             ));
         }
+        let unwritten = |input: &str| refused("input_unwritten", format!("input {input} was not written to this machine"));
         for input in &spec.inputs {
-            match self.objects.path(actor, &input.digest)? {
-                Some((_, length)) if length == input.length => {}
-                _ => {
-                    return Err(refused(
-                        "input_unwritten",
-                        format!("input {} was not written to this machine", input.input_id),
-                    ))
+            let path = match self.objects.path(actor, &input.digest)? {
+                Some((path, length)) if length == input.length => path,
+                _ => return Err(unwritten(&input.input_id)),
+            };
+            if input.media_type != crate::gpu_service::TREE_MEDIA {
+                continue;
+            }
+            // A tree's files were written too: each its manifest names.
+            let manifest: Value = serde_json::from_slice(&std::fs::read(path)?)
+                .map_err(|_| refused("invalid_request", format!("input tree {} has no readable manifest", input.input_id)))?;
+            for entry in manifest["entries"].as_array().into_iter().flatten() {
+                let (Some(sha), Some(length)) = (entry["blob"]["sha256"].as_str(), entry["blob"]["length"].as_u64()) else {
+                    return Err(refused("invalid_request", format!("input tree {} names a file without its blob", input.input_id)));
+                };
+                if self.objects.path(actor, &format!("sha256:{sha}"))?.is_none_or(|(_, held)| held != length) {
+                    return Err(unwritten(&format!("{}/{}", input.input_id, entry["path"].as_str().unwrap_or_default())));
                 }
             }
         }
@@ -450,13 +460,6 @@ impl Runs {
                     ));
                 }
             }
-        }
-        // Device executors take file inputs; a job and its children run in them.
-        if !spec.inputs.is_empty() && plan.is_none() && !spec.job && spec.parent.is_empty() {
-            return Err(refused(
-                "invalid_request",
-                "file inputs reach device executors only; this CPU callable takes none",
-            ));
         }
         if spec.warm {
             let models = match install_only {

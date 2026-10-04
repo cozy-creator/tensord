@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs::{self, File},
-    io::{self, Write},
+    io::{self, Read, Write},
     os::fd::{AsRawFd, OwnedFd},
     path::{Path, PathBuf},
     sync::{
@@ -2216,7 +2216,8 @@ impl GpuPool {
                 plane_budget_bytes,
                 stages: false,
                 cap_bytes,
-                inputs,
+                inputs: inputs.inputs,
+                trees: inputs.trees,
                 floor_bytes: self.first().floor(),
                 activation_bytes: self.first().with(|gpu| gpu.seeds(&plan.id)),
                 device_weights: attaches.then_some(share),
@@ -2826,17 +2827,28 @@ pub(crate) fn remove_old_executor_roots(root: &Path) {
     }
 }
 
-/// Read-only copies of the run's file inputs in its spool (`inputs/NNN-<field>`), from
-/// the bytes the caller's import holds in the store; the executor binds them by field.
+/// A tree input's media type: its digest names a tree manifest (`entries` of files by path).
+pub const TREE_MEDIA: &str = "application/vnd.cozy.tree-manifest";
+
+/// A call's inputs in its spool: file inputs by field path as read-only copies, and input
+/// trees by reference (`Tree` fields) as read-only directories with their manifest digest.
+pub(crate) struct Staged {
+    pub inputs: BTreeMap<String, serde_json::Value>,
+    pub trees: BTreeMap<String, (PathBuf, String)>,
+}
+
 pub(crate) fn stage_inputs(
     store: &Store,
     identity: Option<crate::launch_identity::LaunchIdentity>,
     spool: &Path,
     inputs: &[crate::journal::InputFile],
-) -> io::Result<BTreeMap<String, serde_json::Value>> {
-    let mut granted = BTreeMap::new();
+) -> io::Result<Staged> {
+    let mut staged = Staged {
+        inputs: BTreeMap::new(),
+        trees: BTreeMap::new(),
+    };
     if inputs.is_empty() {
-        return Ok(granted);
+        return Ok(staged);
     }
     let directory = spool.join("inputs");
     fs::create_dir(&directory)?;
@@ -2854,30 +2866,14 @@ pub(crate) fn stage_inputs(
             .take(96)
             .collect();
         let local = directory.join(format!("{position:03}-{field}"));
-        let sha = input
-            .digest
-            .strip_prefix("sha256:")
-            .unwrap_or(&input.digest);
-        let mut source = store
-            .open_verified(sha)
-            .map_err(io::Error::other)?
-            .into_file();
-        let mut copy = std::os::unix::fs::OpenOptionsExt::mode(
-            fs::OpenOptions::new().write(true).create_new(true),
-            0o444,
-        )
-        .open(&local)?;
-        if std::io::copy(&mut source, &mut copy)? != input.length {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "an input's held bytes changed length",
-            ));
+        if input.media_type == TREE_MEDIA {
+            let manifest = held_bytes(store, &input.digest, input.length)?;
+            materialize_tree(store, identity, &manifest, &local)?;
+            staged.trees.insert(input.input_id.clone(), (local, input.digest.clone()));
+            continue;
         }
-        copy.sync_all()?;
-        if let Some(identity) = identity {
-            identity.readable(&local)?;
-        }
-        granted.insert(
+        copy_held(store, identity, &input.digest, input.length, &local)?;
+        staged.inputs.insert(
             input.input_id.clone(),
             serde_json::json!({"local":local,"media_type":input.media_type,"digest":input.digest,"length":input.length,"order":input.order,"file_state":null}),
         );
@@ -2885,7 +2881,104 @@ pub(crate) fn stage_inputs(
     if let Some(identity) = identity {
         identity.readable(&directory)?;
     }
-    Ok(granted)
+    Ok(staged)
+}
+
+/// One held object copied read-only to `local`, exactly `length` bytes.
+fn copy_held(
+    store: &Store,
+    identity: Option<crate::launch_identity::LaunchIdentity>,
+    digest: &str,
+    length: u64,
+    local: &Path,
+) -> io::Result<()> {
+    let sha = digest.strip_prefix("sha256:").unwrap_or(digest);
+    let mut source = store.open_verified(sha).map_err(io::Error::other)?.into_file();
+    let mut copy = std::os::unix::fs::OpenOptionsExt::mode(
+        fs::OpenOptions::new().write(true).create_new(true),
+        0o444,
+    )
+    .open(local)?;
+    if std::io::copy(&mut source, &mut copy)? != length {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "an input's held bytes changed length",
+        ));
+    }
+    copy.sync_all()?;
+    if let Some(identity) = identity {
+        identity.readable(local)?;
+    }
+    Ok(())
+}
+
+fn held_bytes(store: &Store, digest: &str, length: u64) -> io::Result<Vec<u8>> {
+    let sha = digest.strip_prefix("sha256:").unwrap_or(digest);
+    let mut bytes = Vec::new();
+    store
+        .open_verified(sha)
+        .map_err(io::Error::other)?
+        .into_file()
+        .take(length + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != length {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "a tree manifest changed length"));
+    }
+    Ok(bytes)
+}
+
+/// A tree manifest's files under `root`: each a relative path below it, each a held object.
+fn materialize_tree(
+    store: &Store,
+    identity: Option<crate::launch_identity::LaunchIdentity>,
+    manifest: &[u8],
+    root: &Path,
+) -> io::Result<()> {
+    let invalid = |why: &str| io::Error::new(io::ErrorKind::InvalidData, format!("tree manifest: {why}"));
+    let document: serde_json::Value = serde_json::from_slice(manifest).map_err(|_| invalid("not JSON"))?;
+    let entries = document["entries"].as_array().ok_or_else(|| invalid("no entries"))?;
+    fs::create_dir(root)?;
+    for entry in entries {
+        let (Some("file"), Some(path), Some(sha), Some(length)) = (
+            entry["kind"].as_str(),
+            entry["path"].as_str(),
+            entry["blob"]["sha256"].as_str(),
+            entry["blob"]["length"].as_u64(),
+        ) else {
+            return Err(invalid("an entry is not a file with a blob"));
+        };
+        let relative = Path::new(path);
+        let local = relative.components().all(|c| matches!(c, std::path::Component::Normal(_)));
+        if !local || path.contains(['\\', '\0']) {
+            return Err(invalid("a path leaves its tree"));
+        }
+        let target = root.join(relative);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        copy_held(store, identity, &format!("sha256:{sha}"), length, &target)?;
+    }
+    if let Some(identity) = identity {
+        for entry in walk_dirs(root)? {
+            identity.readable(&entry)?;
+        }
+    }
+    Ok(())
+}
+
+fn walk_dirs(root: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut found = vec![root.to_path_buf()];
+    let mut index = 0;
+    while index < found.len() {
+        for entry in fs::read_dir(&found[index])? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                found.push(entry.path());
+            }
+        }
+        index += 1;
+    }
+    Ok(found)
 }
 
 /// The failed attempt's triage bundle, kept before the run settles: the executor's own terminal
