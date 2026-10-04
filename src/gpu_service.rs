@@ -3631,6 +3631,7 @@ mod tests {
             )
             .unwrap(),
             store,
+            _source_gc_guard: Mutex::new(None),
             reserved: AtomicBool::new(true),
             sessions: Mutex::default(),
             zygotes: Mutex::default(),
