@@ -12,10 +12,12 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::Value;
 use std::{
     collections::HashMap,
+    future::Future,
     io::Read,
     pin::Pin,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    task::{Context, Poll},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio_stream::Stream;
 use tonic::{metadata::MetadataMap, Request, Response, Status};
@@ -29,11 +31,95 @@ pub(super) struct MachineV1<B> {
 
 /// Who may do what: a machine-scope cap does everything as its signer; a run-scope cap may only
 /// attach to and read that run.
+#[derive(Clone)]
 struct Caller {
     actor: VerifiedActor,
     grant: Grant,
 }
 impl Caller {
+    /// Authority lasts only until this cap expires or its signer loses admission. Dropping
+    /// the underlying stream detaches its observation; it never controls accepted work.
+    fn observe<T: Send + 'static>(&self, keys: super::auth::Keys, stream: Events<T>) -> Events<T> {
+        let (key, expires) = (self.actor.public_key, self.grant.expires);
+        let ended = Box::pin(async move {
+            let expiry = async move {
+                loop {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default();
+                    let remaining = Duration::from_secs(expires.max(0) as u64).saturating_sub(now);
+                    if remaining.is_zero() {
+                        return;
+                    }
+                    // Keep arbitrarily distant signed expiries within Instant's range.
+                    tokio::time::sleep(remaining.min(Duration::from_secs(86_400))).await;
+                }
+            };
+            tokio::select! {
+                _ = keys.revoked(key) => Status::unauthenticated("the key that opened this stream no longer authorizes it"),
+                _ = expiry => Status::unauthenticated("the capability that opened this stream has expired"),
+            }
+        });
+        Box::pin(AuthorizedStream {
+            stream,
+            ended,
+            closed: false,
+        })
+    }
+    fn authorize(&self, keys: &super::auth::Keys) -> Result<(), Status> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        if now >= self.grant.expires {
+            return Err(Status::unauthenticated(
+                "the capability that opened this stream has expired",
+            ));
+        }
+        if !keys
+            .admitted()
+            .iter()
+            .any(|key| key.to_bytes() == self.actor.public_key)
+        {
+            return Err(Status::unauthenticated(
+                "the key that opened this stream no longer authorizes it",
+            ));
+        }
+        Ok(())
+    }
+    fn limited(&self) -> bool {
+        self.grant.action != capability::MACHINE && !self.grant.outputs.is_empty()
+    }
+    fn filter(&self, event: &mut v1::RunEvent) -> bool {
+        if !self.limited() {
+            return true;
+        }
+        match &mut event.event {
+            Some(v1::run_event::Event::Product(product)) => self.grant.allows(
+                &self.grant.run,
+                &product.output,
+                (product.index > 0).then_some(product.index),
+            ),
+            Some(v1::run_event::Event::Outcome(outcome)) => {
+                outcome.outputs.retain(|product| {
+                    self.grant.allows(
+                        &self.grant.run,
+                        &product.output,
+                        (product.index > 0).then_some(product.index),
+                    )
+                });
+                outcome.result.clear();
+                outcome.triage = false;
+                outcome.measurements.clear();
+                if let Some(reason) = &mut outcome.reason {
+                    reason.message.clear();
+                }
+                true
+            }
+            Some(v1::run_event::Event::Log(_)) => false,
+            _ => true,
+        }
+    }
     fn machine(&self) -> Result<(), Status> {
         if self.grant.action == capability::MACHINE {
             Ok(())
@@ -56,6 +142,29 @@ impl Caller {
                 "the capability does not grant this",
             ))
         }
+    }
+}
+
+/// Poll authority before buffered data, including while the backend is quiet or the peer
+/// applies backpressure. No forwarding buffer can extend a revoked cap's authority.
+struct AuthorizedStream<T> {
+    stream: Events<T>,
+    ended: Pin<Box<dyn Future<Output = Status> + Send>>,
+    closed: bool,
+}
+impl<T> Stream for AuthorizedStream<T> {
+    type Item = Result<T, Status>;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.closed {
+            return Poll::Ready(None);
+        }
+        if let Poll::Ready(status) = self.ended.as_mut().poll(cx) {
+            self.closed = true;
+            // Release the backend observer and any pinned output files immediately.
+            self.stream = Box::pin(tokio_stream::empty());
+            return Poll::Ready(Some(Err(status)));
+        }
+        self.stream.as_mut().poll_next(cx)
     }
 }
 
@@ -162,7 +271,10 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |since| since.as_secs() as i64);
             if hub.expires_at != 0 && hub.expires_at <= now {
-                return Err(refused("hub_access_expired", "the run's Hub access has expired"));
+                return Err(refused(
+                    "hub_access_expired",
+                    "the run's Hub access has expired",
+                ));
             }
             Some(crate::hub::Source {
                 origin: hub.origin.trim_end_matches('/').to_string(),
@@ -451,7 +563,10 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
             None => None,
             Some(_) => Some(self.caller(request.metadata())?),
         };
-        let machine = caller.filter(|c| c.machine().is_ok()).map(|c| c.actor);
+        let machine = caller
+            .as_ref()
+            .filter(|c| c.machine().is_ok())
+            .map(|c| c.actor);
         let keepalive = request.into_inner().keepalive;
         super::machine_status::status(
             self.identity.clone(),
@@ -460,7 +575,14 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
             keepalive,
         )
         .await
-        .map(Response::new)
+        .map(|stream| {
+            Response::new(match caller {
+                Some(caller) if machine.is_some() => {
+                    caller.observe(self.identity.authority.keys.clone(), stream)
+                }
+                _ => stream,
+            })
+        })
     }
 
     async fn run(
@@ -477,7 +599,9 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
             let (identity, backend) = (self.identity.clone(), self.backend.clone());
             return super::machine_update::run(identity, backend, caller.actor, request)
                 .await
-                .map(Response::new);
+                .map(|stream| {
+                    Response::new(caller.observe(self.identity.authority.keys.clone(), stream))
+                });
         }
         match &request.spec {
             Some(_) => caller.machine()?,
@@ -486,14 +610,17 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
         let (sender, receiver) = tokio::sync::mpsc::channel(16);
         let backend = self.backend.clone();
         let actor = caller.actor;
+        let scope = caller.clone();
         tokio::spawn(async move {
-            let result = stream_run(backend, actor, request, sender.clone()).await;
+            let result =
+                stream_run_scoped(backend, actor, request, sender.clone(), Some(scope)).await;
             if let Err(status) = result {
                 let _ = sender.send(Err(status)).await;
             }
         });
-        Ok(Response::new(Box::pin(
-            tokio_stream::wrappers::ReceiverStream::new(receiver),
+        Ok(Response::new(caller.observe(
+            self.identity.authority.keys.clone(),
+            Box::pin(tokio_stream::wrappers::ReceiverStream::new(receiver)),
         )))
     }
 
@@ -509,33 +636,45 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
             .runs()
             .ok_or_else(|| Status::unimplemented("this machine takes no writes"))?;
         let actor = crate::machine_api::actor_id(caller.actor);
-        let mut frames = request.into_inner();
+        let keys = self.identity.authority.keys.clone();
+        let mut frames = caller.observe(keys.clone(), Box::pin(request.into_inner()));
+        use tokio_stream::StreamExt;
         let first = frames
-            .message()
-            .await?
+            .next()
+            .await
+            .transpose()?
             .ok_or_else(|| Status::invalid_argument("a write names its object first"))?;
         let (digest, length, offset) = (first.digest.clone(), first.length, first.offset);
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Option<Vec<u8>>>(4);
         let object = digest.clone();
+        let write_caller = caller.clone();
         let writer = tokio::task::spawn_blocking(move || -> Result<u64, Status> {
             let mut writer = runs
                 .objects
                 .begin(&actor, &object, length, offset)
                 .map_err(refusal)?;
             while let Some(data) = receiver.blocking_recv() {
-                writer.append(&data).map_err(refusal)?;
+                write_caller.authorize(&keys)?;
+                match data {
+                    Some(data) => writer.append(&data).map_err(refusal)?,
+                    None => return writer.finish().map_err(refusal),
+                }
             }
-            writer.finish().map_err(refusal)
+            // A detached or unauthorized upload keeps only its resumable staging bytes.
+            Err(Status::canceled("the write stream closed before its end"))
         });
         let mut data = first.data;
         loop {
             // A refused writer drops its receiver; its refusal is the answer.
-            if !data.is_empty() && sender.send(data).await.is_err() {
+            if !data.is_empty() && sender.send(Some(data)).await.is_err() {
                 break;
             }
-            match frames.message().await? {
+            match frames.next().await.transpose()? {
                 Some(frame) => data = frame.data,
-                None => break,
+                None => {
+                    let _ = sender.send(None).await;
+                    break;
+                }
             }
         }
         drop(sender);
@@ -613,6 +752,11 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
             }
             Some(v1::read_request::Target::Triage(run)) => {
                 caller.run(&run, None)?;
+                if caller.limited() {
+                    return Err(Status::permission_denied(
+                        "triage needs an unrestricted run capability",
+                    ));
+                }
                 let triage = Self::call(&self.backend, move |backend| {
                     backend.read_triage(
                         actor,
@@ -671,19 +815,29 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
         }
         let (sender, receiver) = tokio::sync::mpsc::channel(4);
         tokio::task::spawn_blocking(move || {
-            let mut bytes = bytes;
+            let mut bytes = bytes.take(meta.length);
+            let mut remaining = meta.length - offset;
             if sender.blocking_send(Ok(meta)).is_err() {
                 return;
             }
-            if std::io::copy(&mut (&mut bytes).take(offset), &mut std::io::sink()).is_err() {
+            if std::io::copy(&mut (&mut bytes).take(offset), &mut std::io::sink()).ok()
+                != Some(offset)
+            {
                 let _ = sender.blocking_send(Err(Status::data_loss("output bytes ended early")));
                 return;
             }
             let mut buffer = vec![0; 1 << 20];
             loop {
                 match bytes.read(&mut buffer) {
-                    Ok(0) => return,
+                    Ok(0) => {
+                        if remaining > 0 {
+                            let _ = sender
+                                .blocking_send(Err(Status::data_loss("output bytes ended early")));
+                        }
+                        return;
+                    }
                     Ok(n) => {
+                        remaining -= n as u64;
                         let frame = v1::ReadFrame {
                             data: buffer[..n].to_vec(),
                             ..Default::default()
@@ -699,8 +853,9 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
                 }
             }
         });
-        Ok(Response::new(Box::pin(
-            tokio_stream::wrappers::ReceiverStream::new(receiver),
+        Ok(Response::new(caller.observe(
+            self.identity.authority.keys.clone(),
+            Box::pin(tokio_stream::wrappers::ReceiverStream::new(receiver)),
         )))
     }
 }
@@ -711,6 +866,16 @@ pub(super) async fn stream_run<B: MachineBackend>(
     actor: VerifiedActor,
     request: v1::RunRequest,
     sender: tokio::sync::mpsc::Sender<Result<v1::RunEvent, Status>>,
+) -> Result<(), Status> {
+    stream_run_scoped(backend, actor, request, sender, None).await
+}
+
+async fn stream_run_scoped<B: MachineBackend>(
+    backend: Arc<B>,
+    actor: VerifiedActor,
+    request: v1::RunRequest,
+    sender: tokio::sync::mpsc::Sender<Result<v1::RunEvent, Status>>,
+    scope: Option<Caller>,
 ) -> Result<(), Status> {
     let id = request.id.clone();
     if let Some(spec) = request.spec {
@@ -726,7 +891,8 @@ pub(super) async fn stream_run<B: MachineBackend>(
         .map_err(refusal)?;
     }
     let mut log = Log::default();
-    let mut after = request.after;
+    let cursor = request.after;
+    let mut after = 0;
     let (first_backend, first_id) = (backend.clone(), id.clone());
     let current = tokio::task::spawn_blocking(move || {
         first_backend.get(actor, query(&*first_backend, actor, &first_id)?)
@@ -770,7 +936,12 @@ pub(super) async fn stream_run<B: MachineBackend>(
                     .map_err(|_| Status::internal("machine operation stopped"))??
                     .unwrap_or_default();
                 }
-                if sender.send(Ok(converted)).await.is_err() {
+                if converted.sequence > cursor
+                    && scope
+                        .as_ref()
+                        .is_none_or(|scope| scope.filter(&mut converted))
+                    && sender.send(Ok(converted)).await.is_err()
+                {
                     return Ok(());
                 }
             }
