@@ -335,27 +335,11 @@ impl Runs {
                     "repository": made.repository, "manifest": made.manifest.id()});
                 (made.manifest, row)
             } else {
-                let digest = choice.manifest.as_ref().ok_or_else(|| {
-                    refused(
-                        "invalid_request",
-                        format!("model choice {:?} names no exact manifest or provider source", choice.parameter),
-                    )
-                })?;
-                let sha256 = tensorfs_core::sha256::hex(&digest.digest);
-                let manifest = format!("sha256:{sha256}");
-                if !choice.repository.is_empty() {
-                    let stage = format!("downloading {}", choice.repository);
-                    publisher.download(&self.service, hub_access()?, &choice.repository, &manifest, &|done, total| {
-                        observe(&stage, done, total)
-                    }, id)?;
-                }
-                // No repository: a checkpoint this machine already holds (a run's output).
-                let length = std::fs::metadata(publisher.store().manifest_path(&sha256)).map_err(|_| {
-                    refused("checkpoint_absent", format!("this machine holds no checkpoint {manifest}"))
-                })?;
-                let row = json!({"parameter": choice.parameter,
-                    "repository": choice.repository, "manifest": manifest});
-                (ObjectRef { sha256, length: length.len() }, row)
+                let stage=format!("downloading {}",choice.repository);
+                let (repository,manifest)=publisher.download_choice(&self.service,hub.as_ref(),choice,
+                    &|done,total|observe(&stage,done,total),id)?;
+                let row=json!({"parameter":choice.parameter,"repository":repository,"manifest":manifest.id()});
+                (manifest,row)
             };
             self.service.engine.retain_model(Some(id),row["repository"].as_str().unwrap_or_default(),&manifest)?;
             if !destination.is_empty() {
@@ -739,7 +723,7 @@ impl Runs {
     }
 
     /// The job's own model inputs (`<job>.models.<parameter>`), each made present here: a
-    /// Hub checkpoint downloaded by its exact manifest, a provider source made.
+    /// Logical catalog selector resolved and downloaded, an exact checkpoint held, or a provider source made.
     fn job_inputs(
         &self,
         id: &str,
@@ -773,23 +757,10 @@ impl Runs {
                     .make_source(&choice.source, &choice.profiles, &spec.providers, observe)?
                     .manifest
             } else {
-                let digest = choice.manifest.as_ref().ok_or_else(|| {
-                    refused(
-                        "invalid_request",
-                        format!("the job's model input {parameter:?} names no exact checkpoint or provider source"),
-                    )
-                })?;
-                let manifest = format!("sha256:{}", tensorfs_core::sha256::hex(&digest.digest));
-                let hub = hub.ok_or_else(|| {
-                    refused("hub_access_absent", "a Hub model downloads with the run's Hub access, and this run carries none")
-                })?;
-                let stage = format!("downloading {}", choice.repository);
-                publisher.download(&self.service, hub, &choice.repository, &manifest, &|done, total| {
-                    observe(&stage, done, total)
-                }, id)?;
-                let sha256 = manifest.trim_start_matches("sha256:").to_string();
-                let length = std::fs::metadata(publisher.store().manifest_path(&sha256))?.len();
-                ObjectRef { sha256, length }
+                let stage=format!("downloading {}",choice.repository);
+                let (_,manifest)=publisher.download_choice(&self.service,hub,choice,
+                    &|done,total|observe(&stage,done,total),id)?;
+                manifest
             };
             self.service.engine.retain_model(Some(id),&choice.repository,&manifest)?;
             inputs.insert(parameter, (class, manifest));
@@ -1039,6 +1010,92 @@ mod tests {
         assert_eq!(theirs.state, State::Failed);
         assert!(theirs.failure.unwrap().contains("local_source_incomplete"));
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// A real accepted CPU job resolves a logical catalog selector at the Hub and consumes
+    /// the exact native source channel. No client-side manifest substitution or GPU load.
+    #[test]
+    fn an_accepted_cpu_job_resolves_and_reads_its_logical_model_selector() {
+        use std::{io::{Read,Write},net::TcpListener,sync::atomic::{AtomicUsize,Ordering}};
+        use tensorfs_core::{dtype::Dtype,header::{Header,Part,Tensor},manifest::{Draft,Entry},store::Fault};
+        let repo=Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root=std::env::temp_dir().join(format!("cm-logical-model-job-{}",uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let service=Service::open(&root.join("state"),&root.join("generations"),1).unwrap();
+        let store=Arc::new(Store::ensure(&root.join("store")).unwrap());
+        service.engine.configure_model_custody(store.clone()).unwrap();
+        let payload=vec![0x31;2048];
+        let data=store.put_stream(&mut payload.as_slice(),None,&Fault::default()).unwrap().obj;
+        let plain=tensorfs_core::registry::seeds().into_iter().find(|seed|seed.alias=="plain/1").unwrap().spec;
+        let header=Header {configs:vec![],assets:vec![],encodings:vec![plain.clone()],components:vec![("model".into(),vec![("weight".into(),Tensor {
+            dtype:Dtype::U8,shape:vec![2048],encoding:plain.object_id(),parts:vec![("value".into(),Part::plan(Dtype::U8,vec![2048],&payload))],
+        })])]};
+        let header=store.put_stream(&mut header.canonical_bytes().unwrap().as_slice(),None,&Fault::default()).unwrap().obj;
+        let manifest=store.put_manifest(&Draft {entries:vec![("model".into(),Entry::CozyTensors(header.clone()))]}.seal().unwrap()).unwrap().obj;
+        let listener=TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin=format!("http://{}",listener.local_addr().unwrap());
+        let resolved=Arc::new(AtomicUsize::new(0));
+        let reads=resolved.clone(); let checkpoint=manifest.clone();
+        // Read-only loopback transport fixture, real native ensure/closure/custody paths.
+        let hub=std::thread::spawn(move || {
+            for socket in listener.incoming() {
+                let mut socket=socket.unwrap();
+                let mut bytes=Vec::new(); let mut buffer=[0u8;1024];
+                loop {
+                    let size=socket.read(&mut buffer).unwrap(); if size==0 {break;}
+                    bytes.extend_from_slice(&buffer[..size]);
+                    if bytes.windows(4).any(|part|part==b"\r\n\r\n") {break;}
+                }
+                let text=String::from_utf8_lossy(&bytes); let path=text.split_whitespace().nth(1).unwrap_or("");
+                if path=="/stop" {break;}
+                assert!(text.to_ascii_lowercase().contains("authorization: bearer cpu-model-source"));
+                let value=if path.starts_with("/v1/models/resolve?") {
+                    assert!(path.contains("models%2Ffixture%401.0.0"),"{path}");
+                    reads.fetch_add(1,Ordering::Relaxed);
+                    json!({"model":"models/fixture","release":"1.0.0","lane":"bf16","manifest_id":checkpoint.id(),"components":["model"]})
+                } else {
+                    assert_eq!(path,"/v1/tensorfs/closure");
+                    json!({"complete":true,"scope":"runtime","model":"models/fixture","release":"1.0.0","lane":"bf16",
+                        "manifest":{"sha256":checkpoint.sha256,"length":checkpoint.length},
+                        "objects":[{"sha256":header.sha256,"length":header.length},{"sha256":data.sha256,"length":data.length}],"presign_max_digests":1024})
+                };
+                let body=serde_json::to_vec(&value).unwrap();
+                write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).unwrap();
+                socket.write_all(&body).unwrap();
+            }
+        });
+        assert!(Command::new("uv").current_dir(repo).args(["build","--wheel","--out-dir"]).arg(root.join("client")).status().unwrap().success());
+        let helper=Command::new("uv").current_dir(repo).args(["run","--locked","--extra","test","python","-c","import sys; print(sys.executable)"]).output().unwrap();
+        let client=fs::read_dir(root.join("client")).unwrap().map(|entry|entry.unwrap().path()).find(|path|path.extension().is_some_and(|value|value=="whl")).unwrap();
+        let objects=Arc::new(Objects::new(&root.join("writes"),store.clone(),service.engine.clone()).unwrap());
+        let local=LocalSources::new(objects.clone(),InstallerConfig {
+            helper_python:String::from_utf8(helper.stdout).unwrap().trim().into(),python:"3.12".into(),generations:root.join("generations"),client_wheel:client,
+            staging_root:root.join("staging"),sdk:vec![],uv:"uv".into(),
+        },store.clone());
+        let publisher=crate::published::Publisher::new(&root.join("published"),crate::published::PackageSdk::default(),store.clone()).unwrap();
+        let runs=Arc::new(Runs {service:service.clone(),objects:objects.clone(),publisher:Some(publisher),local:Some(Arc::new(local)),own_hub:None,jobs:Default::default()});
+        crate::jobs::Jobs::configure(&service,store.clone(),Some(&runs)).unwrap();
+        let mut archive=tar::Builder::new(Vec::new());
+        let fixture=repo.join("tests/fixtures/cpu_model_source");
+        for name in ["pyproject.toml","package.toml","cpu_model_source/__init__.py"] {archive.append_path_with_name(fixture.join(name),name).unwrap();}
+        let (source,length)=write(&objects,"alice",&archive.into_inner().unwrap());
+        let local_manifest=json!({"package":"local/cozy-machine-cpu-model-source","release":"0.1.0","python_version":"3.12","source":{"digest":source,"length":length}});
+        let (local_manifest,_)=write(&objects,"alice",local_manifest.to_string().as_bytes());
+        let mut request=spec(Source::Local(local_manifest),false,"model-selector-job");
+        request.job=true; request.entrypoint="metadata".into(); request.input=json!({});
+        request.hub=Some(hub::Source {origin:origin.clone(),credential:"bearer cpu-model-source".into(),ca_der:None,object_hosts:vec![]});
+        request.models=vec![pb::ModelChoice {parameter:"source".into(),repository:"models/fixture".into(),release:"1.0.0".into(),..Default::default()}];
+        let accepted=runs.submit("alice","logical-model-job",request).unwrap();
+        assert_eq!(accepted.waiting_reason.as_deref(),Some(crate::journal::PREPARING));
+        let done=settled(&service.engine,&accepted.id);
+        let mut stop=std::net::TcpStream::connect(origin.trim_start_matches("http://")).unwrap();
+        stop.write_all(b"GET /stop HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap(); hub.join().unwrap();
+        assert_eq!(done.state,State::Completed,"{:?}",done.failure);
+        assert_eq!(done.result.unwrap().value["manifest"],manifest.id());
+        assert_eq!(resolved.load(Ordering::Relaxed),1);
+        tensorfs_core::gc::collect_cached_for(store.root(),&[],1).unwrap();
+        assert!(store.manifest_path(&manifest.sha256).exists());
+        let _=fs::remove_dir_all(root);
     }
 
     /// A preparing run's stages are observed like a running attempt's.

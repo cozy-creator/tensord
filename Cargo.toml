@@ -6,8 +6,8 @@ publish = false
 
 [dependencies]
 str0m = { version = "0.24", default-features = false, features = ["aws-lc-rs"] }
-tensorfs-core = { git = "https://github.com/cozy-creator/tensorfs.git", rev = "ce9c54a8ff90029e322852c72daaeb11a3f0071d" }
-tensorfs-plane = { git = "https://github.com/cozy-creator/tensorfs.git", rev = "ce9c54a8ff90029e322852c72daaeb11a3f0071d" }
+tensorfs-core = { git = "https://github.com/cozy-creator/tensorfs.git", rev = "78e52f5c89508473522850c63ec5161c1fadd9d9" }
+tensorfs-plane = { git = "https://github.com/cozy-creator/tensorfs.git", rev = "78e52f5c89508473522850c63ec5161c1fadd9d9" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 serde_json_canonicalizer = "0.3"
@@ -43,7 +43,7 @@ rustls-pemfile = "2"
 time = "0.3"
 
 [dev-dependencies]
-tensorfs-plane = { git = "https://github.com/cozy-creator/tensorfs.git", rev = "ce9c54a8ff90029e322852c72daaeb11a3f0071d", features = ["faults"] }
+tensorfs-plane = { git = "https://github.com/cozy-creator/tensorfs.git", rev = "78e52f5c89508473522850c63ec5161c1fadd9d9", features = ["faults"] }
 x509-parser = "0.18"
 
 [build-dependencies]
