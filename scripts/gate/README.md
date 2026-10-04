@@ -20,7 +20,8 @@ declaration or supporting evidence the verdict is inconclusive.
  "cells":["cold-sdxl","cold-anima","warm","switch","1gib-grouped"],"min_pairs":3}}
 ```
 
-Each cell row needs a stable `pair` id, equal `request_digest` for normalized model bytes
+Each cell row identifies its actual `engine: {name, commit}`: `ComfyUI` or `cozy-machine`.
+Each also needs a stable `pair` id, equal `request_digest` for normalized model bytes
 and requests, and equal measured `hardware_key`. Both arms record
 `timing_boundary: "submit_to_saved_output"` and the same `output_location` (`controller`
 or `pod`). Three pairs is the minimum; declare more before running when variance warrants it.
