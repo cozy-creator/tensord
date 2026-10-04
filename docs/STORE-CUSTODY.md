@@ -37,6 +37,36 @@ The custody mutex excludes expiration while a new run takes references. Startup 
 old admitted objects before configuring publisher GC; older input references are
 backfilled without rewriting execution records.
 
+## Selected model custody
+
+Selected checkpoints use TensorFS's existing independent `checkpoint_root` primitive.
+One tracked native root serves every live run referencing a manifest; it is not one
+descriptor or one native root per request. Native roots precede acknowledged model
+dependencies. Journal `run_models` rows are attached in acceptance/binding transactions.
+Paused and unknown states remain obligations. When no unfinished run references a root,
+the short cache grace allows preparation handoff before the native root is released;
+the ordinary managed cache repository then owns idle-cache retention and pressure policy.
+
+Cold ensure transfers custody in an additive `on_ready` callback while the download
+flight still holds its objects. This protects every native GC caller, including provider
+source conversion, rather than only callers supplying Publisher's keep list. Provider
+conversion already writes its authored local repository before disposing conversion and
+source roots; the machine adds independent custody before that alias can evolve. Warm
+held plans and configured grants are retained before inspecting/returning their bytes.
+Normal inference, adapter downloads, job model inputs, and prefetch carry the accepted
+execution ID into this handoff.
+
+Startup restores older unfinished preparations and job-input contexts before publisher
+GC. Unreadable obligations retain the native writer guard to disable destructive store
+GC; ordinary fitting work and unrelated CPU acceptance remain available. Transfer
+cancellation and liveness policy are unchanged.
+
+The current ensure and provider conversion paths deliver self-contained runtime model
+closures. Checkpoint custody verifies that existing closure; it downloads no extra
+unselected data. Component selection limits execution access afterward. A partially
+materialized manifest supplied outside those preparation paths remains an unqualified
+boundary; no speculative scoped-custody API is introduced.
+
 ## Pressure plan still required
 
 The inherited O checkpoint is not accepted as qualified implementation. Its proposed

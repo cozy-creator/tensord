@@ -162,6 +162,7 @@ pub struct Engine {
     journal: Mutex<Journal>,
     /// Serializes accepting object dependencies with store-root expiration.
     pub(crate) object_custody: Mutex<()>,
+    model_custody: Mutex<Option<Arc<crate::model_custody::Models>>>,
     active: Mutex<HashMap<String, ActiveRun>>,
     owned: Mutex<HashSet<String>>,
     progress: Mutex<HashMap<String, ProgressSnapshot>>,
@@ -192,6 +193,7 @@ impl Engine {
             incarnation,
             journal: Mutex::new(journal),
             object_custody: Mutex::new(()),
+            model_custody: Mutex::new(None),
             active: Mutex::new(HashMap::new()),
             owned: Mutex::new(HashSet::new()),
             progress: Mutex::new(HashMap::new()),
@@ -247,6 +249,36 @@ impl Engine {
     pub fn with_journal<T>(&self, f: impl FnOnce(&mut Journal) -> io::Result<T>) -> io::Result<T> {
         f(&mut self.journal.lock().unwrap())
     }
+
+    pub fn configure_model_custody(&self, store: Arc<tensorfs_core::store::Store>) -> io::Result<()> {
+        let _custody=self.object_custody.lock().unwrap();
+        let roots=Arc::new(crate::model_custody::Models::new(store));
+        if let Err(error)=roots.restore(self) { roots.block(&error)?; }
+        *self.model_custody.lock().unwrap()=Some(roots);
+        Ok(())
+    }
+    pub fn retain_model(&self, execution:Option<&str>, repository:&str, manifest:&tensorfs_core::ids::ObjectRef) -> io::Result<()> {
+        let _custody=self.object_custody.lock().unwrap();
+        if let Some(roots)=self.model_custody.lock().unwrap().clone() {
+            let _writer=roots.guard()?;
+            roots.retain(self,execution,repository,manifest)?;
+        }
+        Ok(())
+    }
+    pub fn retain_preparation(&self, execution:Option<&str>, preparation:&crate::journal::Preparation) -> io::Result<()> {
+        let _custody=self.object_custody.lock().unwrap();
+        if let Some(roots)=self.model_custody.lock().unwrap().clone() {
+            let _writer=roots.guard()?;
+            roots.preparation(self,execution,preparation)?;
+        }
+        Ok(())
+    }
+    pub fn sweep_models(&self) -> io::Result<usize> {
+        let _custody=self.object_custody.lock().unwrap();
+        match self.model_custody.lock().unwrap().clone() {
+            Some(roots) => roots.sweep(self), None => Ok(0),
+        }
+    }
     pub fn bind_installation(
         &self,
         record: crate::journal::Installation,
@@ -273,6 +305,14 @@ impl Engine {
         &self,
         record: crate::journal::Preparation,
     ) -> io::Result<crate::journal::Preparation> {
+        let _custody=self.object_custody.lock().unwrap();
+        if let Some(roots)=self.model_custody.lock().unwrap().clone() {
+            let _writer=roots.guard()?;
+            if let Err(error)=roots.preparation(self,None,&record) {
+                roots.block(&error)?;
+                return Err(error);
+            }
+        }
         self.journal.lock().unwrap().bind_preparation(record)
     }
 
@@ -367,6 +407,15 @@ impl Engine {
         invocation: Invocation,
         boot: &str,
     ) -> io::Result<Execution> {
+        let _custody=self.object_custody.lock().unwrap();
+        let roots=self.model_custody.lock().unwrap().clone();
+        let _writer=roots.as_ref().map(|roots| roots.guard()).transpose()?;
+        let preparation=if !context.preparation_id.is_empty() {
+            self.preparation(&context.actor,&context.preparation_id)?
+        } else { None };
+        if let (Some(roots),Some(preparation))=(&roots,&preparation) {
+            roots.preparation(self,None,preparation)?;
+        }
         let owned = self.owned.lock().unwrap();
         let progress = self.progress.lock().unwrap();
         let mut record = self
@@ -419,6 +468,17 @@ impl Engine {
         invocation: Invocation,
         preparation: &str,
     ) -> io::Result<Execution> {
+        let _custody=self.object_custody.lock().unwrap();
+        let roots=self.model_custody.lock().unwrap().clone();
+        let _writer=roots.as_ref().map(|roots| roots.guard()).transpose()?;
+        if let Some(roots)=&roots {
+            let record=self.get(id)?;
+            let actor=record.submission.as_ref().map(|s|s.actor.as_str()).unwrap_or_default();
+            if !preparation.is_empty() {
+                let prepared=self.preparation(actor,preparation)?.ok_or_else(||io::Error::other("model preparation absent before binding"))?;
+                roots.preparation(self,Some(id),&prepared)?;
+            }
+        }
         let record = self
             .journal
             .lock()

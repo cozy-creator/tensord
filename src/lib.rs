@@ -19,6 +19,7 @@ pub mod machine_api;
 pub mod memo;
 pub mod memory;
 pub mod model_sources;
+pub mod model_custody;
 pub mod native_inputs;
 pub mod objects;
 pub mod os;

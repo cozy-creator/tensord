@@ -347,7 +347,7 @@ impl Runs {
                     let stage = format!("downloading {}", choice.repository);
                     publisher.download(&self.service, hub_access()?, &choice.repository, &manifest, &|done, total| {
                         observe(&stage, done, total)
-                    })?;
+                    }, id)?;
                 }
                 // No repository: a checkpoint this machine already holds (a run's output).
                 let length = std::fs::metadata(publisher.store().manifest_path(&sha256)).map_err(|_| {
@@ -357,6 +357,7 @@ impl Runs {
                     "repository": choice.repository, "manifest": manifest});
                 (ObjectRef { sha256, length: length.len() }, row)
             };
+            self.service.engine.retain_model(Some(id),row["repository"].as_str().unwrap_or_default(),&manifest)?;
             if !destination.is_empty() {
                 if spec.publication.is_empty() {
                     return Err(refused(
@@ -453,6 +454,7 @@ impl Runs {
         let hub = spec.hub.clone().or_else(|| self.own_hub.clone());
         let (installation, plan) = self.resolve(
             actor,
+            id,
             held,
             release,
             hub.clone(),
@@ -507,7 +509,7 @@ impl Runs {
             return warm_result(installed, models);
         }
         if spec.job {
-            let inputs = self.job_inputs(&spec, &interface, hub.as_ref(), &*observe)?;
+            let inputs = self.job_inputs(id, &spec, &interface, hub.as_ref(), &*observe)?;
             let context = JobContext {
                 installation: installation.alias.clone(),
                 hub,
@@ -548,6 +550,7 @@ impl Runs {
     fn resolve(
         &self,
         actor: &str,
+        execution: &str,
         held: Option<Installation>,
         release: Option<(String, String)>,
         hub: Option<hub::Source>,
@@ -573,7 +576,7 @@ impl Runs {
                     choices: choices.to_vec(),
                 };
                 let prepared = publisher
-                    .prepare_now(&self.service, actor, &request, observe)
+                    .prepare_now(&self.service, actor, &request, observe, execution)
                     .map_err(|(code, message)| refused(code, message))?;
                 Ok((prepared.installation.clone(), prepared.plan.clone()))
             }
@@ -584,7 +587,7 @@ impl Runs {
                         "a release runs with the run's Hub access, and this run carries none",
                     )
                 })?;
-                let plan = self.configured(actor, &installed, &spec.entrypoint, choices)?;
+                let plan = self.configured(actor, execution, &installed, &spec.entrypoint, choices)?;
                 Ok((installed, plan))
             }
         }
@@ -683,7 +686,7 @@ impl Runs {
                     let Source::Installation(alias) = &spec.source else { unreachable!() };
                     let held = runs.service.engine.installation(&actor, alias)?;
                     let (hub, models) = (spec.hub.clone(), spec.models.clone());
-                    runs.resolve(&actor, held, None, hub, &spec, &models, Box::new(|_, _, _| ()))
+                    runs.resolve(&actor, &parent, held, None, hub, &spec, &models, Box::new(|_, _, _| ()))
                 });
             match prepared {
                 Ok((installation, Some(plan))) => {
@@ -739,6 +742,7 @@ impl Runs {
     /// Hub checkpoint downloaded by its exact manifest, a provider source made.
     fn job_inputs(
         &self,
+        id: &str,
         spec: &Spec,
         interface: &Value,
         hub: Option<&hub::Source>,
@@ -782,11 +786,12 @@ impl Runs {
                 let stage = format!("downloading {}", choice.repository);
                 publisher.download(&self.service, hub, &choice.repository, &manifest, &|done, total| {
                     observe(&stage, done, total)
-                })?;
+                }, id)?;
                 let sha256 = manifest.trim_start_matches("sha256:").to_string();
                 let length = std::fs::metadata(publisher.store().manifest_path(&sha256))?.len();
                 ObjectRef { sha256, length }
             };
+            self.service.engine.retain_model(Some(id),&choice.repository,&manifest)?;
             inputs.insert(parameter, (class, manifest));
         }
         Ok(inputs)
@@ -807,6 +812,7 @@ impl Runs {
     fn configured(
         &self,
         actor: &str,
+        execution: &str,
         installed: &Installation,
         entrypoint: &str,
         choices: &[pb::ModelChoice],
@@ -826,15 +832,18 @@ impl Runs {
                 "this callable needs a GPU and this machine has none configured",
             )
         })?;
+        let _reader=self.objects.writer_guard()?;
         let plan = gpu
             .prepare_root(installed, entrypoint, choices, &[], 0)
             .map_err(|e| refused("model_preparation_failed", e.to_string()))?;
-        self.service.engine.bind_preparation(Preparation {
+        let preparation=Preparation {
             actor: actor.into(),
             id: plan.id.clone(),
             installation: installed.alias.clone(),
             document: serde_json::to_vec(&plan).map_err(io::Error::other)?,
-        })?;
+        };
+        self.service.engine.bind_preparation(preparation.clone())?;
+        self.service.engine.retain_preparation(Some(execution),&preparation)?;
         Ok(Some(plan))
     }
 }
