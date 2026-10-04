@@ -41,6 +41,7 @@ struct Lease {
 pub struct Owner {
     store: Arc<Store>,
     _lock: File,
+    _store_lock: File,
     cache: HashMap<String, Cached>,
     peers: HashMap<u64, Peer>,
     leases: HashMap<u64, Lease>,
@@ -79,7 +80,31 @@ impl Owner {
             )
         })?;
         std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+        // Ownership belongs to the store inode, independent of state directory or
+        // canonical-path aliases. Store creation has its own native serialization;
+        // lifetime ownership excludes serving, mutation and socket publication.
+        // For an existing owned store refuse before even opening its catalog. The
+        // first initialization must precede marker creation (native roots refuse foreign files).
+        let existing_lock = match OpenOptions::new().read(true).write(true).open(store.join("owner.lock")) {
+            Ok(lock) => {
+                lock.try_lock_exclusive().map_err(|_| io::Error::new(
+                    io::ErrorKind::AlreadyExists, "TensorFS store already has a machine owner"))?;
+                Some(lock)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
         let store = Arc::new(Store::ensure(store).map_err(io::Error::other)?);
+        let store_lock = match existing_lock {
+            Some(lock) => lock,
+            None => {
+                let lock = OpenOptions::new().read(true).write(true).create(true)
+                    .truncate(false).open(store.root().join("owner.lock"))?;
+                lock.try_lock_exclusive().map_err(|_| io::Error::new(
+                    io::ErrorKind::AlreadyExists, "TensorFS store already has a machine owner"))?;
+                lock
+            }
+        };
         // The machine is the store's owner: its read leases pin in memory, so its GC can make
         // room while layouts are served.
         tensorfs_core::meta::own(&store);
@@ -94,6 +119,7 @@ impl Owner {
         Ok(Arc::new(Mutex::new(Self {
             store,
             _lock: lock,
+            _store_lock: store_lock,
             cache: HashMap::new(),
             peers: HashMap::new(),
             leases: HashMap::new(),

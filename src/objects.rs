@@ -8,9 +8,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, MutexGuard},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tensorfs_core::{ids::ObjectRef, sha256, store::Fault, store::Store};
+use tensorfs_core::{catalog::WriterGuard, ids::ObjectRef, object_roots, sha256, store::Fault, store::Store};
 
 pub struct Objects {
     root: PathBuf,
@@ -50,11 +51,55 @@ pub struct Writer<'a> {
 impl Objects {
     pub fn new(root: &Path, store: Arc<Store>, engine: Arc<Engine>) -> io::Result<Self> {
         fs::create_dir_all(root)?;
-        Ok(Self {
+        let objects = Self {
             root: root.to_path_buf(),
             store,
             engine,
-        })
+        };
+        // Migration/restoration happens before any publisher or background GC is wired.
+        // Current writes are already durably rooted; old admitted rows gain that custody.
+        let _custody = objects.guard();
+        let _writer = objects.writer_guard()?;
+        for object in objects.engine.with_journal(|j| j.written_objects())? {
+            if objects.store.object_path(&object.sha256).is_file() {
+                object_roots::retain(&objects.store, &object).map_err(io::Error::other)?;
+            }
+        }
+        drop(_writer);
+        drop(_custody);
+        Ok(objects)
+    }
+
+    pub(crate) fn guard(&self) -> MutexGuard<'_, ()> {
+        self.engine.object_custody.lock().unwrap()
+    }
+    pub(crate) fn writer_guard(&self) -> io::Result<WriterGuard> {
+        WriterGuard::acquire(self.store.root()).map_err(io::Error::other)
+    }
+    /// Called with custody and native writer exclusion held, before acceptance.
+    pub(crate) fn retain(&self, objects: &[ObjectRef]) -> io::Result<()> {
+        for object in objects {
+            object_roots::retain(&self.store, object).map_err(io::Error::other)?;
+        }
+        Ok(())
+    }
+
+    /// Unreferenced writes expire after the configured cache TTL. Native roots survive
+    /// a crash before the journal bind too: root mtime gives those orphans the same TTL.
+    pub fn sweep(&self, ttl: Duration) -> io::Result<usize> {
+        let _custody = self.guard();
+        let before = SystemTime::now().checked_sub(ttl).unwrap_or(UNIX_EPOCH);
+        let before_ms = before.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis().min(i64::MAX as u128) as i64;
+        let mut removed = 0;
+        for object in object_roots::list(&self.store).map_err(io::Error::other)? {
+            let path = self.store.root().join("roots/objects").join(format!("{}.json",object.sha256));
+            if fs::metadata(path)?.modified()? >= before { continue; }
+            if self.engine.with_journal(|j| j.object_releasable(&object.sha256, before_ms))?
+                && object_roots::remove(&self.store, &object.sha256).map_err(io::Error::other)? {
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 
     /// The stored object this signer wrote, or None.
@@ -71,13 +116,16 @@ impl Objects {
 
     /// A file this machine produced for the signer (a child run's result) as its object, so a
     /// later run of that signer may be handed it.
-    pub fn adopt(&self, actor: &str, file: &Path, object: &ObjectRef) -> io::Result<()> {
+    pub fn adopt(&self, actor: &str, parent: &str, file: &Path, object: &ObjectRef) -> io::Result<()> {
+        let _custody = self.guard();
+        let _writer = self.writer_guard()?;
         if self.path(actor, &format!("sha256:{}", object.sha256))?.is_none() {
             self.store
                 .put_file(file, Some(object), &Fault::default())
                 .map_err(io::Error::other)?;
-            self.engine.with_journal(|j| j.bind_object(actor, object))?;
         }
+        self.retain(std::slice::from_ref(object))?;
+        self.engine.with_journal(|j| j.adopt_object(actor, parent, object))?;
         Ok(())
     }
 
@@ -178,12 +226,18 @@ impl Writer<'_> {
     /// partial one stays staged for the next attempt. Answers the bytes held.
     pub fn finish(mut self) -> Result<u64, Refused> {
         let Some(file) = self.file.take() else {
+            let _custody = self.objects.guard();
+            let _writer = self.objects.writer_guard()?;
+            self.objects.retain(std::slice::from_ref(&self.object))?;
+            self.objects.engine.with_journal(|j| j.bind_object(&self.actor, &self.object))?;
             return Ok(self.held);
         };
         file.sync_data()?;
         if self.held < self.object.length {
             return Ok(self.held);
         }
+        let _custody = self.objects.guard();
+        let _writer = self.objects.writer_guard()?;
         let stored = self
             .objects
             .store
@@ -191,10 +245,15 @@ impl Writer<'_> {
         let _ = fs::remove_file(&self.part);
         stored.map_err(|e| {
             refused(
-                "object_digest_mismatch",
-                format!("the bytes differ from their digest: {e}"),
+                match e.code {
+                    tensorfs_core::err::Code::CAPACITY_EXHAUSTED => "machine_disk_full",
+                    tensorfs_core::err::Code::OBJECT_ID_MISMATCH | tensorfs_core::err::Code::LENGTH_MISMATCH => "object_digest_mismatch",
+                    _ => "object_storage_failed",
+                },
+                e.to_string(),
             )
         })?;
+        self.objects.retain(std::slice::from_ref(&self.object))?;
         let (actor, object) = (self.actor.clone(), self.object.clone());
         self.objects
             .engine

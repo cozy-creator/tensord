@@ -331,6 +331,9 @@ fn start_api(
         uploads,
     );
     backend.own_hub = own_hub;
+    let objects = Arc::new(cozy_machine::objects::Objects::new(
+        &root.join("writes"), store.clone(), service.engine.clone(),
+    )?);
     let publisher =
         cozy_machine::published::Publisher::new(&root.join("published"), sdk, store.clone())?;
     service.configure_publisher(publisher.clone());
@@ -353,11 +356,6 @@ fn start_api(
         }
         _ => None,
     };
-    let objects = Arc::new(cozy_machine::objects::Objects::new(
-        &root.join("writes"),
-        store.clone(),
-        service.engine.clone(),
-    )?);
     backend.runs = Some(Arc::new(cozy_machine::runs::Runs {
         service: service.clone(),
         objects: objects.clone(),
