@@ -6,7 +6,7 @@
 //! end's SDP, so nothing here parses SDP. str0m does ICE, DTLS and SCTP; this module frames TCP
 //! and speaks cozy/1, on the same wire as the Go agent's, so one player reaches either.
 use super::{
-    auth::VerifiedActor,
+    auth::{Lapse, StreamAuthority, VerifiedActor},
     backend::{MachineBackend, OutputSnapshot},
     capability::{self, Grant},
     machine_v1::{query, stream_run},
@@ -42,12 +42,10 @@ const HEADER: usize = 12;
 const MAX_MESSAGE: usize = 64 << 10;
 const MAX_HELLO: usize = 8 << 10;
 const MAX_STREAMS: usize = 8;
-// Limits are by capacity, never by timer: an arrival over a limit evicts the oldest session
-// still pending (before a valid hello), its own IP's first. An authenticated session ends
-// only on its own key's limit, a revocation, or the peer.
+// Only unauthenticated handshakes are bounded by capacity. Authenticated viewers have no
+// viewer cap; each session still bounds its own buffered output and open requests.
 const MAX_CONNS: usize = 64;
 const MAX_CONNS_PER_IP: usize = 8;
-const MAX_PER_KEY: usize = 16;
 /// Ended ufrags kept so a reconnect cannot resume a session no state remains for.
 const ENDED_UFRAGS: usize = 4096;
 const MIN_WINDOW: usize = 256 << 10;
@@ -76,7 +74,6 @@ struct Seat {
     ip: IpAddr,
     /// The key that opened it, once its hello verified.
     key: Mutex<Option<String>>,
-    work: mpsc::UnboundedSender<Work>,
     task: OnceLock<tokio::task::AbortHandle>,
 }
 
@@ -108,27 +105,16 @@ impl<B: MachineBackend> Media<B> {
         }))
     }
 
-    fn admit(
-        self: &Arc<Self>,
-        ip: IpAddr,
-        work: mpsc::UnboundedSender<Work>,
-    ) -> Option<Admission<B>> {
+    fn admit(self: &Arc<Self>, ip: IpAddr) -> Option<Admission<B>> {
         let mut admitted = self.admitted.lock().unwrap();
         loop {
-            let own = admitted.seats.iter().filter(|s| s.ip == ip).count();
-            if own < MAX_CONNS_PER_IP && admitted.seats.len() < MAX_CONNS {
-                let seat = Arc::new(Seat {
-                    ip,
-                    key: Mutex::default(),
-                    work,
-                    task: OnceLock::new(),
-                });
+            let pending: Vec<&Arc<Seat>> =
+                admitted.seats.iter().filter(|s| s.key.lock().unwrap().is_none()).collect();
+            let own = pending.iter().filter(|s| s.ip == ip).count();
+            if own < MAX_CONNS_PER_IP && pending.len() < MAX_CONNS {
+                let seat = Arc::new(Seat { ip, key: Mutex::default(), task: OnceLock::new() });
                 admitted.seats.push(seat.clone());
-                return Some(Admission {
-                    media: self.clone(),
-                    seat,
-                    ufrag: None,
-                });
+                return Some(Admission { media: self.clone(), seat, ufrag: None });
             }
             let pending = |from: Option<IpAddr>| {
                 admitted.seats.iter().position(|s| {
@@ -167,22 +153,8 @@ impl<B: MachineBackend> Admission<B> {
         true
     }
 
-    /// Seats the session under the key that opened it, and ends that key's oldest session
-    /// beyond its limit.
+    /// Seats the session under the key that opened it: it no longer counts as a handshake.
     fn authenticate(&self, key: &str) {
-        let admitted = self.media.admitted.lock().unwrap();
-        let same: Vec<&Arc<Seat>> = admitted
-            .seats
-            .iter()
-            .filter(|s| s.key.lock().unwrap().as_deref() == Some(key))
-            .collect();
-        if same.len() >= MAX_PER_KEY {
-            *same[0].key.lock().unwrap() = None;
-            let _ = same[0].work.send(Work::Bye {
-                code: "evicted",
-                message: "this key opened more sessions than a machine keeps",
-            });
-        }
         *self.seat.key.lock().unwrap() = Some(key.into());
     }
 }
@@ -213,7 +185,7 @@ pub(super) async fn serve<B: MachineBackend>(media: Arc<Media<B>>, listener: Tcp
             continue;
         };
         let (work_tx, work) = mpsc::unbounded_channel();
-        if let Some(admission) = media.admit(peer.ip(), work_tx.clone()) {
+        if let Some(admission) = media.admit(peer.ip()) {
             let seat = admission.seat.clone();
             let task = tokio::spawn(async move {
                 let _ = session(tcp, peer, admission, work_tx, work).await;
@@ -357,10 +329,14 @@ async fn session<B: MachineBackend>(
         }
     });
     let mut cozy = Cozy::new(media.clone(), work_tx);
-    // Set once the hello verifies: resolves when the key that opened the session is revoked.
-    let mut revoked: Option<Pin<Box<dyn Future<Output = ()> + Send>>> = None;
-    let mut seated = false;
+    // Set once the hello verifies: the session ends at revocation or the link's expiry.
+    let mut authority: Option<StreamAuthority> = None;
+    let mut ended: Option<Pin<Box<dyn Future<Output = Lapse> + Send>>> = None;
     loop {
+        // Checked before pumping, so sustained output cannot starve a lapse.
+        if let Some(Err(lapse)) = authority.as_ref().map(StreamAuthority::check) {
+            cozy.bye(lapse.code(), lapse.message());
+        }
         let deadline = loop {
             match rtc.poll_output().map_err(io::Error::other)? {
                 Output::Timeout(at) => break at,
@@ -377,13 +353,12 @@ async fn session<B: MachineBackend>(
                 }
             }
         };
-        if let (Some((grant, actor)), false) = (&cozy.grant, seated) {
-            seated = true;
+        if let (Some((grant, actor)), true) = (&cozy.grant, authority.is_none()) {
             admission.authenticate(&grant.key);
-            let (media, key) = (media.clone(), actor.public_key);
-            revoked = Some(Box::pin(async move {
-                media.identity.authority.keys.revoked(key).await
-            }));
+            let keys = media.identity.authority.keys.clone();
+            let granted = StreamAuthority::new(keys, *actor, Some(grant.expires));
+            ended = Some(Box::pin(granted.clone().ended()));
+            authority = Some(granted);
         }
         if cozy.pump(&mut rtc) {
             continue; // what it wrote is transmitted first
@@ -394,9 +369,9 @@ async fn session<B: MachineBackend>(
             return Ok(());
         }
         let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
-        let key_revoked = async {
-            match revoked.as_mut() {
-                Some(revoked) => revoked.await,
+        let authority_ended = async {
+            match ended.as_mut() {
+                Some(ended) => ended.await,
                 None => std::future::pending().await,
             }
         };
@@ -407,9 +382,9 @@ async fn session<B: MachineBackend>(
             },
             _ = sleep => rtc.handle_input(Input::Timeout(Instant::now())).map_err(io::Error::other)?,
             Some(done) = work.recv() => cozy.work(done),
-            _ = key_revoked => {
-                revoked = None;
-                cozy.bye("revoked", "the key that opened this session was revoked");
+            lapse = authority_ended => {
+                ended = None;
+                cozy.bye(lapse.code(), lapse.message());
             }
         }
     }
@@ -424,10 +399,6 @@ enum Work {
     Stop {
         number: u32,
         message: Value,
-    },
-    Bye {
-        code: &'static str,
-        message: &'static str,
     },
 }
 
@@ -573,6 +544,12 @@ impl<B: MachineBackend> Cozy<B> {
     fn bye(&mut self, code: &str, message: &str) {
         if !self.ending {
             self.ending = true;
+            self.out.clear();
+            for stream in self.streams.drain(..) {
+                if let Some(task) = stream.task {
+                    task.abort();
+                }
+            }
             self.out
                 .push_back(json!({"t": "bye", "code": code, "message": message}));
         }
@@ -780,7 +757,6 @@ impl<B: MachineBackend> Cozy<B> {
                     stream.stop.get_or_insert(message);
                 }
             }
-            Work::Bye { code, message } => self.bye(code, message),
         }
     }
 
@@ -1006,14 +982,13 @@ async fn serve_follow<B: MachineBackend>(
     let stop = |message| {
         let _ = work.send(Work::Stop { number, message });
     };
-    // The log is read from its start: a revision appends or replaces by what preceded it.
     let (events_tx, mut events) = mpsc::channel(256);
     let request = v1::RunRequest {
         id: target.run.clone(),
         after: 0,
         spec: None,
     };
-    let log = tokio::spawn(stream_run(backend.clone(), actor, request, events_tx));
+    let log = tokio::spawn(stream_run(backend.clone(), actor, request, None, events_tx));
     let mut held = target.offset;
     let mut pending: Vec<(u64, v1::Product)> = vec![];
     let mut terminal = None;
@@ -1146,5 +1121,37 @@ mod tests {
         );
         frame[8 + 12 + 4] = b'x'; // another prefix
         assert_eq!(binding_username(&frame), None);
+    }
+
+    struct Backend;
+    impl MachineBackend for Backend {
+        fn workspace(
+            &self,
+            _: VerifiedActor,
+            _: super::super::pb::MachineExecutionWorkspaceQuery,
+        ) -> Result<super::super::pb::MachineExecutionWorkspace, tonic::Status> {
+            Ok(Default::default())
+        }
+    }
+
+    /// Only handshakes are capped: any number of a key's viewers stay seated.
+    #[test]
+    fn authenticated_viewers_are_not_capped() {
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[84; 32]);
+        let identity =
+            MachineIdentity::ephemeral("media-test".into(), vec![signer.verifying_key()], vec![7; 32])
+                .unwrap();
+        let media = Media::new(Arc::new(identity), Arc::new(Backend)).unwrap();
+        let address = "127.0.0.1".parse().unwrap();
+        let viewers: Vec<_> = (0..MAX_CONNS + 1)
+            .map(|_| {
+                let viewer = media.admit(address).expect("an authenticated viewer was capped");
+                viewer.authenticate("one-owner-key");
+                viewer
+            })
+            .collect();
+        assert_eq!(media.admitted.lock().unwrap().seats.len(), MAX_CONNS + 1);
+        drop(viewers);
+        assert!(media.admitted.lock().unwrap().seats.is_empty());
     }
 }

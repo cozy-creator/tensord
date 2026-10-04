@@ -3,7 +3,7 @@
 //! the backend's operations; Status and `Run kind: update` are `machine_status` and
 //! `machine_update` (D2); Write (D1) answers UNIMPLEMENTED until it lands.
 use super::{
-    auth::VerifiedActor,
+    auth::{StreamAuthority, VerifiedActor},
     backend::MachineBackend,
     capability::{self, Grant},
     pb, v1, MachineIdentity,
@@ -17,7 +17,7 @@ use std::{
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
-use tokio_stream::Stream;
+use tokio_stream::{Stream, StreamExt};
 use tonic::{metadata::MetadataMap, Request, Response, Status};
 
 type Events<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -43,6 +43,11 @@ impl Caller {
             ))
         }
     }
+    /// An output-limited run grant (`run play`'s link), which sees only those outputs.
+    fn limit(&self) -> Option<Grant> {
+        let limited = self.grant.action != capability::MACHINE && !self.grant.outputs.is_empty();
+        limited.then(|| self.grant.clone())
+    }
     fn run(&self, id: &str, output: Option<(&str, Option<u32>)>) -> Result<(), Status> {
         let allowed = self.grant.action == capability::MACHINE
             || match output {
@@ -59,7 +64,35 @@ impl Caller {
     }
 }
 
+/// What an output-limited grant sees of an event: its outputs' products, and the outcome's
+/// status and inventory of them. Results, reasons, triage, measurements, waiting details,
+/// progress and logs stay the run owner's.
+fn visible(grant: &Grant, event: &mut v1::RunEvent) -> bool {
+    let allows = |p: &v1::Product| grant.allows(&grant.run, &p.output, (p.index > 0).then_some(p.index));
+    match &mut event.event {
+        Some(v1::run_event::Event::Product(product)) => allows(&*product),
+        Some(v1::run_event::Event::Outcome(outcome)) => {
+            outcome.outputs.retain(allows);
+            outcome.result.clear();
+            outcome.reason = None;
+            outcome.triage = false;
+            outcome.measurements.clear();
+            true
+        }
+        Some(v1::run_event::Event::State(state)) => {
+            state.waiting.clear();
+            true
+        }
+        _ => false,
+    }
+}
+
 impl<B: MachineBackend> MachineV1<B> {
+    /// A v1 stream lives until its key stops authorizing; the cap's expiry held at open.
+    fn authority(&self, caller: &Caller) -> StreamAuthority {
+        StreamAuthority::new(self.identity.authority.keys.clone(), caller.actor, None)
+    }
+
     fn caller(&self, metadata: &MetadataMap) -> Result<Caller, Status> {
         let token = metadata
             .get("authorization")
@@ -282,7 +315,7 @@ fn refusal(refused_: crate::objects::Refused) -> Status {
 fn digest(text: &str) -> Result<Vec<u8>, Status> {
     let hex = text
         .strip_prefix("sha256:")
-        .filter(|hex| hex.len() == 64)
+        .filter(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
         .ok_or_else(|| Status::invalid_argument("a digest is sha256:<64 hex>"))?;
     (0..64)
         .step_by(2)
@@ -477,24 +510,22 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
             let (identity, backend) = (self.identity.clone(), self.backend.clone());
             return super::machine_update::run(identity, backend, caller.actor, request)
                 .await
-                .map(Response::new);
+                .map(|events| Response::new(self.authority(&caller).wrap(events)));
         }
         match &request.spec {
             Some(_) => caller.machine()?,
             None => caller.run(&request.id, None)?,
         }
         let (sender, receiver) = tokio::sync::mpsc::channel(16);
-        let backend = self.backend.clone();
-        let actor = caller.actor;
+        let (backend, actor, limit) = (self.backend.clone(), caller.actor, caller.limit());
         tokio::spawn(async move {
-            let result = stream_run(backend, actor, request, sender.clone()).await;
+            let result = stream_run(backend, actor, request, limit, sender.clone()).await;
             if let Err(status) = result {
                 let _ = sender.send(Err(status)).await;
             }
         });
-        Ok(Response::new(Box::pin(
-            tokio_stream::wrappers::ReceiverStream::new(receiver),
-        )))
+        let events = Box::pin(tokio_stream::wrappers::ReceiverStream::new(receiver));
+        Ok(Response::new(self.authority(&caller).wrap(events)))
     }
 
     /// One object's bytes from the frame's offset; a header-only stream answers what is held.
@@ -509,10 +540,11 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
             .runs()
             .ok_or_else(|| Status::unimplemented("this machine takes no writes"))?;
         let actor = crate::machine_api::actor_id(caller.actor);
-        let mut frames = request.into_inner();
+        let mut frames = self.authority(&caller).wrap(Box::pin(request.into_inner()));
         let first = frames
-            .message()
-            .await?
+            .next()
+            .await
+            .transpose()?
             .ok_or_else(|| Status::invalid_argument("a write names its object first"))?;
         let (digest, length, offset) = (first.digest.clone(), first.length, first.offset);
         let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
@@ -533,7 +565,7 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
             if !data.is_empty() && sender.send(data).await.is_err() {
                 break;
             }
-            match frames.message().await? {
+            match frames.next().await.transpose()? {
                 Some(frame) => data = frame.data,
                 None => break,
             }
@@ -613,6 +645,9 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
             }
             Some(v1::read_request::Target::Triage(run)) => {
                 caller.run(&run, None)?;
+                if caller.limit().is_some() {
+                    return Err(Status::permission_denied("triage is the run owner's"));
+                }
                 let triage = Self::call(&self.backend, move |backend| {
                     backend.read_triage(
                         actor,
@@ -671,19 +706,26 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
         }
         let (sender, receiver) = tokio::sync::mpsc::channel(4);
         tokio::task::spawn_blocking(move || {
-            let mut bytes = bytes;
+            let (mut bytes, mut left) = (bytes, meta.length - offset);
+            let ended_early = || Err(Status::data_loss("output bytes ended early"));
             if sender.blocking_send(Ok(meta)).is_err() {
                 return;
             }
-            if std::io::copy(&mut (&mut bytes).take(offset), &mut std::io::sink()).is_err() {
-                let _ = sender.blocking_send(Err(Status::data_loss("output bytes ended early")));
+            if std::io::copy(&mut (&mut bytes).take(offset), &mut std::io::sink()).ok() != Some(offset) {
+                let _ = sender.blocking_send(ended_early());
                 return;
             }
             let mut buffer = vec![0; 1 << 20];
             loop {
                 match bytes.read(&mut buffer) {
-                    Ok(0) => return,
+                    Ok(0) => {
+                        if left > 0 {
+                            let _ = sender.blocking_send(ended_early());
+                        }
+                        return;
+                    }
                     Ok(n) => {
+                        left = left.saturating_sub(n as u64);
                         let frame = v1::ReadFrame {
                             data: buffer[..n].to_vec(),
                             ..Default::default()
@@ -699,17 +741,18 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
                 }
             }
         });
-        Ok(Response::new(Box::pin(
-            tokio_stream::wrappers::ReceiverStream::new(receiver),
-        )))
+        let frames = Box::pin(tokio_stream::wrappers::ReceiverStream::new(receiver));
+        Ok(Response::new(self.authority(&caller).wrap(frames)))
     }
 }
 
-/// Submit when asked, then follow the log until the outcome or the caller leaves.
+/// Submit when asked, then follow the log until the outcome or the caller leaves. An
+/// output-limited grant (`limit`) sees only what [`visible`] keeps.
 pub(super) async fn stream_run<B: MachineBackend>(
     backend: Arc<B>,
     actor: VerifiedActor,
     request: v1::RunRequest,
+    limit: Option<Grant>,
     sender: tokio::sync::mpsc::Sender<Result<v1::RunEvent, Status>>,
 ) -> Result<(), Status> {
     let id = request.id.clone();
@@ -725,8 +768,9 @@ pub(super) async fn stream_run<B: MachineBackend>(
         .map_err(|_| Status::internal("machine operation stopped"))?
         .map_err(refusal)?;
     }
-    let mut log = Log::default();
-    let mut after = request.after;
+    // The log is read from its start, so a reattach numbers each output's revisions and lists
+    // the outcome's outputs as the run made them; only entries past the cursor are sent.
+    let (mut log, mut after, cursor) = (Log::default(), 0, request.after);
     let (first_backend, first_id) = (backend.clone(), id.clone());
     let current = tokio::task::spawn_blocking(move || {
         first_backend.get(actor, query(&*first_backend, actor, &first_id)?)
@@ -759,20 +803,23 @@ pub(super) async fn stream_run<B: MachineBackend>(
         let mut ended = false;
         for event in page.events {
             after = after.max(event.sequence);
-            if let Some(mut converted) = log.event(event) {
-                if let Some(v1::run_event::Event::Outcome(outcome)) = &mut converted.event {
-                    ended = true;
-                    let (kept_backend, kept_id) = (backend.clone(), id.clone());
-                    outcome.measurements = tokio::task::spawn_blocking(move || {
-                        kept_backend.measurements(actor, query(&*kept_backend, actor, &kept_id)?)
-                    })
-                    .await
-                    .map_err(|_| Status::internal("machine operation stopped"))??
-                    .unwrap_or_default();
-                }
-                if sender.send(Ok(converted)).await.is_err() {
-                    return Ok(());
-                }
+            let Some(mut converted) = log.event(event) else { continue };
+            ended |= matches!(converted.event, Some(v1::run_event::Event::Outcome(_)));
+            let hidden = limit.as_ref().is_some_and(|grant| !visible(grant, &mut converted));
+            if converted.sequence <= cursor || hidden {
+                continue;
+            }
+            if let (Some(v1::run_event::Event::Outcome(outcome)), None) = (&mut converted.event, &limit) {
+                let (kept_backend, kept_id) = (backend.clone(), id.clone());
+                outcome.measurements = tokio::task::spawn_blocking(move || {
+                    kept_backend.measurements(actor, query(&*kept_backend, actor, &kept_id)?)
+                })
+                .await
+                .map_err(|_| Status::internal("machine operation stopped"))??
+                .unwrap_or_default();
+            }
+            if sender.send(Ok(converted)).await.is_err() {
+                return Ok(());
             }
         }
         if ended {
@@ -782,5 +829,18 @@ pub(super) async fn stream_run<B: MachineBackend>(
             return Ok(());
         }
         after = after.max(page.next_after);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A digest of 64 non-hex bytes is refused, not sliced mid-character.
+    #[test]
+    fn a_digest_is_ascii_hex() {
+        for invalid in ["é".repeat(32), format!("a{}a", "é".repeat(31)), "z".repeat(64)] {
+            let refusal = super::digest(&format!("sha256:{invalid}")).unwrap_err();
+            assert_eq!(refusal.code(), tonic::Code::InvalidArgument);
+        }
+        assert_eq!(super::digest(&format!("sha256:{}", "A".repeat(64))).unwrap(), vec![0xaa; 32]);
     }
 }
