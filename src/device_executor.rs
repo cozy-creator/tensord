@@ -220,6 +220,10 @@ pub enum DeviceCommand {
         /// tiers the executor reads no store. Older executors ignore it.
         #[serde(skip_serializing_if = "is_false")]
         model_sources: bool,
+        /// This machine stages layouts in part and hands over object files
+        /// (`sealed_stage`, `object_files`): an executor asks for them only when told so.
+        #[serde(skip_serializing_if = "is_false")]
+        staged_tiers: bool,
         /// `load_pinned/1`: the pinned budget, applied before any weight set registers.
         #[serde(skip_serializing_if = "Option::is_none")]
         pinned_bytes: Option<i64>,
@@ -384,6 +388,8 @@ pub enum Event {
 pub enum Kind {
     ModelSource,
     SealedTier,
+    SealedStage,
+    ObjectFiles,
     SealedPrefetch,
     DeviceTier,
     BudgetCell,
@@ -616,6 +622,8 @@ pub struct Frame {
     pub features: BTreeMap<String, Value>,
     /// `device_tier`: fds that follow the frame, one per chunk of `regions`.
     pub descriptors: u32,
+    /// `sealed_tier`/`sealed_stage`: the regions to stage (the ones the executor streams).
+    pub stage_regions: Option<Vec<u32>>,
     pub device: String,
     pub regions: Vec<crate::resident_custody::SharedRegion>,
     pub shared_bytes: u64,
@@ -741,6 +749,14 @@ pub struct Answer {
     pub stored: bool,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub reason: String,
+    /// `object_files`: the SHA-256 of the objects whose fds follow, in the order the executor
+    /// derives from its own plan (`HostTier::objects_digest`); the list itself would not fit a
+    /// control frame (SDXL's UNet: about 1,700 objects).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub objects_sha256: String,
+    /// `sealed_stage`: the regions staged or staging (the rest stay holes).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub staged: Vec<u32>,
 }
 fn is_zero_ms(value: &f64) -> bool {
     *value == 0.0
@@ -784,6 +800,8 @@ impl Answer {
             disputed: false,
             stored: false,
             reason: String::new(),
+            objects_sha256: String::new(),
+            staged: Vec::new(),
         }
     }
     pub fn ok(seq: u64) -> Self {
@@ -821,6 +839,16 @@ pub trait Services {
         fds: Vec<std::os::fd::OwnedFd>,
     ) -> io::Result<(Answer, Vec<std::os::fd::OwnedFd>)> {
         drop(fds);
+        Ok((Answer::unavailable(frame.seq), Vec::new()))
+    }
+    /// `object_files` (`host_tiers.staged/1`): the plan's memfd arrived with the request; the
+    /// verified object files follow the answer, one fd per `objects` entry.
+    fn object_files(
+        &mut self,
+        frame: &Frame,
+        plan: Option<File>,
+    ) -> io::Result<(Answer, Vec<File>)> {
+        drop(plan);
         Ok((Answer::unavailable(frame.seq), Vec::new()))
     }
 }
@@ -1775,6 +1803,25 @@ impl DeviceExecutor {
                     };
                     watch.serving(false);
                     write_frame(&mut self.stream, &answer)?;
+                }
+                Some(Event::Request) if frame.kind == Kind::ObjectFiles => {
+                    let plan = if frame.descriptor {
+                        Some(File::from(protocol::recv_fd(&self.stream)?))
+                    } else {
+                        None
+                    };
+                    watch.serving(true);
+                    let answered = services.object_files(&frame, plan);
+                    watch.serving(false);
+                    let (mut answer, out) = answered?;
+                    answer.event = "answer";
+                    answer.seq = frame.seq;
+                    answer.descriptor = false;
+                    answer.descriptors = out.len() as u64;
+                    write_frame(&mut self.stream, &answer)?;
+                    for file in &out {
+                        protocol::send_fd(&self.stream, file)?;
+                    }
                 }
                 Some(Event::Request) => {
                     // The machine's own answer time is not the executor's stillness.

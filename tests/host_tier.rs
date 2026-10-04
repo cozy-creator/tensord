@@ -234,11 +234,18 @@ fn sealed(body: &[u8]) -> File {
 struct Executor(Child);
 impl Executor {
     fn spawn(tier: &HostTier) -> (Self, u64) {
+        Self::spawn_as(tier, false)
+    }
+    /// One that reads a layout's holes from object files (`host_tiers.staged/1`).
+    fn spawn_staged(tier: &HostTier) -> (Self, u64) {
+        Self::spawn_as(tier, true)
+    }
+    fn spawn_as(tier: &HostTier, staged: bool) -> (Self, u64) {
         let child = Command::new("sleep").arg("1000").spawn().unwrap();
         // SAFETY: pidfd_open of our own live child.
         let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::c_int, 0) };
         assert!(pidfd >= 0);
-        let peer = tier.register_peer(unsafe { File::from_raw_fd(pidfd as i32) });
+        let peer = tier.register_peer(unsafe { File::from_raw_fd(pidfd as i32) }, staged);
         (Self(child), peer)
     }
     fn exit(mut self) {
@@ -294,6 +301,7 @@ fn ask(tier: &HostTier, peer: u64, fx: &Fixture) -> Option<File> {
         SealedRequest {
             sha256: &sha256,
             length,
+            stage: None,
         },
         plan,
     )
@@ -373,6 +381,7 @@ fn unheld_layouts_go_oldest_first_and_held_ones_never() {
             SealedRequest {
                 sha256: &sha256,
                 length,
+                stage: None,
             },
             plan,
         )
@@ -445,6 +454,7 @@ fn a_plan_outside_the_executors_selection_or_unsealed_is_refused() {
             SealedRequest {
                 sha256: &sha256,
                 length,
+                stage: None,
             },
             plan,
         )
@@ -457,7 +467,8 @@ fn a_plan_outside_the_executors_selection_or_unsealed_is_refused() {
             &[fx.grant()],
             SealedRequest {
                 sha256: "00",
-                length
+                length,
+                stage: None,
             },
             plan
         )
@@ -471,7 +482,8 @@ fn a_plan_outside_the_executors_selection_or_unsealed_is_refused() {
             &[fx.grant()],
             SealedRequest {
                 sha256: &format!("{:x}", Sha256::digest(body)),
-                length: 2
+                length: 2,
+                stage: None,
             },
             open
         )
@@ -484,7 +496,8 @@ fn a_plan_outside_the_executors_selection_or_unsealed_is_refused() {
             &[fx.grant()],
             SealedRequest {
                 sha256: &sha256,
-                length
+                length,
+                stage: None,
             },
             plan
         )
@@ -577,6 +590,7 @@ fn inside_a_256_mib_scope() {
             SealedRequest {
                 sha256: &sha256,
                 length,
+                stage: None,
             },
             plan,
         )
@@ -620,7 +634,7 @@ fn remembered_plans_refill_layouts_before_the_executor_asks() {
     assert_eq!(fs::read_dir(&plans).unwrap().count(), 1);
 
     let second = HostTier::new(fx.store.clone(), config, Box::new(Fixed(1 << 30))).unwrap();
-    second.prepare(vec![fx.grant()]);
+    second.prepare(vec![fx.grant()], false);
     // The executor would be importing now; its ask waits for the fill under way, or hits.
     let (_executor, b) = Executor::spawn(&second);
     fx.adopt(&ask(&second, b, &fx).expect("prefilled"));
@@ -642,7 +656,7 @@ fn remembered_plans_refill_layouts_before_the_executor_asks() {
 fn a_first_load_fills_into_memory_reserved_at_admission() {
     let fx = Fixture::new("reserve", &[3 * MIB, 40 * MIB]);
     let tier = tier(&fx, 1 << 30);
-    tier.prepare(vec![fx.grant()]);
+    tier.prepare(vec![fx.grant()], false);
     let (_executor, a) = Executor::spawn(&tier);
     // The ask waits for an allocation under way rather than allocating again.
     let granted = ask(&tier, a, &fx).expect("room");
@@ -679,6 +693,7 @@ fn a_prefetch_fills_while_the_executor_registers_and_the_ask_finds_it() {
     let request = SealedRequest {
         sha256: &sha256,
         length: body.len() as u64,
+        stage: None,
     };
     tier.prefetch(a, &[fx.grant()], request, sealed(&body))
         .unwrap();
@@ -754,6 +769,7 @@ fn a_failed_fill_is_an_error_for_its_adopters_and_leaves_the_tier() {
         SealedRequest {
             sha256: &sha256,
             length,
+            stage: None,
         },
         plan,
     );
@@ -868,4 +884,93 @@ fn inside_a_192_mib_scope() {
         "window: {} bytes, {} read; host {:?}",
         facts.window_bytes, facts.window_read_bytes, facts.host
     );
+}
+
+fn staged_ask(tier: &HostTier, peer: u64, fx: &Fixture, stage: &[u32]) -> File {
+    let (plan, sha256, length) = fx.plan(&["unet"]);
+    tier.seal(
+        peer,
+        &[fx.grant()],
+        SealedRequest {
+            sha256: &sha256,
+            length,
+            stage: Some(stage),
+        },
+        plan,
+    )
+    .unwrap()
+    .expect("a layout, staged in part")
+}
+
+/// The redesigned host tier: an executor that reads holes from object files gets only the
+/// regions it streams staged (the machine holds no copy of the rest), the verified object
+/// files for the holes, and more regions staged when its stream grows.
+#[test]
+fn a_staged_executor_gets_only_what_it_streams_staged_and_object_files_for_the_rest() {
+    let fx = Fixture::new("staged", &[8 * MIB; 4]);
+    let tier = tier(&fx, 1 << 30);
+    let (_executor, a) = Executor::spawn_staged(&tier);
+    let granted = staged_ask(&tier, a, &fx, &[0]);
+    let layout = fx.layout();
+    let host = tensorfs_plane::host::HostMem::adopt_sealed(granted.as_raw_fd(), &layout).unwrap();
+    host.wait_ready(0).unwrap();
+    assert!((1..4).all(|r| host.hole(r)), "regions 1-3 read the object files");
+    let facts = settled(&tier);
+    assert!(facts.charged_bytes <= 9 * MIB as u64, "one region staged, not four: {facts:?}");
+
+    // The holes' bytes: the verified object files, handed over read-only.
+    let (plan, sha256, length) = fx.plan(&["unet"]);
+    let request = SealedRequest { sha256: &sha256, length, stage: None };
+    let files = tier.object_files(a, &[fx.grant()], request, plan).unwrap();
+    assert!(!files.is_empty());
+    for (_, file) in &files {
+        // SAFETY: a scalar fcntl query on a descriptor we hold.
+        assert_eq!(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE, libc::O_RDONLY);
+    }
+    let source = tensorfs_plane::io::Source::files(files, false, 0);
+    let tally = tensorfs_plane::io::IoTally::default();
+    for r in 1..4 {
+        let region = &layout.regions[r];
+        let mut buf = vec![0u8; region.span as usize];
+        for it in &region.items {
+            // SAFETY: each item's range lies inside `buf`; one thread.
+            unsafe { source.read_item(it, buf.as_mut_ptr().add((it.offset - region.offset) as usize), tensorfs_plane::io::Mode::Cached, &tally) }.unwrap();
+        }
+        for part in layout.parts.iter().filter(|p| p.region as usize == r) {
+            let key = part.what.trim_start_matches("unet/").trim_end_matches("#value");
+            let n = fx.tensors.iter().find(|(k, _)| k == key).unwrap().1;
+            let at = (part.offset - region.offset) as usize;
+            assert!(buf[at..at + n] == bytes_of(key, n)[..], "{} differs", part.what);
+        }
+    }
+
+    // Its stream grows: region 2 is staged too, and only it.
+    let (plan, sha256, length) = fx.plan(&["unet"]);
+    let request = SealedRequest { sha256: &sha256, length, stage: Some(&[2]) };
+    assert_eq!(tier.stage(a, &[fx.grant()], request, plan).unwrap(), vec![2]);
+    host.wait_ready(2).unwrap();
+    assert!(host.hole(1) && host.hole(3));
+    let facts = settled(&tier);
+    assert!(facts.charged_bytes > 9 * MIB as u64 && facts.charged_bytes <= 17 * MIB as u64, "{facts:?}");
+    // An executor that reads no holes asks for the same layout: every region is staged for it.
+    let (_whole, b) = Executor::spawn(&tier);
+    assert!(ask(&tier, b, &fx).is_some());
+    for r in 0..4 {
+        host.wait_ready(r).unwrap();
+    }
+}
+
+/// No room at all: a staged executor gets a layout with nothing staged (every region reads
+/// the object files, the disk rung) instead of a window or a refusal.
+#[test]
+fn without_room_a_staged_executor_reads_every_region_from_the_files() {
+    let fx = Fixture::new("staged-none", &[8 * MIB; 4]);
+    let tier = tier(&fx, MIB as u64);
+    let (_executor, a) = Executor::spawn_staged(&tier);
+    let granted = staged_ask(&tier, a, &fx, &[0, 1, 2, 3]);
+    let host = tensorfs_plane::host::HostMem::adopt_sealed(granted.as_raw_fd(), &fx.layout()).unwrap();
+    assert!((0..4).all(|r| host.hole(r)));
+    let facts = settled(&tier);
+    assert_eq!((facts.windows, facts.ledger.windows_opened), (0, 0), "{facts:?}");
+    assert!(facts.charged_bytes < MIB as u64, "{facts:?}");
 }
