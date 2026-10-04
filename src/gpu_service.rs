@@ -2869,6 +2869,8 @@ pub(crate) fn stage_inputs(
         if input.media_type == TREE_MEDIA {
             let manifest = held_bytes(store, &input.digest, input.length)?;
             materialize_tree(store, identity, &manifest, &local)?;
+            // A payload names a tree by its field's ref or by its manifest digest.
+            staged.trees.insert(input.digest.clone(), (local.clone(), input.digest.clone()));
             staged.trees.insert(input.input_id.clone(), (local, input.digest.clone()));
             continue;
         }

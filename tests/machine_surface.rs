@@ -1525,10 +1525,11 @@ mod v1_api {
             kind: v1::RunKind::Job as i32,
             source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
             entrypoint: "count".into(),
-            payload: br#"{"data":"asset:data"}"#.to_vec(),
+            // As `cozy run --asset data=<dir>` sends it: the payload names the tree's manifest.
+            payload: serde_json::to_vec(&serde_json::json!({ "data": tree_digest })).unwrap(),
             inputs: vec![v1::InputFile {
-                field: "asset:data".into(),
-                digest: tree_digest,
+                field: "data".into(),
+                digest: tree_digest.clone(),
                 length: size,
                 media_type: "application/vnd.cozy.tree-manifest".into(),
                 order: 0,
