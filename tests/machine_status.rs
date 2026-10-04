@@ -133,6 +133,8 @@ async fn status_answers_identity_to_anyone_and_the_machine_to_its_owner() {
         .local_addr()
         .unwrap()
         .port();
+    // The store holds two models before the machine starts; Status lists them.
+    cozy_machine::held_models::fixture(&root.join("var/lib/tensorfs")).unwrap();
     let mut machine = boot(&root, port, "rental");
     let sealed = receipt(&mut machine, &root, port);
     let pem = std::fs::read(root.join("run/cozy/bootstrap/tls.crt")).unwrap();
@@ -180,6 +182,7 @@ async fn status_answers_identity_to_anyone_and_the_machine_to_its_owner() {
         assert_eq!(only.receipt, sealed, "the receipt the HTTPS route serves");
         assert!(only.capabilities.contains(&"update/1".to_string()));
         assert!(only.runs.is_empty() && only.gpus.is_empty() && only.idle_deadline_unix_ms == 0);
+        assert!(only.models.is_empty() && only.models_bytes == 0);
     }
     let refused = client.status(status(true, None)).await.unwrap_err();
     assert_eq!(
@@ -208,6 +211,14 @@ async fn status_answers_identity_to_anyone_and_the_machine_to_its_owner() {
         .disk
         .is_some_and(|d| d.total_bytes > 0 && d.free_bytes <= d.total_bytes));
     assert!(first.runs.is_empty() && first.environments.is_empty());
+    let models: Vec<_> = first
+        .models
+        .iter()
+        .map(|m| (m.repository.as_str(), m.total_bytes, m.unique_bytes))
+        .collect();
+    assert_eq!(models, [("acme/base", 1300, 300), ("local/mine", 1050, 50)]);
+    assert_eq!(first.models_bytes, 1350);
+    assert_eq!(first.models[0].checkpoints[0].lane, "fp8");
 
     // Holding the stream is not activity: no frame, and the ledger's deadline does not move.
     let before = deadline_on_disk(&root);

@@ -126,10 +126,13 @@ async fn frame<B: MachineBackend>(
     backend: &Arc<B>,
     actor: VerifiedActor,
 ) -> Result<v1::StatusFrame, Status> {
-    let backend = backend.clone();
-    let (runs, environments) = tokio::task::spawn_blocking(move || held(&*backend, actor))
-        .await
-        .map_err(|_| Status::internal("machine operation stopped"))??;
+    let (backend, store) = (backend.clone(), identity.store.clone());
+    let ((runs, environments), models) = tokio::task::spawn_blocking(move || {
+        let models = store.as_deref().map(crate::held_models::listing);
+        held(&*backend, actor).map(|held| (held, models.unwrap_or_default()))
+    })
+    .await
+    .map_err(|_| Status::internal("machine operation stopped"))??;
     let software = identity
         .updates
         .as_ref()
@@ -174,6 +177,8 @@ async fn frame<B: MachineBackend>(
         tensorfs: software.tensorfs,
         environments,
         disk: identity.store.as_deref().and_then(disk),
+        models: models.models,
+        models_bytes: models.bytes,
         ..identity_frame(identity)
     })
 }

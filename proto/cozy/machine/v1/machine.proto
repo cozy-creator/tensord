@@ -251,6 +251,20 @@ message StatusFrame {
   string tensorfs = 14;
   repeated Environment environments = 15;  // the caller's held package installations
   Disk disk = 16;                   // the filesystem holding the machine's store
+  repeated Model models = 17;       // the models the machine's store holds
+  uint64 models_bytes = 18;         // their bytes together, shared content counted once
+}
+message Model {
+  string repository = 1;            // org/name; org "local" is a local alias
+  uint64 total_bytes = 2;           // everything this repository reaches
+  uint64 unique_bytes = 3;          // reached by no other held repository
+  repeated Checkpoint checkpoints = 4;
+}
+message Checkpoint {
+  string release = 1;               // empty for a local alias
+  string lane = 2;
+  string manifest = 3;              // sha256:<hex>
+  bool yanked = 4;
 }
 message Gpu {
   uint32 index = 1;

@@ -6,6 +6,7 @@ pub mod child_launcher;
 pub mod device_executor;
 pub mod execution;
 pub mod gpu_service;
+pub mod held_models;
 pub mod host_memory;
 pub mod host_tier;
 pub mod hub;
