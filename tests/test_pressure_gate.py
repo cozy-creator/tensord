@@ -76,6 +76,21 @@ class PhysicalRefusals(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "already released"):
             self.capture()
 
+    def test_unreadable_host_pss_stays_unknown_after_mandatory_gpu_checks(self):
+        original = pathlib.Path.read_text
+
+        def read(path, *args, **kwargs):
+            if path.name == "smaps_rollup":
+                raise PermissionError("executor became nondumpable")
+            return original(path, *args, **kwargs)
+
+        with patch.object(pathlib.Path, "read_text", read):
+            actual = self.capture()
+        self.assertEqual(actual["holder_pid"], self.pid)
+        self.assertEqual(actual["free_bytes"], 3 << 30)
+        self.assertEqual(actual["process_memory"][str(self.pid)]["observation"],
+                         "host_memory_unavailable")
+
 
 class SamplingEvidence(unittest.TestCase):
     def test_early_observer_gap_retained_without_inventing_steps(self):
