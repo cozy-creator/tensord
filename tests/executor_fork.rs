@@ -169,6 +169,7 @@ fn a_forked_executor_is_sealed_serves_and_is_reaped_with_its_status() {
                     stages: false,
                     cap_bytes: None,
                     inputs: Default::default(),
+                    trees: Default::default(),
                     floor_bytes: None,
                     activation_bytes: Default::default(),
                     device_weights: None,

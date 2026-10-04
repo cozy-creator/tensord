@@ -1418,6 +1418,63 @@ mod v1_api {
         assert_eq!(uploaded, declared);
     }
 
+    /// An input tree (`--input-tree ref=dir`, a `Tree` field): each file and the tree's manifest
+    /// written with Write, the manifest named as an input of the tree media type under the
+    /// payload's ref; the machine materializes the directory and the callable reads it.
+    #[tokio::test]
+    async fn a_written_input_tree_reaches_the_callable_as_a_directory() {
+        let (machine, tools) = installing_machine().await;
+        let mut client = client(&machine).await;
+        let all = cap(Grant {
+            action: MACHINE.into(),
+            ..Default::default()
+        });
+        let manifest = write_package(&mut client, &all, "cpu_tree", "local/cozy-machine-cpu-tree").await;
+        let files: [(&str, &[u8]); 2] = [("a.txt", b"alpha"), ("nested/b.bin", b"\x00\x01beta")];
+        let mut entries = vec![];
+        for (path, body) in files {
+            let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(body));
+            let length = body.len() as u64;
+            assert_eq!(write(&mut client, &all, &digest, length, 0, body).await.unwrap(), length);
+            entries.push(serde_json::json!({"kind": "file", "path": path,
+                "blob": {"sha256": digest.trim_start_matches("sha256:"), "length": length}}));
+        }
+        let tree = serde_json::to_vec(&serde_json::json!({"entries": entries})).unwrap();
+        let tree_digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&tree));
+        let size = tree.len() as u64;
+        assert_eq!(write(&mut client, &all, &tree_digest, size, 0, &tree).await.unwrap(), size);
+        let spec = v1::RunSpec {
+            source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
+            entrypoint: "count".into(),
+            payload: br#"{"data":"asset:data"}"#.to_vec(),
+            inputs: vec![v1::InputFile {
+                field: "asset:data".into(),
+                digest: tree_digest,
+                length: size,
+                media_type: "application/vnd.cozy.tree-manifest".into(),
+                order: 0,
+            }],
+            owner: "alice".into(),
+            ..Default::default()
+        };
+        let request = v1::RunRequest {
+            id: "tree".into(),
+            after: 0,
+            spec: Some(spec),
+        };
+        let events = collect(client.run(authorized(request, &all)).await.unwrap().into_inner())
+            .await
+            .unwrap();
+        let done = outcome(&events);
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        assert_eq!(result["files"], serde_json::json!(["a.txt", "nested/b.bin"]), "{result}");
+        let mut whole = b"alpha".to_vec();
+        whole.extend_from_slice(b"\x00\x01beta");
+        assert_eq!(result["sha256"], tensorfs_core::sha256::hex_digest(&whole));
+        let _ = fs::remove_dir_all(tools);
+    }
+
     fn outcome(events: &[v1::RunEvent]) -> v1::Outcome {
         match &events.last().unwrap().event {
             Some(v1::run_event::Event::Outcome(outcome)) => outcome.clone(),
