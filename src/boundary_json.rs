@@ -8,6 +8,29 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Value, serde_json::Error> {
     serde_json::from_slice::<Unique>(bytes).map(|value| value.0)
 }
 
+/// Stable application JSON for intent and results. Keep exact integer precision and number
+/// kind: JCS converts every integer to f64 and can merge distinct valid seeds. Object key
+/// order and spelling/whitespace are not semantics; arrays and typed numbers are.
+pub(crate) fn intent_bytes(value: &Value) -> Result<Vec<u8>, serde_json::Error> {
+    fn ordered(value: &Value) -> Value {
+        match value {
+            Value::Object(fields) => {
+                let mut fields: Vec<_> = fields.iter().collect();
+                fields.sort_by(|(a, _), (b, _)| a.cmp(b));
+                Value::Object(
+                    fields
+                        .into_iter()
+                        .map(|(key, value)| (key.clone(), ordered(value)))
+                        .collect(),
+                )
+            }
+            Value::Array(items) => Value::Array(items.iter().map(ordered).collect()),
+            value => value.clone(),
+        }
+    }
+    serde_json::to_vec(&ordered(value))
+}
+
 struct Unique(Value);
 impl<'de> Deserialize<'de> for Unique {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -78,5 +101,28 @@ mod tests {
         assert!(parse(br#"{"samples":[{"seed":1,"seed":2}]}"#).is_err());
         assert!(parse(br#"{"seed":19} {}"#).is_err());
         assert!(parse(br#"{"seed":1e999}"#).is_err());
+    }
+
+    #[test]
+    fn intent_preserves_large_integers_and_number_kind_while_ignoring_formatting() {
+        let first = parse(br#" { "nested":{"z":2,"a":1}, "seed":9007199254740993 } "#).unwrap();
+        let formatted = parse(br#"{"seed":9007199254740993,"nested":{"a":1,"z":2}}"#).unwrap();
+        let different = parse(br#"{"seed":9007199254740992,"nested":{"a":1,"z":2}}"#).unwrap();
+        assert_eq!(
+            intent_bytes(&first).unwrap(),
+            intent_bytes(&formatted).unwrap()
+        );
+        assert_ne!(
+            intent_bytes(&first).unwrap(),
+            intent_bytes(&different).unwrap()
+        );
+        assert_ne!(
+            intent_bytes(&parse(b"1").unwrap()).unwrap(),
+            intent_bytes(&parse(b"1.0").unwrap()).unwrap()
+        );
+        assert_eq!(
+            intent_bytes(&parse(b"18446744073709551615").unwrap()).unwrap(),
+            b"18446744073709551615"
+        );
     }
 }
