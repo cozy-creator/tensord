@@ -256,6 +256,10 @@ pub async fn serve<B: MachineBackend>(
         .accept_http1(true)
         // Fixed receive windows (Write's uploads): BDP probing from 64 KiB lost 16% to a fixed
         // window on a lossy 160 ms link (G/read-bench); 16 MiB covers 150 Mbit/s at 800 ms.
+        // A ping every 20 s keeps NAT mappings on a client's path alive through a quiet run, and
+        // one left unanswered for 20 s ends a dead connection (its runs go on; a Run attaches).
+        .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
+        .http2_keepalive_timeout(Some(std::time::Duration::from_secs(20)))
         .initial_stream_window_size(Some(16 << 20))
         .initial_connection_window_size(Some(32 << 20))
         .tls_config(tls)?
