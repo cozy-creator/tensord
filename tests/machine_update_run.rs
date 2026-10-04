@@ -72,7 +72,11 @@ fn hold(root: &Path, bytes: &[u8]) -> String {
     let owner = SigningKey::from_bytes(&OWNER).verifying_key();
     cozy_machine::journal::Journal::open(&engine.join("execution"))
         .unwrap()
-        .bind_object(&tensorfs_core::sha256::hex(owner.as_bytes()), &object)
+        // A rental's keys are its owner's: one actor, whichever key writes.
+        .bind_object(
+            &tensorfs_core::sha256::hex(&cozy_machine::api::auth::Holder::owner(owner).actor),
+            &object,
+        )
         .unwrap();
     format!("sha256:{sha256}")
 }
