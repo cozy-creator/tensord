@@ -92,6 +92,17 @@ impl Readiness {
         self.state.lock().unwrap().sealed.clone()
     }
 
+    /// The facts sealed for this boot, including an in-memory foreground service.
+    pub fn payload(&self) -> Option<Vec<u8>> {
+        self.state
+            .lock()
+            .unwrap()
+            .sealed
+            .as_ref()
+            .and_then(|raw| parse(raw).ok())
+            .map(|envelope| envelope.payload)
+    }
+
     /// The GPUs this boot's sealed receipt names.
     pub fn gpus(&self) -> Vec<Gpu> {
         #[derive(serde::Deserialize)]

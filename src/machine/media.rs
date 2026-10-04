@@ -40,12 +40,17 @@ pub fn listen(
     Ok(Some(listener))
 }
 
-fn mapped(port: u16, env: &HashMap<String, String>) -> Option<String> {
+fn mapped(port: u16, env: &HashMap<String, String>) -> io::Result<Option<String>> {
     if let Some(address) = env.get("COZY_WEBRTC_PUBLIC_ADDRESS") {
-        return address
-            .parse::<SocketAddr>()
-            .ok()
-            .map(|address| address.to_string());
+        let address = address.parse::<SocketAddr>().map_err(|_| {
+            io::Error::other("COZY_WEBRTC_PUBLIC_ADDRESS must be an IPv4 host:port")
+        })?;
+        if !address.is_ipv4() || address.port() == 0 {
+            return Err(io::Error::other(
+                "COZY_WEBRTC_PUBLIC_ADDRESS must name a nonzero IPv4 port",
+            ));
+        }
+        return Ok(Some(address.to_string()));
     }
     for (host, key) in [
         ("RUNPOD_PUBLIC_IP", format!("RUNPOD_TCP_PORT_{port}")),
@@ -54,17 +59,22 @@ fn mapped(port: u16, env: &HashMap<String, String>) -> Option<String> {
         if let (Some(host), Some(port)) = (env.get(host), env.get(&key)) {
             if let (Ok(host), Ok(port)) = (host.parse::<IpAddr>(), port.parse::<u16>()) {
                 if port > 0 {
-                    return Some(SocketAddr::new(host, port).to_string());
+                    if !host.is_ipv4() {
+                        return Err(io::Error::other(
+                            "the provider playback mapping must be IPv4",
+                        ));
+                    }
+                    return Ok(Some(SocketAddr::new(host, port).to_string()));
                 }
             }
         }
     }
-    None
+    Ok(None)
 }
-fn addresses(port: u16) -> Vec<String> {
+fn addresses(port: u16) -> io::Result<Vec<String>> {
     let env = std::env::vars().collect();
-    if let Some(mapped) = mapped(port, &env) {
-        return vec![mapped];
+    if let Some(mapped) = mapped(port, &env)? {
+        return Ok(vec![mapped]);
     }
     let mut addresses = vec![];
     if let Ok(interfaces) = nix::ifaddrs::getifaddrs() {
@@ -72,11 +82,7 @@ fn addresses(port: u16) -> Vec<String> {
             let Some(address) = interface.address else {
                 continue;
             };
-            let ip = if let Some(v4) = address.as_sockaddr_in() {
-                Some(IpAddr::V4(v4.ip()))
-            } else {
-                address.as_sockaddr_in6().map(|v6| IpAddr::V6(v6.ip()))
-            };
+            let ip = address.as_sockaddr_in().map(|v4| IpAddr::V4(v4.ip()));
             if let Some(ip) = ip {
                 if !ip.is_unspecified()
                     && !ip.is_multicast()
@@ -94,16 +100,21 @@ fn addresses(port: u16) -> Vec<String> {
         )
     });
     addresses.dedup();
-    addresses
+    Ok(addresses)
 }
 
 pub fn descriptor(identity: &MachineIdentity) -> Option<v1::WebRtc> {
-    let attested = identity.readiness.attested()?;
+    let attested = identity.readiness.payload()?;
     let value: serde_json::Value = serde_json::from_slice(&attested).ok()?;
     let port = u16::try_from(value["webrtc"]["port"].as_u64()?).ok()?;
+    let (addresses, unavailable_reason) = match addresses(port) {
+        Ok(addresses) => (addresses, String::new()),
+        Err(error) => (vec![], error.to_string()),
+    };
     Some(v1::WebRtc {
         port: port as u32,
-        addresses: addresses(port),
+        addresses,
+        unavailable_reason,
         fingerprint: tensorfs_core::sha256::hex_digest(&identity.cert_der),
     })
 }
@@ -137,7 +148,45 @@ mod tests {
             ("PUBLIC_IPADDR".into(), "203.0.113.7".into()),
             ("VAST_TCP_PORT_8085".into(), "30001".into()),
         ]);
-        assert_eq!(mapped(8085, &env).as_deref(), Some("203.0.113.7:30001"));
-        assert!(mapped(8086, &env).is_none());
+        assert_eq!(
+            mapped(8085, &env).unwrap().as_deref(),
+            Some("203.0.113.7:30001")
+        );
+        assert!(mapped(8086, &env).unwrap().is_none());
+    }
+    #[test]
+    fn advertised_ipv4_addresses_accept_real_connections_and_bad_config_is_explicit() {
+        let root = std::env::temp_dir().join(format!("cm-media-connect-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let listener = listen(&root, None, true).unwrap().unwrap();
+        for address in addresses(listener.local_addr().unwrap().port()).unwrap() {
+            let address = address.parse::<SocketAddr>().unwrap();
+            assert!(address.is_ipv4());
+            assert!(std::net::TcpStream::connect_timeout(
+                &address,
+                std::time::Duration::from_secs(2)
+            )
+            .is_ok());
+        }
+        let env = HashMap::from([("COZY_WEBRTC_PUBLIC_ADDRESS".into(), "invalid".into())]);
+        assert!(mapped(8085, &env).is_err());
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[91; 32]);
+        let identity = MachineIdentity::ephemeral(
+            "descriptor".into(),
+            vec![signer.verifying_key()],
+            vec![7; 32],
+        )
+        .unwrap();
+        identity.readiness.seal(serde_json::to_vec(&serde_json::json!({"boot_id":identity.authority.boot_id,"webrtc":{"port":listener.local_addr().unwrap().port()}})).unwrap()).unwrap();
+        let descriptor = descriptor(&identity).unwrap();
+        assert_eq!(
+            descriptor.port,
+            listener.local_addr().unwrap().port() as u32
+        );
+        assert_eq!(
+            descriptor.fingerprint,
+            tensorfs_core::sha256::hex_digest(&identity.cert_der)
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -259,6 +259,7 @@ message WebRTC {
   uint32 port = 1;                  // local listener, stable on persistent machines
   repeated string addresses = 2;   // host:port, LAN/Tailscale or configured provider mapping
   string fingerprint = 3;          // SHA256 hex of this machine's DTLS certificate
+  string unavailable_reason = 4;   // malformed address config affects playback only
 }
 message Model {
   string repository = 1;            // org/name; org "local" is a local alias
