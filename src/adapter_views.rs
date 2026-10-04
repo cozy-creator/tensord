@@ -638,10 +638,11 @@ fn derive(
 }
 
 /// Adapter views manage themselves like the machine's other caches (`reclaim`): a view
-/// unused for the TTL, or idle under storage pressure, loses its repository, and GC then
-/// takes its header and manifest. A view a live executor, an unfinished run or a
-/// preparation names (`keep`) is never touched. Returns the views removed.
-pub fn evict(store: &Store, keep: &[String], pressure: bool) -> io::Result<usize> {
+/// unused for the TTL loses its repository, and GC then takes its header and manifest. A
+/// low disk takes none early: a view shares its closure with what it adapts. A view a live
+/// executor, an unfinished run or a preparation names (`keep`) is never touched. Returns
+/// the views removed.
+pub fn evict(store: &Store, keep: &[String]) -> io::Result<usize> {
     let mut removed = 0;
     let directory = store.root().join("repos").join("local");
     let entries = match std::fs::read_dir(&directory) {
@@ -663,7 +664,7 @@ pub fn evict(store: &Store, keep: &[String], pressure: bool) -> io::Result<usize
             .ok()
             .and_then(|modified| SystemTime::now().duration_since(modified).ok())
             .unwrap_or_default();
-        if age <= crate::reclaim::TTL && !(pressure && age > crate::reclaim::IDLE) {
+        if age <= crate::reclaim::TTL {
             continue;
         }
         let Ok(body) = std::fs::read(entry.path()) else {
@@ -842,16 +843,14 @@ mod tests {
         let view = compose(&store, &base, &selection).unwrap();
         let hour = std::time::Duration::from_secs(3600);
 
-        // In use, or young without pressure: kept.
+        // Young, or in use: kept.
         unused_for(&store, &view.repository, hour);
-        assert_eq!(evict(&store, &[id(&view.manifest)], true).unwrap(), 0);
-        assert_eq!(evict(&store, &[], false).unwrap(), 0);
+        assert_eq!(evict(&store, &[]).unwrap(), 0);
         unused_for(&store, &view.repository, crate::reclaim::TTL + hour);
-        assert_eq!(evict(&store, &[id(&view.manifest)], false).unwrap(), 0);
-        // Past the TTL (or idle under pressure) and unused: its repository goes, then GC
-        // takes the view and nothing else.
-        unused_for(&store, &view.repository, hour);
-        assert_eq!(evict(&store, &[], true).unwrap(), 1);
+        assert_eq!(evict(&store, &[id(&view.manifest)]).unwrap(), 0);
+        // Past the TTL and unused: its repository goes, then GC takes the view and nothing
+        // else.
+        assert_eq!(evict(&store, &[]).unwrap(), 1);
         collect();
         assert!(!held(&view.manifest), "the view outlived its repository");
         assert!(held(&base) && held(&lora));
@@ -963,9 +962,10 @@ mod tests {
             .obj;
         let swept = service.reclaim();
         assert_eq!(swept.adapter_views, 1, "{swept:?}");
-        if crate::reclaim::Disk::measure(store.root())
+        if crate::reclaim::measure(store.root())
             .unwrap()
-            .pressure()
+            .short()
+            .is_some()
         {
             assert!(swept.store_bytes >= garbage.length, "{swept:?}");
             assert!(!store.object_path(&garbage.sha256).exists());

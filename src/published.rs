@@ -345,10 +345,7 @@ impl Publisher {
             message: e.0,
         })?;
         let _fetching = self.fetch(vec![manifest.to_string()]);
-        let keep = match service.gpu() {
-            Some(gpu) => self.protected(service, &gpu),
-            None => self.fetching.lock().unwrap().keys().cloned().collect(),
-        };
+        let keep = self.caches(service).keep;
         ensure(&self.store, &catalog, repository, manifest, &keep, bytes)
             .map_err(|(code, message)| Refused { code, message })
     }
@@ -364,23 +361,17 @@ impl Publisher {
         }
     }
 
-    /// The store's share of the machine's self-managing caches: idle adapter views lose
-    /// their repositories, then TensorFS relieves storage pressure under its GC policy.
-    /// Neither evicts what live executors read, unfinished runs prepared, or preparations
-    /// are fetching. Returns (views removed, bytes collected).
-    pub fn reclaim(&self, service: &Service) -> io::Result<(usize, u64)> {
+    /// The store's share of the machine's self-managing caches (`reclaim`), with what it
+    /// must keep: what live executors read, unfinished runs prepared, and preparations fetch.
+    pub fn caches(&self, service: &Service) -> crate::reclaim::StoreCaches<'_> {
         let keep = match service.gpu() {
             Some(gpu) => self.protected(service, &gpu),
             None => self.fetching.lock().unwrap().keys().cloned().collect(),
         };
-        let pressure = crate::reclaim::Disk::measure(self.store.root())?.pressure();
-        let views = crate::adapter_views::evict(&self.store, &keep, pressure)?;
-        let relief =
-            tensorfs_core::ensure::relieve(&self.store, &keep).map_err(io::Error::other)?;
-        if let Some(unable) = relief.unable {
-            eprintln!("store relief: a GC tier could not run: {unable}");
+        crate::reclaim::StoreCaches {
+            store: &self.store,
+            keep,
         }
-        Ok((views, relief.collected_bytes))
     }
 
     /// What a download's GC must never evict: what live executors read, every unfinished
@@ -1170,7 +1161,7 @@ fn make_source(
             cancellation: None,
         },
     )
-    .map_err(|e| ("model_source_failed", e.to_string()))
+    .map_err(|e| refused("model_source_failed", e))
 }
 
 /// Download one exact checkpoint; `keep` names what its GC must not evict (`protected`).
@@ -1198,7 +1189,15 @@ fn ensure(
     request.on_event = Some(&on_event);
     tensorfs_core::ensure::ensure(&request)
         .map(drop)
-        .map_err(|e| ("model_download_failed", e.to_string()))
+        .map_err(|e| refused("model_download_failed", e))
+}
+
+/// A TensorFS refusal as a run's reason; a download the disk cannot fit is its own.
+fn refused(code: &'static str, refusal: tensorfs_core::err::Refusal) -> Failure {
+    match refusal.code {
+        tensorfs_core::err::Code::CAPACITY_EXHAUSTED => ("machine_disk_full", refusal.to_string()),
+        _ => (code, refusal.to_string()),
+    }
 }
 
 /// One caller adapter's exact checkpoint at the Hub (the worker's `checkpoint()` for an

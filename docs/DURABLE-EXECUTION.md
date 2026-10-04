@@ -118,14 +118,20 @@ Reclamation: the run's spool (`staging/<id>`, the executor's own output director
 before the run's terminal state is written. `results/<id>` is removed when the client releases
 retention and the store holds the public products. The caches manage themselves (`reclaim.rs`, at
 start and every 10 minutes; no purge verb): crash-leftover spools of settled runs go at once;
-logs, collected results and generations go after a 7-day TTL (a generation's last use is its
-`.hold` mtime) or, least recently used first, under the host's storage pressure (below 1/10 of
-the filesystem free, until above 1/5: TensorFS's thresholds). Never evicted: uncollected results,
-journal rows, a generation any run or executor holds (its `.hold` lock) or an installation or
-configured package names. Under pressure the persistent kernel store goes too, least recently
-used first (one compiled kernel, or one generation's torch kernels), before generations and never
-while an executor of that identity is alive. Below the reserve, max(1 GiB, 1/50), an executor's
-compiled kernels go to its run-scoped JIT directory instead of the persistent store.
+logs, collected results, generations (last use: `.hold` mtime), compiled kernels (last read or
+write) and cached models go 7 days after their last use. A disk is low when no more than
+TensorFS's reserve is free (2% of the filesystem within 1 to 10 GiB; `ensure::Disk`). A low disk
+drops a plan that lifts it back above the reserve, or only the store's garbage when nothing
+covers that: collected results, settled logs, memoized stages, generations idle for a sweep
+period, then the fewest least recently used cached models, compiled kernels last and only if
+they alone cover what is still missing. Only bytes an unlink frees count: single-link files this
+process does not hold open, on the measured filesystem. Never evicted: uncollected results,
+journal rows, a generation any run or executor holds (its `.hold` lock) or an installation,
+unfinished run or configured package names, a model a live executor, unfinished run or
+preparation names, a kernel namespace a live executor or kernel boot holds (`kernels/.u<uid>.hold`,
+shared; the sweep takes it exclusively). On a low disk an executor's compiled kernels go to its
+run-scoped JIT directory instead of the persistent store, and a download the disk cannot fit
+fails as `machine_disk_full`.
 
 Write objects: each verified object gets a TensorFS object root (`roots/objects/<sha>.json`)
 before its Write is acknowledged, and a run's references (`run_objects`: its inputs, tree members

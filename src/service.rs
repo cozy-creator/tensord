@@ -336,44 +336,39 @@ impl Service {
             self.engine.wait_activity(epoch, Some(SWEEP_EVERY));
         }
     }
-    /// Caches manage themselves (`reclaim`): TTL and storage pressure, never a purge verb.
+    /// Caches manage themselves (`reclaim`): a TTL and a low disk, never a purge verb.
     pub fn reclaim(&self) -> crate::reclaim::Swept {
         *self.swept.lock().unwrap() = std::time::Instant::now();
-        // Released Write roots first, so the store's relief can collect their bytes.
+        // Released Write roots first, so the store's GC can collect their bytes.
         if let Some(jobs) = self.jobs() {
             if let Err(error) = jobs.sweep_objects() {
                 eprintln!("reclaim object roots: {error}");
             }
         }
-        let bound = self.engine.bound_generations().map(|mut bound| {
-            if let Some(gpu) = self.gpu() {
+        let sweep = || -> io::Result<crate::reclaim::Swept> {
+            let gpu = self.gpu();
+            let mut bound = self.engine.bound_generations()?;
+            if let Some(gpu) = &gpu {
                 bound.extend(gpu.config().packages.iter().map(|p| p.generation.clone()));
             }
-            bound
-        });
-        let kernels = self.gpu().map(|gpu| gpu.kernel_caches());
-        match bound.and_then(|bound| {
-            crate::reclaim::sweep(&self.engine, &self.catalog, &bound, kernels.as_ref())
-        }) {
-            Ok(mut swept) => {
-                if let Some(jobs) = self.jobs() {
-                    swept.scratch = jobs.sweep_scratch(&self.engine);
-                }
-                if let Some(gpu) = self.gpu() {
-                    let disk = || crate::reclaim::Disk::measure(&self.engine.root);
-                    let pressure = disk().is_ok_and(|disk| disk.pressure());
-                    let relieved = || disk().is_ok_and(|disk| disk.relieved());
-                    swept.memo = gpu.memo().sweep(pressure, relieved);
-                }
-                let publisher = self.publisher.lock().unwrap().clone();
-                match publisher.map(|publisher| publisher.reclaim(self)) {
-                    Some(Ok((views, bytes))) => {
-                        swept.adapter_views = views;
-                        swept.store_bytes = bytes;
-                    }
-                    Some(Err(error)) => eprintln!("reclaim store: {error}"),
-                    None => {}
-                }
+            let kernels = gpu.as_ref().map(|gpu| gpu.kernel_caches());
+            let publisher = self.publisher.lock().unwrap().clone();
+            let mut swept = crate::reclaim::sweep(&crate::reclaim::Caches {
+                engine: &self.engine,
+                catalog: &self.catalog,
+                bound: &bound,
+                kernels: kernels.as_ref(),
+                memo: gpu.as_ref().map(|gpu| gpu.memo()),
+                store: publisher.as_ref().map(|publisher| publisher.caches(self)),
+                disk: &|| crate::reclaim::measure(&self.engine.root),
+            })?;
+            if let Some(jobs) = self.jobs() {
+                swept.scratch = jobs.sweep_scratch(&self.engine);
+            }
+            Ok(swept)
+        };
+        match sweep() {
+            Ok(swept) => {
                 if swept != crate::reclaim::Swept::default() {
                     eprintln!("reclaimed {swept:?}");
                 }

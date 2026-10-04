@@ -1193,7 +1193,8 @@ fn a_newer_or_damaged_row_never_hides_the_rest_of_the_journal() {
 
 fn age(path: &std::path::Path, days: u64) {
     let when = std::time::SystemTime::now() - Duration::from_secs(days * 24 * 60 * 60);
-    fs::File::open(path).unwrap().set_modified(when).unwrap();
+    let times = fs::FileTimes::new().set_accessed(when).set_modified(when);
+    fs::File::open(path).unwrap().set_times(times).unwrap();
 }
 
 #[test]
@@ -1262,20 +1263,31 @@ fn caches_expire_but_held_named_and_uncollected_work_stays() {
     }
     let caches = reclaim::KernelCaches {
         root: kernels.clone(),
-        busy: std::collections::HashSet::from(["u2".to_string()]),
     };
-    let swept = reclaim::sweep(&fixture.engine, &catalog, &bound, Some(&caches)).unwrap();
-    assert_eq!((swept.staging, swept.results, swept.generations), (1, 1, 1), "{swept:?}");
-    // Kernels go only under storage pressure, least recently used first, never a live
-    // executor's namespace.
-    let pressure = reclaim::Disk::measure(&fixture.root).unwrap().pressure();
+    // A live executor holds its namespace.
+    let executor = reclaim::kernel_hold(&kernels, "u2").unwrap();
+    fs2::FileExt::lock_shared(&executor).unwrap();
+    let swept = reclaim::sweep(&reclaim::Caches {
+        engine: &fixture.engine,
+        catalog: &catalog,
+        bound: &bound,
+        kernels: Some(&caches),
+        memo: None,
+        store: None,
+        disk: &|| reclaim::measure(&fixture.root),
+    })
+    .unwrap();
+    assert_eq!(
+        (swept.staging, swept.results, swept.generations),
+        (1, 1, 1),
+        "{swept:?}"
+    );
+    // A compiled kernel unused for the TTL goes; a recent one and a held namespace's stay.
+    assert_eq!(swept.kernels, 1, "{swept:?}");
+    assert!(!kernels.join("u1/triton/old").exists());
+    assert!(kernels.join("u1/triton/new").exists());
     assert!(kernels.join("u2/triton/busy").exists());
-    if pressure {
-        assert!(!kernels.join("u1/triton/old").exists(), "{swept:?}");
-    } else {
-        assert_eq!(swept.kernels, 0);
-        assert!(kernels.join("u1/triton/old").exists());
-    }
+    drop(executor);
     assert!(!state.join("staging").join(&collected).exists());
     assert!(state.join("staging").join(&queued).exists());
     assert!(!state.join("results").join(&collected).exists());

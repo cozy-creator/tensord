@@ -522,31 +522,10 @@ impl GpuPool {
         manifests.dedup();
         manifests
     }
-    /// The kernel store and the namespaces live executors and kernel boots use. The pool's
-    /// executors share one identity; a call in progress (the sessions lock is held) counts
-    /// as live.
+    /// The kernel store; live executors and kernel boots hold their namespace's lock.
     pub fn kernel_caches(&self) -> crate::reclaim::KernelCaches {
-        let uid = self
-            .config
-            .identity
-            .map_or_else(|| unsafe { libc::geteuid() }, |identity| identity.uid);
-        let live = match (
-            self.sessions.try_lock(),
-            self.zygotes.try_lock(),
-            self.kernel_boots.try_lock(),
-        ) {
-            (Ok(sessions), Ok(zygotes), Ok(boots)) => {
-                !sessions.is_empty() || !zygotes.is_empty() || boots.values().any(Option::is_some)
-            }
-            _ => true,
-        };
         crate::reclaim::KernelCaches {
             root: self.root.join("kernels"),
-            busy: if live {
-                std::collections::HashSet::from([format!("u{uid}")])
-            } else {
-                std::collections::HashSet::new()
-            },
         }
     }
     /// The first GPU's ledger: every plan runs there (groups take the first K), so it also
@@ -1267,6 +1246,7 @@ impl GpuPool {
                 .stdin(std::process::Stdio::null())
                 .stdout(output.try_clone()?)
                 .stderr(output.try_clone()?);
+            crate::launch_identity::inherit(&mut command, &[seal.kernel_hold.as_ref()]);
             let child = self.launcher.spawn(command)?;
             let birth = crate::execution::process_birth(child.id())?;
             let boot = crate::process::Exact::open(&birth)?

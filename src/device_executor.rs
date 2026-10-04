@@ -1318,19 +1318,14 @@ impl DeviceExecutor {
             .stdin(Stdio::null())
             .stdout(File::create(config.root.join("stdout.log"))?)
             .stderr(File::create(config.root.join("stderr.log"))?);
-        if let Some(hold) = &config.generation_hold {
-            let fd = hold.as_raw_fd();
-            // SAFETY: only async-signal-safe fcntl; this retained shared hold survives core death.
-            unsafe {
-                command.pre_exec(move || {
-                    if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
-                        Err(io::Error::last_os_error())
-                    } else {
-                        Ok(())
-                    }
-                });
-            }
-        }
+        // Its generation and kernel namespace stay held while it lives, past this machine's death.
+        crate::launch_identity::inherit(
+            &mut command,
+            &[
+                config.generation_hold.as_ref(),
+                config.seal.kernel_hold.as_ref(),
+            ],
+        );
         let child = match launcher {
             Some(launcher) => launcher.spawn(command)?,
             None => command.spawn()?,
