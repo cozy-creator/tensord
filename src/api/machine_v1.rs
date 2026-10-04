@@ -12,12 +12,10 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::Value;
 use std::{
     collections::HashMap,
-    future::Future,
     io::Read,
     pin::Pin,
     sync::Arc,
-    task::{Context, Poll},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio_stream::Stream;
 use tonic::{metadata::MetadataMap, Request, Response, Status};
@@ -31,69 +29,20 @@ pub(super) struct MachineV1<B> {
 
 /// Who may do what: a machine-scope cap does everything as its signer; a run-scope cap may only
 /// attach to and read that run.
-fn expired_capability() -> Status {
-    let mut status = Status::unauthenticated(
-        "capability_expired: the capability that opened this stream has expired",
-    );
-    status
-        .metadata_mut()
-        .insert("cozy-error-code", "capability_expired".parse().unwrap());
-    status
-}
-
 #[derive(Clone)]
 struct Caller {
     actor: VerifiedActor,
     grant: Grant,
 }
 impl Caller {
-    /// Authority lasts only until this cap expires or its signer loses admission. Dropping
-    /// the underlying stream detaches its observation; it never controls accepted work.
+    fn authority(&self, keys: super::auth::Keys) -> super::auth::StreamAuthority {
+        super::auth::StreamAuthority::new(keys, self.actor, Some(self.grant.expires))
+    }
     fn observe<T: Send + 'static>(&self, keys: super::auth::Keys, stream: Events<T>) -> Events<T> {
-        let (key, expires) = (self.actor.public_key, self.grant.expires);
-        let ended = Box::pin(async move {
-            let expiry = async move {
-                loop {
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default();
-                    let remaining = Duration::from_secs(expires.max(0) as u64).saturating_sub(now);
-                    if remaining.is_zero() {
-                        return;
-                    }
-                    // Keep arbitrarily distant signed expiries within Instant's range.
-                    tokio::time::sleep(remaining.min(Duration::from_secs(86_400))).await;
-                }
-            };
-            tokio::select! {
-                _ = keys.revoked(key) => Status::unauthenticated("the key that opened this stream no longer authorizes it"),
-                _ = expiry => expired_capability(),
-            }
-        });
-        Box::pin(AuthorizedStream {
-            stream,
-            ended,
-            closed: false,
-        })
+        self.authority(keys).wrap(stream)
     }
     fn authorize(&self, keys: &super::auth::Keys) -> Result<(), Status> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        if now >= self.grant.expires {
-            return Err(expired_capability());
-        }
-        if !keys
-            .admitted()
-            .iter()
-            .any(|key| key.to_bytes() == self.actor.public_key)
-        {
-            return Err(Status::unauthenticated(
-                "the key that opened this stream no longer authorizes it",
-            ));
-        }
-        Ok(())
+        self.authority(keys.clone()).check()
     }
     fn limited(&self) -> bool {
         self.grant.action != capability::MACHINE && !self.grant.outputs.is_empty()
@@ -153,29 +102,6 @@ impl Caller {
                 "the capability does not grant this",
             ))
         }
-    }
-}
-
-/// Poll authority before buffered data, including while the backend is quiet or the peer
-/// applies backpressure. No forwarding buffer can extend a revoked cap's authority.
-struct AuthorizedStream<T> {
-    stream: Events<T>,
-    ended: Pin<Box<dyn Future<Output = Status> + Send>>,
-    closed: bool,
-}
-impl<T: 'static> Stream for AuthorizedStream<T> {
-    type Item = Result<T, Status>;
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if self.closed {
-            return Poll::Ready(None);
-        }
-        if let Poll::Ready(status) = self.ended.as_mut().poll(cx) {
-            self.closed = true;
-            // Release the backend observer and any pinned output files immediately.
-            self.stream = Box::pin(tokio_stream::empty());
-            return Poll::Ready(Some(Err(status)));
-        }
-        self.stream.as_mut().poll_next(cx)
     }
 }
 
