@@ -1099,12 +1099,22 @@ mod tests {
             }
         });
         assert!(Command::new("uv").current_dir(repo).args(["build","--wheel","--out-dir"]).arg(root.join("client")).status().unwrap().success());
-        let helper=Command::new("uv").current_dir(repo).args(["run","--locked","--extra","test","python","-c","import sys; print(sys.executable)"]).output().unwrap();
+        let helper_python=match std::env::var_os("COZY_TEST_SDK_PYTHON") {
+            Some(path)=>std::path::PathBuf::from(path),
+            None=> {
+                let helper=Command::new("uv").current_dir(repo).args(["run","--locked","--extra","test","python","-c","import sys; print(sys.executable)"]).output().unwrap();
+                assert!(helper.status.success(),"test SDK helper resolution failed");
+                String::from_utf8(helper.stdout).unwrap().trim().into()
+            }
+        };
+        let sdk=std::env::var("COZY_TEST_SDK_REQUIREMENTS").map(|value|
+            serde_json::from_str::<Vec<String>>(&value).expect("test SDK requirements must be a JSON string array")
+        ).unwrap_or_default();
         let client=fs::read_dir(root.join("client")).unwrap().map(|entry|entry.unwrap().path()).find(|path|path.extension().is_some_and(|value|value=="whl")).unwrap();
         let objects=Arc::new(Objects::new(&root.join("writes"),store.clone(),service.engine.clone()).unwrap());
         let local=LocalSources::new(objects.clone(),InstallerConfig {
-            helper_python:String::from_utf8(helper.stdout).unwrap().trim().into(),python:"3.12".into(),generations:root.join("generations"),client_wheel:client,
-            staging_root:root.join("staging"),sdk:vec![],uv:"uv".into(),
+            helper_python,python:"3.12".into(),generations:root.join("generations"),client_wheel:client,
+            staging_root:root.join("staging"),sdk,uv:"uv".into(),
         },store.clone());
         let publisher=crate::published::Publisher::new(&root.join("published"),crate::published::PackageSdk::default(),store.clone()).unwrap();
         let runs=Arc::new(Runs {service:service.clone(),objects:objects.clone(),publisher:Some(publisher),local:Some(Arc::new(local)),own_hub:None,jobs:Default::default()});
