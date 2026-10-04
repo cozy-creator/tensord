@@ -405,6 +405,8 @@ pub struct GpuPool {
     host_ledger: Arc<crate::memory::host::HostLedger>,
     /// Degree 2: GPU weights kept across executors. None on a GPU that drives a display.
     custody: Option<Mutex<ResidentCustody>>,
+    /// Memoized Model methods' results, shared by every run on this machine.
+    memo: Arc<crate::memo::Memo>,
     // Drop session/resource custody before ending the actual spawning thread.
     launcher: crate::child_launcher::ChildLauncher,
 }
@@ -501,7 +503,11 @@ impl GpuPool {
             host,
             host_ledger,
             custody,
+            memo: Arc::new(crate::memo::Memo::open(root.join("stage-memo"))?),
         }))
+    }
+    pub fn memo(&self) -> &crate::memo::Memo {
+        &self.memo
     }
     pub fn config(&self) -> &GpuConfig {
         &self.config
@@ -1826,6 +1832,7 @@ impl GpuPool {
         };
         executor.retain_until_exit(directory);
         executor.retain_until_exit(WakeOnExit(Arc::downgrade(engine)));
+        executor.keep_memo(self.memo.clone());
         // Weights come only from the machine's sealed host tier: handed out while it fills, and
         // streamed when it does not fit. Header and configs come from the store. (An executor
         // whose TensorFS predates #313/#314 refuses such a layout and reads the store itself.)

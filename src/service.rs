@@ -353,6 +353,12 @@ impl Service {
                 if let Some(jobs) = self.jobs() {
                     swept.scratch = jobs.sweep_scratch(&self.engine);
                 }
+                if let Some(gpu) = self.gpu() {
+                    let disk = || crate::reclaim::Disk::measure(&self.engine.root);
+                    let pressure = disk().is_ok_and(|disk| disk.pressure());
+                    let relieved = || disk().is_ok_and(|disk| disk.relieved());
+                    swept.memo = gpu.memo().sweep(pressure, relieved);
+                }
                 let publisher = self.publisher.lock().unwrap().clone();
                 match publisher.map(|publisher| publisher.reclaim(self)) {
                     Some(Ok((views, bytes))) => {

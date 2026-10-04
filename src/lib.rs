@@ -15,6 +15,7 @@ pub mod launch_identity;
 pub mod local_source;
 pub mod machine;
 pub mod machine_api;
+pub mod memo;
 pub mod memory;
 pub mod model_sources;
 pub mod native_inputs;

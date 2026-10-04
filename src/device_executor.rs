@@ -56,6 +56,8 @@ pub struct Hello {
     pub tensorfs_version: String,
     pub executor_protocol_revision: u64,
     pub memory: Vec<String>,
+    /// Memo tiers the executor can use (`stage/1`: memoized Model methods).
+    pub memo: Vec<String>,
     pub sealed: BTreeMap<String, String>,
     pub torch_loaded: bool,
 }
@@ -330,6 +332,18 @@ pub struct CallInterface {
     pub kind: String,
 }
 impl DeviceCommand {
+    /// The run a command executes and the spool its executor reads and writes.
+    fn spool(&self) -> Option<(&str, &Path)> {
+        match self {
+            Self::Invoke {
+                request_id, spool, ..
+            }
+            | Self::RunJob {
+                request_id, spool, ..
+            } => Some((request_id.as_str(), spool.as_path())),
+            _ => None,
+        }
+    }
     fn name(&self) -> &'static str {
         match self {
             Self::Hello => "hello",
@@ -620,6 +634,12 @@ pub struct Frame {
     pub export: String,
     pub payload: String,
     pub progress_label: String,
+    // `stage_memo_*` (a memoized Model method): its key and scope (`stage`, `length` above), and
+    // on a store the spool file it offers with what producing it cost.
+    pub key: String,
+    pub numerics: String,
+    pub local: String,
+    pub cost_ms: f64,
     // `checkpoint` (a job's `Checkpoints.declare`): its keys and content (`length` above).
     pub operation_key: String,
     /// `weights_writer`: `source`, `output` or `adopt`, its output and its transaction.
@@ -699,6 +719,22 @@ pub struct Answer {
     pub manifest_length: u64,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub receipt_digest: String,
+    /// A memo hit: the entry's verified copy in the run's spool, and what producing it cost.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub local: String,
+    #[serde(skip_serializing_if = "is_zero_ms")]
+    pub cost_ms: f64,
+    /// The memo scope computed one key twice, differently: the executor stops reusing it.
+    #[serde(skip_serializing_if = "is_false")]
+    pub disputed: bool,
+    /// A memo store: whether the entry was kept, else why not.
+    #[serde(skip_serializing_if = "is_false")]
+    pub stored: bool,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+}
+fn is_zero_ms(value: &f64) -> bool {
+    *value == 0.0
 }
 impl Answer {
     pub fn unavailable(seq: u64) -> Self {
@@ -734,6 +770,11 @@ impl Answer {
             manifest: String::new(),
             manifest_length: 0,
             receipt_digest: String::new(),
+            local: String::new(),
+            cost_ms: 0.0,
+            disputed: false,
+            stored: false,
+            reason: String::new(),
         }
     }
     pub fn ok(seq: u64) -> Self {
@@ -802,6 +843,7 @@ pub struct DeviceExecutor {
     worst_gap: Duration,
     /// Where its stderr stood when the request it serves began.
     log_from: u64,
+    memo: Option<Arc<crate::memo::Memo>>,
 }
 
 /// Cooperative first: the executor stops at its next safe point. The running invocation's
@@ -1477,6 +1519,7 @@ impl DeviceExecutor {
             watched,
             worst_gap: Duration::ZERO,
             log_from: 0,
+            memo: None,
         };
         let hello = executor.command(&DeviceCommand::Hello, &mut Baseline)?;
         let mismatched = config.seal.mismatches(&hello.hello.sealed);
@@ -1507,6 +1550,10 @@ impl DeviceExecutor {
     }
     pub fn codec(&self) -> Arc<Codec> {
         self.codec.clone()
+    }
+    /// The machine tier this executor's memoized stages look up and store in.
+    pub fn keep_memo(&mut self, memo: Arc<crate::memo::Memo>) {
+        self.memo = Some(memo);
     }
     pub fn root_path(&self) -> &Path {
         &self.root
@@ -1645,6 +1692,10 @@ impl DeviceExecutor {
         *self.watched.lock().unwrap() = Some(watching.watch());
         let result = self.exchange(command, group, services, &watching.watch());
         *self.watched.lock().unwrap() = None;
+        // Whatever the run was computing when its exchange ended, its waiters compute themselves.
+        if let (Some(memo), Some((run, _))) = (&self.memo, command.spool()) {
+            memo.release(run);
+        }
         let (killed, worst_gap) = watching.finish();
         if meter == Meter::Frames {
             self.worst_gap = self.worst_gap.max(worst_gap);
@@ -1662,17 +1713,21 @@ impl DeviceExecutor {
         services: &mut impl Services,
         watch: &Watch,
     ) -> io::Result<Frame> {
-        if group.is_empty() {
-            write_frame(&mut self.stream, command)?;
-        } else {
-            let mut value = serde_json::to_value(command)?;
-            if let (Some(object), Value::Object(extra)) =
-                (value.as_object_mut(), serde_json::to_value(group)?)
-            {
-                object.extend(extra);
-            }
-            write_frame(&mut self.stream, &value)?;
+        let mut value = serde_json::to_value(command)?;
+        if let (false, Some(object), Value::Object(extra)) = (
+            group.is_empty(),
+            value.as_object_mut(),
+            serde_json::to_value(group)?,
+        ) {
+            object.extend(extra);
         }
+        // An executor that memoizes stages is told the machine tier takes their results.
+        let memoizes = self.hello.memo.iter().any(|tier| tier == "stage/1");
+        if matches!(command, DeviceCommand::Start { .. }) && self.memo.is_some() && memoizes {
+            value["memo"] =
+                serde_json::json!({"process_bytes": -1, "entry_bytes": crate::memo::ENTRY_BYTES});
+        }
+        write_frame(&mut self.stream, &value)?;
         loop {
             let frame = read_frame(&mut self.stream)?
                 .ok_or_else(|| {
@@ -1699,6 +1754,18 @@ impl DeviceExecutor {
                     for fd in &out {
                         protocol::send_fd(&self.stream, fd)?;
                     }
+                }
+                Some(Event::Request)
+                    if matches!(frame.kind, Kind::StageMemoLookup | Kind::StageMemoStore) =>
+                {
+                    // A lookup may wait on the run computing its key: not this executor's stillness.
+                    watch.serving(true);
+                    let answer = match (&self.memo, command.spool()) {
+                        (Some(memo), Some((run, spool))) => memo.answer(run, spool, &frame),
+                        _ => Answer::unavailable(frame.seq),
+                    };
+                    watch.serving(false);
+                    write_frame(&mut self.stream, &answer)?;
                 }
                 Some(Event::Request) => {
                     // The machine's own answer time is not the executor's stillness.

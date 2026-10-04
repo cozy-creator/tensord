@@ -64,6 +64,8 @@ pub struct Swept {
     pub adapter_views: usize,
     /// Bytes TensorFS's GC collected under storage pressure (`ensure::relieve`).
     pub store_bytes: u64,
+    /// Memoized stage results (`memo::Memo::sweep`).
+    pub memo: usize,
 }
 
 /// The persistent compiled-kernel store (`Seal::prepare`'s `<root>/u<uid>/`). Recompiling is
