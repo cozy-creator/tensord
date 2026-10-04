@@ -165,6 +165,20 @@ fn refused(code: &'static str, message: impl Into<String>) -> Refused {
     }
 }
 
+/// A child's kind is whatever its held package declares it as.
+fn captured_child_job(interface: &[u8], name: &str) -> Result<bool, Refused> {
+    let interface: Value = serde_json::from_slice(interface)
+        .map_err(|_| refused("package_interface_invalid", "held interface is corrupt"))?;
+    let declares = |rows: &str| {
+        interface[rows].as_array().into_iter().flatten().any(|row| row["name"] == name)
+    };
+    match (declares("jobs"), declares("entrypoints")) {
+        (true, false) => Ok(true),
+        (false, true) => Ok(false),
+        _ => Err(refused("invalid_entrypoint", format!("the package declares {name:?} as neither one job nor one entrypoint"))),
+    }
+}
+
 impl Runs {
     /// Accepts the run (or answers the one this id already names) and starts its preparation.
     pub fn submit(self: &Arc<Self>, actor: &str, id: &str, spec: Spec) -> Result<Execution, Refused> {
@@ -578,12 +592,13 @@ impl Runs {
             Err(error) if error.kind() == io::ErrorKind::NotFound => (),
             Err(error) => return Err(error.into()),
         }
-        let spec = self.child_spec(&parent.id, entrypoint, input, inputs, intent)?;
+        let spec = self.child_spec(&actor, &parent.id, entrypoint, input, inputs, intent)?;
         self.submit(&actor, request, spec)
     }
 
     fn child_spec(
         &self,
+        actor: &str,
         parent: &str,
         entrypoint: &str,
         input: Value,
@@ -606,10 +621,13 @@ impl Runs {
                     .context()?
             }
         };
+        let installed = self.service.engine.installation(actor, &context.installation)?
+            .ok_or_else(|| refused("child_call_refused", "the job's installation is gone"))?;
+        let job = captured_child_job(&installed.interface, entrypoint)?;
         let prefix = format!("{entrypoint}.");
         Ok(Spec {
             warm: false,
-            job: false,
+            job,
             parent: parent.into(),
             source: Source::Installation(context.installation),
             entrypoint: entrypoint.into(),
@@ -641,7 +659,7 @@ impl Runs {
         let (runs, parent, entrypoint) = (self.clone(), parent.id.clone(), entrypoint.to_string());
         let started = std::thread::Builder::new().name("child-prefetch".into()).spawn(move || {
             let prepared = runs
-                .child_spec(&parent, &entrypoint, json!({}), vec![], "")
+                .child_spec(&actor, &parent, &entrypoint, json!({}), vec![], "")
                 .and_then(|spec| {
                     let Source::Installation(alias) = &spec.source else { unreachable!() };
                     let held = runs.service.engine.installation(&actor, alias)?;
@@ -946,6 +964,35 @@ mod tests {
         let theirs = settled(&service.engine, &theirs.id);
         assert_eq!(theirs.state, State::Failed);
         assert!(theirs.failure.unwrap().contains("local_source_incomplete"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A job's child that is itself a job runs as one, as its held package declares it.
+    #[test]
+    fn a_child_takes_its_kind_from_the_held_package() {
+        let root = std::env::temp_dir().join(format!("cm-child-kind-{}", uuid::Uuid::new_v4()));
+        let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
+        let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
+        let objects = Arc::new(Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap());
+        let runs = Runs { service: service.clone(), objects, publisher: None, local: None, own_hub: None, jobs: Default::default() };
+        let interface = json!({
+            "jobs": [{"name": "pipeline"}, {"name": "leaf-job"}, {"name": "both"}],
+            "entrypoints": [{"name": "leaf-call"}, {"name": "both"}],
+        });
+        service.engine.bind_installation(crate::journal::Installation {
+            actor: "alice".into(), alias: "pkg".into(), generation: "g1".into(), package: "org/pkg".into(),
+            release: "1.0.0".into(), interface: serde_json::to_vec(&interface).unwrap(),
+        }).unwrap();
+        runs.jobs.lock().unwrap().insert("7".into(), JobContext {
+            installation: "pkg".into(), hub: None, providers: Default::default(), owner: "alice".into(),
+            binding_revision: String::new(), attention_kernel: String::new(), models: vec![],
+            inputs: Default::default(), weights_destination: String::new(), publication: String::new(),
+        });
+        let child = |name: &str| runs.child_spec("alice", "7", name, json!({}), vec![], "d");
+        assert!(child("leaf-job").unwrap().job);
+        assert!(!child("leaf-call").unwrap().job);
+        assert_eq!(child("missing").err().unwrap().code, "invalid_entrypoint");
+        assert_eq!(child("both").err().unwrap().code, "invalid_entrypoint");
         let _ = fs::remove_dir_all(root);
     }
 
