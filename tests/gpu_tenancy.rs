@@ -4,11 +4,13 @@
 //!
 //! `COZY_MACHINE_GPU_TENANCY` names a JSON plan: `state`, `store`, `generations`, `gpu_config`,
 //! `entrypoint`, `input`, `output` (JSON lines) and `packages`: two published packages
-//! (`{package, release}`) of different publishers that bind the same checkpoint.
+//! (`{package, release}`) of different publishers that bind the same checkpoint. On a card
+//! with room for both executors.
 use cozy_machine::{
     gpu_service::{GpuConfig, GpuPool},
     journal::{Execution, Preparation, State, SubmissionContext},
     process::process_ended,
+    resident_custody::HoldingFacts,
     service::{Call, Service},
 };
 use serde::Deserialize;
@@ -124,6 +126,41 @@ impl Pod {
     fn pid(record: &Execution) -> u32 {
         record.process.as_ref().expect("the run's executor").pid
     }
+    /// Custody's holdings once they are as `settled` says (a call offers after its run ended).
+    fn settled(&mut self, settled: impl Fn(&[HoldingFacts]) -> bool) -> Vec<HoldingFacts> {
+        // Test harness bound on a state that never comes; the product has no such limit.
+        let until = Instant::now() + Duration::from_secs(120);
+        loop {
+            let held = self.gpu.resident();
+            if settled(&held) {
+                writeln!(self.output, "{}", json!({ "holdings": held })).unwrap();
+                return held;
+            }
+            assert!(Instant::now() < until, "holdings never settled: {held:?}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    /// Bytes `plan`'s executor has uploaded to the GPU since it started, as of its last call.
+    fn uploaded(&self, plan: &str) -> u64 {
+        let invokes = std::fs::read_to_string(self.plan.state.join("gpu/invokes.jsonl")).unwrap();
+        let mut rows = invokes
+            .lines()
+            .rev()
+            .map(|row| serde_json::from_str::<Value>(row).unwrap());
+        let last = rows.find(|row| row["plan"] == plan).expect("a call");
+        last["plane"]["h2d_bytes"]
+            .as_u64()
+            .expect("the plane's upload count")
+    }
+}
+fn reads(holding: &HoldingFacts, pid: u32) -> bool {
+    holding.readers.iter().any(|birth| birth.pid == pid)
+}
+fn layouts(held: &[HoldingFacts]) -> Vec<&str> {
+    held.iter().map(|h| h.key.layout.as_str()).collect()
+}
+fn bytes(held: &[HoldingFacts]) -> u64 {
+    held.iter().map(|h| h.bytes).sum()
 }
 
 #[test]
@@ -200,37 +237,52 @@ fn submitters_share_a_packages_executor_and_packages_share_a_checkpoints_weights
         "the quote holds stderr from before the request: {quoted}"
     );
 
-    // Another publisher's package binding the same checkpoint: an executor of its own, the
-    // same GPU weights. Its first executor filled a copy before the plan was measured; the
-    // replacement attaches what custody holds.
+    // Another publisher's package binding the same checkpoint: an executor of its own. The
+    // machine gives a plan's first, unmeasured call the card (the first package is unmapped
+    // and its holdings revoked); its second call fills and offers.
     let (other_plan, first) = pod.run("alice", 1, None);
-    assert_eq!(first.state, State::Completed);
+    let (_, second) = pod.run("bob", 1, None);
+    assert_eq!(
+        (first.state, second.state),
+        (State::Completed, State::Completed)
+    );
     assert_ne!(other_plan, alice_plan);
     assert_ne!(first.process, alice.process);
-    let before = pod.gpu.resident();
-    assert_eq!(before.len(), 1, "{before:?}");
-    let birth = first.process.clone().unwrap();
-    // SAFETY: the exact process this test's pool started, by its recorded birth.
+    assert_eq!(first.process, second.process);
+    let theirs = Pod::pid(&second);
+    let offered = pod.settled(|held| !held.is_empty() && held.iter().all(|h| reads(h, theirs)));
+
+    // The first package again. Its executor's holdings were revoked, so it refills a private
+    // copy, and at the end of the call its offer is a duplicate: it lets its copy go and
+    // attaches the other package's. One weight set on the GPU for both, charged once.
+    let (_, back) = pod.run("alice", 0, None);
+    assert_eq!(back.state, State::Completed);
+    assert_eq!(back.process, alice.process);
+    let ours = Pod::pid(&back);
+    let shared = pod.settled(|held| held.iter().all(|h| reads(h, theirs) && reads(h, ours)));
+    assert_eq!(layouts(&shared), layouts(&offered));
+    assert_eq!(bytes(&shared), bytes(&offered));
+
+    // A replacement executor of the other package attaches at its load, uploading almost
+    // nothing.
+    let birth = second.process.clone().unwrap();
     assert_eq!(
         cozy_machine::execution::process_birth(birth.pid).unwrap(),
         birth
     );
+    // SAFETY: the exact process this test's pool started, by its recorded birth.
     assert_eq!(unsafe { libc::kill(birth.pid as i32, libc::SIGKILL) }, 0);
     while !process_ended(&birth).unwrap() {
         std::thread::sleep(Duration::from_millis(20));
     }
-    let (_, second) = pod.run("bob", 1, None);
-    assert_eq!(second.state, State::Completed);
-    assert_ne!(second.process, first.process);
-    let after = pod.gpu.resident();
-    assert_eq!(
-        after.len(),
-        1,
-        "one weight set for both packages: {after:?}"
-    );
-    assert_eq!(after[0].bytes, before[0].bytes);
-    let readers: Vec<u32> = after[0].readers.iter().map(|birth| birth.pid).collect();
-    assert!(readers.contains(&Pod::pid(&second)), "{readers:?}");
+    let (_, replaced) = pod.run("bob", 1, None);
+    assert_eq!(replaced.state, State::Completed);
+    assert_ne!(replaced.process, second.process);
+    let new = Pod::pid(&replaced);
+    let after = pod.settled(|held| held.iter().all(|h| reads(h, new) && reads(h, ours)));
+    assert_eq!(layouts(&after), layouts(&offered));
+    let fresh = pod.uploaded(&other_plan);
+    assert!(fresh < bytes(&offered) / 10, "uploaded {fresh} bytes");
 
     pod.service.stop().unwrap();
     pod.gpu.stop().unwrap(); // every executor's exit observed before the test ends
