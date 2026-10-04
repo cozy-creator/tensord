@@ -345,7 +345,7 @@ impl Publisher {
             message: e.0,
         })?;
         let _fetching = self.fetch(vec![manifest.to_string()]);
-        let keep = self.caches(service).keep;
+        let keep = self.protected(service).map_err(io_failure).map_err(|(code, message)| Refused { code, message })?;
         ensure(&self.store, &catalog, repository, manifest, &keep, bytes)
             .map_err(|(code, message)| Refused { code, message })
     }
@@ -362,42 +362,44 @@ impl Publisher {
     }
 
     /// The store's share of the machine's self-managing caches (`reclaim`), with what it
-    /// must keep: what live executors read, unfinished runs prepared, and preparations fetch.
-    pub fn caches(&self, service: &Service) -> crate::reclaim::StoreCaches<'_> {
-        let keep = match service.gpu() {
-            Some(gpu) => self.protected(service, &gpu),
-            None => self.fetching.lock().unwrap().keys().cloned().collect(),
-        };
-        crate::reclaim::StoreCaches {
+    /// must keep (`protected`).
+    pub fn caches(&self, service: &Service) -> io::Result<crate::reclaim::StoreCaches<'_>> {
+        Ok(crate::reclaim::StoreCaches {
             store: &self.store,
-            keep,
-        }
+            keep: self.protected(service)?,
+        })
     }
 
-    /// What a download's GC must never evict: what live executors read, every unfinished
-    /// run's prepared models, and what preparations are fetching (this one's included).
-    fn protected(&self, service: &Service, gpu: &GpuPool) -> Vec<String> {
-        let mut keep = gpu.serving();
+    /// What no store GC may evict: what live executors read, what preparations are fetching
+    /// (this one's included), and the prepared models and job model inputs of every
+    /// unfinished run, paused and unknown states included. A journal or plan that cannot be
+    /// read is an error, never a shorter list: the caller then runs no store GC this pass.
+    fn protected(&self, service: &Service) -> io::Result<Vec<String>> {
+        let gpu = service.gpu();
+        let mut keep = gpu.as_ref().map(|gpu| gpu.serving()).unwrap_or_default();
         keep.extend(self.fetching.lock().unwrap().keys().cloned());
-        for record in service.engine.nonterminal(usize::MAX).unwrap_or_default() {
-            let Some(submission) = record
-                .submission
-                .filter(|s| !s.preparation_id.is_empty())
-            else {
+        for record in service.engine.with_journal(|journal| journal.unfinished())? {
+            if record.invocation.job {
+                let context = service.engine.with_journal(|journal| journal.job_context(&record.id))?;
+                if let Some(context) = context {
+                    keep.extend(crate::runs::job_models(&context)?);
+                }
+            }
+            let prepared = record.submission.filter(|s| !s.preparation_id.is_empty());
+            let (Some(submission), Some(gpu)) = (prepared, &gpu) else {
                 continue;
             };
-            if let Ok(Some(preparation)) = service
+            let preparation = service
                 .engine
-                .preparation(&submission.actor, &submission.preparation_id)
-            {
-                if let Ok(plan) = gpu.plan(&preparation) {
-                    keep.extend(plan.selections().into_iter().map(|s| s.manifest));
-                }
+                .preparation(&submission.actor, &submission.preparation_id)?;
+            if let Some(preparation) = preparation {
+                let selections = gpu.plan(&preparation)?.selections();
+                keep.extend(selections.into_iter().map(|s| s.manifest));
             }
         }
         keep.sort();
         keep.dedup();
-        keep
+        Ok(keep)
     }
 
     fn alias(&self, request: &Request) -> String {
@@ -1062,7 +1064,7 @@ impl Publisher {
             });
         }
         let _fetching = self.fetch(grants.iter().map(|g| g.manifest.clone()).collect());
-        let keep = self.protected(service, gpu);
+        let keep = self.protected(service).map_err(io_failure)?;
         let mut fetched = std::collections::BTreeSet::new();
         for grant in &grants {
             if !fetched.insert(grant.manifest.clone()) || grant.repository.starts_with("local/") {

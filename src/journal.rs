@@ -1472,6 +1472,20 @@ impl Journal {
             .map(readable)
     }
 
+    /// Every run not completed, failed or canceled: paused and unknown states too. A row
+    /// that does not decode is an error here, where a missed run is a model evicted.
+    pub fn unfinished(&self) -> io::Result<Vec<Execution>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT record FROM executions WHERE state NOT IN ('completed','failed','canceled') ORDER BY id")
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(db_error)?;
+        rows.map(|row| serde_json::from_str(&row.map_err(db_error)?).map_err(db_error))
+            .collect()
+    }
+
     pub fn nonterminal(&self, limit: usize) -> io::Result<Vec<Execution>> {
         self.selected("SELECT record FROM executions WHERE state IN ('queued','starting','running') ORDER BY id LIMIT ?1", limit)
     }
