@@ -41,6 +41,7 @@ struct Lease {
 pub struct Owner {
     store: Arc<Store>,
     _lock: File,
+    _store_lock: File,
     cache: HashMap<String, Cached>,
     peers: HashMap<u64, Peer>,
     leases: HashMap<u64, Lease>,
@@ -62,6 +63,27 @@ fn validate(object: &Object) -> io::Result<()> {
     ids::hex64("object", &object.sha256).map_err(io::Error::other)?;
     Ok(())
 }
+/// The store's own owner lock, taken exclusively; None when it has none yet and `create`
+/// is false.
+fn lock_store(store: &Path, create: bool) -> io::Result<Option<File>> {
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(create)
+        .open(store.join("owner.lock"));
+    let lock = match lock {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    lock.try_lock_exclusive().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "this TensorFS store already has a machine owner",
+        )
+    })?;
+    Ok(Some(lock))
+}
 impl Owner {
     /// `store` is the TensorFS store this owner serves, which may live outside `root`.
     pub fn new(root: &Path, store: &Path, budget: u64, ttl: Duration) -> io::Result<Shared> {
@@ -79,7 +101,15 @@ impl Owner {
             )
         })?;
         std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+        // One machine per store, whichever state directory or path names it. A store another
+        // machine owns is refused before its catalog is opened; a new one is locked once
+        // TensorFS has made it (it refuses a directory that already holds a foreign file).
+        let owned = lock_store(store, false)?;
         let store = Arc::new(Store::ensure(store).map_err(io::Error::other)?);
+        let store_lock = match owned {
+            Some(lock) => lock,
+            None => lock_store(store.root(), true)?.expect("created"),
+        };
         // The machine is the store's owner: its read leases pin in memory, so its GC can make
         // room while layouts are served.
         tensorfs_core::meta::own(&store);
@@ -94,6 +124,7 @@ impl Owner {
         Ok(Arc::new(Mutex::new(Self {
             store,
             _lock: lock,
+            _store_lock: store_lock,
             cache: HashMap::new(),
             peers: HashMap::new(),
             leases: HashMap::new(),

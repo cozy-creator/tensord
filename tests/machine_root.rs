@@ -105,13 +105,18 @@ fn ready(machine: &mut Machine, root: &Path, port: u16) {
     }
 }
 
-/// A machine started on a taken root: it must exit, and this is what it said.
-fn refused(root: &Path) -> String {
-    let output = spawn(root, free_port(), None, Stdio::piped())
-        .wait_with_output()
-        .unwrap();
-    assert!(!output.status.success(), "a second machine ran on the root");
-    String::from_utf8_lossy(&output.stderr).into_owned()
+/// A machine started on a taken root or store: it must exit, and this is what it said.
+fn refused(root: &Path, store: Option<&Path>) -> String {
+    let port = free_port();
+    let mut second = Machine(spawn(root, port, store, Stdio::piped()));
+    while second.0.try_wait().unwrap().is_none() {
+        assert!(!served(root, port), "a second machine ran");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let mut said = String::new();
+    std::io::Read::read_to_string(second.0.stderr.as_mut().unwrap(), &mut said).unwrap();
+    assert!(!second.0.wait().unwrap().success(), "a second machine ran");
+    said
 }
 
 #[test]
@@ -122,7 +127,7 @@ fn one_root_runs_one_machine() {
     ready(&mut first, &root, port);
 
     // Another port changes nothing: the root is taken, and its machine keeps serving.
-    let said = refused(&root);
+    let said = refused(&root, None);
     assert!(said.contains("another machine owns the root"), "{said}");
     assert!(served(&root, port));
 
@@ -137,7 +142,7 @@ fn one_root_runs_one_machine() {
         .expect("the stopped machine still holds its root");
 
     // The lock is the Go agent's: whoever holds it owns the root.
-    let said = refused(&root);
+    let said = refused(&root, None);
     assert!(said.contains("another machine owns the root"), "{said}");
     FileExt::unlock(&lock).unwrap();
     let port = free_port();
@@ -145,6 +150,35 @@ fn one_root_runs_one_machine() {
     ready(&mut again, &root, port);
     drop(again);
     std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn one_store_runs_one_machine() {
+    let scratch = scratch("machine-store-guard");
+    let (first_root, second_root) = (scratch.join("first"), scratch.join("second"));
+    let store = scratch.join("real/store");
+    std::fs::create_dir_all(scratch.join("real")).unwrap();
+    std::os::unix::fs::symlink(scratch.join("real"), scratch.join("alias")).unwrap();
+    let port = free_port();
+    let mut first = boot(&first_root, port, Some(&store));
+    ready(&mut first, &first_root, port);
+
+    // Another root, and another path to the store, change nothing: the store is taken.
+    let said = refused(&second_root, Some(&scratch.join("alias/store")));
+    assert!(said.contains("already has a machine owner"), "{said}");
+    assert!(served(&first_root, port));
+
+    // A stopped machine frees its store at once.
+    Command::new("kill")
+        .args(["-TERM", &first.0.id().to_string()])
+        .status()
+        .unwrap();
+    first.0.wait().unwrap();
+    let port = free_port();
+    let mut second = boot(&second_root, port, Some(&scratch.join("alias/store")));
+    ready(&mut second, &second_root, port);
+    drop(second);
+    std::fs::remove_dir_all(&scratch).unwrap();
 }
 
 fn cap() -> String {
