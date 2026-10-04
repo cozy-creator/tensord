@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io,
     os::{
         fd::AsRawFd,
@@ -13,6 +13,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::Command,
+    sync::Arc,
 };
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -208,7 +209,30 @@ pub struct Seal {
     pub jit: PathBuf,
     /// This identity's persistent kernel-store namespace.
     pub kernels: PathBuf,
+    /// The namespace's lock (`reclaim::kernel_hold`), shared: the process launched under
+    /// this seal inherits it, so no sweep deletes a kernel while it lives.
+    pub kernel_hold: Option<Arc<File>>,
     pub generation: String,
+}
+
+/// The launched process keeps these shared locks open (not close-on-exec) until it exits.
+pub fn inherit(command: &mut Command, holds: &[Option<&Arc<File>>]) {
+    let descriptors: Vec<_> = holds
+        .iter()
+        .flatten()
+        .map(|hold| hold.as_raw_fd())
+        .collect();
+    // SAFETY: only async-signal-safe fcntl, on descriptors the caller keeps open through spawn.
+    unsafe {
+        command.pre_exec(move || {
+            for descriptor in &descriptors {
+                if libc::fcntl(*descriptor, libc::F_SETFD, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
 }
 
 pub const DEFAULT_ALLOC_CONF: &str = "expandable_segments:True";
@@ -251,12 +275,15 @@ impl Seal {
         }
         boundary_directory(&root.join("jit").join(incarnation))?;
         let jit = owned(root.join("jit").join(incarnation).join(generation))?;
-        // Below the disk reserve the persistent kernel store is an optional write: compiled
-        // kernels then live in this run's JIT scope, removed with it.
-        let kernels = if crate::reclaim::Disk::measure(root)?.below_reserve() {
-            owned(jit.join("kernels"))?
+        // On a low disk the persistent kernel store is an optional write: compiled kernels
+        // then live in this run's JIT scope, removed with it.
+        let (kernels, kernel_hold) = if crate::reclaim::measure(root)?.short().is_some() {
+            (owned(jit.join("kernels"))?, None)
         } else {
-            owned(root.join("kernels").join(&namespace))?
+            let hold = crate::reclaim::kernel_hold(&root.join("kernels"), &namespace)?;
+            fs2::FileExt::lock_shared(&hold)?; // waits out a sweep deleting in this namespace
+            let kernels = owned(root.join("kernels").join(&namespace))?;
+            (kernels, Some(Arc::new(hold)))
         };
         owned(kernels.join(format!("torch-kernels.{generation}")))?;
         Ok(Self {
@@ -267,6 +294,7 @@ impl Seal {
             home: owned(root.join("home").join(&namespace))?,
             jit,
             kernels,
+            kernel_hold,
             generation: generation.into(),
         })
     }

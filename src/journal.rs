@@ -588,11 +588,15 @@ impl Journal {
             .map(|record| serde_json::from_str(&record).map_err(db_error))
             .transpose()
     }
-    /// Every generation an installation names: never evicted while named.
+    /// Every generation an installation or an unfinished run names: never evicted meanwhile.
     pub fn bound_generations(&self) -> io::Result<std::collections::HashSet<String>> {
         let mut statement = self
             .connection
-            .prepare("SELECT DISTINCT json_extract(record,'$.generation') FROM installations")
+            .prepare(
+                "SELECT json_extract(record,'$.generation') FROM installations
+                 UNION SELECT json_extract(invocation,'$.generation') FROM executions
+                 WHERE state NOT IN ('completed','failed','canceled')",
+            )
             .map_err(db_error)?;
         let rows = statement
             .query_map([], |row| row.get::<_, Option<String>>(0))

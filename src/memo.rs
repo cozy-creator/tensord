@@ -2,12 +2,12 @@
 //! encoders, shared by every run on this machine and scoped only by their key. An executor
 //! asks before it computes (`stage_memo_lookup`) and offers what it computed
 //! (`stage_memo_store`). The tier manages itself, with no verb: an entry expires the caches'
-//! TTL after it was written, the least recently used go beyond `STORE_BYTES` and under
-//! storage pressure, and below the disk reserve a new entry is not written (a miss, never an
-//! error).
+//! TTL after it was written, the least recently used go beyond `STORE_BYTES` and in a low
+//! disk's covering plan (`reclaim`), and on a low disk a new entry is not written (a miss,
+//! never an error).
 use crate::{
     device_executor::{Answer, Frame, Kind},
-    reclaim::{Disk, TTL},
+    reclaim::{self, TTL},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -172,7 +172,7 @@ impl Memo {
         if frame.length == 0 || frame.length > ENTRY_BYTES {
             return Ok("too_large");
         }
-        if Disk::measure(&self.root)?.below_reserve() {
+        if reclaim::measure(&self.root)?.short().is_some() {
             return Ok("disk_low");
         }
         let Some(raw) = spooled(spool, Path::new(&frame.local), frame.length) else {
@@ -222,9 +222,21 @@ impl Memo {
         }
     }
 
-    /// The TTL, then the cap, then (under `pressure`) every entry until `relieved`; the least
-    /// recently used go first. Answers how many entries went.
-    pub fn sweep(&self, pressure: bool, relieved: impl Fn() -> bool) -> usize {
+    /// Entries' homes, for a low disk's plan.
+    pub fn homes(&self) -> Vec<PathBuf> {
+        let homes = fs::read_dir(&self.root).into_iter().flatten().flatten();
+        homes
+            .filter(|home| {
+                home.file_name()
+                    .to_str()
+                    .is_some_and(|key| self.entry(key).is_some())
+            })
+            .map(|home| home.path())
+            .collect()
+    }
+
+    /// The TTL, then the cap; the least recently used go first. Answers how many went.
+    pub fn sweep(&self) -> usize {
         let Ok(homes) = fs::read_dir(&self.root) else {
             return 0;
         };
@@ -249,7 +261,7 @@ impl Memo {
         }
         kept.sort();
         for (_, size, path) in kept {
-            if total <= STORE_BYTES && (!pressure || relieved()) {
+            if total <= STORE_BYTES {
                 break;
             }
             if fs::remove_dir_all(&path).is_ok() {
@@ -362,9 +374,11 @@ mod tests {
         let third = std::thread::spawn(move || waiter.answer("run-5", &waiting_spool, &waiting));
         memo.release("run-4");
         assert!(third.join().unwrap().local.is_empty());
-        // Under pressure every entry goes, least recently used first.
-        assert_eq!(memo.sweep(false, || true), 0);
-        assert_eq!(memo.sweep(true, || false), 1);
+        // Within the TTL and the cap nothing goes; a low disk's plan takes an entry's home.
+        assert_eq!(memo.sweep(), 0);
+        let homes = memo.homes();
+        assert_eq!(homes.len(), 1);
+        fs::remove_dir_all(&homes[0]).unwrap();
         assert!(memo
             .answer(
                 "run-6",
