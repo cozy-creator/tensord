@@ -2232,6 +2232,27 @@ fn retain_generation(hold: &mut Option<Arc<File>>, retained: &mut Vec<Box<dyn Se
 #[cfg(test)]
 mod generation_custody_tests {
     use super::*;
+
+    #[test]
+    fn strict_native_scope_is_opt_in_and_unavailable_proof_keeps_resources() {
+        use fs2::FileExt;
+        use std::os::unix::process::CommandExt;
+        for strict in [false, true] {
+            let mut child = std::process::Command::new("sh").args(["-c", "read line"]).stdin(Stdio::piped()).process_group(0).spawn().unwrap();
+            let birth = process_birth(child.id()).unwrap();
+            let exact = Exact::open(&birth).unwrap().unwrap();
+            let path = std::env::temp_dir().join(format!("cm-scope-resource-{}", uuid::Uuid::new_v4()));
+            let file = Arc::new(File::create(&path).unwrap());
+            file.lock_exclusive().unwrap();
+            let observer = File::open(&path).unwrap();
+            drop(child.stdin.take());
+            let ended = Ending { exact: Ok(exact), recovery: None, require_source_scope_proof: strict, child: Some(child), forked: false, retained: vec![Box::new(file)], socket: path.with_extension("socket"), liveness: Liveness::default() }.end();
+            assert_eq!(ended.is_err(), strict);
+            assert_eq!(observer.try_lock_exclusive().is_err(), strict);
+            assert!(crate::execution::process_ended(&birth).unwrap());
+            std::fs::remove_file(path).unwrap();
+        }
+    }
     #[test]
     fn generation_hold_stays_quarantined_when_exact_exit_is_unobservable() {
         use fs2::FileExt;

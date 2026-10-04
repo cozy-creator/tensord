@@ -52,6 +52,8 @@ pub struct HoldingFacts {
     pub bytes: u64,
     pub phase: Phase,
     pub readers: Vec<ProcessBirth>,
+    /// Captured receiver scopes whose retirement is not yet proven empty.
+    pub unconfirmed_scopes: usize,
     pub idle_ms: u64,
 }
 
@@ -79,6 +81,8 @@ pub struct Reader {
     pub birth: ProcessBirth,
     pub exit: File,
     lease: UnixStream,
+    source_scope: Option<crate::scope::Recovery>,
+    source_scope_required: bool,
 }
 
 impl Reader {
@@ -91,14 +95,26 @@ impl Reader {
                 birth,
                 exit,
                 lease: ours,
+                source_scope: None,
+                source_scope_required: false,
             },
             theirs.into(),
         ))
     }
 
+    pub fn lease_in_scope(birth: ProcessBirth, exit: File, recovery: Option<crate::scope::Recovery>) -> io::Result<(Reader, OwnedFd)> {
+        let (mut reader, lease) = Self::lease(birth, exit)?;
+        reader.source_scope = recovery;
+        reader.source_scope_required = true;
+        Ok((reader, lease))
+    }
+
     fn ended(&self) -> bool {
-        hung_up(&self.lease)
-            || (crate::os::ended(&self.exit) && process_ended(&self.birth).unwrap_or(false))
+        let leader_ended = crate::os::ended(&self.exit) && process_ended(&self.birth).unwrap_or(false);
+        if leader_ended && self.source_scope_required {
+            return self.source_scope.as_ref().is_some_and(|scope| matches!(scope.empty(), Ok(true)));
+        }
+        hung_up(&self.lease) || leader_ended
     }
 }
 
@@ -122,7 +138,13 @@ struct Holding {
     bytes: u64,
     phase: Phase,
     readers: Vec<Reader>,
+    quarantine: Vec<ScopeFence>,
     used: Instant,
+}
+
+struct ScopeFence {
+    birth: ProcessBirth,
+    recovery: Option<crate::scope::Recovery>,
 }
 
 #[derive(Default)]
@@ -178,6 +200,7 @@ impl ResidentCustody {
                 bytes,
                 phase: Phase::Ready,
                 readers: vec![reader],
+                quarantine: vec![],
                 used: Instant::now(),
             },
         );
@@ -236,6 +259,18 @@ impl ResidentCustody {
         changed
     }
 
+    /// Before retiring this actual receiver, keep every export it reads charged until
+    /// its captured scope is proven empty. No synthetic reader/process is introduced.
+    pub fn fence_reader_scope(&mut self, birth: &ProcessBirth, recovery: Option<crate::scope::Recovery>) {
+        for held in self.holdings.values_mut() {
+            if held.readers.iter().any(|reader| reader.birth == *birth)
+                && !held.quarantine.iter().any(|fence| fence.birth == *birth)
+            {
+                held.quarantine.push(ScopeFence { birth: birth.clone(), recovery: recovery.clone() });
+            }
+        }
+    }
+
     /// A reader answered `revoke`: it unmapped and released the generation after its queued
     /// work. A reader that could not stays charged until its process ends.
     pub fn released(&mut self, key: &HoldingKey, generation: u64, birth: &ProcessBirth) {
@@ -254,11 +289,12 @@ impl ResidentCustody {
     pub fn collect(&mut self) -> Vec<(HoldingKey, u64)> {
         for held in self.holdings.values_mut() {
             held.readers.retain(|r| !r.ended());
+            held.quarantine.retain(|fence| !fence.recovery.as_ref().is_some_and(|recovery| matches!(recovery.empty(), Ok(true))));
         }
         let done: Vec<HoldingKey> = self
             .holdings
             .iter()
-            .filter(|(_, h)| h.phase == Phase::Revoking && h.readers.is_empty())
+            .filter(|(_, h)| h.phase == Phase::Revoking && h.readers.is_empty() && h.quarantine.is_empty())
             .map(|(k, _)| k.clone())
             .collect();
         done.into_iter()
@@ -299,6 +335,7 @@ impl ResidentCustody {
                     }
                     births
                 }),
+                unconfirmed_scopes: h.quarantine.len(),
                 idle_ms: h.used.elapsed().as_millis() as u64,
             })
             .collect()
@@ -404,6 +441,39 @@ mod tests {
     }
     fn fds(n: usize) -> Vec<OwnedFd> {
         (0..n).map(|_| devnull()).collect()
+    }
+
+    #[test]
+    fn every_collector_keeps_exports_charged_for_an_unavailable_retired_scope() {
+        let mut custody = ResidentCustody::default();
+        let (reader, peer) = mine();
+        let birth = reader.birth.clone();
+        custody.offer(key("a"), "actual-reader", regions(), fds(3), reader).unwrap();
+        let charged = custody.charged_bytes("GPU-1");
+        custody.fence_reader_scope(&birth, None);
+        custody.invalidate_all();
+        let generation = custody.holdings()[0].generation;
+        custody.released(&key("a"), generation, &birth);
+        drop(peer);
+        // Explicit release or lease close cannot erase the captured unknown family.
+        for _ in 0..3 {
+            assert!(custody.collect().is_empty());
+            assert_eq!(custody.charged_bytes("GPU-1"), charged);
+            assert_eq!(custody.holdings()[0].unconfirmed_scopes, 1);
+        }
+        assert!(custody.attach(&key("a"), mine().0).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_dead_leader_does_not_end_an_unavailable_source_reader_scope() {
+        let mut child = Command::new("sh").args(["-c", "read line"]).stdin(Stdio::piped()).spawn().unwrap();
+        let birth = process_birth(child.id()).unwrap();
+        let (reader, lease) = Reader::lease_in_scope(birth, pidfd(child.id()), None).unwrap();
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        assert!(!reader.ended());
+        drop(lease);
+        assert!(!reader.ended(), "closing a test-owned lease hid unavailable whole-scope proof");
     }
 
     #[test]

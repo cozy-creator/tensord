@@ -422,6 +422,7 @@ pub struct IdleReclaim {
     pub root_export_bytes_released: u64,
     pub root_export_bytes_remaining: u64,
     pub readers_remaining: usize,
+    pub unconfirmed_scopes_remaining: usize,
     pub warnings: Vec<String>,
 }
 
@@ -492,6 +493,11 @@ impl GpuPool {
         };
         if let Some(custody) = &self.custody {
             let mut custody = custody.lock().unwrap();
+            // Install the family fences under the same mutex before revoking or asking
+            // readers to detach, so every observer/policy collector honors them too.
+            for session in held.values() {
+                custody.fence_reader_scope(&session.executor.birth, session.executor.scope_recovery());
+            }
             receipt.holdings_before = custody.holdings().len();
             receipt.holdings_revoked = custody.invalidate_all().len();
         }
@@ -551,6 +557,7 @@ impl GpuPool {
             receipt.root_export_bytes_remaining =
                 remaining.iter().map(|holding| holding.bytes).sum();
             receipt.readers_remaining = remaining.iter().map(|holding| holding.readers.len()).sum();
+            receipt.unconfirmed_scopes_remaining = remaining.iter().map(|holding| holding.unconfirmed_scopes).sum();
             log_released(released);
         }
         receipt.warnings.truncate(8);
@@ -2053,6 +2060,7 @@ impl GpuPool {
             peer: session.peer,
             grants: &session.grants,
             birth: session.executor.birth.clone(),
+            source_scope: session.executor.scope_recovery(),
             custody: self.custody.as_ref().filter(|_| sharing),
             exit: session.executor.observer_pidfd()?,
             pool: self,
@@ -3314,6 +3322,7 @@ struct Callbacks<'a> {
     custody: Option<&'a Mutex<ResidentCustody>>,
     /// The executor's pidfd: a reader lease ends when it does.
     exit: File,
+    source_scope: Option<crate::scope::Recovery>,
     pool: &'a GpuPool,
     plan: &'a str,
     degree: u32,
@@ -3368,7 +3377,7 @@ impl Services for Callbacks<'_> {
             .learn_holding(self.plan, &holding_id(&key, 0));
         // The reader's lease is a connection: the executor keeps one end while it maps the
         // holding, and its close (release or death) ends the lease.
-        let (reader, lease) = Reader::lease(self.birth.clone(), self.exit.try_clone()?)?;
+        let (reader, lease) = Reader::lease_in_scope(self.birth.clone(), self.exit.try_clone()?, self.source_scope.clone())?;
         answer.ok = true;
         answer.code.clear();
         answer.detail.clear();
