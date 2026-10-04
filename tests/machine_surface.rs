@@ -1562,6 +1562,109 @@ mod v1_api {
         }
     }
 
+    /// A job's memoized call that ran is a `memo` event in the job's log; a later job whose
+    /// spec carries that result as known has the same call answered from it, never run.
+    #[tokio::test]
+    async fn a_memoized_call_is_answered_from_its_callers_known_result() {
+        let (machine, tools) = installing_machine().await;
+        let mut client = client(&machine).await;
+        let all = cap(Grant {
+            action: MACHINE.into(),
+            ..Default::default()
+        });
+        let manifest =
+            write_package(&mut client, &all, "cpu_memo", "local/cozy-machine-cpu-memo").await;
+        let counter = machine.root.join("measured");
+        let survey = |id: &str, values: &[i64], known: Vec<v1::MemoResult>| {
+            let spec = v1::RunSpec {
+                kind: v1::RunKind::Job as i32,
+                source: Some(v1::run_spec::Source::Local(v1::LocalSource {
+                    manifest: manifest.clone(),
+                })),
+                entrypoint: "survey".into(),
+                payload: serde_json::to_vec(
+                    &serde_json::json!({"values": values, "counter": counter}),
+                )
+                .unwrap(),
+                known_results: known,
+                owner: "alice".into(),
+                ..Default::default()
+            };
+            authorized(
+                v1::RunRequest {
+                    id: id.into(),
+                    after: 0,
+                    spec: Some(spec),
+                },
+                &all,
+            )
+        };
+        let memos = |events: &[v1::RunEvent]| -> Vec<v1::MemoRecord> {
+            events
+                .iter()
+                .filter_map(|e| match &e.event {
+                    Some(v1::run_event::Event::Memo(memo)) => Some(memo.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let measured = || {
+            std::fs::read_to_string(&counter)
+                .unwrap()
+                .parse::<u32>()
+                .unwrap()
+        };
+        let first = collect(
+            client
+                .run(survey("survey-1", &[3, 4], vec![]))
+                .await
+                .unwrap()
+                .into_inner(),
+        )
+        .await
+        .unwrap();
+        let done = outcome(&first);
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        assert_eq!(result["squares"], serde_json::json!([9, 16]));
+        assert_eq!(measured(), 2);
+        let recorded = memos(&first);
+        assert_eq!(recorded.len(), 2, "{first:?}");
+        assert!(
+            recorded[0].operation.starts_with("sha256:")
+                && recorded[0].computation_digest.starts_with("sha256:")
+        );
+        assert_eq!(recorded[0].result, br#"{"square":9}"#);
+
+        // The caller holds both: the call for 3 is answered, the one for 5 runs.
+        let known = recorded
+            .iter()
+            .map(|m| v1::MemoResult {
+                operation: m.operation.clone(),
+                computation_digest: m.computation_digest.clone(),
+                result: m.result.clone(),
+            })
+            .collect();
+        let second = collect(
+            client
+                .run(survey("survey-2", &[3, 5], known))
+                .await
+                .unwrap()
+                .into_inner(),
+        )
+        .await
+        .unwrap();
+        let done = outcome(&second);
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        assert_eq!(result["squares"], serde_json::json!([9, 25]));
+        assert_eq!(measured(), 3, "the known call ran again");
+        let recorded = memos(&second);
+        assert_eq!(recorded.len(), 1, "{second:?}");
+        assert_eq!(recorded[0].result, br#"{"square":25}"#);
+        let _ = fs::remove_dir_all(tools);
+    }
+
     /// Write and run sources on the real serve process: an object resumes from what is held,
     /// and unpublished code written with Write prepares inside its run (warm, then a call).
     #[tokio::test]

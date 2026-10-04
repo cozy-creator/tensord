@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
+import importlib.metadata
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -61,12 +64,30 @@ def probe_cpu_bridge(interpreter: Path) -> str:
     return (lines[-1] if lines else f"bridge import exited {probe.returncode}")[:1024]
 
 
+def source_digest(interpreter: Path, distribution: str) -> str:
+    """The installed package's own files by their RECORD hashes: the same wherever this code
+    is installed, so a memoized call's result is reusable there. Empty when unrecorded or
+    editable (a path file's hash says nothing of the code)."""
+    def name(value: str) -> str:
+        return re.sub(r"[-_.]+", "-", value).lower()
+    site = [str(path) for path in (interpreter.parent.parent / "lib").glob("python*/site-packages")]
+    rows = sorted((str(file), file.hash.value)
+                  for found in importlib.metadata.distributions(path=site)
+                  if name(found.metadata["Name"]) == name(distribution)
+                  for file in found.files or []
+                  if file.hash and file.parts[0] != ".." and not file.parts[0].endswith(".dist-info"))
+    if not rows or any(path.endswith(".pth") for path, _ in rows):
+        return ""
+    return "sha256:" + hashlib.sha256(msgspec.json.encode(rows)).hexdigest()
+
+
 def publish_generation(root: Path, metadata: PackageMetadata, interface: msgspec.Raw) -> Generation:
     interpreter = root / "env" / "bin" / "python"
     inventory = subprocess.check_output(["uv", "pip", "list", "--python", str(interpreter), "--format", "json"])
     dependencies = msgspec.json.decode(inventory, type=list[Dependency])
     generation = Generation(root.name, metadata.name, metadata.version, metadata.application,
-                            str(interpreter), dependencies, interface, probe_cpu_bridge(interpreter))
+                            str(interpreter), dependencies, interface, probe_cpu_bridge(interpreter),
+                            source_digest(interpreter, metadata.name))
     with (root / ".generation.json.new").open("wb") as output:
         output.write(msgspec.json.encode(generation))
         output.flush()

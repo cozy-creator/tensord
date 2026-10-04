@@ -29,6 +29,9 @@ pub struct Generation {
     /// Empty when the CPU runner's SDK adapter imported at install; else the reason.
     #[serde(default)]
     pub cpu_bridge: String,
+    /// The package's own installed files, hashed; empty when its installer recorded none.
+    #[serde(default)]
+    pub source_digest: String,
 }
 #[derive(Clone)]
 pub struct HeldGeneration {

@@ -53,6 +53,9 @@ pub struct Spec {
     /// The machine-publication authorization the weights destination is written under.
     pub publication: String,
     pub owner: String,
+    /// Memoized calls' results the caller already holds: (computation digest, result JSON).
+    /// A job's calls are answered from them; a child's one entry is its answer.
+    pub known: Vec<(String, String)>,
     /// The spec's identity (its token excluded): a resubmitted id must carry the same.
     pub digest: String,
 }
@@ -84,6 +87,8 @@ pub struct JobContext {
     inputs: BTreeMap<String, (String, ObjectRef)>,
     weights_destination: String,
     publication: String,
+    /// Memoized calls' known results (memory only: after a restart its calls run).
+    known: Vec<(String, String)>,
 }
 
 /// What a job's weights grant reads of its context (`jobs.rs`).
@@ -146,6 +151,7 @@ impl Durable {
                 .collect(),
             weights_destination: self.weights_destination,
             publication: self.publication,
+            known: vec![],
         })
     }
 }
@@ -413,6 +419,16 @@ impl Runs {
     /// The run's code and models made ready: Ok(None) once it is dispatchable, Ok(Some) for a
     /// warm run's result.
     fn prepare(&self, actor: &str, id: &str, spec: Spec) -> Result<Option<ResultRecord>, Refused> {
+        // A memoized call answered from a result its caller already holds runs nothing.
+        if let (false, Some((_, result))) = (spec.parent.is_empty(), spec.known.first()) {
+            let value = serde_json::from_str(result)
+                .map_err(|_| refused("invalid_request", "a known result is not JSON"))?;
+            return Ok(Some(ResultRecord {
+                value,
+                artifacts: vec![],
+                asset_bindings: vec![],
+            }));
+        }
         let engine = self.service.engine.clone();
         let run = id.to_string();
         // Byte counts arrive per chunk: a new stage shows at once, bytes at most 4 times a second.
@@ -538,6 +554,7 @@ impl Runs {
                 inputs,
                 weights_destination: spec.weights_destination.clone(),
                 publication: spec.publication.clone(),
+                known: spec.known.clone(),
             };
             let durable = serde_json::to_vec(&Durable::of(&context)).map_err(io::Error::other)?;
             self.service
@@ -611,7 +628,8 @@ impl Runs {
 
     /// A child call of a running job: a run `<request>` under the job's signer, idempotent on
     /// `intent`, preparing inside itself with the job's context and the choices addressed to
-    /// its callable.
+    /// its callable. `answer`, a memoized call's known result, completes it without running.
+    #[allow(clippy::too_many_arguments)]
     pub fn child(
         self: &Arc<Self>,
         parent: &Execution,
@@ -620,14 +638,28 @@ impl Runs {
         entrypoint: &str,
         input: Value,
         inputs: Vec<InputFile>,
+        answer: Option<String>,
     ) -> Result<Execution, Refused> {
         let actor = parent.submission.as_ref().map(|s| s.actor.clone()).unwrap_or_default();
         // An earlier attempt's call is already its run (a resumed job): nothing prepares.
         if let Some(existing) = self.existing(&actor, request, intent)? {
             return Ok(existing);
         }
-        let spec = self.child_spec(&actor, &parent.id, entrypoint, input, inputs, intent)?;
+        let mut spec = self.child_spec(&actor, &parent.id, entrypoint, input, inputs, intent)?;
+        spec.known = answer
+            .map(|result| vec![(String::new(), result)])
+            .unwrap_or_default();
         self.submit(&actor, request, spec)
+    }
+
+    /// The result a job's caller already holds for a memoized call's computation, if any.
+    pub fn known(&self, parent: &str, digest: &str) -> Option<String> {
+        let jobs = self.jobs.lock().unwrap();
+        let known = &jobs.get(parent)?.known;
+        known
+            .iter()
+            .find(|(d, _)| d == digest)
+            .map(|(_, r)| r.clone())
     }
 
     fn child_spec(
@@ -679,6 +711,7 @@ impl Runs {
             weights_destination: String::new(),
             publication: String::new(),
             owner: context.owner,
+            known: vec![],
             digest: digest.into(),
         })
     }
@@ -947,6 +980,7 @@ mod tests {
             weights_destination: String::new(),
             publication: String::new(),
             owner: "alice".into(),
+            known: vec![],
             digest: digest.into(),
         }
     }
@@ -1077,6 +1111,7 @@ mod tests {
             installation: "pkg".into(), hub: None, providers: Default::default(), owner: "alice".into(),
             binding_revision: String::new(), attention_kernel: String::new(), models: vec![],
             inputs: Default::default(), weights_destination: String::new(), publication: String::new(),
+            known: vec![],
         });
         let child = |name: &str| runs.child_spec("alice", "7", name, json!({}), vec![], "d");
         assert!(child("leaf-job").unwrap().job);

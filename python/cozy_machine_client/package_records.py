@@ -17,6 +17,8 @@ class Generation(msgspec.Struct, frozen=True):
     interface: msgspec.Raw
     # Empty: the CPU runner's SDK adapter imports in this environment; else why it cannot.
     cpu_bridge: str = ""
+    # The package's own installed files, hashed: what keys its memoized calls across machines.
+    source_digest: str = ""
 
 
 class ApplicationEntry(msgspec.Struct, frozen=True):

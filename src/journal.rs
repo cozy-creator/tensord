@@ -351,6 +351,7 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS public_terminals(execution INTEGER PRIMARY KEY REFERENCES executions(id),outcome BLOB NOT NULL,events BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS run_products(execution INTEGER NOT NULL REFERENCES executions(id),sequence INTEGER NOT NULL,at_ms INTEGER NOT NULL,product BLOB NOT NULL,PRIMARY KEY(execution,sequence));
             CREATE TABLE IF NOT EXISTS run_measurements(execution INTEGER PRIMARY KEY REFERENCES executions(id),measurements BLOB NOT NULL);
+            CREATE TABLE IF NOT EXISTS run_memos(execution INTEGER NOT NULL REFERENCES executions(id),sequence INTEGER NOT NULL,at_ms INTEGER NOT NULL,record BLOB NOT NULL,PRIMARY KEY(execution,sequence));
             CREATE TABLE IF NOT EXISTS native_outputs(actor TEXT NOT NULL,owner TEXT NOT NULL,source BLOB NOT NULL,PRIMARY KEY(actor,owner));
             CREATE TABLE IF NOT EXISTS input_intakes(actor TEXT NOT NULL,retention TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,retention));
             CREATE TABLE IF NOT EXISTS hub_access(actor TEXT NOT NULL,origin TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,origin));
@@ -1682,6 +1683,35 @@ impl Journal {
         Ok(record.revision)
     }
 
+    /// One memoized call's result in the run's log (a `memo` event), at the next sequence.
+    pub fn append_memo(
+        &mut self,
+        id: &str,
+        progress: Option<&ProgressSnapshot>,
+        memo: &[u8],
+    ) -> io::Result<u64> {
+        let record = self.update_with(
+            id,
+            progress,
+            |record| Ok(!record.state.terminal()),
+            |tx, record| {
+                tx.execute(
+                    "INSERT INTO run_memos(execution,sequence,at_ms,record) VALUES(?1,?2,?3,?4)",
+                    params![id, record.revision as i64, timestamp(), memo],
+                )
+                .map_err(db_error)?;
+                Ok(())
+            },
+        )?;
+        Ok(record.revision)
+    }
+    pub fn memos(&self, id: &str) -> io::Result<Vec<StoredProduct>> {
+        self.stored(
+            "SELECT sequence,at_ms,record FROM run_memos WHERE execution=?1 ORDER BY sequence",
+            id,
+        )
+    }
+
     /// What the execution's executor measured of its latest attempt (`run show`).
     pub fn record_measurements(&mut self, id: &str, measurements: &[u8]) -> io::Result<()> {
         self.connection
@@ -1706,10 +1736,13 @@ impl Journal {
 
     /// The execution's output log, oldest first.
     pub fn products(&self, id: &str) -> io::Result<Vec<StoredProduct>> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT sequence,at_ms,product FROM run_products WHERE execution=?1 ORDER BY sequence")
-            .map_err(db_error)?;
+        self.stored(
+            "SELECT sequence,at_ms,product FROM run_products WHERE execution=?1 ORDER BY sequence",
+            id,
+        )
+    }
+    fn stored(&self, query: &str, id: &str) -> io::Result<Vec<StoredProduct>> {
+        let mut statement = self.connection.prepare(query).map_err(db_error)?;
         let rows = statement
             .query_map([id], |row| {
                 Ok(StoredProduct {

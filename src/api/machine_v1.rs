@@ -196,6 +196,7 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
         identity.binding_revision.clear();
         identity.known_results.clear();
         identity.publication.clear();
+        identity.known_results.clear(); // what the caller knows never changes the run
         format!(
             "sha256:{}",
             tensorfs_core::sha256::hex_digest(&prost::Message::encode_to_vec(&identity))
@@ -294,6 +295,15 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
         weights_destination: spec.weights_destination,
         publication: spec.publication,
         owner: spec.owner,
+        // Each a bounded JSON document; anything else is not a known result.
+        known: spec
+            .known_results
+            .into_iter()
+            .filter(|m| m.result.len() <= crate::jobs::MEMO_RESULT_BYTES)
+            .filter_map(|m| Some((m.computation_digest, String::from_utf8(m.result).ok()?)))
+            .filter(|(_, result)| serde_json::from_str::<serde_json::Value>(result).is_ok())
+            .take(256)
+            .collect(),
         digest: identity_digest,
     })
 }
@@ -404,6 +414,14 @@ impl Log {
                     stage_fraction: payload["stage_fraction"].as_f64(),
                 })
             }
+            "memo" => v1::run_event::Event::Memo(v1::MemoRecord {
+                operation: body["operation"].as_str().unwrap_or_default().into(),
+                computation_digest: body["computation_digest"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .into(),
+                result: crate::boundary_json::exact(&body["result"]),
+            }),
             "product" => {
                 let product = event.product?;
                 let list = product.op == pb::RunProductOp::Append as i32;

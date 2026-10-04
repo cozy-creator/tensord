@@ -160,11 +160,12 @@ impl NativeBackend {
             ..Default::default()
         })
     }
-    /// The run's published products, as events with their journaled sequences.
+    /// The run's journaled log: its published products and its memoized calls' results, as
+    /// events with their journaled sequences.
     fn product_events(&self, record: &Execution) -> Result<Vec<pb::MachineExecutionEvent>, Status> {
         let attempt = record.attempt.max(1) as u64;
-        self.service
-            .engine
+        let engine = &self.service.engine;
+        let mut events = engine
             .products(&record.id)
             .map_err(problem)?
             .iter()
@@ -180,7 +181,19 @@ impl NativeBackend {
                     ..Default::default()
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>, Status>>()?;
+        for stored in engine.memos(&record.id).map_err(problem)? {
+            events.push(pb::MachineExecutionEvent {
+                sequence: stored.sequence,
+                attempt_ordinal: attempt,
+                at_ms: stored.at_ms,
+                kind: "memo".into(),
+                body_canonical_bytes: stored.product,
+                ..Default::default()
+            });
+        }
+        events.sort_by_key(|event| event.sequence);
+        Ok(events)
     }
     fn terminal(&self, record: &Execution) -> Result<pb::MachineExecutionEventPage, Status> {
         let _guard = self.projection.lock().unwrap();

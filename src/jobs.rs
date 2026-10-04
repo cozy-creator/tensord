@@ -63,6 +63,8 @@ struct Parent {
     spool: PathBuf,
     /// `(module, export)` of each own invocable, and the entrypoint it is registered as.
     callables: HashMap<(String, String), String>,
+    /// The memoized ones' operation identity.
+    memoized: HashMap<(String, String), String>,
     /// The parent's own file inputs: a child may be handed any of them.
     inputs: Vec<InputFile>,
     calls: Mutex<Calls>,
@@ -91,6 +93,8 @@ struct Calls {
 
 struct ChildCall {
     child: String,
+    /// A memoized call that ran: (operation identity, computation digest), for its `memo` event.
+    memo: Option<(String, String)>,
     request: String,
     /// The answered result and grants, once the child succeeded (materialized once).
     settled: Option<(String, Vec<Value>)>,
@@ -314,6 +318,7 @@ impl Jobs {
                 .unwrap_or_default(),
             spool: spool.clone(),
             callables,
+            memoized: memoized(&held.record),
             inputs: record.invocation.inputs.clone(),
             calls: Mutex::new(Calls::default()),
         });
@@ -695,12 +700,26 @@ impl Jobs {
         let inputs = child_inputs(&input, parent, &calls.received);
         let request = format!("{}/{}", parent.request, frame.call_index);
         let intent = child_intent(&frame.module, &frame.export, &input);
+        // A memoized call's computation: its operation identity and its request. A result the
+        // caller already holds answers it.
+        let memo = parent
+            .memoized
+            .get(&(frame.module.clone(), frame.export.clone()))
+            .map(|operation| {
+                let computation = crate::boundary_json::exact(&json!([operation, input]));
+                let digest = tensorfs_core::sha256::hex_digest(&computation);
+                (operation.clone(), format!("sha256:{digest}"))
+            });
+        let answer = memo
+            .as_ref()
+            .and_then(|(_, digest)| runs.known(&parent.id, digest));
+        let memo = memo.filter(|_| answer.is_none());
         let job = service
             .engine
             .get(&parent.id)
             .map_err(|e| ("child_call_refused", e.to_string()))?;
         let record = runs
-            .child(&job, &request, &intent, entrypoint, input, inputs)
+            .child(&job, &request, &intent, entrypoint, input, inputs, answer)
             .map_err(|refusal| match refusal.code {
                 "run_id_conflict" => (
                     "child_call_refused",
@@ -720,6 +739,7 @@ impl Jobs {
         held.map_err(|e| ("child_call_refused", e.to_string()))?;
         calls.by_index.entry(frame.call_index).or_insert(ChildCall {
             child: record.id.clone(),
+            memo,
             request: request.clone(),
             settled: None,
             progress: (0, None),
@@ -795,6 +815,25 @@ impl Jobs {
                                 media_type: row["media_type"].as_str().unwrap_or_default().into(),
                             },
                         );
+                    }
+                    // A memoized call's file-less result: any machine its caller runs on may reuse it.
+                    if let (Some((operation, digest)), true, true) = (
+                        &call.memo,
+                        settled.1.is_empty(),
+                        settled.0.len() <= MEMO_RESULT_BYTES,
+                    ) {
+                        let result =
+                            crate::boundary_json::parse(settled.0.as_bytes()).unwrap_or_default();
+                        let memo = json!({"operation": operation, "computation_digest": digest, "result": result});
+                        let appended = service
+                            .engine
+                            .append_memo(&parent.id, &crate::boundary_json::exact(&memo));
+                        if let Err(error) = appended {
+                            eprintln!(
+                                "job {}: memo of call {}: {error}",
+                                parent.id, frame.call_index
+                            );
+                        }
                     }
                     call.settled = Some(settled);
                 }
@@ -1048,6 +1087,41 @@ fn conclude(
         }
     }
     Ok(())
+}
+
+/// The largest memoized result kept in a run's log or answered from a caller's known results.
+pub const MEMO_RESULT_BYTES: usize = 48 << 10;
+
+/// `(module, export)` of each memoized own invocable and its operation identity: the
+/// package's installed files, the module and the export, the same on every machine. An
+/// installation that recorded no source digest memoizes nothing.
+fn memoized(generation: &crate::catalog::Generation) -> HashMap<(String, String), String> {
+    let mut memoized = HashMap::new();
+    for section in ["jobs", "entrypoints"] {
+        for entry in generation.interface[section]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            let declared = &entry["invocable"];
+            if let (Some(module), Some(export), Some(true), false) = (
+                declared["module"].as_str(),
+                declared["export"].as_str(),
+                declared["memoize"].as_bool(),
+                generation.source_digest.is_empty(),
+            ) {
+                let identity = format!("{}\0{module}\0{export}", generation.source_digest);
+                memoized.insert(
+                    (module.into(), export.into()),
+                    format!(
+                        "sha256:{}",
+                        tensorfs_core::sha256::hex_digest(identity.as_bytes())
+                    ),
+                );
+            }
+        }
+    }
+    memoized
 }
 
 /// The package's own invocables as the job's call interfaces, and the entrypoint each is.
