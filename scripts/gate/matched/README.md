@@ -55,8 +55,9 @@ all quantized parts are dense logical values or read a foreign Store directly.
 
 Collect same-engine unconstrained controls first with `--reference-only`. Repeat
 the exact six requests three times, then run `controls.py ref1/result.json
-ref2/result.json ref3/result.json --out controls.json`. Cozy must report all authored
-denoise positions; Comfy must execute its sampler rather than return a cached
+ref2/result.json ref3/result.json --out controls.json`. Cozy must report current
+denoise work through the final authored step (early observer gaps are retained);
+Comfy must execute its sampler rather than return a cached
 sampler. Cached encoders/loaders remain visible and are allowed in a warm arm.
 For scored pairs, distinct predeclared prompts/seeds may avoid whole-sampler
 cache, but each pair must match across engines and keep the authored geometry and
