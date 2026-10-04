@@ -2261,6 +2261,18 @@ impl GpuPool {
         // Rank 0 answered, so a follower that ended during the call is the group's first fault.
         let lost = self.lost_followers(plan.degree, &session.followers);
         if !reply.quiescent || !reply.poisoned.is_empty() || !lost.is_empty() {
+            // A partial or unproved failure cannot leave reusable machine-held mappings.
+            // One GPU call owns this slot; every other retained session is idle. Fence
+            // attachments first, then retire those sessions through their observed-exit
+            // resource fence. Custody keeps live/unknown reader references charged.
+            if let Some(custody) = &self.custody {
+                let invalidated = custody.lock().unwrap().invalidate_all();
+                crate::memory::note(serde_json::json!({
+                    "event": "resident_invalidated", "run": id,
+                    "holdings": invalidated.len(), "reason": reply.poisoned,
+                }));
+                callbacks.others.clear();
+            }
             // The run ends once the executor is gone; its own reason travels with it, typed.
             let (code, message) = reply
                 .outcome

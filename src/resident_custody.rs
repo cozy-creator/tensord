@@ -223,6 +223,19 @@ impl ResidentCustody {
         Ok(held.readers.iter().map(|r| r.birth.clone()).collect())
     }
 
+    /// An executor's state is uncertain: fence every future attachment. Existing reader
+    /// references remain charged until their lease closes or exact process exit is observed.
+    pub fn invalidate_all(&mut self) -> Vec<(HoldingKey, u64)> {
+        let mut changed = Vec::new();
+        for (key, held) in &mut self.holdings {
+            if held.phase == Phase::Ready {
+                held.phase = Phase::Revoking;
+                changed.push((key.clone(), held.generation));
+            }
+        }
+        changed
+    }
+
     /// A reader answered `revoke`: it unmapped and released the generation after its queued
     /// work. A reader that could not stays charged until its process ends.
     pub fn released(&mut self, key: &HoldingKey, generation: u64, birth: &ProcessBirth) {
@@ -391,6 +404,36 @@ mod tests {
     }
     fn fds(n: usize) -> Vec<OwnedFd> {
         (0..n).map(|_| devnull()).collect()
+    }
+
+    #[test]
+    fn uncertain_state_fences_attachments_without_releasing_live_readers() {
+        let mut custody = ResidentCustody::default();
+        let (first, first_end) = mine();
+        let (second, second_end) = mine();
+        custody.offer(key("a"), "first", regions(), fds(3), first).unwrap();
+        custody.offer(key("b"), "second", regions(), fds(3), second).unwrap();
+        let charged = custody.charged_bytes("GPU-1");
+        assert_eq!(custody.invalidate_all().len(), 2);
+        assert!(custody.invalidate_all().is_empty());
+        assert!(custody.attach(&key("a"), mine().0).unwrap().is_none());
+        assert!(custody.collect().is_empty());
+        assert_eq!(custody.charged_bytes("GPU-1"), charged);
+        assert!(custody.holdings().iter().all(|h| h.phase == Phase::Revoking));
+        drop(first_end);
+        assert_eq!(custody.collect().len(), 1);
+        assert_eq!(custody.holdings().len(), 1);
+        assert!(!custody.holdings()[0].readers.is_empty());
+        drop(second_end);
+        assert_eq!(custody.collect().len(), 1);
+        assert_eq!(custody.charged_bytes("GPU-1"), 0);
+        let (replacement, end) = mine();
+        assert_eq!(
+            custody.offer(key("a"), "fresh", regions(), fds(3), replacement).unwrap(),
+            Offered::Kept { generation: 3 }
+        );
+        assert_eq!(custody.holdings()[0].phase, Phase::Ready);
+        drop(end);
     }
 
     #[test]
