@@ -134,7 +134,7 @@ fn held_generations_and_external_hardlinks_cannot_make_a_plan_look_covering() {
     let held = fixture.generation('a');
     let linked = fixture.generation('b');
     let hold = fs::File::open(held.join(".hold")).unwrap();
-    hold.lock_shared().unwrap();
+    FileExt::lock_shared(&hold).unwrap();
     let external = fixture.root.join("external-cache");
     fs::hard_link(linked.join("weights"), &external).unwrap();
     let kernel = fixture.kernel("keep", 4096);
