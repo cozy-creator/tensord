@@ -124,8 +124,13 @@ impl Caller {
                 }
                 true
             }
-            Some(v1::run_event::Event::Log(_)) => false,
-            _ => true,
+            Some(v1::run_event::Event::State(state)) => {
+                state.waiting.clear();
+                true
+            }
+            // Author-provided progress/log text and future advisory events are private
+            // unless this grant covers the unrestricted run.
+            _ => false,
         }
     }
     fn machine(&self) -> Result<(), Status> {
