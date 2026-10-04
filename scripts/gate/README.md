@@ -86,6 +86,14 @@ a list of requests (model names, or `{"model", "input"}` payloads) or `{"request
 - an arm with `command` runs another engine's own driver on the host (ComfyUI) and returns the same record;
 - `target_args` adds per-model arguments (e.g. `model.model=...`), `cell_facts` records a host command per cell,
   `continue_on_failure` records a failed cell and goes on.
+- a cell's `setup` command runs first (e.g. that cell's host limits, in place before the machine starts);
+- an arm's `cache_list` command prints the files to read into the page cache, where `cache_paths` (whole directories)
+  would be too much (a shared store);
+- an arm with `cold_by_run` starts a cold cell from a stopped machine: the first `cozy run` starts it, and the total
+  runs from that submit (the rebench's cold start on this computer).
+
+Local mode counts only the executors in the arm's own cgroup, and the 1 Hz samples are fsynced, so a computer that
+freezes keeps its last second.
 
 ## Manifest
 

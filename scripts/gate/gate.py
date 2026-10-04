@@ -78,12 +78,16 @@ def started(pid):
     boot = next(int(l.split()[1]) for l in open("/proc/stat") if l.startswith("btime"))
     return boot + ticks / os.sysconf("SC_CLK_TCK")
 def executors():
+    try: unit = open(os.path.join(HERE, "cgroup")).read().strip().replace("/sys/fs/cgroup", "", 1)   # local: this arm's only
+    except OSError: unit = ""
     out = []
     for d in os.listdir("/proc"):
-        if d.isdigit() and "cozy_runtime.internal.executor" in cmd(d):
-            st = {l.split(":")[0]: l.split(":")[1].split() for l in open(f"/proc/{d}/status")}
-            out.append({"pid": int(d), "ppid": int(st["PPid"][0]), "uid": int(st["Uid"][0]), "started": started(d),
-                        "rss": int(st["VmRSS"][0]) * 1024, "cmd": cmd(d)[:200]})
+        try:
+            if d.isdigit() and "cozy_runtime.internal.executor" in cmd(d) and unit in open(f"/proc/{d}/cgroup").read():
+                st = {l.split(":")[0]: l.split(":")[1].split() for l in open(f"/proc/{d}/status")}
+                out.append({"pid": int(d), "ppid": int(st["PPid"][0]), "uid": int(st["Uid"][0]), "started": started(d),
+                            "rss": int(st["VmRSS"][0]) * 1024, "cmd": cmd(d)[:200]})
+        except (OSError, KeyError, IndexError): pass   # it exited mid-read
     return out
 def gpu():
     q = "memory.used,temperature.gpu,clocks.sm,power.draw,utilization.gpu,clocks_throttle_reasons.active"
@@ -106,7 +110,8 @@ if act == "sample":
             t = time.time()
             try:   # a unit can vanish mid-read while an arm restarts: skip that tick, never die
                 ex = executors()
-                out.write(json.dumps({"t": t, "gpu": gpu(), "cg": cg(), "load": load(), "executors": len(ex)}) + "\n"); out.flush()
+                out.write(json.dumps({"t": t, "gpu": gpu(), "cg": cg(), "load": load(), "executors": len(ex)}) + "\n")
+                out.flush(); os.fsync(out.fileno())   # a frozen computer keeps its last second
             except (OSError, ValueError, KeyError):
                 pass
             time.sleep(max(0.0, 1.0 - (time.time() - t)))
@@ -450,13 +455,21 @@ class Gate:
         if isinstance(spec_cell, list):
             spec_cell = {"requests": spec_cell}
         budget, cold = spec_cell.get("budget"), spec_cell.get("cold", False)
+        by_run = cold and spec.get("cold_by_run", False)   # this computer: the first `cozy run` starts the stopped machine
+        if spec_cell.get("setup"):   # e.g. this cell's host limits, in place before the machine starts
+            self.pod.sh(spec_cell["setup"])
+        if spec.get("cgroup"):
+            self.pod.sh(f"({spec['cgroup']}) > {self.pod.dir}/cgroup")
         if self.m.get("rental"):
             subprocess.run(["cozy", "rental", "keepalive", self.m["rental"], f"--tensorhub={self.m['hub']}"], capture_output=True)
         self.record({"arm": arm, "cell": name, "event": "cell_begin", "clock": self.clock(), "cool": self.cool()})
         warm = None
         paths = spec.get("cache_paths", self.m.get("cache_paths"))
-        if paths:   # this engine's files read into the page cache; the cell's disk reads show what held
-            self.pod.helper("list", json.dumps(paths), self.cache)
+        if paths or spec.get("cache_list"):   # this engine's files read into the page cache; the cell's disk reads show what held
+            if paths:
+                self.pod.helper("list", json.dumps(paths), self.cache)
+            else:   # a command that prints the files (e.g. a model's blobs and the libraries the live engine maps)
+                self.pod.sh(f"({spec['cache_list']}) > {self.cache}")
             warm = self.pod.helper("warm", self.cache)
         ballast = None
         if budget:   # a fixed real allocation made before the engine starts: the free pool is what is left
@@ -475,15 +488,16 @@ class Gate:
                 if spec.get("start"):
                     while self.pod.helper("now")["executors"]:
                         time.sleep(0.2)
-                    self.pod.sh(spec["start"])
-                new = self.pod.helper("newroot", old, spec["root"])
+                    if not by_run:
+                        self.pod.sh(spec["start"])
+                new = {"stopped": True} if by_run else self.pod.helper("newroot", old, spec["root"])
             else:
                 new = {"pid": int(old), "already": True}
-            if spec.get("after_start"):
+            if spec.get("after_start") and not by_run:
                 self.pod.sh(spec["after_start"])
             if spec.get("cgroup"):
                 self.pod.sh(f"({spec['cgroup']}) > {self.pod.dir}/cgroup")
-            limits = self.pod.sh(spec["limits"]) if spec.get("limits") else None
+            limits = self.pod.sh(spec["limits"]) if spec.get("limits") and not by_run else None
             before = self.pod.helper("now")
             if spec.get("command"):
                 try:
@@ -495,24 +509,28 @@ class Gate:
                     row = {"total_s": 0.0, "t_first": time.time(), "t_end": time.time(), "ok": False, "requests": [],
                            "error": str(error)[-3000:]}
             else:
-                row = self.cozy_cell(arm, name, spec, spec_cell["requests"], None if not cold else new["started"])
+                row = self.cozy_cell(arm, name, spec, spec_cell["requests"], new.get("started") if cold else None, ready=not cold)
             after = self.pod.helper("now")
+            if by_run:   # the machine `cozy run` started: the limits it ran under
+                new = self.pod.helper("newroot", "none", spec["root"])
+                limits = self.pod.sh(spec["limits"]) if spec.get("limits") else None
         finally:
             if ballast:
                 self.pod.sh(self.m["ballast"]["stop"], check=False)
         facts = self.pod.sh(self.m["cell_facts"], check=False) if self.m.get("cell_facts") else None   # e.g. kernel Xid lines
         self.record({"arm": arm, "cell": name, "event": "cell", "offset": self.offset, "new_root": new, "limits": limits, "facts": facts,
                      "budget": budget, "cold": cold, "ballast": ballast, "warm": warm, "gpu_before": before["gpu"],
-                     "disk_read_bytes": after["cg"]["read_bytes"] - before["cg"]["read_bytes"],
+                     # a unit that did not exist before the cell (stopped machine) starts its counter at zero
+                     "disk_read_bytes": after["cg"]["read_bytes"] - (before["cg"]["read_bytes"] if before["cg"]["path"] == after["cg"]["path"] else 0),
                      "controller_load": os.getloadavg()[0], **row})
         self.idle_since = time.time()
         log(f"{arm} cell {name}: {row['total_s']:.1f} s", "ok" if row["ok"] else "FAILED")
         if not row["ok"] and not self.m.get("continue_on_failure"):   # between engines a failed cell is a result
             raise RuntimeError(f"cell {name} on {arm} failed")
 
-    def cozy_cell(self, arm: str, name: str, spec: dict, requests: list, born: float | None) -> dict:
+    def cozy_cell(self, arm: str, name: str, spec: dict, requests: list, born: float | None, ready: bool = True) -> dict:
         """Ordinary `cozy run --await` per request; the next is submitted once the previous one holds the GPU."""
-        if born is None:
+        if ready:
             if spec.get("ready"):
                 self.pod.sh(spec["ready"])
             while self.m.get("rental") and subprocess.run(["cozy", "rental", "keepalive", self.m["rental"], f"--tensorhub={self.m['hub']}"],
@@ -564,7 +582,7 @@ class Gate:
 
     def run(self) -> None:
         samples = f"{self.pod.dir}/samples-{self.m['salt']}.jsonl"
-        sampler = self.pod.sh(f"nohup {self.pod.py} {POD_DIR}/pod.py sample {samples} >/dev/null 2>&1 & echo $!").strip()
+        sampler = self.pod.sh(f"nohup {self.pod.py} {self.pod.dir}/pod.py sample {samples} >/dev/null 2>&1 & echo $!").strip()
         try:
             for arm in self.m.get("prime", []):
                 self.prime(arm)
