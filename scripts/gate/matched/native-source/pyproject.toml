@@ -1,0 +1,15 @@
+[project]
+name = "codex-memory-metadata"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["cozy-runtime>=0.18.102", "tensorfs>=0.3.93", "msgspec>=0.19"]
+
+[project.entry-points."cozy.application"]
+default = "native_source.metadata:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["native_source"]
