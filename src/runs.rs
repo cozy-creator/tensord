@@ -166,8 +166,19 @@ fn refused(code: &'static str, message: impl Into<String>) -> Refused {
 }
 
 impl Runs {
+    /// Reattachment observes an accepted obligation before consulting mutable input caches.
+    pub(crate) fn existing(&self, actor: &str, id: &str, digest: &str) -> Result<Option<Execution>, Refused> {
+        match self.service.engine.get_public(actor,id) {
+            Ok(record) if record.submission.as_ref().map(|s|s.invocation_digest.as_str())==Some(digest) => Ok(Some(record)),
+            Ok(_) => Err(refused("run_id_conflict","this run id already names another run spec")),
+            Err(error) if error.kind()==io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(Refused::from(error)),
+        }
+    }
+
     /// Accepts the run (or answers the one this id already names) and starts its preparation.
     pub fn submit(self: &Arc<Self>, actor: &str, id: &str, spec: Spec) -> Result<Execution, Refused> {
+        if let Some(record)=self.existing(actor,id,&spec.digest)? { return Ok(record); }
         if !spec.input.is_object() {
             return Err(refused(
                 "invalid_request",
@@ -844,6 +855,23 @@ fn preparation_launched(engine: &crate::execution::Engine, id: &str, launched: i
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn existing_acceptance_is_found_before_mutable_input_validation() {
+        let root=std::env::temp_dir().join(format!("cm-existing-run-{}",uuid::Uuid::new_v4()));
+        let service=Service::open(&root.join("state"),&root.join("generations"),1).unwrap();
+        let store=Arc::new(tensorfs_core::store::Store::ensure(&root.join("store")).unwrap());
+        let objects=Arc::new(Objects::new(&root.join("writes"),store,service.engine.clone()).unwrap());
+        let runs=Runs {service:service.clone(),objects,publisher:None,local:None,own_hub:None,jobs:Default::default()};
+        let (accepted,_)=service.engine.accept_run("alice","accepted","same-intent",crate::journal::Invocation {
+            package:"audit/package".into(),input:json!({}),..Default::default()
+        }).unwrap();
+        service.engine.end_preparation(&accepted.id,Outcome::Failed("finished without input retention".into())).unwrap();
+        assert_eq!(runs.existing("alice","accepted","same-intent").unwrap().unwrap().id,accepted.id);
+        assert_eq!(runs.existing("alice","accepted","other-intent").unwrap_err().code,"run_id_conflict");
+        assert!(runs.existing("alice","missing","same-intent").unwrap().is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn failed_preparation_launcher_settles_acceptance_and_reattach_observes_failure() {
