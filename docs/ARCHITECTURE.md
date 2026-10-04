@@ -11,7 +11,7 @@ Plan of record and workstream IDs (A–F):
 ## Process picture
 
 ```
-cozy CLI ──TLS/gRPC (ClaimProof)──> api::server ─> machine_api::NativeBackend
+cozy CLI ──TLS/gRPC (Cozy-Cap)──> api::server ─> machine_api::NativeBackend
                                                         │
 machine.sock (weight peers) / admin.sock ─> main.rs ▼
                                           service::Service (dispatch policy)
@@ -48,8 +48,8 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 | Module | Owns | Main types | Owner |
 |---|---|---|---|
 | `main.rs` | `serve`/`version` commands, weight-peer socket and owner-only admin socket, wiring | — | E (admin socket split), D2 (rental config) |
-| `api/server.rs` | TLS/gRPC front door (worker.proto from `vendor/worker-protocol`) | `MachineIdentity`, `serve` | D1 |
-| `api/auth.rs` | ClaimProof/1 verification per request | `Authority`, `VerifiedActor` | D1 |
+| `api/server.rs` | TLS listener: `cozy.machine.v1`, health, the readiness receipt, retired worker.v1 answers | `MachineIdentity`, `serve` | D1 |
+| `api/auth.rs` | Admitted keys (a rental's Hub lease) and each open stream's authority | `Authority`, `Keys`, `StreamAuthority` | D1 |
 | `api/identity.rs` | Persistent P-256 TLS identity, typed machine config, readiness secret | `MachineConfig`, `AuthorizedKeys`, `ReadinessSecret` | D2 |
 | `api/backend.rs` | The one backend trait the server calls | `MachineBackend`, `InputTreeReceiver`, `Observation` | D1 |
 | `api/workspaces.rs` | Resumable package uploads, scoped by owner key | `WorkspaceUploads`, `UploadSession`, `UploadedPackage` | D1 |
@@ -111,7 +111,6 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 | `src/bin/degree2-pilot.rs` | Degree 2 on a rental: stock executors share GPU weights through `ResidentCustody` (replacement, count-once, revoke, output equality) | C |
 | `src/bin/model-source-check.rs`, `scripts/check-model-source-descriptor.py` | Check a selected snapshot's sources | B1 |
 | `src/bin/install-capture.rs` | Run the installer path on a captured archive (used by Python tests) | D1 |
-| `src/bin/front-door.rs`, `tests/*_client`, `tests/creator_*` | Isolated front-door fixture and Go consumer gates | D1 |
 | `scripts/gate/` | Matched old-stack vs Rust-machine gate through ordinary `cozy run` | F |
 | `scripts/benchmarks/permission_probe.py` | CPU executor permission probe | E |
 | `scripts/service_cpu_gate.py` | CPU service end-to-end gate over the admin socket, including machine kill and restart | E |
@@ -119,7 +118,7 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 ## Contracts
 
 - [Durable execution](DURABLE-EXECUTION.md): journal states, acceptance, cancellation, custody.
-- [Front door](FRONT-DOOR.md): TLS identity, ClaimProof, backend hooks.
+- [Front door](FRONT-DOOR.md): the listener, TLS identity, install.
 - [Package bridge](PACKAGE-BRIDGE.md): CPU runner and generation install.
 - [Device executor](DEVICE-EXECUTOR.md): executor launch and control seam.
 - [GPU service](GPU-SERVICE.md): GPU pool, config, launch identity.

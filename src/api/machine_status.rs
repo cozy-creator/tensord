@@ -115,7 +115,7 @@ fn identity_frame(identity: &MachineIdentity) -> v1::StatusFrame {
     }
 }
 
-fn capabilities(identity: &MachineIdentity) -> Vec<String> {
+pub(super) fn capabilities(identity: &MachineIdentity) -> Vec<String> {
     let update = identity.updates.as_ref().map(|_| "update/1");
     CAPABILITIES
         .iter()

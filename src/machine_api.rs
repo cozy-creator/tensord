@@ -3,11 +3,10 @@ use crate::{
     api::{
         auth::{Authority, VerifiedActor},
         pb, v1,
-        workspaces::WorkspaceUploads,
         MachineBackend,
     },
     gpu_service::{without_gpus, KeptMember, Level},
-    journal::{Execution, PublicTerminal, State, SubmissionContext},
+    journal::{Execution, PublicTerminal, State},
     service::Service,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -20,8 +19,8 @@ use std::{
     time::Duration,
 };
 use tensorfs_core::{
-    ids::{ObjectRef, StoredDoc},
-    sha256, source_artifact,
+    ids::ObjectRef,
+    sha256,
     store::Store,
 };
 use tonic::Status;
@@ -30,7 +29,6 @@ pub struct NativeBackend {
     pub service: Arc<Service>,
     pub authority: Authority,
     pub store: Arc<Store>,
-    pub uploads: Arc<WorkspaceUploads>,
     pub installer: Option<crate::api::install::InstallerConfig>,
     pub publisher: Option<Arc<crate::published::Publisher>>,
     /// On a rental: its own Hub, read with the pod's worker capability.
@@ -40,26 +38,22 @@ pub struct NativeBackend {
     // Serialize native projection, not inference or observation. Only one result
     // projection may establish a given immutable output's native custody at once.
     projection: Mutex<()>,
-    installation: Mutex<()>,
 }
 impl NativeBackend {
     pub fn new(
         service: Arc<Service>,
         authority: Authority,
         store: Arc<Store>,
-        uploads: Arc<WorkspaceUploads>,
     ) -> Self {
         Self {
             service,
             authority,
             store,
-            uploads,
             installer: None,
             publisher: None,
             own_hub: None,
             runs: None,
             projection: Mutex::new(()),
-            installation: Mutex::new(()),
         }
     }
     fn workspace_id(&self) -> String {
@@ -80,27 +74,6 @@ impl NativeBackend {
             .engine
             .get_public(&actor_id(actor), &query.request_id)
             .map_err(problem)
-    }
-    fn receipt(&self, record: &Execution) -> Result<pb::MachineExecutionReceipt, Status> {
-        let context = record
-            .submission
-            .as_ref()
-            .ok_or_else(|| Status::internal("public submission context absent"))?;
-        Ok(pb::MachineExecutionReceipt {
-            request_id: context.request_id.clone(),
-            submission_id: context.submission_id.clone(),
-            capture_digest: digest_bytes(&context.capture_digest)?,
-            invocation_spec_digest: digest_bytes(&context.invocation_digest)?,
-            accepted_at_ms: record.accepted_at_ms,
-            worker_id: self.authority.worker_id.clone(),
-            worker_boot_id: record.acceptance_boot_id.clone(),
-            execution_workspace_id: self.workspace_id(),
-            publication_authorization_id: context.publication_authorization_id.clone(),
-            number: record
-                .id
-                .parse()
-                .map_err(|_| Status::internal("invalid journal run number"))?,
-        })
     }
     fn state(&self, record: &Execution) -> Result<pb::MachineExecutionState, Status> {
         let context = record
@@ -452,225 +425,9 @@ fn now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
-fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-impl NativeBackend {
-    /// The root's file inputs, each the committed import of this request and field: one
-    /// `payload` file whose bytes the binding names. Trees are not taken yet.
-    fn file_inputs(
-        &self,
-        actor: &str,
-        request_id: &str,
-        root: &pb::ReleaseRoot,
-    ) -> Result<Vec<crate::journal::InputFile>, Status> {
-        const FILE_BYTES: u64 = 64 << 20;
-        const TOTAL_BYTES: u64 = 256 << 20;
-        let unprepared = |id: &str| {
-            refusal(
-                "input_unprepared",
-                &format!("input {id} was not imported for this request"),
-            )
-        };
-        if root.inputs.len() != root.input_access.len() {
-            return Err(Status::invalid_argument(
-                "every input binding needs exactly one access",
-            ));
-        }
-        let mut files = vec![];
-        let mut total = 0;
-        for binding in &root.inputs {
-            let access: Vec<_> = root
-                .input_access
-                .iter()
-                .filter(|a| a.input_id == binding.input_id)
-                .collect();
-            let [access] = access.as_slice() else {
-                return Err(Status::invalid_argument(
-                    "every input binding needs exactly one access",
-                ));
-            };
-            let tree = access
-                .native_tree
-                .as_ref()
-                .ok_or_else(|| Status::unimplemented("only imported (native) inputs are taken"))?;
-            let state = self
-                .service
-                .engine
-                .with_journal(|j| j.intake(actor, &tree.retention_id))
-                .map_err(problem)?
-                .ok_or_else(|| unprepared(&binding.input_id))?;
-            if state.released
-                || state.spec.request_id != request_id
-                || state.spec.input_id != binding.input_id
-            {
-                return Err(unprepared(&binding.input_id));
-            }
-            let receipt = state.receipt.ok_or_else(|| unprepared(&binding.input_id))?;
-            let committed = pb::NativeByteRetentionResult::decode(receipt.as_slice())
-                .map_err(|_| Status::data_loss("input receipt corrupt"))?;
-            let source = tree
-                .source
-                .as_ref()
-                .filter(|s| committed.source.as_ref() == Some(*s))
-                .ok_or_else(|| unprepared(&binding.input_id))?;
-            let manifest = source
-                .manifest
-                .as_ref()
-                .ok_or_else(|| Status::invalid_argument("input tree names no manifest"))?;
-            let manifest = self
-                .store
-                .read_manifest(&ObjectRef {
-                    sha256: sha256::hex(&manifest.digest),
-                    length: manifest.length,
-                })
-                .map_err(storage)?;
-            let object = match manifest.entries() {
-                [(name, tensorfs_core::manifest::Entry::File(object))] if name == "payload" => {
-                    object.clone()
-                }
-                _ => {
-                    return Err(Status::unimplemented(
-                        "directory (tree) inputs are not taken yet",
-                    ))
-                }
-            };
-            if format!("sha256:{}", object.sha256) != binding.digest
-                || object.length != binding.length
-            {
-                return Err(Status::invalid_argument(format!(
-                    "input {} differs from its imported bytes",
-                    binding.input_id
-                )));
-            }
-            total += object.length;
-            if object.length > FILE_BYTES || total > TOTAL_BYTES {
-                return Err(refusal(
-                    "input_too_large",
-                    "file inputs are limited to 64 MiB each and 256 MiB in all",
-                ));
-            }
-            files.push(crate::journal::InputFile {
-                input_id: binding.input_id.clone(),
-                digest: binding.digest.clone(),
-                length: object.length,
-                media_type: binding.kind_mime.clone(),
-                order: binding.order,
-            });
-        }
-        files.sort_by(|a, b| a.input_id.cmp(&b.input_id));
-        Ok(files)
-    }
-    /// Where a published root's packages and models come from. A root naming a Hub uses the
-    /// owner's delegated access there; one naming none uses a rental's own Hub with the pod's
-    /// worker capability (as the Go agent and Python worker do); elsewhere there is none.
-    fn hub_source(&self, actor: &str, origin: &str) -> Result<Option<crate::hub::Source>, Status> {
-        if origin.is_empty() {
-            return Ok(self.own_hub.clone());
-        }
-        match self.hub_grant(actor, origin) {
-            Ok(grant) => Ok(Some(crate::hub::Source::delegated(&grant.access))),
-            Err(refused) => self
-                .own_hub
-                .as_ref()
-                .filter(|own| crate::hub::origin_key(&own.origin) == crate::hub::origin_key(origin))
-                .map(|own| Some(own.clone()))
-                .ok_or(refused),
-        }
-    }
-    /// This owner's usable access at a Hub: present, bound to this leaf, unexpired.
-    fn hub_grant(&self, actor: &str, origin: &str) -> Result<crate::hub::Grant, Status> {
-        let key = crate::hub::origin_key(origin)
-            .filter(|_| crate::hub::valid_origin(origin))
-            .ok_or_else(|| Status::invalid_argument("release root names an invalid Hub origin"))?;
-        let grant = self
-            .service
-            .engine
-            .with_journal(|j| j.hub_grant(actor, &key))
-            .map_err(problem)?
-            .filter(|g| g.leaf == sha256::hex(&self.authority.leaf_digest))
-            .ok_or_else(|| refusal("hub_access_absent", &format!("this machine holds no execution access for {origin}; the next run from a signed-in CLI delivers it")))?;
-        if grant.expired(unix_now()) {
-            return Err(refusal("hub_access_expired", &format!("execution access for {origin} has expired; the next run from a signed-in CLI renews it")));
-        }
-        Ok(grant)
-    }
-}
 impl MachineBackend for NativeBackend {
     fn runs(&self) -> Option<Arc<crate::runs::Runs>> {
         self.runs.clone()
-    }
-    fn hub_access(
-        &self,
-        actor: VerifiedActor,
-        mut access: crate::hub::Access,
-    ) -> Result<(String, i64), crate::api::backend::HubAccessRefusal> {
-        access.origin = access.origin.trim_end_matches('/').to_string();
-        crate::hub::validate(&access, unix_now())
-            .map_err(|m| (400, "invalid_access", m.to_string()))?;
-        let key = crate::hub::origin_key(&access.origin).expect("validated origin");
-        let (origin, expires_at) = (access.origin.clone(), access.expires_at);
-        let grant = crate::hub::Grant {
-            principal: crate::hub::principal(&access.token),
-            leaf: sha256::hex(&self.authority.leaf_digest),
-            access,
-        };
-        match self.service.engine.with_journal(|j| j.put_hub_grant(&actor_id(actor), &key, &grant)) {
-            Ok(true) => Ok((origin, expires_at)),
-            Ok(false) => Err((409, "hub_access_principal_conflict", "this machine holds another account at this Hub; remove its access with DELETE /v1/hubs/access".into())),
-            Err(_) => Err((503, "hub_access_unavailable", "cannot retain the Hub access grant".into())),
-        }
-    }
-    fn forget_hub_access(
-        &self,
-        actor: VerifiedActor,
-        origin: &str,
-    ) -> Result<(), crate::api::backend::HubAccessRefusal> {
-        let key = crate::hub::origin_key(origin)
-            .filter(|_| crate::hub::valid_origin(origin))
-            .ok_or((
-                400,
-                "invalid_access",
-                "send one valid Hub origin".to_string(),
-            ))?;
-        // Accepted work needs no Hub: removal never waits on it.
-        self.service
-            .engine
-            .with_journal(|j| j.forget_hub_grant(&actor_id(actor), &key))
-            .map_err(|_| {
-                (
-                    503,
-                    "hub_access_unavailable",
-                    "cannot remove the Hub access grant".to_string(),
-                )
-            })
-    }
-    fn begin_input_tree(
-        &self,
-        actor: VerifiedActor,
-        header: pb::InputTreeImportHeader,
-    ) -> Result<Box<dyn crate::api::backend::InputTreeReceiver>, Status> {
-        crate::native_inputs::SourceIntake::begin(
-            self.store.clone(),
-            self.service.engine.clone(),
-            &self.service.engine.root.join("input-staging"),
-            &self.workspace_id(),
-            actor,
-            header,
-        )
-    }
-    fn describe_runtime(&self, _: VerifiedActor) -> Result<pb::MachineRuntime, Status> {
-        Ok(pb::MachineRuntime {
-            wire_minor: crate::api::WIRE_MINOR,
-            minimum_wire_minor: crate::api::WIRE_MINIMUM,
-            tensorfs_version: tensorfs_core::VERSION.into(),
-            accelerator_backend: "none".into(),
-            execution_workspace_id: self.workspace_id(),
-            ..Default::default()
-        })
     }
     fn open_output(
         &self,
@@ -737,23 +494,6 @@ impl MachineBackend for NativeBackend {
             media_type: current.media_type.clone(),
             sha256: terminal.then(|| format!("sha256:{}", sha256::hex(&content.digest))),
         })
-    }
-    fn forget_package(
-        &self,
-        actor: VerifiedActor,
-        request: pb::ForgetPackageCall,
-    ) -> Result<pb::ForgetPackageResult, Status> {
-        let package = request.package.trim();
-        if package.is_empty() || package.len() > 256 || !package.contains('/') {
-            return Err(Status::invalid_argument("package must name org/name"));
-        }
-        // Held installations are keyed by their exact release; the owner's bindings are the
-        // model resolutions, read again on the next run.
-        self.service
-            .engine
-            .with_journal(|j| j.forget_resolutions(&actor_id(actor), package))
-            .map_err(problem)?;
-        Ok(pb::ForgetPackageResult {})
     }
     fn read_triage(
         &self,
@@ -932,87 +672,6 @@ impl MachineBackend for NativeBackend {
         }
         Ok(items)
     }
-    fn retain_bytes(
-        &self,
-        actor: VerifiedActor,
-        request: pb::NativeByteRetentionCall,
-    ) -> Result<pb::NativeByteRetentionResult, Status> {
-        let _guard = self.projection.lock().unwrap();
-        let request = request
-            .request
-            .ok_or_else(|| Status::invalid_argument("native retention request absent"))?;
-        let source = request
-            .source
-            .as_ref()
-            .ok_or_else(|| Status::invalid_argument("native source absent"))?;
-        let actor = actor_id(actor);
-        if self
-            .service
-            .engine
-            .native_owner(&request.retention_id)
-            .map_err(problem)?
-            .is_some_and(|held| held != actor)
-        {
-            return Err(Status::permission_denied(
-                "native retention belongs to another actor",
-            ));
-        }
-        let bytes = self
-            .service
-            .engine
-            .native_output(&actor, &source.producer_root_id)
-            .map_err(problem)?
-            .ok_or_else(|| {
-                Status::permission_denied("native producer is not owned by this actor")
-            })?;
-        let donor = pb::NativeByteRetentionRequest::decode(bytes.as_slice())
-            .map_err(|_| Status::data_loss("native source record corrupt"))?;
-        if donor.source != request.source {
-            return Err(Status::invalid_argument(
-                "native source differs from owned producer",
-            ));
-        }
-        source_artifact::retain(&self.store, &donor.retention_id, &request.retention_id)
-            .map_err(storage)?;
-        self.service
-            .engine
-            .bind_native_output(&actor, &request.retention_id, &request.encode_to_vec())
-            .map_err(problem)?;
-        Ok(pb::NativeByteRetentionResult {
-            source: request.source,
-            retention_id: request.retention_id,
-            released: false,
-        })
-    }
-    fn release_bytes(
-        &self,
-        actor: VerifiedActor,
-        request: pb::NativeByteRetentionCall,
-    ) -> Result<pb::NativeByteRetentionResult, Status> {
-        let _guard = self.projection.lock().unwrap();
-        let request = request
-            .request
-            .ok_or_else(|| Status::invalid_argument("native retention request absent"))?;
-        let bytes = self
-            .service
-            .engine
-            .native_output(&actor_id(actor), &request.retention_id)
-            .map_err(problem)?
-            .ok_or_else(|| {
-                Status::permission_denied("native recipient is not held by this actor")
-            })?;
-        let expected = pb::NativeByteRetentionRequest::decode(bytes.as_slice())
-            .map_err(|_| Status::data_loss("native source record corrupt"))?;
-        if expected != request {
-            return Err(Status::invalid_argument("native release subject changed"));
-        }
-        source_artifact::release(&self.store, &request.retention_id).map_err(storage)?;
-        Ok(pb::NativeByteRetentionResult {
-            source: request.source,
-            retention_id: request.retention_id,
-            released: true,
-        })
-    }
     fn workspace(
         &self,
         _: VerifiedActor,
@@ -1033,231 +692,6 @@ impl MachineBackend for NativeBackend {
             submission_close: true,
             ..Default::default()
         })
-    }
-    fn submit(
-        &self,
-        actor: VerifiedActor,
-        request: pb::MachineExecutionSubmit,
-    ) -> Result<pb::MachineExecutionReceipt, Status> {
-        let root = request.release_root.as_ref().ok_or_else(|| {
-            Status::unimplemented("captured offers are not qualified by this CPU build")
-        })?;
-        let offer = request
-            .offer
-            .as_ref()
-            .ok_or_else(|| Status::invalid_argument("request offer absent"))?;
-        let actor = actor_id(actor);
-        // A replay of accepted work needs nothing from the Hub, even after access expired.
-        if let Some(prior) = self
-            .service
-            .engine
-            .with_journal(|j| j.accepted_public(&actor, &offer.request_id, &request.submission_id))
-            .map_err(problem)?
-        {
-            if request.expected_execution_workspace_id != self.workspace_id() {
-                return Err(refusal(
-                    "execution_workspace_changed",
-                    "the requested execution journal is not this workspace",
-                ));
-            }
-            return self.receipt(&prior);
-        }
-        if root.job
-            || root.deadline_unix_ms != 0
-            || root.capture.is_some()
-            || !request.publication_authorization_id.is_empty()
-        {
-            return Err(Status::unimplemented(
-                "this machine runs callable roots without deadlines or publication",
-            ));
-        }
-        if !request.capture_digest.is_empty()
-            || !request.capture_canonical_bytes.is_empty()
-            || request.prepared_state.is_some()
-            || !offer.invocation_spec_canonical_bytes.is_empty()
-        {
-            return Err(Status::invalid_argument(
-                "release root carries an independently prepared offer",
-            ));
-        }
-        let source = if root.installation_id.is_empty() {
-            self.hub_source(&actor, &root.hub)?
-        } else {
-            None
-        };
-        let (installed, published_plan) = if let Some(source) = source {
-            if root.package.is_empty() || root.release.is_empty() {
-                return Err(Status::invalid_argument(
-                    "a published root names its package and release",
-                ));
-            }
-            let publisher = self.publisher.as_ref().ok_or_else(|| {
-                Status::unimplemented(
-                    "published package preparation is not configured on this machine",
-                )
-            })?;
-            let published = crate::published::Request {
-                source,
-                package: root.package.clone(),
-                release: root.release.clone(),
-                installed: None,
-                owner: String::new(),
-                binding_revision: String::new(),
-                providers: Default::default(),
-                entrypoint: root.entrypoint.clone(),
-                choices: root.models.clone(),
-            };
-            match publisher.prepare(&self.service, &actor, &request.submission_id, published) {
-                crate::published::Progress::Ready(prepared) => {
-                    (prepared.installation.clone(), Some(prepared.plan.clone()))
-                }
-                crate::published::Progress::Failed(code, detail) => {
-                    return Err(refusal(code, &format!("{code}: {detail}")))
-                }
-                crate::published::Progress::Preparing {
-                    stage,
-                    moved,
-                    total,
-                } => {
-                    let mut status = Status::unavailable(stage);
-                    status.metadata_mut().insert(
-                        "cozy-error-code",
-                        "release_root_preparing".parse().expect("ASCII"),
-                    );
-                    if total > 0 {
-                        if let Ok(value) = format!("{moved} {total}").parse() {
-                            status.metadata_mut().insert("cozy-progress-bytes", value);
-                        }
-                    }
-                    return Err(status);
-                }
-            }
-        } else {
-            let installed = if root.installation_id.is_empty() {
-                self.service
-                    .gpu()
-                    .ok_or_else(|| {
-                        Status::unimplemented(
-                            "published cache-only GPU package execution is not configured",
-                        )
-                    })?
-                    .published_installation(&self.service, &actor, &root.package, &root.release)
-                    .map_err(problem)?
-            } else {
-                self.service
-                    .engine
-                    .installation(&actor, &root.installation_id)
-                    .map_err(problem)?
-            }
-            .ok_or_else(|| {
-                refusal(
-                    "release_root_installation_absent",
-                    "this owner has not prepared the named installation",
-                )
-            })?;
-            if (root.installation_id.is_empty() && root.release != installed.release)
-                || (!root.installation_id.is_empty() && !root.release.is_empty())
-                || (!root.package.is_empty() && root.package != installed.package)
-            {
-                return Err(Status::invalid_argument(
-                    "release root differs from its held installation",
-                ));
-            }
-            (installed, None)
-        };
-        let interface: Value = serde_json::from_slice(&installed.interface)
-            .map_err(|_| Status::data_loss("held installation interface is corrupt"))?;
-        let entry = entrypoint(&interface, &root.entrypoint, false)?;
-        let gpu_plan = if let Some(plan) = published_plan {
-            plan
-        } else if entry
-            .get("models")
-            .and_then(Value::as_array)
-            .is_some_and(|models| !models.is_empty())
-        {
-            let gpu = self.service.gpu().ok_or_else(|| Status::unimplemented("this installed callable needs the GPU execution operation; CPU peers remain usable"))?;
-            let plan = gpu
-                .prepare_root(&installed, &root.entrypoint, &root.models, &[], 0)
-                .map_err(problem)?;
-            self.service
-                .engine
-                .bind_preparation(crate::journal::Preparation {
-                    actor: actor.clone(),
-                    id: plan.id.clone(),
-                    installation: installed.alias.clone(),
-                    document: serde_json::to_vec(&plan)
-                        .map_err(|_| Status::internal("GPU preparation encoding failed"))?,
-                })
-                .map_err(problem)?;
-            Some(plan)
-        } else {
-            if !root.models.is_empty() {
-                return Err(Status::invalid_argument(
-                    "model choices do not name a declared model slot",
-                ));
-            }
-            None
-        };
-        let input: Value = crate::boundary_json::parse(&request.payload_canonical_bytes)
-            .map_err(|_| Status::invalid_argument("payload is invalid JSON"))?;
-        if !input.is_object() {
-            return Err(refusal(
-                "invalid_request",
-                "the payload must be a JSON object of the function's parameters",
-            ));
-        }
-        let canonical_input = canonical(&input)?;
-        let payload_digest = format!("sha256:{}", sha256::hex(&sha256::digest(&canonical_input)));
-        let binding = identity(entry)?;
-        let mut spec = json!({"format":"cozy.worker.v1.InvocationSpec/1","installation_id":installed.alias,"payload_digest":payload_digest,"serving":{"entrypoint_binding_digest":binding,"attempt_binding_id":binding,"bindings_digest":binding}});
-        if !root.attention_kernel.is_empty() {
-            spec["attention_kernel"] = json!(root.attention_kernel);
-        }
-        if let Some(plan) = &gpu_plan {
-            spec["model_preparation"] = json!(plan.id);
-        }
-        let inputs = self.file_inputs(&actor, &offer.request_id, root)?;
-        if !inputs.is_empty() {
-            if gpu_plan.is_none() {
-                return Err(Status::unimplemented("file inputs reach device executors only; this CPU callable cannot take them yet"));
-            }
-            spec["inputs"] = serde_json::to_value(&inputs)
-                .map_err(|_| Status::internal("input encoding failed"))?;
-        }
-        let mut capture = json!({"installation":installed.alias,"generation":installed.generation,"entrypoint":root.entrypoint,"owner":root.owner,"hub":root.hub});
-        if let Some(plan) = &gpu_plan {
-            capture["model_preparation"] = json!(plan.id);
-        }
-        let context = SubmissionContext {
-            actor,
-            request_id: offer.request_id.clone(),
-            submission_id: request.submission_id,
-            expected_workspace_id: request.expected_execution_workspace_id,
-            capture_digest: identity(&capture)?,
-            invocation_digest: identity(&spec)?,
-            payload_digest,
-            publication_authorization_id: String::new(),
-            preparation_id: gpu_plan
-                .as_ref()
-                .map(|plan| plan.id.clone())
-                .unwrap_or_default(),
-        };
-        let record = self
-            .service
-            .submit_public(
-                context,
-                &installed.generation,
-                crate::service::Call {
-                    entrypoint: root.entrypoint.clone(),
-                    input,
-                    attention_kernel: root.attention_kernel.clone(),
-                    inputs,
-                    ..Default::default()
-                },
-                &self.authority.boot_id,
-            )
-            .map_err(problem)?;
-        self.receipt(&record)
     }
     fn get(
         &self,
@@ -1471,301 +905,6 @@ impl MachineBackend for NativeBackend {
             head_number,
             execution_workspace_id: self.workspace_id(),
         })
-    }
-    fn close_submission(
-        &self,
-        actor: VerifiedActor,
-        request: pb::MachineSubmissionClose,
-    ) -> Result<pb::MachineSubmissionClosure, Status> {
-        let held = self
-            .service
-            .engine
-            .close_submission(
-                &actor_id(actor),
-                &request.submission_id,
-                &request.request_id,
-                &request.expected_execution_workspace_id,
-            )
-            .map_err(problem)?;
-        Ok(pb::MachineSubmissionClosure {
-            submission_id: request.submission_id,
-            request_id: request.request_id,
-            execution_workspace_id: self.workspace_id(),
-            receipt: held.as_ref().map(|r| self.receipt(r)).transpose()?,
-        })
-    }
-    fn uploads(&self) -> Option<Arc<WorkspaceUploads>> {
-        Some(self.uploads.clone())
-    }
-    fn collect(
-        &self,
-        actor: VerifiedActor,
-        request: pb::MachineExecutionCollect,
-    ) -> Result<pb::AttemptOutcome, Status> {
-        let record = self.query(
-            actor,
-            request
-                .execution
-                .ok_or_else(|| Status::invalid_argument("execution query absent"))?,
-        )?;
-        if request.attempt_ordinal != 0 && request.attempt_ordinal != record.attempt.max(1) as u64 {
-            return Err(Status::not_found(
-                "requested attempt is not retained by this execution",
-            ));
-        }
-        self.terminal(&record)?
-            .events
-            .into_iter()
-            .find_map(|e| e.outcome)
-            .ok_or_else(|| Status::data_loss("durable terminal outcome absent"))
-    }
-    fn ack_collection(
-        &self,
-        actor: VerifiedActor,
-        request: pb::MachineExecutionCollectionAck,
-    ) -> Result<pb::MachineExecutionState, Status> {
-        let record = self.query(
-            actor,
-            request
-                .execution
-                .ok_or_else(|| Status::invalid_argument("execution query absent"))?,
-        )?;
-        let ack = request
-            .outcome
-            .ok_or_else(|| Status::invalid_argument("outcome acknowledgement absent"))?;
-        let outcome = self
-            .terminal(&record)?
-            .events
-            .into_iter()
-            .find_map(|e| e.outcome)
-            .ok_or_else(|| Status::data_loss("durable terminal outcome absent"))?;
-        if !ack.worker_boot_id.is_empty() && ack.worker_boot_id != outcome.worker_boot_id {
-            return Err(Status::invalid_argument(
-                "acknowledgement names a different outcome boot",
-            ));
-        }
-        if (
-            ack.request_id,
-            ack.attempt_ordinal,
-            ack.invocation_spec_digest,
-            ack.outcome_id,
-            ack.outcome_digest,
-        ) != (
-            outcome.request_id,
-            outcome.attempt_ordinal,
-            outcome.invocation_spec_digest,
-            outcome.outcome_id,
-            outcome.outcome_digest,
-        ) {
-            return Err(Status::invalid_argument(
-                "acknowledgement differs from the exact retained outcome",
-            ));
-        }
-        let events = if !ack.retain_work {
-            // This slice admits no asset inputs. A canceled terminal has no result/native
-            // output binding, and terminal settlement has already ended its runner hold.
-            // Output trees of completed runs retain their explicit source-release authority.
-            let _guard = self.projection.lock().unwrap();
-            let held = self
-                .service
-                .engine
-                .public_terminal(&record.id)
-                .map_err(problem)?
-                .ok_or_else(|| Status::data_loss("terminal projection absent"))?;
-            let mut page = pb::MachineExecutionEventPage::decode(held.events.as_slice())
-                .map_err(|_| Status::data_loss("terminal event projection corrupt"))?;
-            if !page
-                .events
-                .iter()
-                .any(|event| event.kind == "retention_released")
-            {
-                let sequence = page
-                    .head_sequence
-                    .checked_add(1)
-                    .ok_or_else(|| Status::resource_exhausted("event cursor exhausted"))?;
-                page.events.push(pb::MachineExecutionEvent {
-                    sequence,
-                    attempt_ordinal: record.attempt.max(1) as u64,
-                    at_ms: record.finished_at_ms,
-                    kind: "retention_released".into(),
-                    body_canonical_bytes: canonical(
-                        &json!({"reason":"final custody acknowledged"}),
-                    )?,
-                    ..Default::default()
-                });
-                page.head_sequence = sequence;
-                page.next_after = sequence;
-            }
-            Some(page.encode_to_vec())
-        } else {
-            None
-        };
-        self.state(
-            &self
-                .service
-                .engine
-                .acknowledge_collection_events(&record.id, events.as_deref())
-                .map_err(problem)?,
-        )
-    }
-    fn prepare_local(
-        &self,
-        actor: VerifiedActor,
-        request: pb::PrepareLocalPackageCall,
-        uploaded: Option<crate::api::workspaces::UploadedPackage>,
-    ) -> Result<Vec<pb::PrepareEvent>, Status> {
-        let verified_actor = actor;
-        if !request.hub.is_empty() {
-            return Err(Status::unimplemented(
-                "scoped Hub grant routing is not qualified by this CPU installer",
-            ));
-        }
-        let selection = request
-            .local_package_set
-            .as_ref()
-            .and_then(|s| s.package.as_ref())
-            .ok_or_else(|| Status::invalid_argument("local package metadata absent"))?;
-        let alias = selection.installation_id.clone();
-        let actor = actor_id(verified_actor);
-        let _guard = self.installation.lock().unwrap();
-        let installed = if let Some(prior) = self
-            .service
-            .engine
-            .installation(&actor, &alias)
-            .map_err(problem)?
-        {
-            if prior.package != selection.package || prior.release != selection.release {
-                return Err(Status::already_exists(
-                    "installation alias names different package semantics",
-                ));
-            }
-            prior
-        } else {
-            let uploaded = uploaded.ok_or_else(|| {
-                Status::failed_precondition("captured package uploads are incomplete")
-            })?;
-            let config = self
-                .installer
-                .as_ref()
-                .ok_or_else(|| Status::unimplemented("package installer is not configured"))?;
-            let prepared = crate::api::install::prepare_uploaded(config, &uploaded)?;
-            let record = self
-                .service
-                .engine
-                .bind_installation(crate::journal::Installation {
-                    actor,
-                    alias,
-                    generation: prepared.record.identity,
-                    package: uploaded.root.package.clone(),
-                    release: uploaded.root.release.clone(),
-                    interface: prepared.interface_bytes,
-                })
-                .map_err(problem)?;
-            self.service.changed_environment().map_err(problem)?;
-            self.uploads
-                .release_after_install(verified_actor, &uploaded.root.operation_id)?;
-            record
-        };
-        Ok(vec![pb::PrepareEvent {
-            stage: pb::PrepareStage::Prepared as i32,
-            installed_package: Some(pb::InstalledPackage {
-                installation_id: installed.alias,
-                package: installed.package,
-                release: installed.release,
-                package_interface: installed.interface,
-            }),
-            ..Default::default()
-        }])
-    }
-    fn read_stream(
-        &self,
-        actor: VerifiedActor,
-        request: pb::NativeByteReadCall,
-    ) -> Result<crate::api::backend::NativeByteStream, Status> {
-        let source = request
-            .source
-            .ok_or_else(|| Status::invalid_argument("native source absent"))?;
-        let expected = self
-            .service
-            .engine
-            .native_output(&actor_id(actor), &source.retention_id)
-            .map_err(problem)?
-            .ok_or_else(|| Status::not_found("native output is not retained for this actor"))?;
-        let expected = pb::NativeByteRetentionRequest::decode(expected.as_slice())
-            .map_err(|_| Status::data_loss("native output record corrupt"))?;
-        if expected != source {
-            return Err(Status::invalid_argument(
-                "native source differs from its retained record",
-            ));
-        }
-        let object = request
-            .object
-            .ok_or_else(|| Status::invalid_argument("byte object absent"))?;
-        let root = source_artifact::read(&self.store, &source.retention_id)
-            .map_err(storage)?
-            .ok_or_else(|| Status::not_found("native output root absent"))?;
-        if root.released || !root.complete {
-            return Err(Status::not_found(
-                "native recipient is released or incomplete",
-            ));
-        }
-        let object_ref = ObjectRef {
-            sha256: sha256::hex(&object.digest),
-            length: object.length,
-        };
-        if (!root.objects.contains(&object_ref) && root.manifest != object_ref)
-            || request.offset > object.length
-        {
-            return Err(Status::invalid_argument(
-                "byte range is outside retained source",
-            ));
-        }
-        if root.manifest == object_ref {
-            let manifest = self.store.read_manifest(&object_ref).map_err(storage)?;
-            let mut file = std::io::Cursor::new(manifest.canonical_bytes().map_err(storage)?);
-            file.seek(SeekFrom::Start(request.offset))
-                .map_err(problem)?;
-            return Ok(Box::new(ByteReader {
-                file: Box::new(file),
-                offset: request.offset,
-                remaining: object.length - request.offset,
-            }));
-        }
-        let mut file = self
-            .store
-            .open_verified(&object_ref.sha256)
-            .map_err(storage)?
-            .into_file();
-        file.seek(SeekFrom::Start(request.offset))
-            .map_err(problem)?;
-        Ok(Box::new(ByteReader {
-            file: Box::new(file),
-            offset: request.offset,
-            remaining: object.length - request.offset,
-        }))
-    }
-}
-struct ByteReader {
-    file: Box<dyn Read + Send>,
-    offset: u64,
-    remaining: u64,
-}
-impl Iterator for ByteReader {
-    type Item = Result<pb::NativeByteReadChunk, Status>;
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 {
-            return None;
-        }
-        // worker.proto MaxNativeByteReadChunkBytes: clients refuse larger chunks.
-        let mut data = vec![0; self.remaining.min(32 << 10) as usize];
-        if let Err(error) = self.file.read_exact(&mut data) {
-            self.remaining = 0;
-            return Some(Err(problem(error)));
-        }
-        let offset = self.offset;
-        self.offset += data.len() as u64;
-        self.remaining -= data.len() as u64;
-        Some(Ok(pb::NativeByteReadChunk { offset, data }))
     }
 }
 pub fn actor_id(actor: VerifiedActor) -> String {
@@ -2027,7 +1166,7 @@ mod product_log_tests {
             Services,
         },
         execution::Engine as Execution_Engine,
-        journal::{Installation, Invocation},
+        journal::{Installation, Invocation, SubmissionContext},
     };
     use std::{
         collections::BTreeMap,
@@ -2035,7 +1174,6 @@ mod product_log_tests {
         path::{Path, PathBuf},
         process::Command,
     };
-    use tensorfs_core::manifest::{Draft, Entry};
 
     const INSTALL: &str = r#"
 import json, subprocess, sys
@@ -2121,234 +1259,6 @@ print(json.dumps({"identity": generation.identity}))
             .collect()
     }
 
-    #[test]
-    fn imported_file_inputs_are_verified_at_submit_and_granted_to_the_executor() {
-        let root = std::env::temp_dir().join(format!("cm-inputs-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let identity = install_named(&root, "cpu_input");
-        let state = root.join("state");
-        let service = Service::open(&state, &root.join("generations"), 1).unwrap();
-        assert!(service.stop().unwrap());
-        let store = Arc::new(Store::ensure(&state.join("tensorfs")).unwrap());
-        let signer = ed25519_dalek::SigningKey::from_bytes(&[43; 32]);
-        let machine =
-            MachineIdentity::ephemeral("inputs".into(), vec![signer.verifying_key()], vec![7; 32])
-                .unwrap();
-        let actor = VerifiedActor {
-            public_key: signer.verifying_key().to_bytes(),
-        };
-        let backend = NativeBackend::new(
-            service.clone(),
-            machine.authority.clone(),
-            store.clone(),
-            WorkspaceUploads::open(&state.join("uploads"), store.clone()).unwrap(),
-        );
-        // The CLI's import: a one-file tree whose member is `payload`.
-        let bytes = b"%PDF-1.4 a document the package reads".to_vec();
-        let object = ObjectRef::of(&bytes);
-        let tree = Draft {
-            entries: vec![("payload".into(), Entry::File(object.clone()))],
-        }
-        .seal()
-        .unwrap();
-        let manifest = tree.object_ref().unwrap();
-        let reference = |o: &ObjectRef| pb::Ref {
-            digest: digest_bytes(&format!("sha256:{}", o.sha256)).unwrap(),
-            length: o.length,
-        };
-        let import = |request: &str| {
-            let mut receiver = backend
-                .begin_input_tree(
-                    actor,
-                    pb::InputTreeImportHeader {
-                        request_id: request.into(),
-                        input_id: "document".into(),
-                        manifest: Some(reference(&manifest)),
-                        manifest_canonical_bytes: StoredDoc::canonical_bytes(&tree).unwrap(),
-                        content_bytes: object.length,
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
-            receiver
-                .blob(pb::InputTreeImportBlob {
-                    object: Some(reference(&object)),
-                    offset: 0,
-                    data: bytes.clone(),
-                })
-                .unwrap();
-            receiver
-                .commit(pb::InputTreeImportCommit { abort: false })
-                .unwrap()
-        };
-        let held = import("request-1");
-        let release_root = |digest: String| pb::ReleaseRoot {
-            inputs: vec![pb::InputBinding {
-                input_id: "document".into(),
-                digest,
-                length: object.length,
-                kind_mime: "application/pdf".into(),
-                order: 0,
-            }],
-            input_access: vec![pb::InputAccess {
-                input_id: "document".into(),
-                native_tree: Some(pb::NativeByteRetentionRequest {
-                    source: held.source.clone(),
-                    retention_id: held.retention_id.clone(),
-                }),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let actor_key = actor_id(actor);
-        let inputs = backend
-            .file_inputs(
-                &actor_key,
-                "request-1",
-                &release_root(format!("sha256:{}", object.sha256)),
-            )
-            .unwrap();
-        assert_eq!(inputs.len(), 1);
-        // Another request cannot borrow this import, and the binding must name its bytes.
-        let other = backend
-            .file_inputs(
-                &actor_key,
-                "request-2",
-                &release_root(format!("sha256:{}", object.sha256)),
-            )
-            .unwrap_err();
-        assert_eq!(
-            other.metadata().get("cozy-error-code").unwrap(),
-            "input_unprepared"
-        );
-        assert!(backend
-            .file_inputs(
-                &actor_key,
-                "request-1",
-                &release_root(format!("sha256:{}", "b".repeat(64)))
-            )
-            .is_err());
-
-        let held_generation = service.catalog.resolve(&identity).unwrap();
-        let executor_root = root.join("executor");
-        std::fs::create_dir(&executor_root).unwrap();
-        let mut executor = DeviceExecutor::spawn(ExecutorConfig {
-            python: held_generation.record.python.clone(),
-            root: executor_root.clone(),
-            socket: executor_root.join("e.sock"),
-            environment: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
-            seal: {
-                let mut seal = crate::launch_identity::Seal::prepare(
-                    &executor_root,
-                    None,
-                    "inputs",
-                    &identity,
-                    "",
-                )
-                .unwrap();
-                seal.threads = 1;
-                seal
-            },
-            generation_hold: Some(held_generation.retention()),
-            identity: None,
-            cgroup_namespace: None,
-        })
-        .unwrap();
-        let interface = executor_root.join("package-interface.json");
-        std::fs::write(
-            &interface,
-            serde_json::to_vec(&held_generation.record.interface).unwrap(),
-        )
-        .unwrap();
-        let application = held_generation.record.application.clone();
-        command(
-            &mut executor,
-            &DeviceCommand::Start {
-                devices: String::new(),
-                application: application.clone(),
-                package_interface: interface.clone(),
-                sequence_parallel_degree: 1,
-                import_only: false,
-            },
-        )
-        .unwrap();
-        command(
-            &mut executor,
-            &DeviceCommand::Load {
-                construction: "inputs".into(),
-                devices: String::new(),
-                sequence_parallel_degree: 1,
-                binding: Box::new(Binding {
-                    application,
-                    package_interface: interface.display().to_string(),
-                    ..Binding::default()
-                }),
-                budgets: Budgets::default(),
-                models: Vec::new(),
-                authorized_device_limit_bytes: None,
-                attention_pin: String::new(),
-                stages: false,
-                device_weights: false,
-                cap_bytes: None,
-                sealed_tiers: false,
-                model_sources: false,
-                staged_tiers: false,
-                pinned_bytes: None,
-            },
-        )
-        .unwrap();
-        command(
-            &mut executor,
-            &DeviceCommand::Activate {
-                construction: "inputs".into(),
-            },
-        )
-        .unwrap();
-        let payload = json!({"document": format!("sha256:{}", object.sha256)});
-        command(&mut executor, &DeviceCommand::PrepareRequest {
-            request_id: "run-1".into(),
-            construction: "inputs".into(),
-            entrypoint: "measure".into(),
-            payload,
-            attention_kernel: String::new(),
-            input_metadata: inputs.iter().map(|i| (i.input_id.clone(), json!({"input_id":i.input_id,"media_type":i.media_type,"digest":i.digest,"length":i.length,"order":i.order}))).collect(),
-        })
-        .unwrap();
-        let spool = root.join("spool");
-        std::fs::create_dir(&spool).unwrap();
-        let granted = crate::gpu_service::stage_inputs(&store, None, &spool, &inputs).unwrap();
-        let reply = executor
-            .command(
-                &DeviceCommand::Invoke {
-                    request_id: "run-1".into(),
-                    construction: "inputs".into(),
-                    entrypoint: "measure".into(),
-                    spool: spool.clone(),
-                    deadline_s: None,
-                    attention_kernel: String::new(),
-                    plane_budget_bytes: -1,
-                    stages: false,
-                    cap_bytes: None,
-                    inputs: granted.inputs,
-                    trees: granted.trees,
-                    floor_bytes: None,
-                    activation_bytes: Default::default(),
-                    squeezed_bytes: Default::default(),
-                    device_weights: None,
-                },
-                &mut Baseline,
-            )
-            .unwrap();
-        let result = device_executor::read_result(&spool, &reply)
-            .unwrap_or_else(|e| panic!("{e}: {:?}", reply.outcome));
-        assert_eq!(
-            result,
-            json!({"length": bytes.len(), "sha256": object.sha256, "media_type": "application/pdf"})
-        );
-        executor.shutdown().unwrap();
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
     struct Scratch(PathBuf);
     impl Drop for Scratch {
         fn drop(&mut self) {
@@ -2396,7 +1306,6 @@ print(json.dumps({"identity": generation.identity}))
             service.clone(),
             machine.authority.clone(),
             store.clone(),
-            WorkspaceUploads::open(&state.join("uploads"), store.clone()).unwrap(),
         );
         let held = service.catalog.resolve(&identity).unwrap();
         engine
@@ -2703,35 +1612,19 @@ print(json.dumps({"identity": generation.identity}))
             (Some(1), Some(true))
         );
         assert!(timing["execution_ms"].as_f64().is_some_and(|ms| ms >= 0.0));
-        // Every product's bytes are fetchable with the actor's own Claim.
-        let bytes: Vec<Vec<u8>> = page
-            .events
-            .iter()
-            .filter_map(|event| event.product.as_ref())
-            .map(|product| {
-                backend
-                    .read_stream(
-                        actor,
-                        pb::NativeByteReadCall {
-                            source: product.source.clone(),
-                            object: product.content.clone(),
-                            ..Default::default()
-                        },
-                    )
-                    .unwrap()
-                    .flat_map(|chunk| chunk.unwrap().data)
-                    .collect()
-            })
-            .collect();
+        // Each output's current bytes are what Read serves the actor.
+        let number = backend.get(actor, fixture.execution()).unwrap().number;
+        let read = |output: &str, index: Option<u32>| -> Vec<u8> {
+            let snapshot = backend.open_output(actor, number, output, index).unwrap();
+            let mut bytes = vec![];
+            for (file, length) in snapshot.parts {
+                file.take(length).read_to_end(&mut bytes).unwrap();
+            }
+            bytes
+        };
         assert_eq!(
-            bytes,
-            [
-                &b"frame-1"[..],
-                b"preview-draft",
-                b"frame-2",
-                b"frame-3",
-                b"preview-final"
-            ]
+            [read("frames", Some(1)), read("frames", Some(2)), read("frames", Some(3)), read("preview", None)],
+            [&b"frame-1"[..], b"frame-2", b"frame-3", b"preview-final"]
         );
     }
 
@@ -2786,7 +1679,7 @@ print(json.dumps({"identity": generation.identity}))
 #[cfg(test)]
 mod terminal_tests {
     use super::*;
-    use crate::journal::{Invocation, Outcome};
+    use crate::journal::{Invocation, Outcome, SubmissionContext};
 
     /// A run seen queued and next read finished still shows it ran, before its outcome.
     #[test]
@@ -2799,8 +1692,7 @@ mod terminal_tests {
         let machine =
             crate::api::MachineIdentity::ephemeral("terminal".into(), vec![signer.verifying_key()], vec![7; 32]).unwrap();
         let actor = VerifiedActor { public_key: signer.verifying_key().to_bytes() };
-        let uploads = WorkspaceUploads::open(&root.join("uploads"), store.clone()).unwrap();
-        let backend = NativeBackend::new(service.clone(), machine.authority.clone(), store, uploads);
+        let backend = NativeBackend::new(service.clone(), machine.authority.clone(), store);
         let engine = &service.engine;
         let digest = format!("sha256:{}", "a".repeat(64));
         let (queued, started) = engine.with_journal(|journal| {

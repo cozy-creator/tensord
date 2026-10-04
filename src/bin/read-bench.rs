@@ -1,6 +1,6 @@
 //! Development tool: Read throughput from a far machine. `seed` (on the machine's host) journals
 //! one finished run with a large output; `measure` (on the client) reads it N times through
-//! `cozy.machine.v1` Read and through the HTTPS output route, and prints MB/s. Not proof of
+//! `cozy.machine.v1` Read and prints MB/s. Not proof of
 //! anything but the transport.
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use cozy_machine::{
@@ -139,11 +139,11 @@ async fn measure(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         &args[4],
         &args[5],
     );
-    let (number, repeat): (u64, u32) = (args[6].parse()?, args[7].parse()?);
+    let repeat: u32 = args[7].parse()?;
     let limit: u64 = args.get(8).map_or(Ok(u64::MAX), |l| l.parse())?;
     let server: Option<u32> = args.get(9).map(|p| p.parse()).transpose()?;
     let window = args.get(10).map_or("adaptive", String::as_str);
-    // CPU seconds from /proc stat: utime+stime (self or server) and cutime+cstime (curl).
+    // CPU seconds from /proc stat: utime+stime (self or server).
     let ticks = |pid: &str, field: usize| -> f64 {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
         let rest: Vec<&str> = stat
@@ -168,19 +168,7 @@ async fn measure(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             ..Default::default()
         },
     );
-    let run = mint(
-        &signer,
-        Grant {
-            machine: worker.into(),
-            run: number.to_string(),
-            expires: now + 3600,
-            ..Default::default()
-        },
-    );
-    let (host, port) = address.rsplit_once(':').ok_or("address is host:port")?;
-    let ca = std::env::temp_dir().join("read-bench-leaf.pem");
-    std::fs::write(&ca, pem)?;
-    // Each transfer opens its own connection, as curl does: adaptive (BDP), fixed (16 MiB
+    // Each transfer opens its own connection: adaptive (BDP), fixed (16 MiB
     // stream / 32 MiB connection) or default (hyper's own) HTTP/2 windows.
     let connect = |window: &str| {
         Endpoint::from_shared(format!("https://{address}")).map(|endpoint| {
@@ -228,40 +216,6 @@ async fn measure(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let (cpu, served) = (ticks("self", 11) - cpu, server_cpu() - served);
             println!("{{\"path\":\"grpc-read-{}\",\"attempt\":{attempt},\"bytes\":{bytes},\"seconds\":{seconds:.3},\"mb_per_s\":{:.1},\"client_cpu_s\":{cpu:.2},\"server_cpu_s\":{served:.2}}}", window, bytes as f64 / seconds / 1e6);
         }
-        let (cpu, served) = (ticks("self", 13), server_cpu());
-        let output = Command::new("curl")
-            .args([
-                "-sS",
-                "-o",
-                "/dev/null",
-                "-w",
-                "%{size_download} %{time_total} %{http_version}",
-                "--cacert",
-            ])
-            .arg(&ca)
-            .args([
-                "-r",
-                &format!("0-{}", limit.saturating_sub(1).min(u64::MAX - 1)),
-            ])
-            .args([
-                "--resolve",
-                &format!("localhost:{port}:{host}"),
-                "-H",
-                &format!("Authorization: Cozy-Cap {run}"),
-            ])
-            .arg(format!(
-                "https://localhost:{port}/v1/runs/{number}/outputs/blob"
-            ))
-            .output()?;
-        let text = String::from_utf8_lossy(&output.stdout);
-        let mut words = text.split(' ');
-        let (size, total, version) = (words.next(), words.next(), words.next().unwrap_or("?"));
-        let (size, total): (f64, f64) = (
-            size.ok_or("curl reported nothing")?.parse()?,
-            total.ok_or("curl reported nothing")?.parse()?,
-        );
-        let (cpu, served) = (ticks("self", 13) - cpu, server_cpu() - served);
-        println!("{{\"path\":\"https-get-http{version}\",\"attempt\":{attempt},\"bytes\":{size},\"seconds\":{total:.3},\"mb_per_s\":{:.1},\"client_cpu_s\":{cpu:.2},\"server_cpu_s\":{served:.2}}}", size / total / 1e6);
     }
     Ok(())
 }

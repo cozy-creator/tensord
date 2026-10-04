@@ -22,6 +22,7 @@ pub mod v1 {
 }
 
 pub use backend::MachineBackend;
+pub use machine_status::CAPABILITIES;
 pub use server::{serve, MachineIdentity};
 pub const WIRE_MINOR: u32 = 72;
 // The deployed baseline the Go agent reports; released CLIs read 0 as "no usable range".

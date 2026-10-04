@@ -4,7 +4,6 @@
 //! bundles a Rust machine also replaces the service binary (the stable parent runs it). The
 //! previous pair and binary stay installed; a candidate that never proves readiness is rolled
 //! back by the parent. Boot id, leaf, journal and outputs are kept.
-use super::receipt::Readiness;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -15,7 +14,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-pub const CAPABILITY: &str = "runtime-update/1";
 /// The service's exit status asking its parent to exec the selected application.
 pub const REPLACE_EXIT: i32 = 75;
 const MAX_WHEEL_BYTES: u64 = 256 << 20;
@@ -163,7 +161,6 @@ fn latest(paths: &Paths, pending: Status) -> Status {
 
 pub struct Updates {
     paths: Paths,
-    readiness: Arc<Readiness>,
     status: Mutex<Option<Status>>,
     idle: Box<dyn Fn() -> bool + Send + Sync>,
     lifecycle: Option<Arc<super::lifecycle::Lifecycle>>,
@@ -172,7 +169,6 @@ pub struct Updates {
 impl Updates {
     pub fn open(
         paths: Paths,
-        readiness: Arc<Readiness>,
         idle: Box<dyn Fn() -> bool + Send + Sync>,
         lifecycle: Option<Arc<super::lifecycle::Lifecycle>>,
     ) -> io::Result<Arc<Self>> {
@@ -189,7 +185,6 @@ impl Updates {
         }
         Ok(Arc::new(Self {
             paths,
-            readiness,
             status: Mutex::new(status),
             idle,
             lifecycle,
@@ -223,31 +218,6 @@ impl Updates {
     /// The executors' Runtime/TensorFS pair.
     pub fn software(&self) -> Pair {
         pair_in(&self.paths.sdk())
-    }
-
-    /// GET /v1/machine/runtime.
-    pub fn state(&self, agent_capabilities: &[&str]) -> serde_json::Value {
-        let pair = pair_in(&self.paths.sdk());
-        let (sha256, selection) = match fs::read("/proc/self/exe") {
-            Ok(bytes) => (
-                hex(&Sha256::digest(bytes)),
-                if self.paths.current_agent_link().exists() {
-                    "bundled"
-                } else {
-                    "explicit"
-                },
-            ),
-            Err(_) => (String::new(), "explicit"),
-        };
-        serde_json::json!({
-            "phase": if self.readiness.proved() { "ready" } else { "booting" },
-            "capabilities": [CAPABILITY],
-            "runtime": pair.runtime,
-            "tensorfs": pair.tensorfs,
-            "agent": {"version": env!("CARGO_PKG_VERSION"), "sha256": sha256, "selection": selection, "capabilities": agent_capabilities},
-            "bootstrap": {"abi": "machine-bootstrap/1", "version": env!("CARGO_PKG_VERSION"), "update_boundary": "measured-idle"},
-            "update": *self.status.lock().unwrap(),
-        })
     }
 
     /// PUT /v1/machine/runtime/wheels/{file}: kept as staged/<sha256>/<file>.
@@ -722,9 +692,8 @@ mod tests {
         let lifecycle = super::super::lifecycle::Lifecycle::open(root.join("idle.json"), false, true).unwrap();
         let earlier = lifecycle.admit().unwrap();
         let drained = lifecycle.clone();
-        let readiness = Readiness::open(None, Some(vec![7; 32]), false).unwrap();
         let idle = Box::new(move || drained.admitted() == 0);
-        let updates = Updates::open(paths.clone(), readiness, idle, Some(lifecycle.clone())).unwrap();
+        let updates = Updates::open(paths.clone(), idle, Some(lifecycle.clone())).unwrap();
         let candidate = wheel(&root, "cozy_runtime", "0.2.0", None);
         let file = candidate.file_name().unwrap().to_str().unwrap().to_owned();
         let (sha256, _) = updates.stage(&file, &mut fs::File::open(&candidate).unwrap()).unwrap();
@@ -751,8 +720,7 @@ mod tests {
         status.enter("preparing");
         fs::create_dir_all(paths.update("")).unwrap();
         write_json(&paths.update("status.json"), &status).unwrap();
-        let readiness = Readiness::open(None, Some(vec![7; 32]), false).unwrap();
-        let updates = Updates::open(paths, readiness, Box::new(|| true), None).unwrap();
+        let updates = Updates::open(paths, Box::new(|| true), None).unwrap();
         let stopped = updates.update("u1").unwrap();
         assert_eq!(stopped.state, "failed");
         assert!(stopped.error.starts_with("machine_restarted"));

@@ -50,7 +50,7 @@ fn run() -> io::Result<()> {
             struct Version { name: &'static str, implementation: &'static str, version: &'static str, #[serde(skip_serializing_if = "Option::is_none")] commit: Option<&'static str>,
                 tensorfs: &'static str, api: [&'static str; 1], wire_minor: u32, minimum_wire_minor: u32, capabilities: Vec<&'static str> }
             // Machine contracts beside the private socket's: clients choose by capability.
-            let capabilities = cozy_machine::machine::CAPABILITIES.iter().chain(CAPS).copied().collect();
+            let capabilities = cozy_machine::api::CAPABILITIES.iter().chain(CAPS).copied().collect();
             // `api` names the client API it serves (G/API.md): a controller chooses its machine by it.
             // `commit` is the source a release build was made from (`task release`).
             let record = Version { name: "cozy-machine", implementation: "rust", version: env!("CARGO_PKG_VERSION"), commit: option_env!("COZY_MACHINE_COMMIT"), tensorfs: tensorfs_core::VERSION, api: ["cozy.machine.v1"],
@@ -159,7 +159,6 @@ fn run_machine(
         let idle = move || service.idle().unwrap_or(false) && admitted.admitted() == 0;
         cozy_machine::machine::update::Updates::open(
             paths.clone(),
-            identity.readiness.clone(),
             Box::new(idle),
             Some(lifecycle.clone()),
         )?
@@ -324,14 +323,7 @@ fn start_api(
         sdk.uv.clone(),
     );
     let store = owner.lock().unwrap().store();
-    let uploads = api::workspaces::WorkspaceUploads::open(&root.join("uploads"), store.clone())
-        .map_err(io::Error::other)?;
-    let mut backend = NativeBackend::new(
-        service.clone(),
-        identity.authority.clone(),
-        store.clone(),
-        uploads,
-    );
+    let mut backend = NativeBackend::new(service.clone(), identity.authority.clone(), store.clone());
     backend.own_hub = own_hub;
     let publisher =
         cozy_machine::published::Publisher::new(&root.join("published"), sdk, store.clone())?;

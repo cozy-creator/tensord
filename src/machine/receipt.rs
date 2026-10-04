@@ -244,10 +244,8 @@ fn parse_gpus(text: &str) -> io::Result<Vec<Gpu>> {
     Ok(rows)
 }
 
-/// The facts the Hub's readiness reader requires of a machine image, as measured here. Both
-/// listener facts are observed on `cozy.machine.v1`. `worker_protocol` still names
-/// `cozy.worker.v1`, which this listener also serves and which Hubs before tensorhub #951
-/// require; the commit that stops serving it states `cozy.machine.v1` here.
+/// The facts the Hub's readiness reader requires of a machine image, as measured here on
+/// `cozy.machine.v1`, the one protocol this listener serves.
 pub struct Measured<'a> {
     pub boot_id: &'a str,
     pub worker_port: u16,
@@ -255,7 +253,8 @@ pub struct Measured<'a> {
     pub gpus: Vec<Gpu>,
     pub listener_bound: bool,
     pub foreign_credential_refused: bool,
-    pub capabilities: &'a [&'a str],
+    /// What it serves on `cozy.machine.v1`, as Status names it.
+    pub capabilities: Vec<String>,
     /// The port `cozy/1` is served on; the Hub derives its pin from the leaf.
     pub webrtc_port: Option<u16>,
 }
@@ -264,7 +263,7 @@ impl Measured<'_> {
         let mut value = serde_json::json!({
             "pod_boot_id": self.boot_id,
             "worker_internal_port": self.worker_port,
-            "worker_protocol": "cozy.worker.v1",
+            "worker_protocol": "cozy.machine.v1",
             "worker_listener_bound": self.listener_bound,
             "worker_foreign_credential_refused": self.foreign_credential_refused,
             "tls_certificate_der_base64": STANDARD.encode(self.cert_der),
@@ -387,7 +386,7 @@ mod tests {
             }],
             listener_bound: true,
             foreign_credential_refused: true,
-            capabilities: &[],
+            capabilities: vec![],
             webrtc_port: None,
         }
         .payload()

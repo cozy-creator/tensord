@@ -124,7 +124,8 @@ fn receipt_verifies_and_a_restart_keeps_boot_and_bytes() {
     assert_eq!(facts["pod_boot_id"], boot_id.as_str());
     assert_eq!(URL_SAFE_NO_PAD.decode(&boot_id).unwrap().len(), 32);
     assert_eq!(facts["worker_internal_port"], port);
-    assert_eq!(facts["worker_protocol"], "cozy.worker.v1");
+    assert_eq!(facts["worker_protocol"], "cozy.machine.v1");
+    assert!(facts["machine_capabilities"].as_array().unwrap().iter().any(|c| c == "run/1"));
     assert_eq!(facts["worker_listener_bound"], true);
     assert_eq!(facts["worker_foreign_credential_refused"], true);
     assert_eq!(facts["runtime_gpus"], serde_json::json!([]));
