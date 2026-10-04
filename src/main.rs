@@ -35,6 +35,7 @@ fn run() -> io::Result<()> {
         },
         None | Some("run") if args.len() == 0 => match cozy_machine::machine::grant::from_process()? {
             Some(grant) => {
+                cozy_machine::machine::identity::hold(&grant.layout)?;
                 if let Some(key) = grant.developer_key.as_deref().filter(|_| nix::unistd::geteuid().is_root()) {
                     cozy_machine::machine::ssh::start(key)?;
                 }
@@ -87,7 +88,7 @@ fn run() -> io::Result<()> {
             }
             let root=root.ok_or_else(||io::Error::other("--state is required"))?;
             let generations=generations.unwrap_or_else(||root.join("generations"));
-            let owner=Owner::new(&root,budget,Duration::from_secs(ttl))?;
+            let owner=Owner::new(&root,&root.join("tensorfs"),budget,Duration::from_secs(ttl))?;
             let service=cozy_machine::service::Service::open(&root,&generations,parallelism)?;
             if let Some(config)=gpu_config {
                 let gpu=cozy_machine::gpu_service::GpuPool::new(&root.join("gpu"),cozy_machine::gpu_service::GpuConfig::load(&config)?,owner.lock().unwrap().store())?;
@@ -148,9 +149,9 @@ fn run_machine(
     )?;
     identity.lifecycle = Some(lifecycle.clone());
     let engine = layout.engine();
-    identity.engine = Some(engine.clone());
+    identity.store = Some(layout.store.clone());
     let generations = engine.join("generations");
-    let owner = Owner::new(&engine, 16 * 1024 * 1024, Duration::from_secs(300))?;
+    let owner = Owner::new(&engine, &layout.store, 16 * 1024 * 1024, Duration::from_secs(300))?;
     let service = cozy_machine::service::Service::open(&engine, &generations, 1)?;
     let paths = cozy_machine::machine::update::Paths::new(&engine, &layout.root);
     let updates = {

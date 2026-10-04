@@ -63,7 +63,8 @@ fn validate(object: &Object) -> io::Result<()> {
     Ok(())
 }
 impl Owner {
-    pub fn new(root: &Path, budget: u64, ttl: Duration) -> io::Result<Shared> {
+    /// `store` is the TensorFS store this owner serves, which may live outside `root`.
+    pub fn new(root: &Path, store: &Path, budget: u64, ttl: Duration) -> io::Result<Shared> {
         std::fs::create_dir_all(root)?;
         let lock = OpenOptions::new()
             .read(true)
@@ -78,7 +79,7 @@ impl Owner {
             )
         })?;
         std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
-        let store = Arc::new(Store::ensure(&root.join("tensorfs")).map_err(io::Error::other)?);
+        let store = Arc::new(Store::ensure(store).map_err(io::Error::other)?);
         let incarnation = format!(
             "{}-{}",
             std::process::id(),

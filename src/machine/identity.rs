@@ -19,6 +19,33 @@ pub struct Lifetime {
     pub cert_der: Vec<u8>,
 }
 
+/// One machine per root. Every machine on a root holds this lock for its life, and a launcher
+/// probes it before it starts or replaces one: the Go agent's `agent.lock`, so each agent
+/// excludes the other. The kernel releases it when the last machine process is gone.
+pub fn hold(layout: &Layout) -> io::Result<()> {
+    use fs2::FileExt;
+    fs::create_dir_all(&layout.state)?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(layout.state.join("agent.lock"))?;
+    lock.try_lock_exclusive().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "another machine owns the root {}",
+                layout.root.display()
+            ),
+        )
+    })?;
+    // Held by this parent and the service it forks; never by an executor (close-on-exec).
+    std::mem::forget(lock);
+    Ok(())
+}
+
 /// Mints or reopens this root's lifetime. A root booted by the Go agent keeps its boot id
 /// and leaf; so does a later Go agent on a root this service booted.
 pub fn open(layout: &Layout) -> io::Result<Lifetime> {

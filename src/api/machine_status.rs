@@ -164,7 +164,7 @@ async fn frame<B: MachineBackend>(
         runtime: software.runtime,
         tensorfs: software.tensorfs,
         environments,
-        disk: identity.engine.as_deref().and_then(disk),
+        disk: identity.store.as_deref().and_then(disk),
         ..identity_frame(identity)
     })
 }
