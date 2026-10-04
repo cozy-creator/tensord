@@ -876,6 +876,7 @@ pub struct DeviceExecutor {
     _generation_hold: Option<Arc<File>>,
     codec: Arc<Codec>,
     retained: Vec<Box<dyn Send>>,
+    require_source_scope_proof: bool,
     identity: Option<LaunchIdentity>,
     watched: Watched,
     /// Longest gap between frames this executor has shown during invocations.
@@ -1554,6 +1555,7 @@ impl DeviceExecutor {
             _generation_hold: config.generation_hold,
             codec,
             retained: Vec::new(),
+            require_source_scope_proof: false,
             identity: config.identity,
             watched,
             worst_gap: Duration::ZERO,
@@ -1622,6 +1624,13 @@ impl DeviceExecutor {
     /// Observer lifetimes must never own the DeviceExecutor handle.
     pub fn retain_until_exit(&mut self, resource: impl Send + 'static) {
         self.retained.push(Box::new(resource));
+    }
+
+    /// Native source custody requires a supported, proven empty receiver scope.
+    /// Generic resources keep their existing exact-exit behavior.
+    pub fn retain_source_until_exit(&mut self, resource: impl Send + 'static) {
+        self.require_source_scope_proof = true;
+        self.retain_until_exit(resource);
     }
 
     fn offered(&self, command: &DeviceCommand) -> io::Result<()> {
@@ -1856,7 +1865,7 @@ impl DeviceExecutor {
         Ok(())
     }
 
-    /// Attempt-keyed cooperative cancellation; observer teardown never calls this.
+    /// Recovery of this receiver's supported containment scope; None is unavailable.
     pub fn scope_recovery(&self) -> Option<crate::scope::Recovery> {
         let uid = self.identity.map_or_else(|| unsafe { libc::geteuid() }, |identity| identity.uid);
         self.exact.scope_recovery(uid)
@@ -1883,6 +1892,7 @@ impl DeviceExecutor {
 
     /// Retire an already quiescent retained executor through its exact exit fence.
     pub fn retire_quiescent(mut self) -> io::Result<Ended> {
+        self.require_source_scope_proof = true;
         let _ = self.command(&DeviceCommand::Shutdown, &mut Baseline);
         self.terminate()
     }
@@ -1900,6 +1910,7 @@ impl DeviceExecutor {
         Ending {
             exact: self.exact.try_clone(),
             recovery: self.scope_recovery(),
+            require_source_scope_proof: self.require_source_scope_proof,
             child: self.child.take(),
             forked: std::mem::take(&mut self.forked),
             retained: std::mem::take(&mut self.retained),
@@ -1962,6 +1973,7 @@ impl Drop for Unready {
 struct Ending {
     exact: io::Result<Exact>,
     recovery: Option<crate::scope::Recovery>,
+    require_source_scope_proof: bool,
     child: Option<Child>,
     forked: bool,
     retained: Vec<Box<dyn Send>>,
@@ -1991,8 +2003,12 @@ impl Ending {
         if self.forked {
             ended.status = zombie_status(&exact.birth).unwrap_or(ended.status);
         }
-        if let Some(recovery) = &self.recovery {
-            match recovery.empty() {
+        if self.require_source_scope_proof {
+            let proof = match &self.recovery {
+                Some(recovery) => recovery.empty(),
+                None => Err(io::Error::new(io::ErrorKind::Unsupported, "executor source scope recovery is unavailable")),
+            };
+            match proof {
                 Ok(true) => (),
                 proof => {
                     std::mem::forget(std::mem::take(&mut self.retained));
@@ -2232,6 +2248,7 @@ mod generation_custody_tests {
         let ending = Ending {
             exact: Err(io::Error::other("unknown exact process birth")),
             recovery: None,
+            require_source_scope_proof: false,
             child: None,
             forked: false,
             retained,
