@@ -355,6 +355,37 @@ impl Publisher {
             .map_err(|(code, message)| Refused { code, message })
     }
 
+    /// A CPU job/warm model input resolves its logical catalog selector at its trusted Hub,
+    /// then uses the same exact download/custody path as serving preparations.
+    pub(crate) fn download_choice(
+        &self, service:&Service, source:Option<&hub::Source>, choice:&pb::ModelChoice,
+        bytes:&(dyn Fn(u64,u64)+Sync), execution:&str,
+    )->Result<(String,tensorfs_core::ids::ObjectRef),Refused> {
+        let mut repository=choice.repository.clone();
+        let manifest=if let Some(reference)=&choice.manifest {
+            if reference.digest.len()!=32 {return Err(Refused {code:"invalid_request",message:"model manifest must be SHA-256".into()});}
+            format!("sha256:{}",sha256::hex(&reference.digest))
+        } else if !repository.is_empty() {
+            let source=source.ok_or_else(||Refused {code:"hub_access_absent",message:"a catalog model resolves with this run's Hub access".into()})?;
+            let catalog=Catalog::new(source).map_err(|error|Refused {code:"catalog_read_failed",message:error.0})?;
+            let resolved=resolve_catalog_checkpoint(&catalog,&repository,&choice.release,&choice.lane,false)
+                .map_err(|(code,message)|Refused {code,message})?;
+            repository=resolved.get("model").and_then(Value::as_str).unwrap_or(&repository).into();
+            catalog_manifest(&resolved).map_err(|(code,message)|Refused {code,message})?
+        } else {
+            return Err(Refused {code:"invalid_request",message:format!("model choice {:?} names no catalog checkpoint, exact manifest or provider source",choice.parameter)});
+        };
+        if !repository.is_empty() {
+            let source=source.ok_or_else(||Refused {code:"hub_access_absent",message:"a catalog model downloads with this run's Hub access".into()})?;
+            self.download(service,source,&repository,&manifest,bytes,execution)?;
+        }
+        let sha256=manifest.trim_start_matches("sha256:").to_string();
+        let length=fs::metadata(self.store.manifest_path(&sha256)).map_err(|_|Refused {
+            code:"checkpoint_absent",message:format!("this machine holds no checkpoint {manifest}"),
+        })?.len();
+        Ok((repository,tensorfs_core::ids::ObjectRef {sha256,length}))
+    }
+
     fn fetch(&self, manifests: Vec<String>) -> Fetching<'_> {
         let mut fetching = self.fetching.lock().unwrap();
         for manifest in &manifests {
@@ -1031,31 +1062,8 @@ impl Publisher {
                     format!("{path} names no model repository"),
                 ));
             }
-            let reference = if release.is_empty() {
-                model.clone()
-            } else {
-                format!("{model}@{release}")
-            };
-            let mut query = format!("/v1/models/resolve?ref={}", hub::escape(&reference));
-            if !lane.is_empty() && !manifest {
-                query.push_str(&format!("&lane={}", hub::escape(&lane)));
-            }
-            let resolved = catalog
-                .json(&query)
-                .map_err(|e| ("catalog_read_failed", e.0))?;
-            let manifest_id = resolved
-                .get("manifest_id")
-                .and_then(Value::as_str)
-                .ok_or((
-                    "catalog_read_failed",
-                    "model resolution named no manifest".to_string(),
-                ))?
-                .to_string();
-            let manifest_id = if manifest_id.starts_with("sha256:") {
-                manifest_id
-            } else {
-                format!("sha256:{manifest_id}")
-            };
+            let resolved=resolve_catalog_checkpoint(catalog,&model,&release,&lane,manifest)?;
+            let manifest_id=catalog_manifest(&resolved)?;
             let field = |name: &str, fallback: &str| {
                 resolved
                     .get(name)
@@ -1183,6 +1191,22 @@ fn make_source(
         },
     )
     .map_err(|e| ("model_source_failed", e.to_string()))
+}
+
+/// Exact and logical catalog selections share this authoritative resolve operation.
+fn resolve_catalog_checkpoint(catalog:&Catalog,model:&str,release:&str,lane:&str,manifest:bool)->Result<Value,Failure> {
+    let reference=if release.is_empty() {model.to_string()} else {format!("{model}@{release}")};
+    let mut query=format!("/v1/models/resolve?ref={}",hub::escape(&reference));
+    if !lane.is_empty() && !manifest {query.push_str(&format!("&lane={}",hub::escape(lane)));}
+    catalog.json(&query).map_err(|error|("catalog_read_failed",error.0))
+}
+fn catalog_manifest(resolved:&Value)->Result<String,Failure> {
+    let value=resolved.get("manifest_id").and_then(Value::as_str).ok_or((
+        "catalog_read_failed","model resolution named no manifest".into()))?;
+    let sha256=value.strip_prefix("sha256:").unwrap_or(value);
+    tensorfs_core::ids::hex64("resolved model manifest",sha256)
+        .map_err(|error|("catalog_read_failed",error.to_string()))?;
+    Ok(format!("sha256:{sha256}"))
 }
 
 /// Download one exact checkpoint; `keep` names what its GC must not evict (`protected`).
