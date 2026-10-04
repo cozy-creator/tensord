@@ -165,6 +165,19 @@ fn refused(code: &'static str, message: impl Into<String>) -> Refused {
     }
 }
 
+/// The held package capture owns callable kind; a child frame owns no placement authority.
+fn captured_child_job(interface: &[u8], name: &str) -> Result<bool, Refused> {
+    let interface: Value = serde_json::from_slice(interface)
+        .map_err(|_| refused("interface_invalid", "held interface is corrupt"))?;
+    let contains = |section: &str| interface[section].as_array().into_iter().flatten()
+        .any(|row| row["name"].as_str() == Some(name) && row["invocable"].is_object());
+    match (contains("jobs"), contains("entrypoints")) {
+        (true, false) => Ok(true),
+        (false, true) => Ok(false),
+        _ => Err(refused("child_undeclared", "child is absent or ambiguous in the held callable capture")),
+    }
+}
+
 impl Runs {
     /// Reattachment observes an accepted obligation before consulting mutable input caches.
     pub(crate) fn existing(&self, actor: &str, id: &str, digest: &str) -> Result<Option<Execution>, Refused> {
@@ -646,10 +659,15 @@ impl Runs {
                     .context()?
             }
         };
+        let actor = self.service.engine.get(parent)?.submission
+            .ok_or_else(|| refused("child_call_refused", "parent has no submission actor"))?.actor;
+        let installed = self.service.engine.installation(&actor, &context.installation)?
+            .ok_or_else(|| refused("installation_absent", "parent's held installation is absent"))?;
+        let job = captured_child_job(&installed.interface, entrypoint)?;
         let prefix = format!("{entrypoint}.");
         Ok(Spec {
             warm: false,
-            job: false,
+            job,
             parent: parent.into(),
             source: Source::Installation(context.installation),
             entrypoint: entrypoint.into(),
@@ -880,6 +898,23 @@ mod tests {
         assert_eq!(runs.existing("alice","accepted","other-intent").unwrap_err().code,"run_id_conflict");
         assert!(runs.existing("alice","missing","same-intent").unwrap().is_none());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn captured_children_use_the_held_callable_kind() {
+        let interface = serde_json::to_vec(&json!({
+            "jobs": [{"name":"leaf-job", "invocable":{"module":"package", "export":"leaf_job"}}],
+            "entrypoints": [{"name":"leaf-call", "invocable":{"module":"package", "export":"leaf_call"}}]
+        })).unwrap();
+        assert!(captured_child_job(&interface,"leaf-job").unwrap());
+        assert!(!captured_child_job(&interface,"leaf-call").unwrap());
+        assert_eq!(captured_child_job(&interface,"missing").unwrap_err().code,"child_undeclared");
+        assert_eq!(captured_child_job(b"broken","leaf-job").unwrap_err().code,"interface_invalid");
+        let ambiguous = serde_json::to_vec(&json!({
+            "jobs":[{"name":"duplicate","invocable":{}}],
+            "entrypoints":[{"name":"duplicate","invocable":{}}]
+        })).unwrap();
+        assert_eq!(captured_child_job(&ambiguous,"duplicate").unwrap_err().code,"child_undeclared");
     }
 
     #[test]
