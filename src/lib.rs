@@ -35,3 +35,6 @@ pub mod weights;
 pub mod scope;
 pub mod service;
 pub mod triage;
+
+#[cfg(test)]
+mod terminal_running_tests;
