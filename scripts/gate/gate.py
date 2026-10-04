@@ -51,7 +51,13 @@ def cg():   # cgroup v2, else v1 (v1 rss = anon without shmem; shmem sits inside
         r = sum(int(l.split()[2]) for l in open(f"{CG}/blkio/blkio.throttle.io_service_bytes_recursive")
                 if len(l.split()) == 3 and l.split()[1] == "Read")
         anon, shmem, mapped, file = m["total_rss"], m["total_shmem"], m["total_mapped_file"], m["total_cache"]
-    return {"anon": anon, "shmem": shmem, "file_mapped": mapped, "file": file, "host": anon + shmem, "read_bytes": r, "path": CG}
+    cpu = None
+    for path, scale in ((f"{CG}/cpuacct/cpuacct.usage", 1), (f"{CG}/cpu,cpuacct/cpuacct.usage", 1)):
+        if os.path.exists(path): cpu = int(open(path).read()) * scale; break
+    if cpu is None and os.path.exists(f"{CG}/cpu.stat"):
+        cpu = next(int(l.split()[1]) for l in open(f"{CG}/cpu.stat") if l.startswith("usage_usec")) * 1000
+    return {"anon": anon, "shmem": shmem, "file_mapped": mapped, "file": file, "host": anon + shmem, "read_bytes": r,
+            "cpu_ns": cpu, "path": CG}
 def unit_reads(cg):   # no io controller (a user unit): the storage reads of the unit's live processes
     total = 0
     for d, _, fs in os.walk(cg):
@@ -280,7 +286,8 @@ class Gate:
         place = spec.get("run_args", [f"--rental={self.m.get('rental')}", f"--tensorhub={self.m.get('hub')}"])
         before = self.pod.helper("now")
         submit = time.time()
-        done = subprocess.run([cli, "run", self.m["targets"][model], f"--input={root / 'input.json'}", *place,
+        done = subprocess.run([cli, "run", self.m["targets"][model], *self.m.get("target_args", {}).get(model, []),
+                               f"--input={root / 'input.json'}", *place,
                                "--await", "--json", f"--out={root / 'out'}",
                                f"--idempotency-key=gate-{self.m['salt']}-{self.index}"], capture_output=True, text=True)
         finished = time.time()
@@ -434,70 +441,119 @@ class Gate:
         self.record({"arm": arm, "event": "kill_proof", "cycles": n, "failed": failed})
         log(f"kill proof on {arm}: {n} cycles, {failed} failed")
 
-    def cell(self, arm: str, name: str, models: list[str]) -> None:
-        """A rebench cell: a freshly started, ready machine, then the requests in order with at most one
-        successor waiting behind a predecessor that holds the GPU. Total = first submit to last saved output."""
+    def cell(self, arm: str, name: str, spec_cell) -> None:
+        """A rebench cell on a freshly started machine. Requests are model names (a fresh prompt and seed
+        each) or {"model", "input"} payloads. Options: "budget" (a ballast leaves that much GPU memory free),
+        "cold" (clock from the machine's birth, no ready wait). An arm with "command" runs its own driver
+        on the host (another engine) and returns the same record. Total = first submit to last saved output."""
         spec = self.m["arms"][arm]
-        cycle = 2000 + self.index
+        if isinstance(spec_cell, list):
+            spec_cell = {"requests": spec_cell}
+        budget, cold = spec_cell.get("budget"), spec_cell.get("cold", False)
+        if self.m.get("rental"):
+            subprocess.run(["cozy", "rental", "keepalive", self.m["rental"], f"--tensorhub={self.m['hub']}"], capture_output=True)
         self.record({"arm": arm, "cell": name, "event": "cell_begin", "clock": self.clock(), "cool": self.cool()})
-        old = (self.pod.sh(spec["root"]).split() or ["none"])[0]
-        self.pod.sh(spec["restart"])
-        if spec.get("start"):
-            while self.pod.helper("now")["executors"]:
-                time.sleep(0.2)
-            self.pod.sh(spec["start"])
-        new = self.pod.helper("newroot", old, spec["root"])
-        if spec.get("after_start"):
-            self.pod.sh(spec["after_start"])
-        if spec.get("ready"):   # e.g. the owner's machine reports phase ready
-            self.pod.sh(spec["ready"])
-        if spec.get("cgroup"):
-            self.pod.sh(f"({spec['cgroup']}) > {self.pod.dir}/cgroup")
-        limits = self.pod.sh(spec["limits"]) if spec.get("limits") else None
+        warm = None
+        paths = spec.get("cache_paths", self.m.get("cache_paths"))
+        if paths:   # this engine's files read into the page cache; the cell's disk reads show what held
+            self.pod.helper("list", json.dumps(paths), self.cache)
+            warm = self.pod.helper("warm", self.cache)
+        ballast = None
+        if budget:   # a fixed real allocation made before the engine starts: the free pool is what is left
+            ballast = json.loads(self.pod.sh(self.m["ballast"]["start"].format(gib=budget)))
+        try:
+            old = (self.pod.sh(spec["root"]).split() or ["none"])[0]
+            if not (spec.get("command") and old != "none"):   # a command arm only needs its parking machine up
+                self.pod.sh(spec["restart"])
+                if spec.get("start"):
+                    while self.pod.helper("now")["executors"]:
+                        time.sleep(0.2)
+                    self.pod.sh(spec["start"])
+                new = self.pod.helper("newroot", old, spec["root"])
+            else:
+                new = {"pid": int(old), "already": True}
+            if spec.get("after_start"):
+                self.pod.sh(spec["after_start"])
+            if spec.get("cgroup"):
+                self.pod.sh(f"({spec['cgroup']}) > {self.pod.dir}/cgroup")
+            limits = self.pod.sh(spec["limits"]) if spec.get("limits") else None
+            before = self.pod.helper("now")
+            if spec.get("command"):
+                try:
+                    done = json.loads(self.pod.sh(spec["command"].format(cell=name, budget=budget or "uncapped")))
+                    row = {"total_s": done["total_s"], "t_first": done["t_first"] - self.offset, "t_end": done["t_end"] - self.offset,
+                           "ok": done["ok"], "requests": done["requests"], "startup_s": done.get("startup_s"),
+                           "engine": done.get("engine"), "engine_pss_peak": done.get("engine_pss_peak")}
+                except (RuntimeError, ValueError, KeyError) as error:   # the engine's driver failed: a failed cell
+                    row = {"total_s": 0.0, "t_first": time.time(), "t_end": time.time(), "ok": False, "requests": [],
+                           "error": str(error)[-3000:]}
+            else:
+                row = self.cozy_cell(arm, name, spec, spec_cell["requests"], None if not cold else new["started"])
+            after = self.pod.helper("now")
+        finally:
+            if ballast:
+                self.pod.sh(self.m["ballast"]["stop"], check=False)
+        facts = self.pod.sh(self.m["cell_facts"], check=False) if self.m.get("cell_facts") else None   # e.g. kernel Xid lines
+        self.record({"arm": arm, "cell": name, "event": "cell", "offset": self.offset, "new_root": new, "limits": limits, "facts": facts,
+                     "budget": budget, "cold": cold, "ballast": ballast, "warm": warm, "gpu_before": before["gpu"],
+                     "disk_read_bytes": after["cg"]["read_bytes"] - before["cg"]["read_bytes"],
+                     "controller_load": os.getloadavg()[0], **row})
+        self.idle_since = time.time()
+        log(f"{arm} cell {name}: {row['total_s']:.1f} s", "ok" if row["ok"] else "FAILED")
+        if not row["ok"] and not self.m.get("continue_on_failure"):   # between engines a failed cell is a result
+            raise RuntimeError(f"cell {name} on {arm} failed")
+
+    def cozy_cell(self, arm: str, name: str, spec: dict, requests: list, born: float | None) -> dict:
+        """Ordinary `cozy run --await` per request; the next is submitted once the previous one holds the GPU."""
+        if born is None:
+            if spec.get("ready"):
+                self.pod.sh(spec["ready"])
+            while self.m.get("rental") and subprocess.run(["cozy", "rental", "keepalive", self.m["rental"], f"--tensorhub={self.m['hub']}"],
+                                                          capture_output=True).returncode:
+                time.sleep(0.5)   # the rental's machine answers: ready
         cli = spec.get("cli", "cozy")
         place = spec.get("run_args", [f"--rental={self.m.get('rental')}", f"--tensorhub={self.m.get('hub')}"])
         on_gpu = ("machine.gpu.grant", "machine.executor", "run.in_progress", "machine.stage.turn")
-        procs, before = [], self.pod.helper("now")
-        first = None
-        for k, model in enumerate(models):
-            if procs:   # wait until the previous request holds the GPU (or has already finished)
+        procs, first = [], None
+        for k, item in enumerate(requests):
+            if procs:
                 while procs[-1]["proc"].poll() is None and not any(f'"type":"{t}"' in procs[-1]["err"].read_text() for t in on_gpu):
                     time.sleep(0.1)
-            prompt, seed = self.unique()
+            if isinstance(item, str):
+                prompt, seed = self.unique()
+                model, payload = item, {**self.m["requests"][item], "prompt": prompt, "seed": seed}
+            else:
+                model, payload = item["model"], item["input"]
             root = self.out / "runs" / f"{self.index:03}-{arm}-{name}-{k}-{model}"
             root.mkdir(parents=True)
-            (root / "input.json").write_text(json.dumps({**self.m["requests"][model], "prompt": prompt, "seed": seed}))
+            (root / "input.json").write_text(json.dumps(payload))
             submit = time.time()
             first = first or submit
             err = root / "events.jsonl"
-            proc = subprocess.Popen([cli, "run", self.m["targets"][model], f"--input={root / 'input.json'}", *place,
-                                     "--await", "--json", f"--out={root / 'out'}", f"--idempotency-key=gate-{self.m['salt']}-{self.index}"],
+            proc = subprocess.Popen([cli, "run", self.m["targets"][model], *self.m.get("target_args", {}).get(model, []),
+                                     f"--input={root / 'input.json'}", *place, "--await", "--json", f"--out={root / 'out'}",
+                                     f"--idempotency-key=gate-{self.m['salt']}-{self.index}"],
                                     stdout=(root / "stdout.json").open("w"), stderr=err.open("w"))
-            procs.append({"proc": proc, "err": err, "root": root, "model": model, "prompt": prompt, "seed": seed, "submit": submit})
+            procs.append({"proc": proc, "err": err, "root": root, "model": model, "payload": payload, "submit": submit})
             self.index += 1
         for p in procs:
             p["proc"].wait()
             p["done"] = time.time()
-        end = max(p["done"] for p in procs)
-        after = self.pod.helper("now")
         rows = []
         for p in procs:
             images = verify(p["root"] / "out", self.m["shapes"][p["model"]]) if (p["root"] / "out").is_dir() else []
             seen = marks(p["err"].read_text())
-            rows.append({"model": p["model"], "prompt": p["prompt"], "seed": p["seed"], "exit": p["proc"].returncode,
-                         "dir": str(p["root"]), "submit": p["submit"], "done": p["done"], "images": images,
-                         "machine_s": (seen["machine.outcome"] - seen["request.machine_accepted"])
-                         if "machine.outcome" in seen and "request.machine_accepted" in seen else None,
-                         "ok": p["proc"].returncode == 0 and len(images) == 1 and images[0]["ok"]})
-        ok = all(r["ok"] for r in rows)
-        self.record({"arm": arm, "cell": name, "event": "cell", "total_s": end - first, "t_first": first, "t_end": end,
-                     "offset": self.offset, "new_root": new, "limits": limits, "ok": ok, "requests": rows,
-                     "disk_read_bytes": after["cg"]["read_bytes"] - before["cg"]["read_bytes"],
-                     "controller_load": os.getloadavg()[0]})
-        self.idle_since = end
-        log(f"{arm} cell {name}: {end - first:.1f} s", "ok" if ok else "FAILED")
-        if not ok:
-            raise RuntimeError(f"cell {name} on {arm} failed")
+            rows.append({"model": p["model"], "prompt": p["payload"]["prompt"], "seed": p["payload"]["seed"],
+                         "exit": p["proc"].returncode, "dir": str(p["root"]), "submit": p["submit"], "done": p["done"],
+                         "accepted_pod": seen.get("request.machine_accepted"), "outcome_pod": seen.get("machine.outcome"),
+                         "images": images, "ok": p["proc"].returncode == 0 and len(images) == 1 and images[0]["ok"]})
+        start = first if born is None else born - self.offset
+        end = max(p["done"] for p in procs)
+        outcomes = [r["outcome_pod"] for r in rows if r["outcome_pod"]]
+        accepted = [r["accepted_pod"] for r in rows if r["accepted_pod"]]
+        machine = (max(outcomes) - (born if born is not None else min(accepted))) if outcomes and accepted else None
+        return {"total_s": end - start, "machine_total_s": machine, "t_first": start, "t_end": end,
+                "ok": all(r["ok"] for r in rows), "requests": rows}
 
     def run(self) -> None:
         samples = f"{self.pod.dir}/samples-{self.m['salt']}.jsonl"
@@ -567,19 +623,27 @@ def report(out: Path) -> dict:
         cell["gpu_peak_gib"] = spread(gpu)
         cell["busy_sm_mhz"] = spread(clocks)
         summary["arms"][arm] = cell
-    cells = [r for r in rows if r.get("event") == "cell"]
-    summary["cells"] = {}
-    for r in cells:
+    summary["cells"] = []
+    for r in rows:
+        if r.get("event") != "cell":
+            continue
         window = [x for x in samples if r["t_first"] + r["offset"] <= x["t"] <= r["t_end"] + r["offset"]
                   and (rental or x["cg"].get("path") != "/sys/fs/cgroup")]
-        cell = summary["cells"].setdefault(r["arm"], {}).setdefault(r["cell"], {"total_s": [], "host_peak_gib": [], "gpu_peak_gib": [],
-                                                                               "disk_read_gib": [], "ok": []})
-        cell["total_s"].append(round(r["total_s"], 2))
-        cell["ok"].append(r["ok"])
-        cell["disk_read_gib"].append(round(r["disk_read_bytes"] / 2**30, 2))
-        if window:
-            cell["host_peak_gib"].append(round(max(x["cg"]["host"] for x in window) / 2**30, 2))
-            cell["gpu_peak_gib"].append(round(max(x["gpu"]["mem_mib"] or 0 for x in window) / 1024, 2))
+        cpu = [x["cg"]["cpu_ns"] for x in window if x["cg"].get("cpu_ns") is not None]
+        busy = [x["gpu"]["sm_mhz"] for x in window if (x["gpu"]["util"] or 0) > 50 and x["gpu"]["sm_mhz"]]
+        done = sorted(q.get("outcome_pod") or q.get("done") for q in r["requests"] if q.get("outcome_pod") or q.get("done"))
+        summary["cells"].append({
+            "arm": r["arm"], "cell": r["cell"], "budget": r.get("budget"), "cold": r.get("cold"), "ok": r["ok"],
+            "total_s": round(r["total_s"], 2), "startup_s": r.get("startup_s"), "engine_pss_peak_gib": round(r["engine_pss_peak"] / 2**30, 2) if r.get("engine_pss_peak") else None,
+            "machine_total_s": round(r["machine_total_s"], 2) if r.get("machine_total_s") else None,
+            "spans_s": [round(b - a, 2) for a, b in zip(done, done[1:])],
+            "host_peak_gib": round(max(x["cg"]["host"] for x in window) / 2**30, 2) if window else None,
+            "gpu_peak_gib": round(max(x["gpu"]["mem_mib"] or 0 for x in window) / 1024, 2) if window else None,
+            "cpu_s": round((cpu[-1] - cpu[0]) / 1e9, 1) if len(cpu) > 1 else None,
+            "busy_sm_mhz": round(statistics.mean(busy)) if busy else None,
+            "max_temp_c": max((x["gpu"]["temp_c"] or 0) for x in window) if window else None,
+            "throttled": sorted({x["gpu"]["throttle"] for x in window}) if window else None,
+            "disk_read_gib": round(r["disk_read_bytes"] / 2**30, 2), "controller_load": r.get("controller_load")})
     old, new = summary["arms"].get("old"), summary["arms"].get("rust")
     if old and new:
         def gain(key: str) -> float | None:

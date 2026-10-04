@@ -76,11 +76,16 @@ machines) and stops the harness at once.
 An arm's optional `facts` command is recorded at every restart; a manifest `collect` command's stdout
 (a tarball) is saved as `OUT/collect.tgz` at the end.
 
-`cells` (name → models, e.g. `grouped: [sdxl, sdxl, sdxl, anima, anima, anima]`) with `cell_order`
-([arm, cell] pairs) runs the 2026-10-01 rebench's six-request cells before the cycles: equal soak and
-thermal start, a freshly started ready machine (`ready` command), then each request as its own
-`cozy run --await`, the next submitted once the previous one holds the GPU. Total = first submit to last
-saved output.
+`cells` with `cell_order` ([arm, cell] pairs) run the 2026-10-01 rebench's cells before the cycles. A cell is
+a list of requests (model names, or `{"model", "input"}` payloads) or `{"requests", "budget", "cold"}`:
+- each cell starts with equal soak and thermal start on a freshly started, ready machine;
+- each request is its own `cozy run --await`, the next submitted once the previous one holds the GPU;
+- total = first submit to last saved output; `machine_total_s` is the same on the pod's clock;
+- `budget` (e.g. `6GiB`) holds a ballast (`ballast.start` / `ballast.stop`) so that much GPU memory stays free;
+- `cold` clocks from the machine's birth with no ready wait;
+- an arm with `command` runs another engine's own driver on the host (ComfyUI) and returns the same record;
+- `target_args` adds per-model arguments (e.g. `model.model=...`), `cell_facts` records a host command per cell,
+  `continue_on_failure` records a failed cell and goes on.
 
 ## Manifest
 
