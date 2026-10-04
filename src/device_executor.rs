@@ -1857,6 +1857,12 @@ impl DeviceExecutor {
     }
 
     /// Attempt-keyed cooperative cancellation; observer teardown never calls this.
+    pub fn scope_recovery(&self) -> Option<crate::scope::Recovery> {
+        let uid = self.identity.map_or_else(|| unsafe { libc::geteuid() }, |identity| identity.uid);
+        self.exact.scope_recovery(uid)
+    }
+
+    /// Attempt-keyed cooperative cancellation; observer teardown never calls this.
     pub fn cancel(&self, request_id: &str) -> io::Result<()> {
         self.cancellation().cancel(request_id)
     }
@@ -1893,6 +1899,7 @@ impl DeviceExecutor {
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
         Ending {
             exact: self.exact.try_clone(),
+            recovery: self.scope_recovery(),
             child: self.child.take(),
             forked: std::mem::take(&mut self.forked),
             retained: std::mem::take(&mut self.retained),
@@ -1954,6 +1961,7 @@ impl Drop for Unready {
 /// Everything an executor's teardown must hold until its exit is observed.
 struct Ending {
     exact: io::Result<Exact>,
+    recovery: Option<crate::scope::Recovery>,
     child: Option<Child>,
     forked: bool,
     retained: Vec<Box<dyn Send>>,
@@ -1982,6 +1990,15 @@ impl Ending {
         };
         if self.forked {
             ended.status = zombie_status(&exact.birth).unwrap_or(ended.status);
+        }
+        if let Some(recovery) = &self.recovery {
+            match recovery.empty() {
+                Ok(true) => (),
+                proof => {
+                    std::mem::forget(std::mem::take(&mut self.retained));
+                    return Err(io::Error::other(format!("executor source scope exit unproven: {proof:?}")));
+                }
+            }
         }
         if !self.socket.as_os_str().is_empty() {
             let _ = fs::remove_file(&self.socket);
@@ -2214,6 +2231,7 @@ mod generation_custody_tests {
         assert!(observer.try_lock_exclusive().is_err());
         let ending = Ending {
             exact: Err(io::Error::other("unknown exact process birth")),
+            recovery: None,
             child: None,
             forked: false,
             retained,
