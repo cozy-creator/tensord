@@ -33,6 +33,15 @@ CPU callable `tests/fixtures/cpu_progress_burst` emits actual SDK callbacks 0–
 emits decoding, and returns 30. Creator's ordinary CLI test submits it on the real machine,
 then watches the stored run before and after restarting only its isolated controller.
 
-Source checkpoint only: these new tests have not run while host load exceeds 10 and free
-space is below 80 GiB. Rented GPU delivery, congested-disk timing and the ComfyUI matrix
-remain separate gates; this advisory projection cannot qualify any of them.
+Remote CPU proof is green on the current integration cohort plus this change: four
+progress tests, eight TLS/auth controls, clippy and binary build. Creator's real authored
+SDK/managed-executor/ordinary CLI burst passes in 8.95 s and preserves emitted denoise 30
+and decoding before/after its isolated controller restart. The compiled Rust source is
+f2636abf (integration91524d9 plus production52); the fixture manifest is792bf02, and the
+consumer source isdf82db87 (integration30d0e559 plus1027). RuntimeH370 SHA0d50f6b1 and
+TensorFSf089 were used with CUDA_VISIBLE_DEVICES empty; compute-apps stayed empty.
+
+A separate skipped-running follow-up remains: an observer that first sees queued and
+then receives a terminal page needs the actual durable running revision/time before
+later progress. Rented GPU delivery, congested-disk timing and the ComfyUI matrix also
+remain separate gates; this CPU advisory projection cannot qualify them.
