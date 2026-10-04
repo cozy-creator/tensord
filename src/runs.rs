@@ -13,8 +13,9 @@ use crate::{
     service::{Call, Service},
 };
 use serde_json::{json, Value};
+use tensorfs_core::ids::ObjectRef;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     io,
     sync::{Arc, Mutex},
 };
@@ -79,6 +80,16 @@ pub struct JobContext {
     binding_revision: String,
     attention_kernel: String,
     models: Vec<pb::ModelChoice>,
+    /// The job's own model inputs, made present: parameter -> (class, manifest).
+    inputs: BTreeMap<String, (String, ObjectRef)>,
+    weights_destination: String,
+    publication: String,
+}
+
+/// What a job's weights grant reads of its context (`jobs.rs`).
+pub struct JobWeights {
+    pub inputs: BTreeMap<String, (String, ObjectRef)>,
+    pub destination: Option<crate::weights::Destination>,
 }
 
 /// A job context's journaled part: everything but its tokens (choices prost-encoded).
@@ -89,6 +100,12 @@ struct Durable {
     binding_revision: String,
     attention_kernel: String,
     models: Vec<Vec<u8>>,
+    #[serde(default)]
+    inputs: BTreeMap<String, (String, String, u64)>,
+    #[serde(default)]
+    weights_destination: String,
+    #[serde(default)]
+    publication: String,
 }
 impl Durable {
     fn of(context: &JobContext) -> Self {
@@ -98,6 +115,13 @@ impl Durable {
             binding_revision: context.binding_revision.clone(),
             attention_kernel: context.attention_kernel.clone(),
             models: context.models.iter().map(prost::Message::encode_to_vec).collect(),
+            inputs: context
+                .inputs
+                .iter()
+                .map(|(p, (class, m))| (p.clone(), (class.clone(), m.sha256.clone(), m.length)))
+                .collect(),
+            weights_destination: context.weights_destination.clone(),
+            publication: context.publication.clone(),
         }
     }
     /// Without the run's tokens: its children prepare with the machine's own Hub, if any.
@@ -115,7 +139,22 @@ impl Durable {
                 .map(|m| <pb::ModelChoice as prost::Message>::decode(m.as_slice()))
                 .collect::<Result<_, _>>()
                 .map_err(io::Error::other)?,
+            inputs: self
+                .inputs
+                .into_iter()
+                .map(|(p, (class, sha256, length))| (p, (class, ObjectRef { sha256, length })))
+                .collect(),
+            weights_destination: self.weights_destination,
+            publication: self.publication,
         })
+    }
+}
+
+/// A job's own model input: a bare parameter, or one under the job's own name.
+fn own_input(choice: &pb::ModelChoice, job: &str) -> bool {
+    match choice.parameter.split_once(".models.") {
+        None => true,
+        Some((callable, _)) => callable == job,
     }
 }
 
@@ -392,7 +431,8 @@ impl Runs {
             ));
         }
         if spec.job {
-            for choice in &spec.models {
+            // A bare parameter, or `<job>.models.<parameter>`, is the job's own model input.
+            for choice in spec.models.iter().filter(|c| !own_input(c, &spec.entrypoint)) {
                 let callable = choice.parameter.split_once(".models.").map(|(name, _)| name);
                 let declared = interface["entrypoints"].as_array().is_some_and(|rows| {
                     rows.iter()
@@ -426,6 +466,7 @@ impl Runs {
             return warm_result(installed, models);
         }
         if spec.job {
+            let inputs = self.job_inputs(&spec, &interface, hub.as_ref(), &*observe)?;
             let context = JobContext {
                 installation: installation.alias.clone(),
                 hub,
@@ -434,6 +475,9 @@ impl Runs {
                 binding_revision: spec.binding_revision.clone(),
                 attention_kernel: spec.attention_kernel.clone(),
                 models: spec.models.clone(),
+                inputs,
+                weights_destination: spec.weights_destination.clone(),
+                publication: spec.publication.clone(),
             };
             let durable = serde_json::to_vec(&Durable::of(&context)).map_err(io::Error::other)?;
             self.service
@@ -619,6 +663,94 @@ impl Runs {
     }
 
     /// A job ended: its children prepare no more.
+    /// A job's model inputs and where its weights outputs go, for its weights grant.
+    pub fn job_weights(&self, id: &str) -> io::Result<Option<JobWeights>> {
+        let context = match self.jobs.lock().unwrap().get(id).cloned() {
+            Some(context) => context,
+            None => match self.service.engine.with_journal(|journal| journal.job_context(id))? {
+                Some(journaled) => serde_json::from_slice::<Durable>(&journaled)
+                    .map_err(io::Error::other)?
+                    .context()?,
+                None => return Ok(None),
+            },
+        };
+        let hub = context.hub.clone().or_else(|| self.own_hub.clone());
+        let destination = match (context.weights_destination.is_empty(), hub) {
+            (true, _) => None,
+            (false, Some(hub)) => Some(crate::weights::Destination {
+                repository: context.weights_destination.clone(),
+                hub,
+                publication: context.publication.clone(),
+            }),
+            (false, None) => {
+                return Err(io::Error::other(
+                    "a weights destination needs the run's Hub access, and the job has none",
+                ))
+            }
+        };
+        Ok(Some(JobWeights {
+            inputs: context.inputs,
+            destination,
+        }))
+    }
+
+    /// The job's own model inputs (`<job>.models.<parameter>`), each made present here: a
+    /// Hub checkpoint downloaded by its exact manifest, a provider source made.
+    fn job_inputs(
+        &self,
+        spec: &Spec,
+        interface: &Value,
+        hub: Option<&hub::Source>,
+        observe: &(dyn Fn(&str, u64, u64) + Sync),
+    ) -> Result<BTreeMap<String, (String, ObjectRef)>, Refused> {
+        let declared = interface["jobs"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["name"] == spec.entrypoint.as_str()))
+            .and_then(|row| row["models"].as_array().cloned())
+            .unwrap_or_default();
+        let mut inputs = BTreeMap::new();
+        for row in declared {
+            let path = row["path"].as_str().unwrap_or_default();
+            let parameter = path.rsplit_once(".models.").map_or(path, |(_, p)| p).to_string();
+            let class = row["class"].as_str().unwrap_or_default().to_string();
+            let choice = spec
+                .models
+                .iter()
+                .find(|c| c.parameter == parameter || c.parameter == path)
+                .ok_or_else(|| {
+                    refused("model_input_absent", format!("the job's model input {parameter:?} is not chosen"))
+                })?;
+            let publisher = self.publisher.as_ref().ok_or_else(|| {
+                refused("capability_unavailable", "this machine prepares no models")
+            })?;
+            let manifest = if !choice.source.is_empty() {
+                publisher
+                    .make_source(&choice.source, &choice.profiles, &spec.providers, observe)?
+                    .manifest
+            } else {
+                let digest = choice.manifest.as_ref().ok_or_else(|| {
+                    refused(
+                        "invalid_request",
+                        format!("the job's model input {parameter:?} names no exact checkpoint or provider source"),
+                    )
+                })?;
+                let manifest = format!("sha256:{}", tensorfs_core::sha256::hex(&digest.digest));
+                let hub = hub.ok_or_else(|| {
+                    refused("hub_access_absent", "a Hub model downloads with the run's Hub access, and this run carries none")
+                })?;
+                let stage = format!("downloading {}", choice.repository);
+                publisher.download(&self.service, hub, &choice.repository, &manifest, &|done, total| {
+                    observe(&stage, done, total)
+                })?;
+                let sha256 = manifest.trim_start_matches("sha256:").to_string();
+                let length = std::fs::metadata(publisher.store().manifest_path(&sha256))?.len();
+                ObjectRef { sha256, length }
+            };
+            inputs.insert(parameter, (class, manifest));
+        }
+        Ok(inputs)
+    }
+
     pub fn end_job(&self, id: &str) {
         self.jobs.lock().unwrap().remove(id);
         if let Err(error) = self

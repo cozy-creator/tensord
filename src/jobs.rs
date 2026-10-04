@@ -51,6 +51,8 @@ pub struct Jobs {
     runs: Weak<Runs>,
     /// Running jobs by execution id: what their child calls need.
     parents: Mutex<HashMap<String, Arc<Parent>>>,
+    /// A job's weights sources and outputs (`weights_writer`).
+    weights: crate::weights::Weights,
 }
 
 /// A running job: its signer, spool, callables and calls.
@@ -152,6 +154,7 @@ impl Jobs {
             service: Arc::downgrade(service),
             runs: runs.map_or_else(Weak::new, Arc::downgrade),
             parents: Mutex::new(HashMap::new()),
+            weights: crate::weights::Weights::new(store)?,
         });
         // The startup sweep ran before jobs were configured: ended runs' scratch goes now.
         jobs.sweep_scratch(&service.engine);
@@ -315,6 +318,7 @@ impl Jobs {
             .insert(id.into(), parent.clone());
         let (waiting, journal) = (parent.clone(), engine.clone());
         executor.waits = Some(Arc::new(move || waiting.unfinished(&journal)));
+        let (grant, models) = self.weights_grant(engine, &record, &held.record.interface, &spool)?;
         let mut services = Seam {
             engine,
             id,
@@ -324,6 +328,7 @@ impl Jobs {
             publish: true,
             job: Some((self, &parent)),
             appended: HashMap::new(),
+            weights: Some((&self.weights, &grant)),
         };
         let reply = executor.command(
             &DeviceCommand::RunJob {
@@ -337,12 +342,54 @@ impl Jobs {
                 deadline_s: None,
                 inputs,
                 call_interfaces,
+                models,
+                weights: true,
             },
             &mut services,
         );
         self.parents.lock().unwrap().remove(id);
         conclude(engine, id, &executor, &spool, command_ok(reply?)?)?;
         executor.shutdown()
+    }
+
+    /// The job attempt's weights grant: its model inputs as sources (and as the executor's
+    /// `models`), its declared weights outputs, and where they are published.
+    fn weights_grant(
+        &self,
+        engine: &Arc<Engine>,
+        record: &Execution,
+        interface: &Value,
+        spool: &Path,
+    ) -> io::Result<(crate::weights::Grant, BTreeMap<String, Value>)> {
+        let context = match self.runs.upgrade() {
+            Some(runs) => runs.job_weights(&record.id)?,
+            None => None,
+        };
+        let (inputs, destination) = context.map_or_else(Default::default, |c| (c.inputs, c.destination));
+        let models = inputs
+            .iter()
+            .map(|(parameter, (class, manifest))| {
+                (parameter.clone(), json!({"class": class, "manifest": manifest.id(), "length": manifest.length}))
+            })
+            .collect();
+        let sources = inputs.values().map(|(_, m)| (m.id(), m.length)).collect();
+        let outputs = interface["jobs"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["name"] == record.invocation.entrypoint.as_str()))
+            .and_then(|row| row["weights_outputs"].as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|row| Some((row["output_id"].as_str()?.to_string(), row["max_bytes"].as_u64()?)))
+            .collect();
+        let actor = record.submission.as_ref().map(|s| s.actor.clone()).unwrap_or_default();
+        let (journal, run) = (engine.clone(), record.id.clone());
+        let current = Arc::new(move || {
+            journal
+                .get(&run)
+                .is_ok_and(|r| r.state == State::Running && r.cancel_actor.is_none() && r.pause_actor.is_none())
+        });
+        let grant = crate::weights::Grant::new(&actor, &record.id, spool, sources, outputs, destination, current);
+        Ok((grant, models))
     }
 
     /// A model-less call (a run's own, or a job's child) in a weightless construction.
@@ -368,6 +415,7 @@ impl Jobs {
             publish: record.invocation.parent.is_empty(),
             job: None,
             appended: HashMap::new(),
+            weights: None,
         };
         let application = held.record.application.clone();
         command_ok(executor.command(
@@ -877,6 +925,8 @@ struct Seam<'a> {
     job: Option<(&'a Arc<Jobs>, &'a Arc<Parent>)>,
     /// This attempt's list items per output: a resumed job's replay adds no duplicates.
     appended: HashMap<String, usize>,
+    /// A job's weights broker and this attempt's grant.
+    weights: Option<(&'a crate::weights::Weights, &'a crate::weights::Grant)>,
 }
 impl Services for Seam<'_> {
     fn progress(&mut self, frame: &Frame) {
@@ -920,6 +970,18 @@ impl Services for Seam<'_> {
             // A child call's product shows nothing (`sequence` 0): its parent decides.
             (Kind::Publish, _) => Ok((Answer::ok(frame.seq), None)),
             (Kind::StageEnter | Kind::StageExit, _) => Ok((Answer::ok(frame.seq), None)),
+            (Kind::WeightsWriter, _) => {
+                let Some((weights, grant)) = self.weights else {
+                    return Ok((Answer::unavailable(frame.seq), None));
+                };
+                let (mut answer, channel, adopted) = weights.answer(grant, frame);
+                if let Some(adopted) = adopted {
+                    if let Err(error) = crate::products::record_manifest(self.engine, self.id, &adopted.output, &adopted.manifest) {
+                        answer = Answer::refused(frame.seq, "publish_refused", error.to_string());
+                    }
+                }
+                Ok((answer, channel))
+            }
             (_, Some((jobs, parent))) => jobs.seam(parent, frame),
             _ => Ok((Answer::unavailable(frame.seq), None)),
         }

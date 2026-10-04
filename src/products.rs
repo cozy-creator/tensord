@@ -357,6 +357,33 @@ fn commit(
     Ok((content, sequence))
 }
 
+/// A job's adopted weights output as a product of its run's log: its bytes are the output's
+/// manifest (`weights::MANIFEST_MEDIA`), held in the machine's store; a resumed attempt that
+/// adopts the same manifest adds nothing.
+pub fn record_manifest(engine: &Engine, id: &str, output: &str, manifest: &tensorfs_core::ids::ObjectRef) -> io::Result<u64> {
+    let content = pb::Ref {
+        digest: unhex(&manifest.sha256)?,
+        length: manifest.length,
+    };
+    let product = pb::RunProduct {
+        output: output.into(),
+        op: pb::RunProductOp::Set as i32,
+        media_type: crate::weights::MANIFEST_MEDIA.into(),
+        label: output.into(),
+        content: Some(content.clone()),
+        ..Default::default()
+    };
+    engine.append_product(id, |prior| {
+        let prior = prior.iter().map(decode).collect::<io::Result<Vec<_>>>()?;
+        let held = prior
+            .iter()
+            .rev()
+            .find(|p| p.output == product.output)
+            .is_some_and(|current| current.content.as_ref() == Some(&content));
+        Ok((!held).then(|| product.encode_to_vec()))
+    })
+}
+
 /// The canonical body of one product event.
 pub fn document(product: &pb::RunProduct) -> io::Result<Value> {
     let missing = || io::Error::new(io::ErrorKind::InvalidData, "product reference absent");
