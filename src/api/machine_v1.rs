@@ -353,6 +353,7 @@ impl Log {
                     total: payload["total"].as_u64().unwrap_or(0),
                     bytes_done: payload["bytes_done"].as_u64().unwrap_or(0),
                     bytes_total: payload["bytes_total"].as_u64().unwrap_or(0),
+                    stage_fraction: payload["stage_fraction"].as_f64(),
                 })
             }
             "product" => {

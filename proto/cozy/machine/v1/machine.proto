@@ -141,6 +141,7 @@ message Progress {
   uint64 bytes_done = 5;
   uint64 bytes_total = 6;
   double step_ms = 7;   // the latest step's time, while a stage steps
+  optional double stage_fraction = 8;  // how far this stage is, when it says
 }
 // One revision of an output: a single output is replaced by each, a list output grows.
 message Product {
