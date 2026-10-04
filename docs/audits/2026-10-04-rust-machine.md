@@ -214,6 +214,22 @@ reported as PSS. Cold, warm, switching and degraded results remain separate meas
 
 ## Release and consumer blockers
 
+Two additional identity findings arose while implementing the initial fixes. **P1,
+CONFIRMED SOURCE:** the current JCS helper converts arbitrary JSON integers through f64.
+Child-run intent hashing can therefore equate seeds 9007199254740992 and 9007199254740993;
+arbitrary child returns and terminal inline results can also be rounded. Use precision
+preserving structural JSON for these values and preserve ordered input semantics.
+Refreshing access credentials or advisory binding/memo hints must not redefine accepted
+request intent. Existing experimental rows that lack full authored source/model history
+cannot be silently reinterpreted; no-spec observation remains available.
+
+**P1, CONFIRMED SOURCE:** TensorFS plane `layout.rs:123` includes object source hashes
+and ranges in its cache identity but omits inline source bytes. Equal layouts with
+different inline values can incorrectly share cached host/GPU bytes. This requires a
+native CPU cache-identity red arm and a correction based on artifact bytes, not any
+client or server source revision equality check. Both fixes are tracked in the existing
+component issues.
+
 **P1, CONFIRMED SOURCE.** Runtime master is still version 0.18.102 and bundles the old
 Go agent, while its `cozy-runtime-worker` entrypoint has been deleted. That agent launches
 the missing worker. Its bundled Rust pin is 1b57a88, behind the audit baseline and fixes.
