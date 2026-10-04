@@ -76,7 +76,10 @@ def cozy(spec, requests, out):
                 position = progress.get("position")
                 if isinstance(position, int):
                     positions.add(position)
-        sampling = set(range(1, row["input"]["steps"] + 1)).issubset(positions)
+        # Progress is a live observation; attaching after execution starts may miss
+        # early steps. Require current step work through the authored final step,
+        # retain the gap, and separately reject an explicitly cached result.
+        sampling = row["input"]["steps"] in positions and bool(positions)
         rows.append(
             {
                 "model": row["model"],
@@ -87,6 +90,9 @@ def cozy(spec, requests, out):
                 "state": state,
                 "cached_result": cached,
                 "denoise_positions": sorted(positions),
+                "all_denoise_events_observed": set(
+                    range(1, row["input"]["steps"] + 1)
+                ).issubset(positions),
                 "fresh_sampling_evidence": sampling,
                 "ok": result.returncode == 0
                 and state in ("completed", "succeeded")
