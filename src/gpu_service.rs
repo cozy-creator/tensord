@@ -570,7 +570,7 @@ impl GpuPool {
                     boundary -= 1;
                 }
                 warning.truncate(boundary);
-                warning.push_str("…");
+                warning.push('…');
             }
         }
         Ok(receipt)
