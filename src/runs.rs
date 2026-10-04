@@ -1032,12 +1032,11 @@ mod tests {
         assert_eq!(warm.result.unwrap().value["package"], "local/cozy-machine-cpu-lifecycle");
 
         // Another signer cannot run code it did not write.
-        let theirs = runs
+        let refusal = runs
             .submit("bob", "run-1", spec(Source::Local(manifest), false, "d1"))
-            .unwrap();
-        let theirs = settled(&service.engine, &theirs.id);
-        assert_eq!(theirs.state, State::Failed);
-        assert!(theirs.failure.unwrap().contains("local_source_incomplete"));
+            .unwrap_err();
+        assert_eq!(refusal.code, "input_unwritten");
+        assert_eq!(service.engine.get_public("bob", "run-1").unwrap_err().kind(), io::ErrorKind::NotFound);
         let _ = fs::remove_dir_all(root);
     }
 

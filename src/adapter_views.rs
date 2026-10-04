@@ -963,9 +963,9 @@ mod tests {
             .obj;
         let swept = service.reclaim();
         assert_eq!(swept.adapter_views, 1, "{swept:?}");
-        if crate::reclaim::Disk::measure(store.root())
+        if tensorfs_core::ensure::Disk::measure(store.root())
             .unwrap()
-            .pressure()
+            .short().is_some()
         {
             assert!(swept.store_bytes >= garbage.length, "{swept:?}");
             assert!(!store.object_path(&garbage.sha256).exists());
