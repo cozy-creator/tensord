@@ -160,6 +160,8 @@ pub struct Engine {
     /// Scopes runner JIT caches to this machine run.
     incarnation: String,
     journal: Mutex<Journal>,
+    /// Held while a run takes object references, and while unneeded roots are released.
+    pub(crate) object_custody: Mutex<()>,
     active: Mutex<HashMap<String, ActiveRun>>,
     owned: Mutex<HashSet<String>>,
     progress: Mutex<HashMap<String, ProgressSnapshot>>,
@@ -189,6 +191,7 @@ impl Engine {
             root: root.to_path_buf(),
             incarnation,
             journal: Mutex::new(journal),
+            object_custody: Mutex::new(()),
             active: Mutex::new(HashMap::new()),
             owned: Mutex::new(HashSet::new()),
             progress: Mutex::new(HashMap::new()),
@@ -387,12 +390,23 @@ impl Engine {
         digest: &str,
         invocation: Invocation,
     ) -> io::Result<(Execution, bool)> {
+        self.accept_run_objects(actor, id, digest, invocation, &[])
+    }
+
+    pub fn accept_run_objects(
+        &self,
+        actor: &str,
+        id: &str,
+        digest: &str,
+        invocation: Invocation,
+        objects: &[tensorfs_core::ids::ObjectRef],
+    ) -> io::Result<(Execution, bool)> {
         let mut owned = self.owned.lock().unwrap();
         let (record, new) = self
             .journal
             .lock()
             .unwrap()
-            .accept_run(actor, id, digest, invocation)?;
+            .accept_run_objects(actor, id, digest, invocation, objects)?;
         if new {
             owned.insert(record.id.clone());
         }
