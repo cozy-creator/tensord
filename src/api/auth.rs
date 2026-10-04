@@ -25,15 +25,44 @@ pub struct Keys {
     state: Arc<RwLock<KeyState>>,
     changes: Arc<tokio::sync::watch::Sender<u64>>,
 }
+/// One admitted key and whose it is, as SSH authorized_keys: runs belong to the actor, and only
+/// an owner (a rental's renter) maintains the machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Holder {
+    pub key: VerifyingKey,
+    pub actor: [u8; 32],
+    pub owner: bool,
+}
+impl Holder {
+    /// A key that is its own actor and an owner: a computer's authorized_keys, a rental's boot
+    /// keys, and a lease that names no users.
+    pub fn own(key: VerifyingKey) -> Self {
+        Self {
+            key,
+            actor: key.to_bytes(),
+            owner: true,
+        }
+    }
+    /// A key of a Hub account: every key of one account acts as that account.
+    pub fn user(key: VerifyingKey, user: &str, owner: bool) -> Self {
+        let mut named = b"cozy.machine.user/1\0".to_vec();
+        named.extend_from_slice(user.as_bytes());
+        Self {
+            key,
+            actor: sha256::digest(&named),
+            owner,
+        }
+    }
+}
 struct KeyState {
-    keys: Vec<VerifyingKey>,
+    keys: Vec<Holder>,
     until: Option<Instant>,
     leased: bool,
 }
 impl Keys {
     pub fn fixed(keys: Vec<VerifyingKey>) -> Self {
         let state = KeyState {
-            keys,
+            keys: keys.into_iter().map(Holder::own).collect(),
             until: None,
             leased: false,
         };
@@ -46,7 +75,15 @@ impl Keys {
         *self.state.write().unwrap() = state;
         self.changes.send_modify(|generation| *generation += 1);
     }
-    pub fn renew(&self, keys: Vec<VerifyingKey>, lease: Duration) {
+    /// A computer's set, read from its `authorized_keys`: no lease.
+    pub fn set(&self, keys: Vec<VerifyingKey>) {
+        self.replace(KeyState {
+            keys: keys.into_iter().map(Holder::own).collect(),
+            until: None,
+            leased: false,
+        });
+    }
+    pub fn renew(&self, keys: Vec<Holder>, lease: Duration) {
         self.replace(KeyState {
             keys,
             until: Some(Instant::now() + lease),
@@ -63,11 +100,28 @@ impl Keys {
     /// The keys that may authorize a new control now: none without a current lease.
     pub fn admitted(&self) -> Vec<VerifyingKey> {
         match self.current() {
-            (keys, true) => keys,
+            (keys, true) => keys.iter().map(|h| h.key).collect(),
             (_, false) => vec![],
         }
     }
-    fn current(&self) -> (Vec<VerifyingKey>, bool) {
+    /// Who a key that signed acts as: its holder, or itself as an owner if it left the set since.
+    pub fn actor(&self, key: &VerifyingKey) -> VerifiedActor {
+        let holder = self
+            .state
+            .read()
+            .unwrap()
+            .keys
+            .iter()
+            .find(|h| h.key == *key)
+            .copied()
+            .unwrap_or_else(|| Holder::own(*key));
+        VerifiedActor {
+            public_key: key.to_bytes(),
+            actor: holder.actor,
+            owner: holder.owner,
+        }
+    }
+    fn current(&self) -> (Vec<Holder>, bool) {
         let state = self.state.read().unwrap();
         let live = !state.leased || state.until.is_some_and(|until| Instant::now() < until);
         (state.keys.clone(), live)
@@ -100,9 +154,23 @@ impl From<Vec<VerifyingKey>> for Keys {
     }
 }
 
+/// The key that signed a call and whom it acts as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VerifiedActor {
     pub public_key: [u8; 32],
+    /// Runs, outputs and workspaces belong to it: the key itself, or a Hub account's.
+    pub actor: [u8; 32],
+    /// May maintain the machine (update, keepalive): a computer's keys and a rental's renter.
+    pub owner: bool,
+}
+impl VerifiedActor {
+    pub fn own(public_key: [u8; 32]) -> Self {
+        Self {
+            public_key,
+            actor: public_key,
+            owner: true,
+        }
+    }
 }
 
 impl Authority {
@@ -117,9 +185,9 @@ impl Authority {
         let signature = Signature::from_slice(&claim.proof)
             .map_err(|_| Status::unauthenticated("Claim signature must be 64 bytes"))?;
         let (keys, live) = self.keys.current();
-        if let Some(key) = keys
+        if let Some(holder) = keys
             .iter()
-            .find(|key| key.verify_strict(&bytes, &signature).is_ok())
+            .find(|h| h.key.verify_strict(&bytes, &signature).is_ok())
         {
             if !live {
                 return Err(Status::unavailable(
@@ -127,7 +195,9 @@ impl Authority {
                 ));
             }
             Ok(VerifiedActor {
-                public_key: key.to_bytes(),
+                public_key: holder.key.to_bytes(),
+                actor: holder.actor,
+                owner: holder.owner,
             })
         } else {
             Err(Status::unauthenticated(

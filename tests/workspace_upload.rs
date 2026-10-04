@@ -26,9 +26,7 @@ impl Drop for Area {
     }
 }
 fn actor(key: u8) -> VerifiedActor {
-    VerifiedActor {
-        public_key: [key; 32],
-    }
+    VerifiedActor::own([key; 32])
 }
 fn make_header(operation: &str, name: &str, bytes: &[u8]) -> pb::LocalPackageUploadHeader {
     pb::LocalPackageUploadHeader {

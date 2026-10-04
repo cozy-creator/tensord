@@ -31,6 +31,12 @@ impl Drop for Machine {
 
 fn boot(root: &Path, port: u16, lifetime: &str) -> Machine {
     let owner = SigningKey::from_bytes(&OWNER).verifying_key();
+    // A rental's keys come from its grant and lease; a computer's from its authorized_keys.
+    std::fs::write(
+        root.join("authorized_keys"),
+        cozy_machine::machine::authorized_keys::line(&owner, "status-test") + "\n",
+    )
+    .unwrap();
     Machine(
         Command::new(env!("CARGO_BIN_EXE_cozy-machine"))
             .env_clear()
@@ -83,6 +89,10 @@ fn receipt(machine: &mut Machine, root: &Path, port: u16) -> Vec<u8> {
 }
 
 fn cap(run: &str) -> String {
+    cap_by(&SigningKey::from_bytes(&OWNER), run)
+}
+
+fn cap_by(key: &SigningKey, run: &str) -> String {
     let expires = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -99,7 +109,7 @@ fn cap(run: &str) -> String {
         expires,
         ..Default::default()
     };
-    capability::mint(&SigningKey::from_bytes(&OWNER), grant)
+    capability::mint(key, grant)
 }
 
 fn status(keepalive: bool, cap: Option<&str>) -> Request<v1::StatusRequest> {
@@ -244,7 +254,7 @@ async fn status_answers_identity_to_anyone_and_the_machine_to_its_owner() {
 }
 
 /// A persistent machine (this computer's) never releases itself: Status names no deadline. It
-/// makes its installer helper from the client it embeds.
+/// makes its installer helper from the client it embeds, and admits its authorized_keys.
 #[tokio::test]
 async fn a_persistent_machine_reports_no_idle_deadline() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -302,6 +312,51 @@ async fn a_persistent_machine_reports_no_idle_deadline() {
             ("ready", 0)
         );
     }
+
+    // Its keys are its authorized_keys, as sshd's: a line appended by hand admits that key at
+    // the next look, and deleting it ends the streams it opened and refuses it again.
+    let friend = SigningKey::from_bytes(&[44; 32]);
+    let pictured = |client: &mut MachineClient<Channel>, key: &SigningKey| {
+        let mut client = client.clone();
+        let cap = cap_by(key, "");
+        async move {
+            match client.status(status(false, Some(&cap))).await {
+                Ok(frames) => {
+                    let mut frames = frames.into_inner();
+                    let first = frames.message().await.ok().flatten();
+                    first.filter(|f| f.phase == "ready").map(|_| frames)
+                }
+                Err(_) => None,
+            }
+        }
+    };
+    assert!(pictured(&mut client, &friend).await.is_none());
+    let file = root.join("authorized_keys");
+    let owner_line = std::fs::read_to_string(&file).unwrap();
+    let friend_line =
+        cozy_machine::machine::authorized_keys::line(&friend.verifying_key(), "friend@desk");
+    std::fs::write(&file, format!("{owner_line}{friend_line}\n")).unwrap();
+    let start = Instant::now();
+    let mut held = loop {
+        if let Some(frames) = pictured(&mut client, &friend).await {
+            break frames;
+        }
+        assert!(start.elapsed() < Duration::from_secs(10), "the appended key is never admitted");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    std::fs::write(&file, &owner_line).unwrap();
+    let ended = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Err(status) = held.message().await {
+                return status;
+            }
+        }
+    })
+    .await
+    .expect("deleting the key ends its stream");
+    assert_eq!(ended.code(), Code::Unauthenticated);
+    assert!(pictured(&mut client, &friend).await.is_none());
+    assert!(pictured(&mut client, &SigningKey::from_bytes(&OWNER)).await.is_some());
     drop(machine);
     std::fs::remove_dir_all(&root).unwrap();
 }

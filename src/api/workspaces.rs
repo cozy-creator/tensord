@@ -177,7 +177,7 @@ impl WorkspaceUploads {
                     sha256::hex_digest(
                         format!(
                             "cozy.machine.package-carrier/1\0{}\0{}\0{}",
-                            sha256::hex(&actor.public_key),
+                            sha256::hex(&actor.actor),
                             header.operation_id,
                             carrier.filename
                         )
@@ -298,7 +298,7 @@ impl WorkspaceUploads {
     }
 
     fn directory(&self, actor: VerifiedActor, operation: &str) -> Result<PathBuf, Status> {
-        let owner = self.root.join(sha256::hex(&actor.public_key));
+        let owner = self.root.join(sha256::hex(&actor.actor));
         let operation = owner.join(operation);
         for path in [&owner, &operation] {
             fs::create_dir_all(path).map_err(disk)?;

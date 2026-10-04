@@ -1,6 +1,7 @@
 //! The Hub's worker API as this machine: worker id and token headers, JSON, HTTPS to the
 //! granted origin (public roots plus the granted CA). Two calls: rental authority and release.
 use super::grant::HubGrant;
+use crate::api::auth::Holder;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use bytes::Bytes;
 use ed25519_dalek::VerifyingKey;
@@ -115,8 +116,10 @@ impl Hub {
         }
     }
 
-    /// The rental's current authorized keys and their lease.
-    pub async fn authorized_keys(&self) -> Result<(Vec<VerifyingKey>, Duration), Refusal> {
+    /// The rental's current authorized keys and their lease. A lease that names users says whose
+    /// each key is: the renter's and its members' (runs are each user's; only the renter is an
+    /// owner); one that names none holds the renter's keys alone.
+    pub async fn authorized_keys(&self) -> Result<(Vec<Holder>, Duration), Refusal> {
         let (status, answer) = self
             .call(Method::GET, "/v1/worker/rental/authorized-keys", None)
             .await?;
@@ -126,9 +129,18 @@ impl Hub {
             )));
         }
         #[derive(serde::Deserialize)]
+        struct User {
+            id: String,
+            #[serde(default)]
+            owner: bool,
+            keys: Vec<String>,
+        }
+        #[derive(serde::Deserialize)]
         struct Document {
             worker_id: String,
             authorized_keys: Vec<String>,
+            #[serde(default)]
+            users: Option<Vec<User>>,
             lease_seconds: u64,
         }
         let invalid = || Refusal::Transport("rental authority metadata is invalid".into());
@@ -138,16 +150,23 @@ impl Hub {
         {
             return Err(invalid());
         }
-        let keys = document
-            .authorized_keys
-            .iter()
-            .map(|spelled| {
-                let raw: [u8; 32] = URL_SAFE_NO_PAD.decode(spelled).ok()?.try_into().ok()?;
-                VerifyingKey::from_bytes(&raw).ok()
-            })
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(invalid)?;
-        Ok((keys, Duration::from_secs(document.lease_seconds)))
+        let key = |spelled: &String| {
+            let raw: [u8; 32] = URL_SAFE_NO_PAD.decode(spelled).ok()?.try_into().ok()?;
+            VerifyingKey::from_bytes(&raw).ok()
+        };
+        let holders = match document.users {
+            None => document
+                .authorized_keys
+                .iter()
+                .map(|k| key(k).map(Holder::own))
+                .collect::<Option<Vec<_>>>(),
+            Some(users) => users
+                .iter()
+                .flat_map(|u| u.keys.iter().map(move |k| key(k).map(|k| Holder::user(k, &u.id, u.owner))))
+                .collect::<Option<Vec<_>>>(),
+        }
+        .ok_or_else(invalid)?;
+        Ok((holders, Duration::from_secs(document.lease_seconds)))
     }
 
     /// Ends this rental's allocation; 204 is acceptance.

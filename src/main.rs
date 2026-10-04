@@ -135,7 +135,13 @@ fn run_machine(
         }
     }
     let fresh = readiness.attested().is_none();
-    let keys = cozy_machine::api::auth::Keys::fixed(grant.authorized.clone());
+    let keys = match rental {
+        true => cozy_machine::api::auth::Keys::fixed(grant.authorized.clone()),
+        false => {
+            cozy_machine::machine::authorized_keys::start(&layout.root, &grant.authorized)?;
+            cozy_machine::machine::authorized_keys::watch(&layout.root)?
+        }
+    };
     let mut identity = cozy_machine::api::MachineIdentity::machine(
         grant.worker_id.clone(),
         keys.clone(),

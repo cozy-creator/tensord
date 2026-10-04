@@ -36,9 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let length = fs::metadata(&archive)?.len();
     let store = Arc::new(Store::ensure(&output.join("store"))?);
     let uploads = WorkspaceUploads::open(&output.join("uploads"), store)?;
-    let actor = VerifiedActor {
-        public_key: [19; 32],
-    };
+    let actor = VerifiedActor::own([19; 32]);
     let file = pb::LocalPackageFileRef {
         filename: "source.tar".into(),
         length,

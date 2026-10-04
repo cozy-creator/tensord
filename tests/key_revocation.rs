@@ -49,7 +49,10 @@ async fn a_revoked_key_ends_its_control_stream() {
     }
     // The stream stays open while its key authorizes; the Hub lease then names another key.
     assert!(tokio::time::timeout(Duration::from_millis(300), answers.message()).await.is_err());
-    keys.renew(vec![other.verifying_key()], Duration::from_secs(60));
+    keys.renew(
+        vec![api::auth::Holder::own(other.verifying_key())],
+        Duration::from_secs(60),
+    );
     let ended = tokio::time::timeout(Duration::from_secs(5), answers.message()).await.expect("the stream was not ended");
     assert_eq!(ended.unwrap_err().code(), tonic::Code::Unauthenticated);
     drop(frames);

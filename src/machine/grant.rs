@@ -66,6 +66,7 @@ pub struct Grant {
     pub webrtc_port: Option<u16>,
     pub hub: Option<HubGrant>,
     pub repo_cache_root: Option<PathBuf>,
+    /// A rental's boot keys until its Hub lease answers; a computer's first authorized_keys.
     pub authorized: Vec<VerifyingKey>,
     /// The one-shot readiness key; taken by the receipt and never kept elsewhere.
     pub receipt_key: Option<Vec<u8>>,
@@ -206,12 +207,8 @@ impl Grant {
         if let Some(text) = get("COZY_AUTHORIZED_KEYS") {
             authorized = text.split(',').map(public_key).collect::<io::Result<_>>()?;
         }
-        // On a rental the Hub lease replaces this boot value once it is read.
-        if authorized.is_empty() {
-            return Err(invalid(
-                "the grant authorizes no key: COZY_AUTHORIZED_KEYS is required",
-            ));
-        }
+        // A rental's boot keys hold until its Hub lease answers (none: nobody until then). A
+        // computer's machine admits its root's authorized_keys, which these keys start when absent.
         let receipt_key = match (get(RECEIPT_KEY), get(RECEIPT_KEY_FILE)) {
             (Some(_), Some(_)) => {
                 return Err(invalid("specify only one bootstrap receipt key source"))

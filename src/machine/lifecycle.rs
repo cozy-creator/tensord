@@ -432,4 +432,77 @@ mod hub_tests {
         );
         assert!(seen[0].starts_with("GET /v1/worker/rental/authorized-keys ra-1 "));
     }
+
+    /// A shared rental's lease names whose each key is: the renter's keys are an owner's, a
+    /// member's act as that member, and a member the renter removed is refused at the next lease.
+    #[tokio::test]
+    async fn a_shared_lease_scopes_each_key_to_its_user() {
+        let (renter, laptop, friend) = (
+            SigningKey::from_bytes(&[1; 32]),
+            SigningKey::from_bytes(&[4; 32]),
+            SigningKey::from_bytes(&[5; 32]),
+        );
+        let answers: Answers = Default::default();
+        let (port, ca) = fake_hub(answers.clone(), Default::default()).await;
+        let hub = Arc::new(
+            Hub::new(HubGrant {
+                origin: format!("https://localhost:{port}"),
+                public_origin: None,
+                worker_id: "ra-1".into(),
+                worker_token: URL_SAFE_NO_PAD.encode([3; 32]),
+                ca_der: Some(ca),
+                object_hosts: vec![],
+            })
+            .unwrap(),
+        );
+        let authority = crate::api::auth::Authority {
+            worker_id: "ra-1".into(),
+            boot_id: "boot".into(),
+            leaf_digest: [9; 32],
+            keys: Keys::fixed(vec![renter.verifying_key()]),
+        };
+        let claim = |key: &SigningKey| crate::api::pb::Claim {
+            record_owner_epoch: 1,
+            worker_id: "ra-1".into(),
+            worker_boot_id: "boot".into(),
+            proof: ed25519_dalek::Signer::sign(key, &authority.transcript(1).unwrap())
+                .to_bytes()
+                .to_vec(),
+            ..Default::default()
+        };
+        let spell = |key: &SigningKey| URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes());
+        let renter_user = serde_json::json!({"id": "u-renter", "owner": true, "keys": [spell(&renter), spell(&laptop)]});
+        let shared = serde_json::json!({"worker_id": "ra-1", "lease_seconds": 1,
+            "authorized_keys": [spell(&renter), spell(&laptop), spell(&friend)],
+            "users": [renter_user, {"id": "u-friend", "keys": [spell(&friend)]}]});
+        let unshared = serde_json::json!({"worker_id": "ra-1", "lease_seconds": 60,
+            "authorized_keys": [spell(&renter), spell(&laptop)], "users": [renter_user]});
+        answers
+            .lock()
+            .unwrap()
+            .extend([(200, shared.to_string()), (200, unshared.to_string())]);
+        let task = tokio::spawn(keep_authority(hub, authority.keys.clone()));
+        let start = std::time::Instant::now();
+        let member = loop {
+            if let Ok(member) = authority.verify(Some(&claim(&friend))) {
+                break member;
+            }
+            assert!(start.elapsed() < Duration::from_secs(10), "the shared lease never applied");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let (a, b) = (
+            authority.verify(Some(&claim(&renter))).unwrap(),
+            authority.verify(Some(&claim(&laptop))).unwrap(),
+        );
+        assert!(a.owner && b.owner && !member.owner);
+        assert_eq!(a.actor, b.actor, "the renter's two devices act as one user");
+        assert_ne!(a.actor, member.actor, "a member acts as itself");
+        // The next lease (half the first's length later) no longer names the member.
+        while authority.verify(Some(&claim(&friend))).is_ok() {
+            assert!(start.elapsed() < Duration::from_secs(10), "the removed member kept access");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        task.abort();
+        assert!(authority.verify(Some(&claim(&laptop))).unwrap().owner);
+    }
 }

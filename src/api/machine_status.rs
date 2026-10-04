@@ -37,6 +37,11 @@ pub(super) async fn status<B: MachineBackend>(
         return Ok(Box::pin(tokio_stream::once(Ok(identity_frame(&identity)))));
     };
     if keepalive {
+        if !actor.owner {
+            return Err(Status::permission_denied(
+                "only the rental's renter keeps its machine alive",
+            ));
+        }
         identity
             .lifecycle
             .as_ref()

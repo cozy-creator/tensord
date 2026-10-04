@@ -79,9 +79,7 @@ impl<B: MachineBackend> MachineV1<B> {
         )
         .map_err(|refusal| Status::unauthenticated(refusal.to_string()))?;
         Ok(Caller {
-            actor: VerifiedActor {
-                public_key: signer.to_bytes(),
-            },
+            actor: authority.keys.actor(&signer),
             grant,
         })
     }
@@ -452,6 +450,11 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
         }
         if super::machine_update::owns(&self.identity, &request) {
             caller.machine()?;
+            if !caller.actor.owner {
+                return Err(Status::permission_denied(
+                    "only the rental's renter updates its machine",
+                ));
+            }
             let (identity, backend) = (self.identity.clone(), self.backend.clone());
             return super::machine_update::run(identity, backend, caller.actor, request)
                 .await

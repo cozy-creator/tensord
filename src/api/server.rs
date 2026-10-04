@@ -681,9 +681,7 @@ impl<B: MachineBackend> Api<B> {
         if body.len() > 64 << 10 {
             return refuse(400, "invalid_access", "Hub access body exceeds 64 KiB");
         }
-        let actor = super::auth::VerifiedActor {
-            public_key: key.to_bytes(),
-        };
+        let actor = authority.keys.actor(&key);
         let backend = self.backend.clone();
         let answer = tokio::task::spawn_blocking(move || {
             if forget {

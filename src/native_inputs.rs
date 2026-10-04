@@ -141,7 +141,7 @@ impl SourceIntake {
                 ));
             }
         }
-        let actor = sha256::hex(&actor.public_key);
+        let actor = sha256::hex(&actor.actor);
         let retention_id = format!(
             "sha256:{}",
             sha256::hex_digest(&canon::write(&canon::Value::obj(vec![

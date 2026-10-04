@@ -1682,7 +1682,7 @@ impl Iterator for ByteReader {
     }
 }
 pub fn actor_id(actor: VerifiedActor) -> String {
-    sha256::hex(&actor.public_key)
+    sha256::hex(&actor.actor)
 }
 fn verify_checksum(
     source: &mut std::fs::File,
@@ -2047,9 +2047,7 @@ print(json.dumps({"identity": generation.identity}))
         let machine =
             MachineIdentity::ephemeral("inputs".into(), vec![signer.verifying_key()], vec![7; 32])
                 .unwrap();
-        let actor = VerifiedActor {
-            public_key: signer.verifying_key().to_bytes(),
-        };
+        let actor = VerifiedActor::own(signer.verifying_key().to_bytes());
         let backend = NativeBackend::new(
             service.clone(),
             machine.authority.clone(),
@@ -2299,9 +2297,7 @@ print(json.dumps({"identity": generation.identity}))
             vec![7; 32],
         )
         .unwrap();
-        let actor = VerifiedActor {
-            public_key: signer.verifying_key().to_bytes(),
-        };
+        let actor = VerifiedActor::own(signer.verifying_key().to_bytes());
         let backend = NativeBackend::new(
             service.clone(),
             machine.authority.clone(),
