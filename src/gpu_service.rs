@@ -390,6 +390,8 @@ pub struct GpuPool {
     incarnation: String,
     config: GpuConfig,
     store: Arc<Store>,
+    // Unreadable source-reader obligations remove destructive native-GC authority.
+    _source_gc_guard: Mutex<Option<tensorfs_core::catalog::WriterGuard>>,
     reserved: AtomicBool,
     /// One retained executor per plan; the memory policy decides which keep weights mapped.
     sessions: Mutex<BTreeMap<String, Session>>,
@@ -446,6 +448,13 @@ impl GpuPool {
                     .ok_or_else(|| io::Error::other("GPU root has no owned state parent"))?,
             )?;
         }
+        let source_gc_guard=match ModelSources::recover_sessions(store.clone(),&root.join("source-holds")) {
+            Ok(_)=>None,
+            Err(error)=> {
+                eprintln!("source reader custody unavailable; destructive store GC disabled: {error}");
+                Some(tensorfs_core::catalog::WriterGuard::acquire(store.root()).map_err(io::Error::other)?)
+            }
+        };
         let defaults = HostTierConfig::default();
         let host_ledger = Arc::new(crate::memory::host::HostLedger::default());
         let host = HostTier::new(
@@ -496,6 +505,7 @@ impl GpuPool {
             incarnation,
             config,
             store,
+            _source_gc_guard: Mutex::new(source_gc_guard),
             reserved: AtomicBool::new(false),
             sessions: Mutex::new(BTreeMap::new()),
             zygotes: Mutex::new(BTreeMap::new()),
@@ -506,6 +516,21 @@ impl GpuPool {
             memo: Arc::new(crate::memo::Memo::open(root.join("stage-memo"))?),
         }))
     }
+    /// Reconcile consumer-specific recovery records by exit evidence, never elapsed age.
+    pub fn recover_source_readers(&self)->io::Result<usize> {
+        let mut blocked=self._source_gc_guard.lock().unwrap();
+        match ModelSources::recover_sessions(self.store.clone(),&self.root.join("source-holds")) {
+            Ok(released)=> {blocked.take();Ok(released)},
+            Err(error)=> {
+                if blocked.is_none() {
+                    *blocked=Some(tensorfs_core::catalog::WriterGuard::acquire(self.store.root())
+                        .map_err(io::Error::other)?);
+                }
+                Err(error)
+            }
+        }
+    }
+
     pub fn memo(&self) -> &crate::memo::Memo {
         &self.memo
     }
@@ -1855,7 +1880,11 @@ impl GpuPool {
             serving: self.serving.clone(),
             id,
         };
-        let sources = Arc::new(ModelSources::open_shared(self.store.clone(), &selections)?);
+        let scope=executor.scope_recovery().ok_or_else(||io::Error::new(
+            io::ErrorKind::Unsupported,"executor has no captured source-reader scope"))?;
+        let sources=Arc::new(ModelSources::open_session_shared(self.store.clone(),&selections,
+            &self.root.join("source-holds"),executor.birth.clone(),scope)?);
+        executor.retain_source_until_exit(sources.clone());
         // An executor that reads holes from object files gets only what it streams staged.
         let staged = executor.hello.offers("host_tiers.staged/1");
         let peer = self.host.register_peer(executor.observer_pidfd()?, staged);

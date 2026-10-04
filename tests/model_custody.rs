@@ -312,3 +312,55 @@ fn unreadable_model_obligation_disables_native_gc_but_other_cpu_acceptance_works
     assert!(fixture.store.object_path(&fixture.data.sha256).is_file());
     fixture.engine = reopened;
 }
+
+/// Native source custody is a different lifetime from accepted-work cache grace.
+/// Run with COZY_REQUIRE_STRICT_SOURCE_EXIT=1 in an isolated PID namespace for positive
+/// strict-empty proof; this host's unrelated unreadable same-UID processes may be unknown.
+#[test]
+fn accepted_repo_gone_and_idle_reader_roots_survive_independent_gc_until_scope_exit() {
+    use cozy_machine::{model_sources::{ModelSources,SelectedManifest},scope::Scope};
+    let fixture=Fixture::new(true);
+    let accepted=fixture.accept("reader");
+    let repository=RepositoryName::new("models","fixture").unwrap();
+    fs::remove_file(fixture.store.repository_path(&repository)).unwrap();
+    let scope=Scope::create(&format!("reader{}",uuid::Uuid::new_v4().simple())).unwrap();
+    let mut command=std::process::Command::new("sleep"); command.arg("1000");
+    if let Some((name,value))=scope.environment() {command.env(name,value);}
+    let mut reader=command.spawn().unwrap(); scope.adopt(reader.id()).unwrap();
+    struct EndReader(cozy_machine::journal::ProcessBirth);
+    impl Drop for EndReader {
+        fn drop(&mut self) {
+            if let Ok(Some(exact))=cozy_machine::process::Exact::open(&self.0) {
+                let _=exact.kill(); let _=exact.wait();
+            }
+        }
+    }
+    let birth=cozy_machine::process::process_birth(reader.id()).unwrap();
+    let _end=EndReader(birth.clone());
+    let directory=fixture.root.join("state/gpu/source-holds");
+    let selected=SelectedManifest {manifest:fixture.manifest.id(),components:vec!["model".into()]};
+    let sources=ModelSources::open_session_shared(fixture.store.clone(),&[selected],&directory,
+        birth,scope.recovery(unsafe{libc::geteuid()})).unwrap();
+    fixture.engine.with_journal(|journal|journal.cancel(&accepted,"alice")).unwrap();
+    fixture.age();
+    assert_eq!(fixture.engine.sweep_models().unwrap(),1);
+    // Losing the owner handle before exact receiver exit retains the independent root.
+    drop(sources);
+    fixture.gc();
+    assert!(fixture.store.object_path(&fixture.data.sha256).exists());
+    assert_eq!(ModelSources::recover_sessions(fixture.store.clone(),&directory).unwrap(),0);
+    reader.kill().unwrap(); reader.wait().unwrap(); scope.end().unwrap();
+    match ModelSources::recover_sessions(fixture.store.clone(),&directory) {
+        Ok(released)=> {
+            assert_eq!(released,1);
+            fixture.gc();
+            assert!(!fixture.store.object_path(&fixture.data.sha256).exists());
+        }
+        Err(error)=> {
+            assert!(std::env::var_os("COZY_REQUIRE_STRICT_SOURCE_EXIT").is_none(),"{error}");
+            eprintln!("source exit remains unknown on this host; bytes stay rooted: {error}");
+            fixture.gc();
+            assert!(fixture.store.object_path(&fixture.data.sha256).exists());
+        }
+    }
+}
