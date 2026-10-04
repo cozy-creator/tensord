@@ -30,6 +30,7 @@ struct Machine {
     token: String,
     task: tokio::task::JoinHandle<()>,
     actor: String,
+    lifecycle: Arc<cozy_machine::machine::lifecycle::Lifecycle>,
 }
 impl Drop for Machine {
     fn drop(&mut self) {
@@ -50,9 +51,13 @@ impl Machine {
         );
         let signer = SigningKey::from_bytes(&[71; 32]);
         let actor = tensorfs_core::sha256::hex(signer.verifying_key().as_bytes());
-        let identity =
+        let mut identity =
             MachineIdentity::ephemeral("intent".into(), vec![signer.verifying_key()], vec![7; 32])
                 .unwrap();
+        let lifecycle =
+            cozy_machine::machine::lifecycle::Lifecycle::open(root.join("idle.json"), false, true)
+                .unwrap();
+        identity.lifecycle = Some(lifecycle.clone());
         let pem = identity.cert_pem.clone();
         let uploads =
             api::workspaces::WorkspaceUploads::open(&root.join("uploads"), store.clone()).unwrap();
@@ -106,6 +111,7 @@ impl Machine {
             token,
             task,
             actor,
+            lifecycle,
         }
     }
     async fn run(
@@ -227,6 +233,7 @@ async fn formatted_refreshed_access_attaches_without_old_input_blobs_but_a_chang
         huggingface: "new-provider".into(),
         civitai: "new-civitai".into(),
     });
+    let activation = machine.lifecycle.begin_activation().unwrap();
     let attached = machine.run("same", Some(repeated.clone())).await.unwrap();
     assert_eq!(number(&first), number(&attached));
     let mut changed = repeated.clone();
@@ -235,6 +242,15 @@ async fn formatted_refreshed_access_attaches_without_old_input_blobs_but_a_chang
         machine.run("same", Some(changed)).await.unwrap_err().code(),
         tonic::Code::AlreadyExists
     );
+    assert_eq!(
+        machine
+            .run("fresh-frozen", Some(repeated.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unavailable
+    );
+    drop(activation);
     assert_eq!(
         machine
             .run("fresh-expired", Some(repeated))

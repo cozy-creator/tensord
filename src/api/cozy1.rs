@@ -74,7 +74,6 @@ struct Seat {
     ip: IpAddr,
     /// The key that opened it, once its hello verified.
     key: Mutex<Option<String>>,
-    work: mpsc::UnboundedSender<Work>,
     task: OnceLock<tokio::task::AbortHandle>,
 }
 
@@ -106,11 +105,7 @@ impl<B: MachineBackend> Media<B> {
         }))
     }
 
-    fn admit(
-        self: &Arc<Self>,
-        ip: IpAddr,
-        work: mpsc::UnboundedSender<Work>,
-    ) -> Option<Admission<B>> {
+    fn admit(self: &Arc<Self>, ip: IpAddr) -> Option<Admission<B>> {
         let mut admitted = self.admitted.lock().unwrap();
         loop {
             let pending = |seat: &&Arc<Seat>| seat.key.lock().unwrap().is_none();
@@ -125,7 +120,6 @@ impl<B: MachineBackend> Media<B> {
                 let seat = Arc::new(Seat {
                     ip,
                     key: Mutex::default(),
-                    work,
                     task: OnceLock::new(),
                 });
                 admitted.seats.push(seat.clone());
@@ -172,8 +166,7 @@ impl<B: MachineBackend> Admission<B> {
         true
     }
 
-    /// Seats the session under the key that opened it, and ends that key's oldest session
-    /// beyond its limit.
+    /// Marks the verified session so it no longer consumes handshake capacity.
     fn authenticate(&self, key: &str) {
         *self.seat.key.lock().unwrap() = Some(key.into());
     }
@@ -205,7 +198,7 @@ pub(super) async fn serve<B: MachineBackend>(media: Arc<Media<B>>, listener: Tcp
             continue;
         };
         let (work_tx, work) = mpsc::unbounded_channel();
-        if let Some(admission) = media.admit(peer.ip(), work_tx.clone()) {
+        if let Some(admission) = media.admit(peer.ip()) {
             let seat = admission.seat.clone();
             let task = tokio::spawn(async move {
                 let _ = session(tcp, peer, admission, work_tx, work).await;
@@ -426,18 +419,8 @@ async fn session<B: MachineBackend>(
 
 /// What a stream's task, or the listener, hands the session.
 enum Work {
-    Push {
-        number: u32,
-        items: Vec<Item>,
-    },
-    Stop {
-        number: u32,
-        message: Value,
-    },
-    Bye {
-        code: &'static str,
-        message: &'static str,
-    },
+    Push { number: u32, items: Vec<Item> },
+    Stop { number: u32, message: Value },
 }
 
 /// A control message, an output's log entry, or bytes [from, to) of a body.
@@ -795,7 +778,6 @@ impl<B: MachineBackend> Cozy<B> {
                     stream.stop.get_or_insert(message);
                 }
             }
-            Work::Bye { code, message } => self.bye(code, message),
         }
     }
 
@@ -1191,9 +1173,8 @@ mod authority_tests {
         let address = "127.0.0.1".parse().unwrap();
         let mut viewers = vec![];
         for _ in 0..(MAX_CONNS + 1) {
-            let (work, _) = mpsc::unbounded_channel();
-            let mut viewer = media
-                .admit(address, work)
+            let viewer = media
+                .admit(address)
                 .expect("an authenticated viewer was capped");
             viewer.authenticate("one-owner-key");
             viewers.push(viewer);

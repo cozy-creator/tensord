@@ -2,7 +2,6 @@
 use super::pb::Claim;
 use ed25519_dalek::{Signature, VerifyingKey};
 use std::{
-    future::Future,
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
