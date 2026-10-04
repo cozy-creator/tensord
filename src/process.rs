@@ -249,6 +249,29 @@ pub fn group_members(leader: &ProcessBirth) -> Vec<ProcessBirth> {
         .collect()
 }
 
+/// Exact leader and every live member of its old process group have exited.
+/// This is group evidence only; callers retaining resources for setsid descendants must
+/// also prove the executor's owned Scope is empty. Unknown census reads are errors.
+pub fn group_ended(leader: &ProcessBirth) -> io::Result<bool> {
+    if boot_id()? != leader.boot_id { return Ok(true); }
+    if !process_ended(leader)? { return Ok(false); }
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Some(pid) = entry.file_name().to_str().and_then(|name|name.parse::<u32>().ok()) else {
+            continue;
+        };
+        let stat = match process_stat(pid) {
+            Ok(stat) => stat,
+            Err(error) if gone(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        if stat.pgrp as u32 == leader.pid && !matches!(stat.state, 'Z' | 'X') {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Whether a member of `leader`'s group born before `before` (start ticks) still lives: a
 /// previous machine's follower, killed with its leader, until its exit is observed.
 pub fn group_outlives(leader: &ProcessBirth, before: u64) -> bool {
@@ -621,6 +644,17 @@ mod tests {
     use super::*;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
+
+    #[test]
+    fn strict_group_exit_requires_the_exact_receiver_to_exit() {
+        let mut child=std::process::Command::new("sleep").arg("1000").spawn().unwrap();
+        let birth=process_birth(child.id()).unwrap();
+        assert!(!group_ended(&birth).unwrap());
+        child.kill().unwrap(); child.wait().unwrap();
+        assert!(group_ended(&birth).unwrap());
+        let old_boot=ProcessBirth {boot_id:"another-boot".into(),..birth};
+        assert!(group_ended(&old_boot).unwrap());
+    }
 
     #[test]
     fn pace_learns_its_own_pauses_and_judges_against_the_floor() {
