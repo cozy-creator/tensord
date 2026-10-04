@@ -391,13 +391,20 @@ fn unheld_layouts_go_oldest_first_and_held_ones_never() {
     drop(other_tier_ask(&tier, a).unwrap().expect("streamed"));
     assert_eq!(tier.facts().windows, 1);
     // Unheld once its executor exits: the window goes with it, the small layout on demand,
-    // and the other model then gets a whole layout.
+    // and the other model then gets the whole layout or a bounded window if released
+    // pages still count as stranded host bytes in the kernel observation.
     first.exit();
     let (_second, b) = Executor::spawn(&tier);
     let granted = other_tier_ask(&tier, b).unwrap().expect("room");
-    other.adopt(&granted);
+    let streamed = tensorfs_plane::host::HostMem::adopt_sealed(
+        granted.as_raw_fd(), &other.layout()).unwrap().window().is_some();
+    if streamed {
+        assert_eq!(stream_through(&other, &granted, 1), 8 * MIB as u64);
+    } else {
+        other.adopt(&granted);
+    }
     let facts = settled(&tier);
-    assert_eq!((facts.windows, facts.ledger.released), (0, 2), "{facts:?}");
+    assert_eq!((facts.windows, facts.ledger.released), (u64::from(streamed), 2), "{facts:?}");
     assert!(facts.ledger.released_bytes >= 8 * MIB as u64, "{facts:?}");
     assert_eq!(facts.entries, 1);
 }
