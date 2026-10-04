@@ -2231,6 +2231,7 @@ print(json.dumps({"identity": generation.identity}))
                     inputs: granted,
                     floor_bytes: None,
                     activation_bytes: Default::default(),
+                    device_weights: None,
                 },
                 &mut Baseline,
             )
@@ -2439,6 +2440,7 @@ print(json.dumps({"identity": generation.identity}))
                             inputs: Default::default(),
                             floor_bytes: None,
                             activation_bytes: Default::default(),
+                            device_weights: None,
                         },
                         &mut Publisher {
                             store: &task_store,

@@ -264,6 +264,9 @@ pub enum DeviceCommand {
         /// Activation growth per stage method learned for this request's shape.
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         activation_bytes: BTreeMap<String, u64>,
+        /// Degree 2 for this call (`weights.attach/1`); None leaves the executor's setting.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        device_weights: Option<bool>,
     },
     Budget {
         vram_bytes: i64,

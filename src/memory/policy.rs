@@ -247,6 +247,12 @@ impl Gpu {
     /// reservation. With Degree 2 holdings on the GPU its report comes first: NVML charges a
     /// shared allocation to whichever process the driver picks, and custody counts it once.
     fn held(&self, plan: &str, tenant: &Tenant, sample: &Sample) -> u64 {
+        self.actual(plan, tenant, sample).max(tenant.reserved)
+    }
+
+    /// Bytes `tenant` is known to hold now: NVML's charge or its report, never a reservation
+    /// (a spawn's reservation is room it may take, not memory anyone holds yet).
+    fn actual(&self, plan: &str, tenant: &Tenant, sample: &Sample) -> u64 {
         let measured = sample
             .processes
             .as_ref()
@@ -258,7 +264,7 @@ impl Gpu {
         } else {
             reported.or(measured)
         };
-        held.unwrap_or(0).max(tenant.reserved)
+        held.unwrap_or(0)
     }
 
     /// Bytes `tenant` may come to hold: a call grows into its cap, a spawn into its reservation.
@@ -273,10 +279,14 @@ impl Gpu {
     /// Device bytes held by anything the machine does not account for: the desktop, other
     /// processes, library memory an executor did not report.
     pub fn external(&self, sample: &Sample) -> u64 {
+        // Reservations are not subtracted: a starting executor's would hide that much foreign
+        // memory (F, rtx-3070: a 2.16 GB spawn reservation hid a 2.15 GB pool ballast, and
+        // Degree 2 engaged on a card it did not fit). What a spawn allocates before it
+        // reports counts as external meanwhile: conservative, and brief.
         let ours: u64 = self
             .tenants
             .iter()
-            .map(|(plan, tenant)| self.held(plan, tenant, sample))
+            .map(|(plan, tenant)| self.actual(plan, tenant, sample))
             .sum::<u64>()
             + self.resident();
         (sample.total.saturating_sub(sample.free)).saturating_sub(ours)
@@ -789,6 +799,30 @@ mod tests {
         gpu.holdings[0].revoking = false;
         gpu.holdings[0].id = "GPU-1/sha256:other#1".into();
         assert!(!gpu.fits_resident("img2img", &s));
+    }
+
+    #[test]
+    fn a_spawn_reservation_never_hides_foreign_memory() {
+        // rtx-3070 with a 6 GiB pool: 2 GiB of ballast, no per-process NVML in the container.
+        // Anima (5.4 GiB of weights, 1.4 GiB of activations) was measured in an earlier run.
+        let mut gpu = Gpu::default();
+        gpu.learned.load("anima", 5 * GIB + 2 * GIB / 5, 300 * MIB);
+        gpu.learned
+            .call("anima", "height=1024,width=1024", 7 * GIB / 5, &BTreeMap::new());
+        let reserved = gpu.spawn_need("anima");
+        gpu.starting("anima", reserved);
+        let s = Sample {
+            total: 8 * GIB,
+            free: 6 * GIB,
+            display: false,
+            processes: None,
+        };
+        assert!(reserved > GIB);
+        assert_eq!(gpu.external(&s), 2 * GIB);
+        assert_eq!(gpu.room("anima", &s), 6 * GIB - HEADLESS_FLOOR);
+        assert!(!gpu.fits_resident("anima", &s));
+        // Another tenant still sees the spawn's reservation as taken.
+        assert_eq!(gpu.room("sdxl", &s), 6 * GIB - HEADLESS_FLOOR - reserved);
     }
 
     #[test]

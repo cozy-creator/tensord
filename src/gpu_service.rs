@@ -2158,6 +2158,18 @@ impl GpuPool {
             &spool,
             &record.invocation.inputs,
         )?;
+        // Degree 2 per call: on while the whole construction and its activations fit beside the
+        // other tenants now. A sharing executor that no longer fits lets go of what it maps
+        // first, so this call streams privately and the ladder can reclaim those holdings.
+        let attaches = session.executor.hello.offers("weights.attach/1");
+        let share = self.degree2(&plan.id, plan.degree, &session.executor)?;
+        if session.sharing && !share {
+            if let Some(custody) = &self.custody {
+                detach(custody, &mut session.executor)?;
+            }
+        }
+        session.sharing = share;
+        callbacks.custody = self.custody.as_ref().filter(|_| share);
         self.shed(&plan.id, callbacks.others);
         // A real grant for the whole call: one tenant needs no per-stage turns.
         // A group's cap holds on every GPU of it (each rank caps its own process).
@@ -2195,6 +2207,7 @@ impl GpuPool {
                 inputs,
                 floor_bytes: self.first().floor(),
                 activation_bytes: self.first().with(|gpu| gpu.seeds(&plan.id)),
+                device_weights: attaches.then_some(share),
             },
             &group,
             &mut callbacks,
@@ -2581,6 +2594,30 @@ fn load_facts(facts: Option<&device_executor::LoadFacts>) -> Facts {
 }
 
 /// Ask the executor to release every revoked generation it reads (it is idle here).
+/// `executor` lets go of every holding it maps (queued work first): its weights become its
+/// own again. Holdings others still read stay; the rest are unread, for the ladder to reclaim.
+fn detach(custody: &Mutex<ResidentCustody>, executor: &mut DeviceExecutor) -> io::Result<()> {
+    let read = custody.lock().unwrap().read_by(&executor.birth);
+    for (key, generation) in read {
+        let reply = executor.command(
+            &DeviceCommand::Revoke {
+                layout: key.layout.clone(),
+                generation,
+            },
+            &mut device_executor::Baseline,
+        )?;
+        if reply.ok {
+            custody
+                .lock()
+                .unwrap()
+                .released(&key, generation, &executor.birth);
+        }
+        crate::memory::note(serde_json::json!({"event": "detach", "layout": key.layout,
+            "ok": reply.ok}));
+    }
+    Ok(())
+}
+
 fn release_revoked(
     custody: &Mutex<ResidentCustody>,
     executor: &mut DeviceExecutor,

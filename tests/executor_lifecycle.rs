@@ -145,6 +145,7 @@ fn invoke(
             inputs: Default::default(),
             floor_bytes: None,
             activation_bytes: Default::default(),
+            device_weights: None,
         },
         &mut Baseline,
     )
@@ -521,6 +522,7 @@ fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
                 cap_bytes: None,
                 floor_bytes: None,
                 activation_bytes: Default::default(),
+                device_weights: None,
             },
             &mut Baseline,
         )

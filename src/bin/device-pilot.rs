@@ -440,6 +440,7 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
                 inputs: Default::default(),
                 floor_bytes: None,
                 activation_bytes: Default::default(),
+                device_weights: None,
             },
             &mut turns,
         )?;

@@ -449,6 +449,7 @@ impl Jobs {
                 inputs,
                 floor_bytes: None,
                 activation_bytes: BTreeMap::new(),
+                device_weights: None,
             },
             &mut services,
         )?;
