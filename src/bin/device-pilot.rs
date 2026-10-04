@@ -65,6 +65,19 @@ struct Turns {
     sources: Option<ModelSources>,
 }
 impl Services for Turns {
+    fn object_files(&mut self, frame: &Frame, plan: Option<File>) -> io::Result<(Answer, Vec<File>)> {
+        let mut answer = Answer::unavailable(frame.seq);
+        let (Some((tier, peer, grants)), Some(plan)) = (&self.host, plan) else {
+            return Ok((answer, Vec::new()));
+        };
+        let request = SealedRequest { sha256: &frame.sha256, length: frame.length, stage: None };
+        let files = tier.object_files(*peer, grants, request, plan)?;
+        (answer.ok, answer.code, answer.detail) = (true, String::new(), String::new());
+        answer.objects_sha256 = cozy_machine::host_tier::objects_digest(&files);
+        let row = serde_json::json!({"phase":self.phase,"exchange":"ObjectFiles","files":files.len()});
+        writeln!(self.events, "{row}")?;
+        Ok((answer, files.into_iter().map(|(_, file)| file).collect()))
+    }
     fn progress(&mut self, frame: &Frame) {
         let row = serde_json::json!({"phase":self.phase,"request_id":frame.request_id,"stage":frame.stage,"position":frame.position,"total":frame.total,"advance":frame.advance});
         let _ = writeln!(self.events, "{row}");
@@ -75,9 +88,20 @@ impl Services for Turns {
         descriptor: Option<File>,
     ) -> io::Result<(Answer, Option<File>)> {
         let mut answer = Answer::unavailable(frame.seq);
+        if let (Kind::SealedStage, Some((tier, peer, grants))) = (frame.kind, &self.host) {
+            let plan = descriptor.ok_or_else(|| io::Error::other("sealed stage omitted its plan"))?;
+            let request =
+                SealedRequest { sha256: &frame.sha256, length: frame.length, stage: frame.stage_regions.as_deref() };
+            let staged = tier.stage(*peer, grants, request, plan)?;
+            let row = serde_json::json!({"phase":self.phase,"exchange":"SealedStage","asked":frame.stage_regions,"staged":staged});
+            writeln!(self.events, "{row}")?;
+            (answer.ok, answer.code, answer.detail) = (true, String::new(), String::new());
+            answer.staged = staged;
+            return Ok((answer, None));
+        }
         if let (Kind::SealedPrefetch, Some((tier, peer, grants))) = (frame.kind, &self.host) {
             let plans = descriptor.ok_or_else(|| io::Error::other("sealed prefetch omitted its plans"))?;
-            let request = SealedRequest { sha256: &frame.sha256, length: frame.length };
+            let request = SealedRequest { sha256: &frame.sha256, length: frame.length, stage: None };
             if let Err(error) = tier.prefetch(*peer, grants, request, plans) {
                 answer.detail = error.to_string();
             } else {
@@ -99,7 +123,8 @@ impl Services for Turns {
         if let (Kind::SealedTier, Some((tier, peer, grants))) = (frame.kind, &self.host) {
             let plan = descriptor.ok_or_else(|| io::Error::other("sealed tier omitted its plan"))?;
             let started = Instant::now();
-            let request = SealedRequest { sha256: &frame.sha256, length: frame.length };
+            let request =
+                SealedRequest { sha256: &frame.sha256, length: frame.length, stage: frame.stage_regions.as_deref() };
             let granted = match tier.seal(*peer, grants, request, plan) {
                 Ok(granted) => granted,
                 Err(error) => {
@@ -302,8 +327,9 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
                 })
             })
             .collect::<io::Result<Vec<_>>>()?;
-        tier.prepare(grants.clone());
-        turns.host = Some((tier.clone(), tier.register_peer(executor.observer_pidfd()?), grants));
+        let staged = executor.hello.offers("host_tiers.staged/1");
+        tier.prepare(grants.clone(), staged);
+        turns.host = Some((tier.clone(), tier.register_peer(executor.observer_pidfd()?, staged), grants));
         turns.sources = Some(sources);
     }
     let disk_before = disk_read_bytes();
@@ -347,6 +373,7 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
             cap_bytes: None,
             sealed_tiers: sealed,
             model_sources: sealed,
+            staged_tiers: sealed,
             pinned_bytes: at_load.then_some(config.pinned_budget_bytes),
         },
         &mut turns,

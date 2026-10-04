@@ -446,6 +446,7 @@ impl Jobs {
                 stages: false,
                 sealed_tiers: false,
                 model_sources: false,
+                staged_tiers: false,
                 pinned_bytes: None,
                 device_weights: false,
                 cap_bytes: None,

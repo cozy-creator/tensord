@@ -6,8 +6,8 @@ publish = false
 
 [dependencies]
 str0m = { version = "0.24", default-features = false, features = ["aws-lc-rs"] }
-tensorfs-core = { git = "https://github.com/cozy-creator/tensorfs.git", rev = "dad983f51c24e1db7143ba360a84c15a1af141ef" }
-tensorfs-plane = { git = "https://github.com/cozy-creator/tensorfs.git", rev = "dad983f51c24e1db7143ba360a84c15a1af141ef" }
+tensorfs-core = { git = "https://github.com/cozy-creator/tensorfs.git", rev = "3fc31b3814e35e5c79033ddf2b820219c0fe7acd" }
+tensorfs-plane = { git = "https://github.com/cozy-creator/tensorfs.git", rev = "3fc31b3814e35e5c79033ddf2b820219c0fe7acd" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 serde_json_canonicalizer = "0.3"
