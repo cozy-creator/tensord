@@ -25,8 +25,8 @@ pub struct Keys {
     state: Arc<RwLock<KeyState>>,
     changes: Arc<tokio::sync::watch::Sender<u64>>,
 }
-/// One admitted key and whose it is, as SSH authorized_keys: runs belong to the actor, and only
-/// an owner (a rental's renter) maintains the machine.
+/// One admitted key and whose it is, as SSH authorized_keys names keys for one account. Runs,
+/// outputs and workspaces belong to the actor; only an owner maintains the machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Holder {
     pub key: VerifyingKey,
@@ -34,23 +34,24 @@ pub struct Holder {
     pub owner: bool,
 }
 impl Holder {
-    /// A key that is its own actor and an owner: a computer's authorized_keys, a rental's boot
-    /// keys, and a lease that names no users.
-    pub fn own(key: VerifyingKey) -> Self {
+    /// A key of the machine's owner: every key in a computer's authorized_keys, a rental's boot
+    /// keys and its renter's leased keys. They are one actor, so the owner's work stays its own
+    /// across its devices, a new key after logout, and a rental's boot keys becoming its lease.
+    pub fn owner(key: VerifyingKey) -> Self {
         Self {
             key,
-            actor: key.to_bytes(),
+            actor: sha256::digest(b"cozy.machine.owner/1"),
             owner: true,
         }
     }
-    /// A key of a Hub account: every key of one account acts as that account.
-    pub fn user(key: VerifyingKey, user: &str, owner: bool) -> Self {
+    /// A key of a user the renter shared the rental with: every key of that user is one actor.
+    pub fn member(key: VerifyingKey, user: &str) -> Self {
         let mut named = b"cozy.machine.user/1\0".to_vec();
         named.extend_from_slice(user.as_bytes());
         Self {
             key,
             actor: sha256::digest(&named),
-            owner,
+            owner: false,
         }
     }
 }
@@ -62,7 +63,7 @@ struct KeyState {
 impl Keys {
     pub fn fixed(keys: Vec<VerifyingKey>) -> Self {
         let state = KeyState {
-            keys: keys.into_iter().map(Holder::own).collect(),
+            keys: keys.into_iter().map(Holder::owner).collect(),
             until: None,
             leased: false,
         };
@@ -78,7 +79,7 @@ impl Keys {
     /// A computer's set, read from its `authorized_keys`: no lease.
     pub fn set(&self, keys: Vec<VerifyingKey>) {
         self.replace(KeyState {
-            keys: keys.into_iter().map(Holder::own).collect(),
+            keys: keys.into_iter().map(Holder::owner).collect(),
             until: None,
             leased: false,
         });
@@ -99,26 +100,14 @@ impl Keys {
     }
     /// The keys that may authorize a new control now: none without a current lease.
     pub fn admitted(&self) -> Vec<VerifyingKey> {
-        match self.current() {
-            (keys, true) => keys.iter().map(|h| h.key).collect(),
-            (_, false) => vec![],
-        }
+        self.holders().iter().map(|h| h.key).collect()
     }
-    /// Who a key that signed acts as: its holder, or itself as an owner if it left the set since.
-    pub fn actor(&self, key: &VerifyingKey) -> VerifiedActor {
-        let holder = self
-            .state
-            .read()
-            .unwrap()
-            .keys
-            .iter()
-            .find(|h| h.key == *key)
-            .copied()
-            .unwrap_or_else(|| Holder::own(*key));
-        VerifiedActor {
-            public_key: key.to_bytes(),
-            actor: holder.actor,
-            owner: holder.owner,
+    /// The admitted keys with whose each is, as one snapshot: verify a signature and name its
+    /// actor against the same set.
+    pub fn holders(&self) -> Vec<Holder> {
+        match self.current() {
+            (keys, true) => keys,
+            (_, false) => vec![],
         }
     }
     fn current(&self) -> (Vec<Holder>, bool) {
@@ -164,12 +153,21 @@ pub struct VerifiedActor {
     pub owner: bool,
 }
 impl VerifiedActor {
+    /// A key that is its own actor and an owner, for tools and tests that take no key set.
     pub fn own(public_key: [u8; 32]) -> Self {
         Self {
             public_key,
             actor: public_key,
             owner: true,
         }
+    }
+    /// The signer among `holders`, the set its signature was verified against.
+    pub fn of(holders: &[Holder], signer: &VerifyingKey) -> Option<Self> {
+        holders.iter().find(|h| h.key == *signer).map(|h| Self {
+            public_key: h.key.to_bytes(),
+            actor: h.actor,
+            owner: h.owner,
+        })
     }
 }
 

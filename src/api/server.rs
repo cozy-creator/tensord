@@ -665,13 +665,16 @@ impl<B: MachineBackend> Api<B> {
             .and_then(|v| v.strip_prefix("Cozy-Cap "))
             .unwrap_or_default();
         let authority = &self.identity.authority;
-        let Some(key) = crate::hub::verify_capability(
+        let holders = authority.keys.holders();
+        let keys: Vec<_> = holders.iter().map(|h| h.key).collect();
+        let Some(actor) = crate::hub::verify_capability(
             token,
             &authority.worker_id,
-            &authority.keys.admitted(),
+            &keys,
             now_ms() as i64 / 1000,
             crate::hub::ACTION,
-        ) else {
+        )
+        .and_then(|key| super::auth::VerifiedActor::of(&holders, &key)) else {
             return refuse(
                 403,
                 "capability_required",
@@ -681,7 +684,6 @@ impl<B: MachineBackend> Api<B> {
         if body.len() > 64 << 10 {
             return refuse(400, "invalid_access", "Hub access body exceeds 64 KiB");
         }
-        let actor = authority.keys.actor(&key);
         let backend = self.backend.clone();
         let answer = tokio::task::spawn_blocking(move || {
             if forget {

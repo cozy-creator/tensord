@@ -158,11 +158,18 @@ impl Hub {
             None => document
                 .authorized_keys
                 .iter()
-                .map(|k| key(k).map(Holder::own))
+                .map(|k| key(k).map(Holder::owner))
                 .collect::<Option<Vec<_>>>(),
             Some(users) => users
                 .iter()
-                .flat_map(|u| u.keys.iter().map(move |k| key(k).map(|k| Holder::user(k, &u.id, u.owner))))
+                .flat_map(|u| {
+                    u.keys.iter().map(move |k| {
+                        key(k).map(|k| match u.owner {
+                            true => Holder::owner(k),
+                            false => Holder::member(k, &u.id),
+                        })
+                    })
+                })
                 .collect::<Option<Vec<_>>>(),
         }
         .ok_or_else(invalid)?;

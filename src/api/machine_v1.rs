@@ -70,18 +70,14 @@ impl<B: MachineBackend> MachineV1<B> {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| since.as_secs() as i64);
         let authority = &self.identity.authority;
-        let (grant, signer) = capability::verify_signer(
-            token,
-            &authority.worker_id,
-            &authority.keys.admitted(),
-            now,
-            "",
-        )
-        .map_err(|refusal| Status::unauthenticated(refusal.to_string()))?;
-        Ok(Caller {
-            actor: authority.keys.actor(&signer),
-            grant,
-        })
+        let holders = authority.keys.holders();
+        let keys: Vec<_> = holders.iter().map(|h| h.key).collect();
+        let (grant, signer) =
+            capability::verify_signer(token, &authority.worker_id, &keys, now, "")
+                .map_err(|refusal| Status::unauthenticated(refusal.to_string()))?;
+        let actor = VerifiedActor::of(&holders, &signer)
+            .ok_or_else(|| Status::unauthenticated("the capability's key is not authorized"))?;
+        Ok(Caller { actor, grant })
     }
 
     async fn call<T: Send + 'static>(

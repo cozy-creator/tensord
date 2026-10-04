@@ -1,7 +1,8 @@
 //! A computer's machine admits the keys in `<root>/authorized_keys`, read as sshd reads its
 //! file: one `ssh-ed25519 <base64> [comment]` per line, `#` comments and blank lines skipped,
 //! a line it cannot read reported and skipped. A key appended or deleted by hand applies at
-//! the next look (each second); a deleted key's open streams end then.
+//! the next look (each second); a deleted key's open streams end then. Every key is the
+//! machine's owner, as every key in an account's authorized_keys is that account.
 use crate::api::auth::Keys;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use ed25519_dalek::VerifyingKey;
@@ -69,17 +70,30 @@ pub fn line(key: &VerifyingKey, comment: &str) -> String {
         .to_owned()
 }
 
-/// Starts `<root>/authorized_keys` with a launcher's keys when the root has none, so a launcher
-/// that grants keys in its environment still reaches the machine it starts. An existing file is
-/// the truth and is never touched.
-pub fn start(root: &Path, keys: &[VerifyingKey]) -> io::Result<()> {
+/// Adds a launcher's keys to `<root>/authorized_keys` where it lacks them, so a launcher that
+/// grants keys in its environment reaches the machine it starts. Every other line is kept.
+pub fn grant(root: &Path, keys: &[VerifyingKey]) -> io::Result<()> {
     let path = root.join(FILE);
-    if keys.is_empty() || path.exists() {
+    let mut text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    let held = parse(&text).0;
+    let missing: Vec<_> = keys.iter().filter(|k| !held.contains(k)).collect();
+    if missing.is_empty() {
         return Ok(());
     }
-    let text: String = keys.iter().map(|k| line(k, "launcher") + "\n").collect();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    for key in missing {
+        text.push_str(&line(key, "launcher"));
+        text.push('\n');
+    }
     let staged = root.join(".authorized_keys.new");
     fs::write(&staged, text)?;
+    fs::set_permissions(&staged, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
     fs::rename(staged, path)
 }
 
@@ -153,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn a_launchers_keys_start_the_file_only_when_absent() {
+    fn a_launchers_keys_join_the_file_and_other_lines_stay() {
         let root = std::env::temp_dir().join(format!("authorized-keys-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
@@ -161,10 +175,15 @@ mod tests {
             SigningKey::from_bytes(&[1; 32]).verifying_key(),
             SigningKey::from_bytes(&[2; 32]).verifying_key(),
         );
-        start(&root, &[a]).unwrap();
-        start(&root, &[b]).unwrap();
-        let (keys, _) = parse(&fs::read_to_string(root.join(FILE)).unwrap());
-        assert_eq!(keys, vec![a], "an existing file is the truth");
+        grant(&root, &[a]).unwrap();
+        let first = fs::read_to_string(root.join(FILE)).unwrap();
+        grant(&root, &[a]).unwrap();
+        assert_eq!(fs::read_to_string(root.join(FILE)).unwrap(), first);
+        fs::write(root.join(FILE), format!("# mine\n{}", line(&a, "by hand"))).unwrap();
+        grant(&root, &[b, a]).unwrap();
+        let text = fs::read_to_string(root.join(FILE)).unwrap();
+        assert!(text.starts_with("# mine\n") && text.contains("by hand\n"));
+        assert_eq!(parse(&text).0, vec![a, b]);
         fs::remove_dir_all(&root).unwrap();
     }
 
