@@ -73,7 +73,7 @@ leaves out the executor kill (fault injection stays on rentals). Disk reads fall
 processes' `/proc/<pid>/io` when its cgroup has no io controller. `xid_watch: true` follows `journalctl -kf`; any `NVRM: Xid` runs `on_xid` (stop both
 machines) and stops the harness at once.
 
-An arm's optional `facts` command is recorded at every restart; a manifest `collect` command's stdout
+A manifest `on_start` command runs once on the host before the first request (e.g. watchers). An arm's optional `facts` command is recorded at every restart; a manifest `collect` command's stdout
 (a tarball) is saved as `OUT/collect.tgz` at the end.
 
 `cells` with `cell_order` ([arm, cell] pairs) run the 2026-10-01 rebench's cells before the cycles. A cell is

@@ -575,6 +575,7 @@ class Gate:
             rows.append({"model": p["model"], "prompt": p["payload"]["prompt"], "seed": p["payload"]["seed"],
                          "exit": p["proc"].returncode, "dir": str(p["root"]), "submit": p["submit"], "done": p["done"],
                          "accepted_pod": seen.get("request.machine_accepted"), "outcome_pod": seen.get("machine.outcome"),
+                         "events": seen,   # first time of each event type the CLI printed (client events on this clock)
                          "images": images, "ok": p["proc"].returncode == 0 and len(images) == 1 and images[0]["ok"]})
         for p, row in zip(procs, rows):   # what the machine reports per request, read after the timed window
             run = row["images"][0]["path"].rsplit("/", 1)[1].split("-")[0] if row["images"] else None
@@ -598,6 +599,8 @@ class Gate:
     def run(self) -> None:
         samples = f"{self.pod.dir}/samples-{self.m['salt']}.jsonl"
         sampler = self.pod.sh(f"nohup {self.pod.py} {self.pod.dir}/pod.py sample {samples} >/dev/null 2>&1 & echo $!").strip()
+        if self.m.get("on_start"):   # e.g. host-side watchers that stamp the machine's log
+            self.record({"event": "on_start", "out": self.pod.sh(self.m["on_start"]), "t": time.time()})
         try:
             for arm in self.m.get("prime", []):
                 self.prime(arm)
