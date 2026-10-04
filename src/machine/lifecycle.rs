@@ -24,6 +24,8 @@ struct IdleState {
     released: bool,
     work_observed: bool,
     unknown: bool,
+    #[serde(skip)]
+    activating: bool,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     keepalives: BTreeMap<String, [i64; 2]>,
 }
@@ -37,6 +39,15 @@ pub struct Lifecycle {
 
 /// Holds idle release while a call that may start work is in flight.
 pub struct Admission(Arc<Lifecycle>);
+
+/// Closes external work admission while accepted work drains and the update activates.
+/// Internal children of accepted runs keep executing. A failed activation reopens it.
+pub struct Activation(Arc<Lifecycle>);
+impl Drop for Activation {
+    fn drop(&mut self) {
+        self.0.state.lock().unwrap().0.activating = false;
+    }
+}
 impl Drop for Admission {
     fn drop(&mut self) {
         self.0.admissions.fetch_sub(1, Ordering::AcqRel);
@@ -84,6 +95,9 @@ impl Lifecycle {
 
     pub fn admit(self: &Arc<Self>) -> Result<Admission, Status> {
         let state = self.state.lock().unwrap();
+        if state.0.activating {
+            return Err(Status::unavailable("machine_updating: the machine is activating an update; attach to accepted work or try admission again"));
+        }
         if self.rental && Self::due(&state, now_ms()) {
             return Err(Status::unavailable(
                 "machine_released: this rental released itself after its idle deadline",
@@ -91,6 +105,20 @@ impl Lifecycle {
         }
         self.admissions.fetch_add(1, Ordering::AcqRel);
         Ok(Admission(self.clone()))
+    }
+
+    /// Atomically exclude new root admission before checking whether accepted work drained.
+    /// This shares the same mutex as admit and idle-release claim, so an admitted call is
+    /// either counted before the barrier or refused after it.
+    pub fn begin_activation(self: &Arc<Self>) -> Result<Activation, Status> {
+        let mut state = self.state.lock().unwrap();
+        if state.0.activating || state.0.released {
+            return Err(Status::unavailable(
+                "machine_updating: activation or release is already committed",
+            ));
+        }
+        state.0.activating = true;
+        Ok(Activation(self.clone()))
     }
 
     /// Accepted work renews the deadline.
@@ -184,7 +212,10 @@ impl Lifecycle {
         if state.0.released {
             return Ok(true);
         }
-        if self.admissions.load(Ordering::Acquire) > 0 || !Self::due(&state, now_ms()) {
+        if state.0.activating
+            || self.admissions.load(Ordering::Acquire) > 0
+            || !Self::due(&state, now_ms())
+        {
             return Ok(false);
         }
         state.0.released = true;
@@ -281,6 +312,32 @@ mod tests {
         assert_eq!(raw["released"], true);
         assert!(raw["deadline_ms"].is_i64());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn activation_and_release_share_admission_exclusion_and_failure_reopens_it() {
+        let root =
+            std::env::temp_dir().join(format!("cm-lifecycle-activation-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let lifecycle = Lifecycle::open(root.join("idle.json"), true, true).unwrap();
+        let prior = lifecycle.admit().unwrap();
+        let activation = lifecycle.begin_activation().unwrap();
+        assert!(lifecycle.admit().is_err());
+        assert_eq!(lifecycle.admitted(), 1);
+        drop(prior);
+        lifecycle.state.lock().unwrap().0.deadline_ms = now_ms() - 1;
+        assert!(
+            !lifecycle.claim().unwrap(),
+            "idle release crossed activation"
+        );
+        drop(activation);
+        assert!(lifecycle.claim().unwrap());
+        let persistent = Lifecycle::open(root.join("persistent.json"), false, true).unwrap();
+        let failed = persistent.begin_activation().unwrap();
+        assert!(persistent.admit().is_err());
+        drop(failed);
+        assert!(persistent.admit().is_ok());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 

@@ -45,8 +45,8 @@ pub(super) async fn run<B: MachineBackend>(
         .clone()
         .ok_or_else(|| Status::failed_precondition("this machine does not update in place"))?;
     let id = request.id.clone();
-    if let Some(spec) = request.spec.filter(|_| updates.update(&id).is_none()) {
-        if !identity.readiness.proved() {
+    if let Some(spec) = request.spec {
+        if updates.update(&id).is_none() && !identity.readiness.proved() {
             return Err(Status::unavailable(
                 "the machine is starting; update it once it is ready",
             ));
@@ -132,6 +132,15 @@ fn submit(
             .strip_prefix("sha256:")
             .filter(|h| h.len() == 64)
             .ok_or_else(|| Status::invalid_argument("an input digest is sha256:<64 hex>"))?;
+        if updates.update(id).is_some() {
+            // Idempotent reattachment compares the named cohort, without requiring its
+            // original input blob to remain in the store after a completed update.
+            return Ok(Some(Choice {
+                file: value,
+                sha256: sha256.into(),
+                ..Default::default()
+            }));
+        }
         let mut object = backend.object(actor, sha256).map_err(|e| {
             Status::failed_precondition(format!(
                 "the {member} wheel {} is not held here; Write it first: {}",

@@ -40,6 +40,8 @@ pub struct Status {
     /// Every state it passed through: the update's run log.
     #[serde(default)]
     pub history: Vec<Step>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub request_digest: String,
 }
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Step {
@@ -61,7 +63,7 @@ impl Status {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Choice {
     #[serde(default)]
     pub file: String,
@@ -71,7 +73,7 @@ pub struct Choice {
     pub version: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Request {
     pub operation: String,
     #[serde(default)]
@@ -147,7 +149,7 @@ pub fn rollback_pending(paths: &Paths, cause: &str) -> io::Result<bool> {
     let mut status = latest(paths, pending.status);
     status.error = cause.into();
     status.enter("rolled_back");
-    write_json(&paths.update("status.json"), &status)?;
+    save_status(paths, &status)?;
     fs::remove_file(paths.update("pending.json"))?;
     Ok(true)
 }
@@ -166,6 +168,7 @@ pub struct Updates {
     readiness: Arc<Readiness>,
     status: Mutex<Option<Status>>,
     idle: Box<dyn Fn() -> bool + Send + Sync>,
+    lifecycle: Option<Arc<super::lifecycle::Lifecycle>>,
 }
 
 impl Updates {
@@ -173,16 +176,32 @@ impl Updates {
         paths: Paths,
         readiness: Arc<Readiness>,
         idle: Box<dyn Fn() -> bool + Send + Sync>,
+        lifecycle: Option<Arc<super::lifecycle::Lifecycle>>,
     ) -> io::Result<Arc<Self>> {
         fs::create_dir_all(paths.update("staged"))?;
-        let status = fs::read(paths.update("status.json"))
+        let mut status = fs::read(paths.update("status.json"))
             .ok()
             .and_then(|raw| serde_json::from_slice::<Status>(&raw).ok());
+        if !paths.update("pending.json").is_file() {
+            if let Some(interrupted) = status.as_mut().filter(|s| {
+                matches!(
+                    s.state.as_str(),
+                    "waiting" | "preparing" | "waiting_activation" | "installing" | "starting"
+                )
+            }) {
+                interrupted.error = "machine_restarted: the update did not reach activation before this service stopped".into();
+                interrupted.enter("failed");
+                if let Err(error) = save_status(&paths, interrupted) {
+                    eprintln!("cozy-machine: interrupted update could not be recorded: {error}");
+                }
+            }
+        }
         Ok(Arc::new(Self {
             paths,
             readiness,
             status: Mutex::new(status),
             idle,
+            lifecycle,
         }))
     }
 
@@ -195,7 +214,7 @@ impl Updates {
         let mut status = latest(&self.paths, pending.status);
         status.to = pair_in(&self.paths.sdk());
         status.enter("succeeded");
-        write_json(&self.paths.update("status.json"), &status)?;
+        save_status(&self.paths, &status)?;
         fs::remove_file(self.paths.update("pending.json"))?;
         *self.status.lock().unwrap() = Some(status);
         Ok(())
@@ -203,11 +222,15 @@ impl Updates {
 
     /// The update `operation` names, if it is this machine's latest.
     pub fn update(&self, operation: &str) -> Option<Status> {
+        if !valid_operation(operation) {
+            return None;
+        }
         self.status
             .lock()
             .unwrap()
             .clone()
             .filter(|s| s.operation == operation)
+            .or_else(|| archived(&self.paths, operation).ok().flatten())
     }
 
     /// The executors' Runtime/TensorFS pair.
@@ -295,12 +318,7 @@ impl Updates {
         request: Request,
         exit: fn(i32),
     ) -> Result<Status, (u16, String)> {
-        let valid = !request.operation.is_empty()
-            && request.operation.len() <= 128
-            && request
-                .operation
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+        let valid = valid_operation(&request.operation)
             && matches!(request.agent.as_str(), "" | "bundled" | "explicit")
             && (request.runtime.is_some() || request.tensorfs.is_some());
         if !valid {
@@ -310,11 +328,32 @@ impl Updates {
                     .into(),
             ));
         }
+        let mut intent = request.clone();
+        if intent.agent.is_empty() {
+            intent.agent = "bundled".into();
+        }
+        intent.pin = Some(intent.pin.unwrap_or(false));
+        let request_digest = hex(&Sha256::digest(
+            serde_json::to_vec(&intent)
+                .map_err(io::Error::other)
+                .map_err(server)?,
+        ));
         let mut current = self.status.lock().unwrap();
-        if let Some(status) = current.as_ref() {
-            if status.operation == request.operation {
-                return Ok(status.clone());
+        let previous = current
+            .as_ref()
+            .filter(|s| s.operation == request.operation)
+            .cloned()
+            .or(archived(&self.paths, &request.operation).map_err(server)?);
+        if let Some(status) = previous {
+            if !status.request_digest.is_empty() && status.request_digest != request_digest {
+                return Err((
+                    409,
+                    "run_id_conflict: this update id already names another cohort".into(),
+                ));
             }
+            return Ok(status);
+        }
+        if let Some(status) = current.as_ref() {
             if !status.terminal() {
                 return Err((
                     409,
@@ -325,43 +364,80 @@ impl Updates {
                 ));
             }
         }
+        if let Some(previous) = current.as_ref() {
+            save_status(&self.paths, previous).map_err(server)?;
+        }
+        let admitted = self
+            .lifecycle
+            .as_ref()
+            .map(|l| l.admit())
+            .transpose()
+            .map_err(|e| (503, e.message().to_string()))?;
         let mut status = Status {
             operation: request.operation.clone(),
+            request_digest,
             from: pair_in(&self.paths.sdk()),
             pinned: request.pin.unwrap_or(false),
             ..Status::default()
         };
         status.enter("waiting");
-        write_json(&self.paths.update("status.json"), &status).map_err(server)?;
+        save_status(&self.paths, &status).map_err(server)?;
         *current = Some(status.clone());
         drop(current);
+        if let Some(lifecycle) = &self.lifecycle {
+            if let Err(error) = lifecycle.work() {
+                let message = error.to_string();
+                self.set(|s| {
+                    s.error = format!("update activity could not be recorded: {message}");
+                    s.enter("failed");
+                })
+                .map_err(server)?;
+                return Err(server(error));
+            }
+        }
         let updates = self.clone();
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("runtime-update".into())
             .spawn(move || {
-                if let Err(error) = updates.run(&request, exit) {
-                    updates.set(|s| {
+                if let Err(error) = updates.run(&request, exit, admitted) {
+                    if let Err(write) = updates.set(|s| {
                         s.error = error.to_string();
                         s.enter("failed");
-                    });
+                    }) {
+                        eprintln!(
+                            "cozy-machine: Runtime update failure could not be recorded: {write}"
+                        );
+                    }
                 }
+            });
+        if let Err(error) = spawned {
+            let message = error.to_string();
+            self.set(|s| {
+                s.error = format!("update preparation could not start: {message}");
+                s.enter("failed");
             })
             .map_err(server)?;
+            return Err(server(error));
+        }
         Ok(status)
     }
 
-    fn set(&self, change: impl FnOnce(&mut Status)) {
+    fn set(&self, change: impl FnOnce(&mut Status)) -> io::Result<()> {
         let mut current = self.status.lock().unwrap();
         if let Some(status) = current.as_mut() {
             change(status);
-            if let Err(error) = write_json(&self.paths.update("status.json"), status) {
-                eprintln!("cozy-machine: Runtime update status: {error}");
-            }
+            save_status(&self.paths, status)?;
         }
+        Ok(())
     }
 
-    fn run(&self, request: &Request, exit: fn(i32)) -> io::Result<()> {
-        self.set(|s| s.enter("preparing"));
+    fn run(
+        &self,
+        request: &Request,
+        exit: fn(i32),
+        admitted: Option<super::lifecycle::Admission>,
+    ) -> io::Result<()> {
+        self.set(|s| s.enter("preparing"))?;
         let candidate = self.paths.engine.join("sdk").join(&request.operation);
         let _ = fs::remove_dir_all(&candidate);
         fs::create_dir_all(&candidate)?;
@@ -386,14 +462,21 @@ impl Updates {
             }
         }
         let to = pair_in(&candidate);
-        self.set(|s| s.to = to.clone());
+        self.set(|s| s.to = to.clone())?;
+        let _activation = self
+            .lifecycle
+            .as_ref()
+            .map(|l| l.begin_activation())
+            .transpose()
+            .map_err(|e| io::Error::other(e.message().to_string()))?;
+        drop(admitted);
         if !(self.idle)() {
-            self.set(|s| s.enter("waiting_activation"));
+            self.set(|s| s.enter("waiting_activation"))?;
             while !(self.idle)() {
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
         }
-        self.set(|s| s.enter("installing"));
+        self.set(|s| s.enter("installing"))?;
         let pending = Pending {
             status: self.status.lock().unwrap().clone().unwrap_or_default(),
             sdk_before: fs::read_link(self.paths.current_sdk_link()).ok(),
@@ -404,7 +487,7 @@ impl Updates {
         if let Some(binary) = agent {
             relink(&self.paths.current_agent_link(), Some(&binary))?;
         }
-        self.set(|s| s.enter("starting"));
+        self.set(|s| s.enter("starting"))?;
         eprintln!(
             "cozy-machine: Runtime update {}: restarting on {} / {}",
             request.operation, to.runtime, to.tensorfs
@@ -439,6 +522,31 @@ impl Updates {
             &self.paths.update("downloads"),
         )
     }
+}
+
+fn valid_operation(operation: &str) -> bool {
+    !operation.is_empty()
+        && operation.len() <= 128
+        && operation
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+}
+fn archived(paths: &Paths, operation: &str) -> io::Result<Option<Status>> {
+    match fs::read(paths.update(&format!("operations/{operation}.json"))) {
+        Ok(raw) => serde_json::from_slice(&raw)
+            .map(Some)
+            .map_err(io::Error::other),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+fn save_status(paths: &Paths, status: &Status) -> io::Result<()> {
+    // Archive first: publishing a newer latest operation can never erase an older id.
+    write_json(
+        &paths.update(&format!("operations/{}.json", status.operation)),
+        status,
+    )?;
+    write_json(&paths.update("status.json"), status)
 }
 
 fn existing_wheel(dir: &Path, distribution: &str) -> io::Result<PathBuf> {
@@ -680,5 +788,165 @@ mod tests {
         );
         assert!(!rollback_pending(&paths, "again").unwrap());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn test_updates(
+        root: &Path,
+        lifecycle: Option<Arc<super::super::lifecycle::Lifecycle>>,
+        idle: Box<dyn Fn() -> bool + Send + Sync>,
+    ) -> Arc<Updates> {
+        let paths = Paths::new(&root.join("engine"), root);
+        fs::create_dir_all(&paths.image_wheels).unwrap();
+        wheel(&paths.image_wheels, "cozy_runtime", "0.1.0", None);
+        wheel(&paths.image_wheels, "tensorfs", "0.1.0", None);
+        Updates::open(
+            paths,
+            Readiness::open(None, Some(vec![7; 32]), false).unwrap(),
+            idle,
+            lifecycle,
+        )
+        .unwrap()
+    }
+    fn staged_request(updates: &Updates, root: &Path, operation: &str) -> Request {
+        fs::create_dir_all(root.join("candidate")).unwrap();
+        let candidate = wheel(&root.join("candidate"), "cozy_runtime", "0.2.0", None);
+        let file = candidate.file_name().unwrap().to_str().unwrap().to_owned();
+        let (sha256, _) = updates
+            .stage(&file, &mut fs::File::open(candidate).unwrap())
+            .unwrap();
+        Request {
+            operation: operation.into(),
+            agent: "explicit".into(),
+            pin: None,
+            runtime: Some(Choice {
+                file,
+                sha256,
+                ..Default::default()
+            }),
+            tensorfs: None,
+        }
+    }
+    fn wait_starting(updates: &Updates, id: &str) {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let state = updates.update(id).unwrap();
+            if state.state == "starting" {
+                return;
+            }
+            assert!(!state.terminal(), "{}: {}", state.state, state.error);
+            assert!(
+                std::time::Instant::now() < until,
+                "update did not reach starting"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    fn test_exit(code: i32) {
+        assert_eq!(code, REPLACE_EXIT);
+    }
+
+    #[test]
+    fn activation_excludes_new_admission_while_existing_work_drains() {
+        let root = std::env::temp_dir().join(format!("cm-activation-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let lifecycle =
+            super::super::lifecycle::Lifecycle::open(root.join("idle.json"), false, true).unwrap();
+        let prior = lifecycle.admit().unwrap();
+        let observed = lifecycle.clone();
+        let updates = test_updates(
+            &root,
+            Some(lifecycle.clone()),
+            Box::new(move || observed.admitted() == 0),
+        );
+        let request = staged_request(&updates, &root, "activation");
+        updates.request(request, test_exit).unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if updates.update("activation").unwrap().state == "waiting_activation" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "activation never closed admission"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            lifecycle.admit().is_err(),
+            "a new root crossed the activation barrier"
+        );
+        assert_eq!(
+            lifecycle.admitted(),
+            1,
+            "the prior root's admission was lost"
+        );
+        assert!(
+            !updates.paths.update("pending.json").is_file(),
+            "activation began before prior admission ended"
+        );
+        drop(prior);
+        wait_starting(&updates, "activation");
+        updates.commit().unwrap();
+        assert!(lifecycle.admit().is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn completed_update_ids_survive_a_new_update_and_restart_and_reject_another_cohort() {
+        let root = std::env::temp_dir().join(format!("cm-update-history-{}", uuid::Uuid::new_v4()));
+        let updates = test_updates(&root, None, Box::new(|| true));
+        let first = staged_request(&updates, &root, "first");
+        updates.request(first.clone(), test_exit).unwrap();
+        wait_starting(&updates, "first");
+        updates.commit().unwrap();
+        let second = staged_request(&updates, &root, "second");
+        updates.request(second, test_exit).unwrap();
+        wait_starting(&updates, "second");
+        updates.commit().unwrap();
+        assert_eq!(updates.update("first").unwrap().state, "succeeded");
+        assert_eq!(
+            updates.request(first.clone(), test_exit).unwrap().state,
+            "succeeded"
+        );
+        let mut conflicting = first.clone();
+        conflicting.agent = "bundled".into();
+        assert_eq!(updates.request(conflicting, test_exit).unwrap_err().0, 409);
+        let reopened = Updates::open(
+            updates.paths.clone(),
+            updates.readiness.clone(),
+            Box::new(|| true),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.request(first, test_exit).unwrap().state,
+            "succeeded"
+        );
+        assert!(reopened.update("../status").is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interrupted_update_is_failed_without_replaying_preparation() {
+        let root =
+            std::env::temp_dir().join(format!("cm-interrupted-update-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::new(&root.join("engine"), &root);
+        let mut status = Status {
+            operation: "interrupted".into(),
+            ..Default::default()
+        };
+        status.enter("preparing");
+        save_status(&paths, &status).unwrap();
+        let updates = Updates::open(
+            paths,
+            Readiness::open(None, Some(vec![7; 32]), false).unwrap(),
+            Box::new(|| true),
+            None,
+        )
+        .unwrap();
+        let interrupted = updates.update("interrupted").unwrap();
+        assert_eq!(interrupted.state, "failed");
+        assert!(interrupted.error.starts_with("machine_restarted:"));
+        fs::remove_dir_all(root).unwrap();
     }
 }
