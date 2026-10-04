@@ -37,9 +37,9 @@ Remote CPU proof is green on the current integration cohort plus this change: fo
 progress tests, eight TLS/auth controls, clippy and binary build. Creator's real authored
 SDK/managed-executor/ordinary CLI burst passes in 8.95 s and preserves emitted denoise 30
 and decoding before/after its isolated controller restart. The compiled Rust source is
-f2636abf (integration91524d9 plus production52); the fixture manifest is792bf02, and the
-consumer source isdf82db87 (integration30d0e559 plus1027). RuntimeH370 SHA0d50f6b1 and
-TensorFSf089 were used with CUDA_VISIBLE_DEVICES empty; compute-apps stayed empty.
+f2636abf (integration 91524d9 plus production #52); the fixture manifest is 792bf02, and the
+consumer source is df82db87 (integration 30d0e559 plus #1027). Runtime H370 SHA 0d50f6b1 and
+TensorFS f089 were used with CUDA_VISIBLE_DEVICES empty; compute-apps stayed empty.
 
 A separate skipped-running follow-up remains: an observer that first sees queued and
 then receives a terminal page needs the actual durable running revision/time before
