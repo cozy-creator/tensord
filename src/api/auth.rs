@@ -2,6 +2,7 @@
 use super::pb::Claim;
 use ed25519_dalek::{Signature, VerifyingKey};
 use std::{
+    future::Future,
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
@@ -98,6 +99,115 @@ impl From<Vec<VerifyingKey>> for Keys {
     fn from(keys: Vec<VerifyingKey>) -> Self {
         Self::fixed(keys)
     }
+}
+
+/// Authority for one open transport. Its loss detaches only that transport; this type has
+/// no run-control operation. Claims have no token expiry; capabilities do.
+#[derive(Clone)]
+pub(crate) struct StreamAuthority {
+    keys: Keys,
+    actor: VerifiedActor,
+    expires: Option<i64>,
+}
+type AuthorizedEvents<T> =
+    std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<T, Status>> + Send + 'static>>;
+impl StreamAuthority {
+    pub(crate) fn new(keys: Keys, actor: VerifiedActor, expires: Option<i64>) -> Self {
+        Self {
+            keys,
+            actor,
+            expires,
+        }
+    }
+    pub(crate) fn check(&self) -> Result<(), Status> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        if self.expires.is_some_and(|expiry| now >= expiry) {
+            return Err(expired_capability());
+        }
+        if !self
+            .keys
+            .admitted()
+            .iter()
+            .any(|key| key.to_bytes() == self.actor.public_key)
+        {
+            return Err(Status::unauthenticated(
+                "the key that opened this stream no longer authorizes it",
+            ));
+        }
+        Ok(())
+    }
+    pub(crate) async fn ended(self) -> Status {
+        let expiry = async {
+            let Some(expires) = self.expires else {
+                return std::future::pending().await;
+            };
+            loop {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let remaining = Duration::from_secs(expires.max(0) as u64).saturating_sub(now);
+                if remaining.is_zero() {
+                    return;
+                }
+                tokio::time::sleep(remaining.min(Duration::from_secs(86_400))).await;
+            }
+        };
+        tokio::select! {
+            _ = self.keys.revoked(self.actor.public_key) => Status::unauthenticated("the key that opened this stream no longer authorizes it"),
+            _ = expiry => expired_capability(),
+        }
+    }
+    pub(crate) fn wrap<T: Send + 'static>(
+        &self,
+        stream: AuthorizedEvents<T>,
+    ) -> AuthorizedEvents<T> {
+        Box::pin(AuthorizedStream {
+            stream: Some(stream),
+            authority: self.clone(),
+            ended: Box::pin(self.clone().ended()),
+        })
+    }
+}
+struct AuthorizedStream<T> {
+    stream: Option<AuthorizedEvents<T>>,
+    authority: StreamAuthority,
+    ended: std::pin::Pin<Box<dyn std::future::Future<Output = Status> + Send>>,
+}
+impl<T: 'static> tokio_stream::Stream for AuthorizedStream<T> {
+    type Item = Result<T, Status>;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+        if self.stream.is_none() {
+            return Poll::Ready(None);
+        }
+        let refusal = match self.authority.check() {
+            Err(status) => Some(status),
+            Ok(()) => match self.ended.as_mut().poll(cx) {
+                Poll::Ready(status) => Some(status),
+                Poll::Pending => None,
+            },
+        };
+        if let Some(status) = refusal {
+            self.stream = None; // Release the observer and its files even under backpressure.
+            return Poll::Ready(Some(Err(status)));
+        }
+        self.stream.as_mut().unwrap().as_mut().poll_next(cx)
+    }
+}
+pub(crate) fn expired_capability() -> Status {
+    let mut status = Status::unauthenticated(
+        "capability_expired: the capability that opened this stream has expired",
+    );
+    status
+        .metadata_mut()
+        .insert("cozy-error-code", "capability_expired".parse().unwrap());
+    status
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -224,5 +334,47 @@ mod tests {
         claim.proof[0] ^= 1;
         assert!(auth.verify(Some(&claim)).is_err());
         assert!(auth.verify(None).is_err());
+    }
+
+    #[tokio::test]
+    async fn transport_authority_ends_quiet_and_buffered_streams_without_any_control() {
+        use tokio_stream::StreamExt;
+        let signer = SigningKey::from_bytes(&[83; 32]);
+        let keys = Keys::fixed(vec![signer.verifying_key()]);
+        let actor = VerifiedActor {
+            public_key: signer.verifying_key().to_bytes(),
+        };
+        let authority = StreamAuthority::new(keys.clone(), actor, None);
+        let mut stream = authority.wrap(Box::pin(tokio_stream::iter([Ok(1), Ok(2)])));
+        assert_eq!(stream.next().await.unwrap().unwrap(), 1);
+        keys.revoke();
+        assert_eq!(
+            stream.next().await.unwrap().unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
+        assert!(stream.next().await.is_none());
+        let keys = Keys::fixed(vec![signer.verifying_key()]);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let authority = StreamAuthority::new(keys, actor, Some(now + 1));
+        let mut stream = authority.wrap(Box::pin(
+            tokio_stream::pending::<Result<u8, tonic::Status>>(),
+        ));
+        let refusal = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            refusal
+                .metadata()
+                .get("cozy-error-code")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "capability_expired"
+        );
     }
 }
