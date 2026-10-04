@@ -174,12 +174,18 @@ impl Runs {
                 "the payload is a JSON object of the function's parameters",
             ));
         }
+        // Native GC exclusion covers validation -> durable roots -> journal acceptance.
+        // The machine custody gate also excludes TTL release of those same roots.
+        let custody = self.objects.guard();
+        let writer = self.objects.writer_guard()?;
+        let mut references = Vec::new();
         let unwritten = |input: &str| refused("input_unwritten", format!("input {input} was not written to this machine"));
         for input in &spec.inputs {
             let path = match self.objects.path(actor, &input.digest)? {
                 Some((path, length)) if length == input.length => path,
                 _ => return Err(unwritten(&input.input_id)),
             };
+            references.push(ObjectRef { sha256: input.digest.trim_start_matches("sha256:").into(), length: input.length });
             if input.media_type != crate::gpu_service::TREE_MEDIA {
                 continue;
             }
@@ -193,8 +199,25 @@ impl Runs {
                 if self.objects.path(actor, &format!("sha256:{sha}"))?.is_none_or(|(_, held)| held != length) {
                     return Err(unwritten(&format!("{}/{}", input.input_id, entry["path"].as_str().unwrap_or_default())));
                 }
+                references.push(ObjectRef { sha256: sha.into(), length });
             }
         }
+        if let Source::Local(digest) = &spec.source {
+            let (path, length) = self.objects.path(actor, digest)?.ok_or_else(|| unwritten("local package manifest"))?;
+            if length > 1 << 20 { return Err(refused("local_source_invalid", "a local package manifest is at most 1 MiB")); }
+            references.push(ObjectRef { sha256: digest.trim_start_matches("sha256:").into(), length });
+            let manifest: crate::local_source::Manifest = serde_json::from_slice(&std::fs::read(path)?)
+                .map_err(|e| refused("local_source_invalid", e.to_string()))?;
+            for member in manifest.source.iter().chain(&manifest.wheels).chain(&manifest.requirements) {
+                match self.objects.path(actor, &member.digest)? {
+                    Some((_, length)) if length == member.length => references.push(ObjectRef {
+                        sha256: member.digest.trim_start_matches("sha256:").into(), length,
+                    }),
+                    _ => return Err(unwritten(&member.name)),
+                }
+            }
+        }
+        self.objects.retain(&references)?;
         let package = match &spec.source {
             Source::Release { package, .. } => package.clone(),
             Source::Installation(alias) => alias.clone(),
@@ -215,11 +238,13 @@ impl Runs {
         let (record, new) = self
             .service
             .engine
-            .accept_run(actor, id, &spec.digest, draft)
+            .accept_run_objects(actor, id, &spec.digest, draft, &references)
             .map_err(|e| match e.kind() {
                 io::ErrorKind::AlreadyExists => refused("run_id_conflict", e.to_string()),
                 _ => Refused::from(e),
             })?;
+        drop(writer);
+        drop(custody);
         if new {
             let (this, actor, run) = (self.clone(), actor.to_string(), record.id.clone());
             std::thread::Builder::new()

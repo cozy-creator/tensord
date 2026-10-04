@@ -339,6 +339,11 @@ impl Service {
     /// Caches manage themselves (`reclaim`): TTL and storage pressure, never a purge verb.
     pub fn reclaim(&self) -> crate::reclaim::Swept {
         *self.swept.lock().unwrap() = std::time::Instant::now();
+        if let Some(jobs) = self.jobs() {
+            if let Err(error) = jobs.sweep_objects(crate::reclaim::TTL) {
+                eprintln!("reclaim object roots: {error}");
+            }
+        }
         let bound = self.engine.bound_generations().map(|mut bound| {
             if let Some(gpu) = self.gpu() {
                 bound.extend(gpu.config().packages.iter().map(|p| p.generation.clone()));

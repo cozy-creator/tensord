@@ -522,6 +522,13 @@ impl Jobs {
     }
 
     /// Scratch of runs that have ended (or are unknown); a paused run keeps its own.
+    pub fn sweep_objects(&self, ttl: std::time::Duration) -> io::Result<usize> {
+        match self.runs.upgrade() {
+            Some(runs) => runs.objects.sweep(ttl),
+            None => Ok(0),
+        }
+    }
+
     pub fn sweep_scratch(&self, engine: &Engine) -> usize {
         let Ok(entries) = fs::read_dir(self.root.join("scratch")) else {
             return 0;
@@ -775,7 +782,7 @@ impl Jobs {
                         };
                         let local = Path::new(row["local"].as_str().unwrap_or_default());
                         runs.objects
-                            .adopt(&parent.actor, local, &object)
+                            .adopt(&parent.actor, &parent.id, local, &object)
                             .map_err(|e| ("child_result_unavailable", e.to_string()))?;
                         received.insert(
                             digest.into(),
