@@ -244,7 +244,10 @@ fn parse_gpus(text: &str) -> io::Result<Vec<Gpu>> {
     Ok(rows)
 }
 
-/// The facts the Hub's readiness reader requires of a machine image, as measured here.
+/// The facts the Hub's readiness reader requires of a machine image, as measured here. Both
+/// listener facts are observed on `cozy.machine.v1`. `worker_protocol` still names
+/// `cozy.worker.v1`, which this listener also serves and which Hubs before tensorhub #951
+/// require; the commit that stops serving it states `cozy.machine.v1` here.
 pub struct Measured<'a> {
     pub boot_id: &'a str,
     pub worker_port: u16,

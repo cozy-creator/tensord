@@ -277,13 +277,8 @@ impl MeasuredIdentity {
 /// of this boot is kept as is; a measurement that contradicts it is reported, never signed.
 async fn prove_readiness(port: u16, readiness: Arc<Readiness>, id: MeasuredIdentity) {
     let listener_bound = crate::machine::probe::presents_leaf(port, &id.cert_der).await;
-    let foreign_credential_refused = crate::machine::probe::refuses_foreign_claim(
-        port,
-        &id.cert_pem,
-        &id.worker_id,
-        &id.boot_id,
-    )
-    .await;
+    let foreign_credential_refused =
+        crate::machine::probe::refuses_foreign_capability(port, &id.cert_pem, &id.worker_id).await;
     let gpus = match readiness.measures_gpus() {
         false => Ok(vec![]),
         true => tokio::task::spawn_blocking(receipt::gpus)
@@ -305,7 +300,7 @@ async fn prove_readiness(port: u16, readiness: Arc<Readiness>, id: MeasuredIdent
         )
     });
     match result {
-        Ok(true) => eprintln!("cozy-machine: readiness sealed (listener {listener_bound}, foreign Claim refused {foreign_credential_refused})"),
+        Ok(true) => eprintln!("cozy-machine: readiness sealed (listener {listener_bound}, foreign capability refused {foreign_credential_refused})"),
         Ok(false) => eprintln!("cozy-machine: this boot's retained readiness still holds"),
         Err(error) => eprintln!("cozy-machine: readiness not proved: {error}"),
     }

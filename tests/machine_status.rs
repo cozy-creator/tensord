@@ -140,7 +140,7 @@ async fn status_answers_identity_to_anyone_and_the_machine_to_its_owner() {
         .unwrap()
         .tls_config(
             ClientTlsConfig::new()
-                .ca_certificate(Certificate::from_pem(pem))
+                .ca_certificate(Certificate::from_pem(&pem))
                 .domain_name("cozy-worker"),
         )
         .unwrap()
@@ -149,6 +149,16 @@ async fn status_answers_identity_to_anyone_and_the_machine_to_its_owner() {
         .unwrap();
     let mut client = MachineClient::new(channel);
     let boot_id = std::fs::read_to_string(root.join("var/lib/cozy/machine/boot-id")).unwrap();
+
+    // The readiness proof's observation can fail: a key this machine admits is not refused.
+    let leaf = String::from_utf8(pem.clone()).unwrap();
+    for (key, refused) in [(OWNER, false), ([9; 32], true)] {
+        let key = SigningKey::from_bytes(&key);
+        assert_eq!(
+            cozy_machine::machine::probe::refuses_capability_of(port, &leaf, WORKER, &key).await,
+            refused
+        );
+    }
 
     // No cap (the Hub's readiness read) and a run-scope cap: one identity frame, then the end.
     for cap in [None, Some(cap("some-run"))] {
