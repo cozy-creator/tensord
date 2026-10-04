@@ -89,13 +89,42 @@ struct Received {
 }
 
 impl Jobs {
-    pub fn new(
+    /// The machine's CPU execution, configured on `service`: jobs and model-less calls in
+    /// deviceless executors, with the GPU executors' environment and identity when a GPU is
+    /// configured, else a minimal one. `runs` prepares a job's children (none: no children).
+    pub fn configure(
+        service: &Arc<Service>,
+        store: Arc<Store>,
+        runs: Option<&Arc<Runs>>,
+    ) -> io::Result<Arc<Self>> {
+        let root = service
+            .engine
+            .root
+            .parent()
+            .ok_or_else(|| io::Error::other("the engine has no machine root"))?
+            .join("cpu");
+        let (environment, identity) = match service.gpu() {
+            Some(gpu) => (gpu.config().environment.clone(), gpu.config().identity),
+            None => {
+                let home = root.join("home");
+                fs::create_dir_all(&home)?;
+                let home = home.to_string_lossy().into_owned();
+                let minimal = [("PATH", "/usr/local/bin:/usr/bin:/bin"), ("LANG", "C.UTF-8"), ("HOME", &home)];
+                (minimal.into_iter().map(|(k, v)| (k.into(), v.into())).collect(), None)
+            }
+        };
+        let jobs = Self::new(&root, store, environment, identity, service, runs)?;
+        service.configure_jobs(jobs.clone());
+        Ok(jobs)
+    }
+
+    fn new(
         root: &Path,
         store: Arc<Store>,
         environment: BTreeMap<String, String>,
         identity: Option<LaunchIdentity>,
         service: &Arc<Service>,
-        runs: &Arc<Runs>,
+        runs: Option<&Arc<Runs>>,
     ) -> io::Result<Arc<Self>> {
         fs::create_dir_all(root)?;
         let incarnation = uuid::Uuid::new_v4().simple().to_string();
@@ -108,7 +137,7 @@ impl Jobs {
             identity,
             store,
             service: Arc::downgrade(service),
-            runs: Arc::downgrade(runs),
+            runs: runs.map_or_else(Weak::new, Arc::downgrade),
             parents: Mutex::new(HashMap::new()),
         });
         // The startup sweep ran before jobs were configured: ended runs' scratch goes now.
@@ -120,13 +149,13 @@ impl Jobs {
         Ok(jobs)
     }
 
-    /// Whether this record runs here: a job, or a child that needs no GPU.
+    /// Whether this record runs here: a job, or a call that needs no GPU.
     pub fn takes(record: &Execution) -> bool {
-        let gpu = record
-            .submission
-            .as_ref()
-            .is_some_and(|s| !s.preparation_id.is_empty());
-        record.invocation.job || (!record.invocation.parent.is_empty() && !gpu)
+        record.invocation.job
+            || record
+                .submission
+                .as_ref()
+                .is_none_or(|s| s.preparation_id.is_empty())
     }
 
     pub fn dispatch(
@@ -139,7 +168,7 @@ impl Jobs {
         engine.dispatch_managed(&record.id, move |engine, id| {
             let result = match job {
                 true => jobs.job(&engine, &id, held),
-                false => jobs.child(&engine, &id, held),
+                false => jobs.call(&engine, &id, held),
             };
             let settled = match &result {
                 Err(error) => settle(&engine, &id, error),
@@ -301,7 +330,8 @@ impl Jobs {
         executor.shutdown()
     }
 
-    fn child(
+    /// A model-less call (a run's own, or a job's child) in a weightless construction.
+    fn call(
         self: &Arc<Self>,
         engine: &Arc<Engine>,
         id: &str,
@@ -319,7 +349,8 @@ impl Jobs {
             store: &self.store,
             spool: &spool,
             completed: 0,
-            publish: false,
+            // A child's products show nothing; its parent decides.
+            publish: record.invocation.parent.is_empty(),
             job: None,
             appended: HashMap::new(),
         };
@@ -546,7 +577,7 @@ impl Jobs {
     }
 
     /// `child_call`: the call's run, accepted once per index (its intent must not change).
-    fn call(&self, parent: &Parent, frame: &Frame) -> Result<Answer, (&'static str, String)> {
+    fn child_call(&self, parent: &Parent, frame: &Frame) -> Result<Answer, (&'static str, String)> {
         let service = self
             .service
             .upgrade()
@@ -752,7 +783,7 @@ impl Jobs {
 
     fn seam(&self, parent: &Parent, frame: &Frame) -> io::Result<(Answer, Option<File>)> {
         let answered = match frame.kind {
-            Kind::ChildCall => self.call(parent, frame),
+            Kind::ChildCall => self.child_call(parent, frame),
             Kind::ChildPoll => self.state(parent, frame),
             Kind::ChildCancel => {
                 let call = parent

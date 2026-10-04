@@ -433,7 +433,7 @@ impl Service {
                     let Some(jobs) = &jobs else {
                         self.engine.wait_for_environment(
                             &record.id,
-                            Some("jobs are not configured on this machine".into()),
+                            Some("CPU execution is not configured on this machine".into()),
                         )?;
                         continue;
                     };
@@ -468,8 +468,6 @@ impl Service {
                         })?;
                     gpu_active =
                         gpu.dispatch(&self.engine, &record, held, gpu.plan(&preparation)?)?;
-                } else if room > 0 && self.engine.dispatch(&record.id, held.runner())? {
-                    room -= 1;
                 }
                 if room == 0 && gpu_active && jobs.is_none() {
                     return Ok(());

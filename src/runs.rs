@@ -630,7 +630,7 @@ mod tests {
                 staging_root: root.join("staging"),
                 sdk: vec![],
             },
-            store,
+            store.clone(),
         );
         let runs = Arc::new(Runs {
             service: service.clone(),
@@ -640,6 +640,7 @@ mod tests {
             own_hub: None,
             jobs: Default::default(),
         });
+        crate::jobs::Jobs::configure(&service, store.clone(), Some(&runs)).unwrap();
         let mut archive = tar::Builder::new(Vec::new());
         let fixture = repo.join("tests/fixtures/cpu_lifecycle");
         for name in ["pyproject.toml", "package.toml", "cpu_lifecycle/__init__.py"] {

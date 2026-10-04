@@ -98,7 +98,7 @@ fn run() -> io::Result<()> {
                     sdk.python=package_python.clone();
                     start_api(&root,&generations,identity,std::net::TcpListener::bind(listen)?,&owner,&service,installer_python,client_wheel,package_python,sdk,None)?
                 }
-                (None,None)=>(),
+                (None,None)=>{ cozy_machine::jobs::Jobs::configure(&service,owner.lock().unwrap().store(),None)?; }
                 _=>return Err(io::Error::other("--machine-config and --listen are required together")),
             }
             serve(owner,service,listener)
@@ -362,36 +362,7 @@ fn start_api(
         own_hub: backend.own_hub.clone(),
         jobs: Default::default(),
     }));
-    // Jobs run where GPU executors run, with their environment; a machine without a GPU
-    // gives its deviceless executors a minimal one.
-    let cpu = root.join("cpu");
-    let (environment, launch_identity) = match service.gpu() {
-        Some(gpu) => (gpu.config().environment.clone(), gpu.config().identity),
-        None => {
-            let home = cpu.join("home");
-            std::fs::create_dir_all(&home)?;
-            let home = home.to_string_lossy().into_owned();
-            (
-                [
-                    ("PATH", "/usr/local/bin:/usr/bin:/bin"),
-                    ("LANG", "C.UTF-8"),
-                    ("HOME", &home),
-                ]
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-                None,
-            )
-        }
-    };
-    service.configure_jobs(cozy_machine::jobs::Jobs::new(
-        &cpu,
-        store.clone(),
-        environment,
-        launch_identity,
-        service,
-        backend.runs.as_ref().expect("runs are configured above"),
-    )?);
+    cozy_machine::jobs::Jobs::configure(service, store.clone(), backend.runs.as_ref())?;
     listener.set_nonblocking(true)?;
     #[derive(serde::Serialize)]
     struct Ready<'a> {
