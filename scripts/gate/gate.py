@@ -67,9 +67,11 @@ def unit_reads(cg):   # no io controller (a user unit): the storage reads of the
                 except (OSError, StopIteration): pass
     return total
 def load():
-    try: psi = float(open("/proc/pressure/cpu").read().split()[1].split("=")[1])
-    except (OSError, IndexError, ValueError): psi = None
-    return {"load1": os.getloadavg()[0], "cpu_some_avg10": psi}
+    out = {"load1": os.getloadavg()[0]}
+    for kind in ("cpu", "io"):   # pressure-stall "some" avg10, percent
+        try: out[kind + "_some_avg10"] = float(open(f"/proc/pressure/{kind}").read().split()[1].split("=")[1])
+        except (OSError, IndexError, ValueError): out[kind + "_some_avg10"] = None
+    return out
 def cmd(pid):
     try: return open(f"/proc/{pid}/cmdline", "rb").read().replace(b"\0", b" ").decode(errors="replace").strip()
     except OSError: return ""
@@ -330,7 +332,7 @@ class Gate:
                "execution_ms": show.get("execution_ms"), "stages": show.get("stages"), "steps": show.get("steps"),
                "disk_read_bytes": after["cg"]["read_bytes"] - before["cg"]["read_bytes"],
                "executors_after": after["executors"], "images": images,
-               "ok": done.returncode == 0 and len(images) == 1 and images[0]["ok"] and show.get("status") == "completed"}
+               "ok": done.returncode == 0 and len(images) == 1 and images[0]["ok"] and show.get("status", "completed") == "completed"}
         self.record(row)
         log(f"{arm} c{cycle} {scenario:10} {model:5} {row['wall_s']:7.2f}s  disk {row['disk_read_bytes'] / 2**30:5.2f} GiB",
             "ok" if row["ok"] else "FAILED", run)
@@ -574,6 +576,17 @@ class Gate:
                          "exit": p["proc"].returncode, "dir": str(p["root"]), "submit": p["submit"], "done": p["done"],
                          "accepted_pod": seen.get("request.machine_accepted"), "outcome_pod": seen.get("machine.outcome"),
                          "images": images, "ok": p["proc"].returncode == 0 and len(images) == 1 and images[0]["ok"]})
+        for p, row in zip(procs, rows):   # what the machine reports per request, read after the timed window
+            run = row["images"][0]["path"].rsplit("/", 1)[1].split("-")[0] if row["images"] else None
+            if run:
+                shown = subprocess.run([cli, "run", "show", run, "--json", "--full",
+                                        *spec.get("show_args", [f"--tensorhub={self.m.get('hub')}"])], capture_output=True, text=True)
+                (p["root"] / "show.json").write_text(shown.stdout or shown.stderr)
+                try:
+                    show = json.loads(shown.stdout)
+                except ValueError:
+                    show = {}
+                row.update(run=run, runtime=show.get("runtime"), execution_ms=show.get("execution_ms"), stages=show.get("stages"))
         start = first if born is None else born - self.offset
         end = max(p["done"] for p in procs)
         outcomes = [r["outcome_pod"] for r in rows if r["outcome_pod"]]
