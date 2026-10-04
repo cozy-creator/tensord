@@ -174,6 +174,7 @@ impl MachineIdentity {
             updates: None,
             media: None,
             store: None,
+            webrtc: None,
         })
     }
 }
@@ -209,6 +210,7 @@ impl MachineIdentity {
             updates: None,
             media: None,
             store: None,
+            webrtc: None,
         })
     }
 }

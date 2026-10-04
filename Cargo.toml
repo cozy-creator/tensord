@@ -5,6 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
+str0m = { version = "0.24", default-features = false, features = ["aws-lc-rs"] }
 tensorfs-core = { git = "https://github.com/cozy-creator/tensorfs.git", rev = "d1aad922c2586574754b6c5cea764859aa6f0246" }
 tensorfs-plane = { git = "https://github.com/cozy-creator/tensorfs.git", rev = "d1aad922c2586574754b6c5cea764859aa6f0246" }
 serde = { version = "1", features = ["derive"] }

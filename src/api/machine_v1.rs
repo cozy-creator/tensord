@@ -97,7 +97,7 @@ impl<B: MachineBackend> MachineV1<B> {
     }
 }
 
-fn query(
+pub(super) fn query(
     backend: &impl MachineBackend,
     actor: VerifiedActor,
     id: &str,
@@ -327,11 +327,17 @@ fn reason(body: &Value) -> v1::Reason {
     }
 }
 
+/// One revision's parts: (digest, length) each.
+type Parts = Vec<(Vec<u8>, u64)>;
+
 /// Translates the engine's event pages into the run's log, numbering each output's revisions.
 #[derive(Default)]
 struct Log {
     revisions: HashMap<(String, u32), u64>,
     products: Vec<v1::Product>,
+    /// Each item's latest revision as parts (digest, length): a revision whose parts extend
+    /// them appends.
+    parts: HashMap<(String, u32), Parts>,
 }
 impl Log {
     fn event(&mut self, event: pb::MachineExecutionEvent) -> Option<v1::RunEvent> {
@@ -371,6 +377,21 @@ impl Log {
                     .or_default();
                 *rev += 1;
                 let content = product.content.unwrap_or_default();
+                let parts: Parts = product
+                    .parts
+                    .iter()
+                    .filter_map(|p| p.content.as_ref().map(|c| (c.digest.clone(), c.length)))
+                    .collect();
+                let previous = self
+                    .parts
+                    .insert((product.output.clone(), index), parts.clone());
+                let appended_from = previous
+                    .filter(|before| {
+                        !before.is_empty()
+                            && before.len() <= parts.len()
+                            && parts.starts_with(before)
+                    })
+                    .map(|before| before.iter().map(|(_, length)| length).sum());
                 let converted = v1::Product {
                     output: product.output,
                     index,
@@ -380,6 +401,7 @@ impl Log {
                     media_type: product.media_type,
                     label: product.label,
                     duration_us: product.parts.iter().map(|p| p.duration_us).sum(),
+                    appended_from,
                 };
                 self.products.retain(|p| {
                     (p.output.as_str(), p.index) != (converted.output.as_str(), converted.index)
@@ -684,7 +706,7 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
 }
 
 /// Submit when asked, then follow the log until the outcome or the caller leaves.
-async fn stream_run<B: MachineBackend>(
+pub(super) async fn stream_run<B: MachineBackend>(
     backend: Arc<B>,
     actor: VerifiedActor,
     request: v1::RunRequest,

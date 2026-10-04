@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod backend;
 pub mod capability;
+mod cozy1;
 pub mod identity;
 pub mod install;
 mod machine_status;

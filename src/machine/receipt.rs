@@ -256,10 +256,12 @@ pub struct Measured<'a> {
     pub listener_bound: bool,
     pub foreign_credential_refused: bool,
     pub capabilities: &'a [&'a str],
+    /// The port `cozy/1` is served on; the Hub derives its pin from the leaf.
+    pub webrtc_port: Option<u16>,
 }
 impl Measured<'_> {
     pub fn payload(&self) -> Vec<u8> {
-        let value = serde_json::json!({
+        let mut value = serde_json::json!({
             "pod_boot_id": self.boot_id,
             "worker_internal_port": self.worker_port,
             "worker_protocol": "cozy.worker.v1",
@@ -270,6 +272,9 @@ impl Measured<'_> {
             "machine_version": env!("CARGO_PKG_VERSION"),
             "machine_capabilities": self.capabilities,
         });
+        if let Some(port) = self.webrtc_port {
+            value["webrtc"] = serde_json::json!({ "port": port });
+        }
         serde_json::to_vec(&value).expect("a JSON value serializes")
     }
 }
@@ -383,6 +388,7 @@ mod tests {
             listener_bound: true,
             foreign_credential_refused: true,
             capabilities: &[],
+            webrtc_port: None,
         }
         .payload()
     }

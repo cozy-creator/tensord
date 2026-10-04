@@ -232,6 +232,9 @@ fn run_machine(
     if let Some(port) = grant.media_port {
         identity.media = Some(std::net::TcpListener::bind((grant.listen_host, port))?);
     }
+    if let Some(port) = grant.webrtc_port {
+        identity.webrtc = Some(std::net::TcpListener::bind((grant.listen_host, port))?);
+    }
     // The client this binary embeds, and the installer helper over it (made once per client).
     let uv = cozy_machine::machine::client::uv(&layout.root);
     let wheel = cozy_machine::machine::client::wheel(&engine)?;

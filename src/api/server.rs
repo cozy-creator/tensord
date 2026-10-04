@@ -36,6 +36,8 @@ pub struct MachineIdentity {
     pub updates: Option<Arc<crate::machine::update::Updates>>,
     /// A granted media port: the CLI's machine launcher reads the receipt there.
     pub media: Option<std::net::TcpListener>,
+    /// A granted WebRTC port: `cozy/1` for browsers (ICE-TCP).
+    pub webrtc: Option<std::net::TcpListener>,
     /// The store's directory; Status reports its filesystem. None on development front doors.
     pub store: Option<std::path::PathBuf>,
 }
@@ -74,6 +76,7 @@ impl MachineIdentity {
             updates: None,
             media: None,
             store: None,
+            webrtc: None,
         })
     }
 }
@@ -115,11 +118,19 @@ pub async fn serve<B: MachineBackend>(
             }
         });
     }
-    tokio::spawn(prove_readiness(
-        port,
-        readiness.clone(),
-        MeasuredIdentity::of(&identity),
-    ));
+    let webrtc = match identity.webrtc.take() {
+        Some(listener) => {
+            listener.set_nonblocking(true)?;
+            Some(tokio::net::TcpListener::from_std(listener)?)
+        }
+        None => None,
+    };
+    let mut measured = MeasuredIdentity::of(&identity);
+    measured.webrtc_port = match &webrtc {
+        Some(listener) => Some(listener.local_addr()?.port()),
+        None => None,
+    };
+    tokio::spawn(prove_readiness(port, readiness.clone(), measured));
     let tls =
         ServerTlsConfig::new().identity(Identity::from_pem(&identity.cert_pem, &identity.key_pem));
     let service = Api {
@@ -127,6 +138,10 @@ pub async fn serve<B: MachineBackend>(
         backend,
         control_epoch: Arc::new(AtomicU64::new(0)),
     };
+    if let Some(listener) = webrtc {
+        let media = super::cozy1::Media::new(service.identity.clone(), service.backend.clone())?;
+        tokio::spawn(super::cozy1::serve(media, listener));
+    }
     let (post_access, delete_access) = (service.clone(), service.clone());
     let (output, listed) = (service.clone(), service.clone());
     let (state_api, stage_api, update_api) = (service.clone(), service.clone(), service.clone());
@@ -261,6 +276,7 @@ struct MeasuredIdentity {
     boot_id: String,
     cert_pem: String,
     cert_der: Vec<u8>,
+    webrtc_port: Option<u16>,
 }
 impl MeasuredIdentity {
     fn of(identity: &MachineIdentity) -> Self {
@@ -269,6 +285,7 @@ impl MeasuredIdentity {
             boot_id: identity.authority.boot_id.clone(),
             cert_pem: identity.cert_pem.clone(),
             cert_der: identity.cert_der.clone(),
+            webrtc_port: None,
         }
     }
 }
@@ -295,6 +312,7 @@ async fn prove_readiness(port: u16, readiness: Arc<Readiness>, id: MeasuredIdent
                 listener_bound,
                 foreign_credential_refused,
                 capabilities: crate::machine::CAPABILITIES,
+                webrtc_port: id.webrtc_port,
             }
             .payload(),
         )
