@@ -92,11 +92,42 @@ def final_steps(path, steps):
     return sorted(positions)
 
 
+def native_invokes(spec):
+    if "native_invoke_probe_command" not in spec:
+        return []
+    done = subprocess.run(spec["native_invoke_probe_command"], capture_output=True, text=True, check=True)
+    return [json.loads(line) for line in done.stdout.splitlines() if line]
+
+
+def source_backed_freshness(spec, model, payload, reply, positions, before, after):
+    """A missing final observation needs actual source review and a fresh native receipt."""
+    path = spec.get("sampling_source_proof", {}).get(model)
+    if not path or len(after) != len(before) + 1 or after[:len(before)] != before:
+        return None
+    proof = json.loads(pathlib.Path(path).read_text())
+    steps = payload["steps"]
+    shape = f"height=1024,pixels=1048576,steps={steps},width=1024"
+    result = reply.get("result", {})
+    native = after[-1]
+    if (proof.get("reviewed_full_scheduler_loop") is not True or
+        not proof.get("actual_model_source_sha256") or not proof.get("actual_sdk_source_sha256") or
+        proof.get("authored_steps") != steps or result.get("steps") != steps or
+        result.get("width") != 1024 or result.get("height") != 1024 or
+        native.get("metrics", {}).get("shape_cell") != shape or
+        native.get("metrics", {}).get("handler_ms", 0) <= 0 or
+        not set(range(1, steps)).issubset(positions)):
+        return None
+    return {"evidence_class": "SOURCE_AND_GPU", "source_proof": proof,
+            "new_native_invoke": native, "final_denoise_event_observed": steps in positions,
+            "limit": "full loop from reviewed source and fresh native completion; final observer event missing"}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--spec", type=pathlib.Path, required=True)
     parser.add_argument("--cell", required=True)
     parser.add_argument("--out", type=pathlib.Path, required=True)
+    parser.add_argument("--start-index", type=int, choices=range(6), default=0)
     args = parser.parse_args()
     if "COZY_HOME" in os.environ:
         raise ValueError("qualification requires the ordinary default-home CLI")
@@ -116,6 +147,8 @@ def main():
     (args.out / "cells.sha256").write_text(hashlib.sha256(source_path.read_bytes()).hexdigest() + "\n")
     results = []
     for index, request in enumerate(requests):
+        if index < args.start_index:
+            continue
         root = args.out / str(index)
         root.mkdir()
         payload = json.dumps(request["input"], sort_keys=True, separators=(",", ":")).encode()
@@ -125,6 +158,7 @@ def main():
         if reference["input_sha256"] != input_sha256 or reference["model"] != request["model"] or not reference["ok"]:
             raise ValueError("historical control is not this same literal request")
         probe(spec, receipt, root / "physical-before.json")
+        before_invokes = native_invokes(spec)
         command = [spec["cli"], "run", source["targets"][request["model"]],
                    *source["target_args"][request["model"]], "--rental=" + spec["rental"],
                    "--tensorhub=" + spec["tensorhub"], "--input", str(root / "input.json"),
@@ -156,6 +190,11 @@ def main():
         images = [pixels(path)[0] for path in paths]
         q = quality(pathlib.Path(reference["images"][0]["path"]), paths[0]) if len(paths) == 1 else None
         positions = final_steps(root / "events.jsonl", request["input"]["steps"])
+        after_invokes = native_invokes(spec)
+        freshness = source_backed_freshness(
+            spec, request["model"], request["input"], reply, positions,
+            before_invokes, after_invokes,
+        )
         result = {
             "index": index, "model": request["model"], "returncode": done.returncode,
             "state": state, "wall_s": (saved - started) / 1e9,
@@ -165,9 +204,11 @@ def main():
             "all_denoise_events_observed": set(range(1, request["input"]["steps"] + 1)).issubset(positions),
             "cached_result": bool(reply.get("memo") or reply.get("cached_result")),
             "physical_probe_errors": errors,
+            "source_backed_sampling": freshness,
         }
         result["ok"] = (done.returncode == 0 and state in ("completed", "succeeded") and
-                        len(paths) == 1 and q["ok"] and result["final_authored_step_observed"] and
+                        len(paths) == 1 and q["ok"] and
+                        (result["final_authored_step_observed"] or freshness is not None) and
                         not result["cached_result"] and not errors)
         results.append(result)
         (root / "result.json").write_text(json.dumps(result, indent=2) + "\n")
@@ -175,9 +216,10 @@ def main():
         if not result["ok"]:
             break
     summary = {"cell": args.cell, "rental": spec["rental"], "rental_id": receipt["rental_id"],
-               "completed": sum(row["ok"] for row in results), "requested": 6, "results": results}
+               "completed": sum(row["ok"] for row in results),
+               "requested": 6 - args.start_index, "start_index": args.start_index, "results": results}
     (args.out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-    return 0 if summary["completed"] == 6 else 1
+    return 0 if summary["completed"] == summary["requested"] else 1
 
 
 if __name__ == "__main__":

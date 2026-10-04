@@ -85,6 +85,24 @@ class SamplingEvidence(unittest.TestCase):
             self.assertEqual(run.final_steps(events, 20), [20])
             self.assertEqual(run.final_steps(events, 30), [])
 
+    def test_missing_final_event_needs_reviewed_source_and_one_new_native_invoke(self):
+        with tempfile.TemporaryDirectory() as directory:
+            proof = pathlib.Path(directory) / "proof.json"
+            proof.write_text(json.dumps({"reviewed_full_scheduler_loop": True,
+                "actual_model_source_sha256": "owned-model-source",
+                "actual_sdk_source_sha256": "owned-sdk-source", "authored_steps": 30}))
+            spec = {"sampling_source_proof": {"anima": str(proof)}}
+            reply = {"result": {"steps": 30, "width": 1024, "height": 1024}}
+            native = {"metrics": {"shape_cell": "height=1024,pixels=1048576,steps=30,width=1024",
+                                  "handler_ms": 43000}}
+            positions = list(range(1, 30))
+            self.assertIsNotNone(run.source_backed_freshness(spec, "anima", {"steps": 30},
+                reply, positions, [], [native]))
+            self.assertIsNone(run.source_backed_freshness(spec, "anima", {"steps": 30},
+                reply, positions, [native], [native]))
+            self.assertIsNone(run.source_backed_freshness(spec, "anima", {"steps": 30},
+                reply, positions[:-1], [], [native]))
+
 
 if __name__ == "__main__":
     unittest.main()
