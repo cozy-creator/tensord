@@ -1191,9 +1191,43 @@ fn a_newer_or_damaged_row_never_hides_the_rest_of_the_journal() {
     assert_eq!(format, journal::JOURNAL_FORMAT.to_string());
 }
 
+/// Unused for `days`: every write and read time in the tree.
 fn age(path: &std::path::Path, days: u64) {
     let when = std::time::SystemTime::now() - Duration::from_secs(days * 24 * 60 * 60);
-    fs::File::open(path).unwrap().set_modified(when).unwrap();
+    if path.is_dir() {
+        for entry in fs::read_dir(path).unwrap().flatten() {
+            age(&entry.path(), days);
+        }
+    }
+    let times = fs::FileTimes::new().set_accessed(when).set_modified(when);
+    fs::File::open(path).unwrap().set_times(times).unwrap();
+}
+
+/// Bytes on disk under `path`.
+fn du(path: &std::path::Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    let own = fs::symlink_metadata(path).map_or(0, |m| m.blocks() * 512);
+    match fs::read_dir(path) {
+        Ok(entries) => own + entries.flatten().map(|e| du(&e.path())).sum::<u64>(),
+        Err(_) => own,
+    }
+}
+
+/// A filesystem of `capacity` bytes holding `foreign` bytes of other data and everything
+/// under `root`, which a sweep's deletions really shrink.
+fn filesystem<'a>(
+    root: &'a std::path::Path,
+    capacity: u64,
+    foreign: &'a AtomicU64,
+) -> impl Fn() -> std::io::Result<cozy_machine::reclaim::Disk> + 'a {
+    move || {
+        Ok(cozy_machine::reclaim::Disk {
+            capacity,
+            available: capacity.saturating_sub(foreign.load(Ordering::Relaxed) + du(root)),
+            inodes: 0,
+            available_inodes: 0,
+        })
+    }
 }
 
 #[test]
@@ -1264,18 +1298,25 @@ fn caches_expire_but_held_named_and_uncollected_work_stays() {
         root: kernels.clone(),
         busy: std::collections::HashSet::from(["u2".to_string()]),
     };
-    let swept = reclaim::sweep(&fixture.engine, &catalog, &bound, Some(&caches)).unwrap();
-    assert_eq!((swept.staging, swept.results, swept.generations), (1, 1, 1), "{swept:?}");
-    // Kernels go only under storage pressure, least recently used first, never a live
-    // executor's namespace.
-    let pressure = reclaim::Disk::measure(&fixture.root).unwrap().pressure();
-    assert!(kernels.join("u2/triton/busy").exists());
-    if pressure {
-        assert!(!kernels.join("u1/triton/old").exists(), "{swept:?}");
-    } else {
-        assert_eq!(swept.kernels, 0);
-        assert!(kernels.join("u1/triton/old").exists());
-    }
+    let roomy = AtomicU64::new(0);
+    let swept = reclaim::sweep(&reclaim::Caches {
+        engine: &fixture.engine,
+        catalog: &catalog,
+        bound: &bound,
+        kernels: Some(&caches),
+        memo: None,
+        store: None,
+        disk: &filesystem(&fixture.root, 1 << 40, &roomy),
+    })
+    .unwrap();
+    assert_eq!(
+        (swept.staging, swept.results, swept.generations, swept.kernels),
+        (1, 1, 1, 1),
+        "{swept:?}"
+    );
+    // A kernel unused for the TTL goes; never a live executor's namespace.
+    assert!(!kernels.join("u1/triton/old").exists());
+    assert!(kernels.join("u1/triton/new").exists() && kernels.join("u2/triton/busy").exists());
     assert!(!state.join("staging").join(&collected).exists());
     assert!(state.join("staging").join(&queued).exists());
     assert!(!state.join("results").join(&collected).exists());
@@ -1285,4 +1326,125 @@ fn caches_expire_but_held_named_and_uncollected_work_stays() {
     drop(lease);
     // The journal keeps every row.
     assert_eq!(fixture.engine.list().unwrap().len(), 3);
+}
+
+/// CUTOVER item 20: a disk low only at its reserve; a covering plan or nothing; TTLs.
+#[test]
+fn a_low_disk_drops_a_covering_lru_plan_or_nothing_and_caches_expire_by_ttl() {
+    use cozy_machine::{catalog::Catalog, reclaim};
+    use tensorfs_core::{
+        manifest::{Draft, Entry},
+        repository::{Mutation, RepositoryName},
+        store::{Fault, Store},
+    };
+    const MIB: u64 = 1 << 20;
+    let fixture = Fixture::new();
+    let store = Store::ensure(&fixture.root.join("state/tensorfs")).unwrap();
+    // Three cached models of 6 MiB: one a live executor serves, two idle.
+    let model = |name: &str, days: u64| {
+        let bytes: Vec<u8> = (0..6 * MIB).map(|i| (i % 251) as u8 ^ name.as_bytes()[0]).collect();
+        let blob = store.put_stream(&mut &bytes[..], None, &Fault::default()).unwrap().obj;
+        let draft = Draft {
+            entries: vec![("weights".into(), Entry::File(blob))],
+        };
+        let manifest = store.put_manifest(&draft.seal().unwrap()).unwrap().obj;
+        let repo = RepositoryName::new("fidika", name).unwrap();
+        let put = Mutation::PutCheckpoint {
+            repo: repo.clone(),
+            manifest: manifest.clone(),
+        };
+        store.apply_cached_repository(None, &[put], &Fault::default()).unwrap();
+        age(&store.repository_path(&repo), days);
+        age(&store.root().join("tmp/cache-roots/fidika").join(name), days);
+        (repo, format!("sha256:{}", manifest.sha256))
+    };
+    let (served, serving) = model("served", 5);
+    let (cold, _) = model("cold", 3);
+    let (warm, _) = model("warm", 1);
+    let garbage = store
+        .put_stream(&mut &vec![9u8; MIB as usize][..], None, &Fault::default())
+        .unwrap()
+        .obj;
+    // Compiled kernels: three days unused, and fresh.
+    let kernels = fixture.root.join("kernels");
+    for (entry, days) in [("old", 3), ("new", 0)] {
+        let directory = kernels.join("u1/triton").join(entry);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("kernel.cubin"), vec![1u8; 64 << 10]).unwrap();
+        age(&directory, days);
+    }
+    // A result copy its client collected.
+    let run = fixture.submit("infer");
+    fixture.wait(&run, |record| record.state.terminal());
+    fixture.engine.acknowledge_collection(&run).unwrap();
+    let result = fixture.root.join("state/results").join(&run);
+    assert!(result.exists());
+
+    let generations = fixture.root.join("generations");
+    let catalog = Catalog::new(&generations).unwrap();
+    let bound = std::collections::HashSet::new();
+    let busy = std::collections::HashSet::new();
+    let kernel_caches = reclaim::KernelCaches {
+        root: kernels.clone(),
+        busy,
+    };
+    // 100 GiB, its reserve 2 GiB, the rest foreign data.
+    let capacity = 100 << 30;
+    let foreign = AtomicU64::new(0);
+    let disk = filesystem(&fixture.root, capacity, &foreign);
+    let free_at = |free: u64| foreign.store(capacity - du(&fixture.root) - free, Ordering::Relaxed);
+    let sweep = || {
+        reclaim::sweep(&reclaim::Caches {
+            engine: &fixture.engine,
+            catalog: &catalog,
+            bound: &bound,
+            kernels: Some(&kernel_caches),
+            memo: None,
+            store: Some(reclaim::StoreCaches {
+                store: &store,
+                keep: vec![serving.clone()],
+            }),
+            disk: &disk,
+        })
+        .unwrap()
+    };
+    let held = |repo: &RepositoryName| store.repository_path(repo).exists();
+    let entry = |name: &str| kernels.join("u1/triton").join(name).exists();
+
+    // Not low at a tenth free, nor at a fortieth: nothing goes.
+    free_at(capacity / 40);
+    assert_eq!(sweep(), reclaim::Swept::default());
+    assert!(store.object_path(&garbage.sha256).exists());
+
+    // 1 GiB short of the reserve: nothing droppable covers that, so only garbage goes.
+    free_at(1 << 30);
+    let swept = sweep();
+    assert!(swept.store_bytes >= MIB && !store.object_path(&garbage.sha256).exists());
+    assert_eq!((swept.results, swept.kernels), (0, 0), "{swept:?}");
+    assert!(held(&served) && held(&cold) && held(&warm));
+    assert!(entry("old") && entry("new") && result.exists());
+
+    // 3 MiB short: the result copy goes first, then the least recently used model that is
+    // not served covers the rest; kernels and the other models stay.
+    free_at((2 << 30) - 3 * MIB);
+    let swept = sweep();
+    assert_eq!((swept.results, swept.kernels), (1, 0), "{swept:?}");
+    assert!(swept.store_bytes >= 6 * MIB, "{swept:?}");
+    assert!(!result.exists() && !held(&cold));
+    assert!(held(&served) && held(&warm) && entry("old") && entry("new"));
+    assert!(disk().unwrap().short().is_none());
+
+    // Plenty free: what went unused for the TTL goes, low disk or not; served stays.
+    free_at(capacity / 2);
+    age(&store.root().join("tmp/cache-roots.since"), 9);
+    for name in ["served", "warm"] {
+        age(&store.root().join("tmp/cache-roots/fidika").join(name), 8);
+    }
+    age(&store.repository_path(&warm), 8);
+    age(&kernels.join("u1/triton/old"), 8);
+    let swept = sweep();
+    assert_eq!(swept.kernels, 1, "{swept:?}");
+    assert!(swept.store_bytes >= 6 * MIB, "{swept:?}");
+    assert!(!held(&warm) && !entry("old"));
+    assert!(held(&served) && entry("new"));
 }

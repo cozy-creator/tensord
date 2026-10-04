@@ -638,10 +638,10 @@ fn derive(
 }
 
 /// Adapter views manage themselves like the machine's other caches (`reclaim`): a view
-/// unused for the TTL, or idle under storage pressure, loses its repository, and GC then
-/// takes its header and manifest. A view a live executor, an unfinished run or a
-/// preparation names (`keep`) is never touched. Returns the views removed.
-pub fn evict(store: &Store, keep: &[String], pressure: bool) -> io::Result<usize> {
+/// unused for the TTL loses its repository, and GC then takes its header and manifest. A
+/// view a live executor, an unfinished run or a preparation names (`keep`) is never
+/// touched. Returns the views removed.
+pub fn evict(store: &Store, keep: &[String]) -> io::Result<usize> {
     let mut removed = 0;
     let directory = store.root().join("repos").join("local");
     let entries = match std::fs::read_dir(&directory) {
@@ -663,7 +663,7 @@ pub fn evict(store: &Store, keep: &[String], pressure: bool) -> io::Result<usize
             .ok()
             .and_then(|modified| SystemTime::now().duration_since(modified).ok())
             .unwrap_or_default();
-        if age <= crate::reclaim::TTL && !(pressure && age > crate::reclaim::IDLE) {
+        if age <= crate::reclaim::TTL {
             continue;
         }
         let Ok(body) = std::fs::read(entry.path()) else {
@@ -842,16 +842,13 @@ mod tests {
         let view = compose(&store, &base, &selection).unwrap();
         let hour = std::time::Duration::from_secs(3600);
 
-        // In use, or young without pressure: kept.
+        // Young, or in use: kept.
         unused_for(&store, &view.repository, hour);
-        assert_eq!(evict(&store, &[id(&view.manifest)], true).unwrap(), 0);
-        assert_eq!(evict(&store, &[], false).unwrap(), 0);
+        assert_eq!(evict(&store, &[]).unwrap(), 0);
         unused_for(&store, &view.repository, crate::reclaim::TTL + hour);
-        assert_eq!(evict(&store, &[id(&view.manifest)], false).unwrap(), 0);
-        // Past the TTL (or idle under pressure) and unused: its repository goes, then GC
-        // takes the view and nothing else.
-        unused_for(&store, &view.repository, hour);
-        assert_eq!(evict(&store, &[], true).unwrap(), 1);
+        assert_eq!(evict(&store, &[id(&view.manifest)]).unwrap(), 0);
+        // Unused past the TTL: its repository goes, then GC takes the view and nothing else.
+        assert_eq!(evict(&store, &[]).unwrap(), 1);
         collect();
         assert!(!held(&view.manifest), "the view outlived its repository");
         assert!(held(&base) && held(&lora));
@@ -896,10 +893,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// The machine's periodic sweep reaches the store: an unused view goes, and under
-    /// storage pressure TensorFS's GC collects what nothing references.
+    /// The machine's periodic sweep reaches the store: a view unused for the TTL goes, and
+    /// TensorFS's GC takes it and what nothing references.
     #[test]
-    fn the_machine_sweep_evicts_views_and_relieves_the_store() {
+    fn the_machine_sweep_evicts_views_and_collects_them() {
         let root = std::env::temp_dir().join(format!("adapter-sweep-{}", uuid::Uuid::new_v4()));
         let state = root.join("state");
         let service = crate::service::Service::open(&state, &root.join("generations"), 1).unwrap();
@@ -963,17 +960,9 @@ mod tests {
             .obj;
         let swept = service.reclaim();
         assert_eq!(swept.adapter_views, 1, "{swept:?}");
-        if crate::reclaim::Disk::measure(store.root())
-            .unwrap()
-            .pressure()
-        {
-            assert!(swept.store_bytes >= garbage.length, "{swept:?}");
-            assert!(!store.object_path(&garbage.sha256).exists());
-            assert!(!store.manifest_path(&view.manifest.sha256).exists());
-        } else {
-            assert_eq!(swept.store_bytes, 0, "{swept:?}");
-            assert!(store.object_path(&garbage.sha256).exists());
-        }
+        assert!(swept.store_bytes >= garbage.length, "{swept:?}");
+        assert!(!store.object_path(&garbage.sha256).exists());
+        assert!(!store.manifest_path(&view.manifest.sha256).exists());
         let _ = std::fs::remove_dir_all(root);
     }
 

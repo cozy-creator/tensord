@@ -251,9 +251,9 @@ impl Seal {
         }
         boundary_directory(&root.join("jit").join(incarnation))?;
         let jit = owned(root.join("jit").join(incarnation).join(generation))?;
-        // Below the disk reserve the persistent kernel store is an optional write: compiled
-        // kernels then live in this run's JIT scope, removed with it.
-        let kernels = if crate::reclaim::Disk::measure(root)?.below_reserve() {
+        // On a low disk the persistent kernel store is an optional write: compiled kernels
+        // then live in this run's JIT scope, removed with it.
+        let kernels = if crate::reclaim::measure(root)?.short().is_some() {
             owned(jit.join("kernels"))?
         } else {
             owned(root.join("kernels").join(&namespace))?
