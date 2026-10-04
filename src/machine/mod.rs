@@ -5,6 +5,7 @@ pub mod grant;
 pub mod hub;
 pub mod identity;
 pub mod lifecycle;
+pub mod player;
 pub mod probe;
 pub mod pypi;
 pub mod receipt;

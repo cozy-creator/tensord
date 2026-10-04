@@ -175,6 +175,8 @@ impl MachineIdentity {
             media: None,
             store: None,
             webrtc: None,
+            player: Default::default(),
+            webrtc_port: None,
         })
     }
 }
@@ -211,6 +213,8 @@ impl MachineIdentity {
             media: None,
             store: None,
             webrtc: None,
+            player: Default::default(),
+            webrtc_port: None,
         })
     }
 }

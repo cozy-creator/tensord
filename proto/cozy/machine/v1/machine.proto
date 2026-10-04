@@ -253,6 +253,13 @@ message StatusFrame {
   Disk disk = 16;                   // the filesystem holding the machine's store
   repeated Model models = 17;       // the models the machine's store holds
   uint64 models_bytes = 18;         // their bytes together, shared content counted once
+  WebRTC webrtc = 19;               // the direct player endpoint, when the machine listens
+}
+message WebRTC {
+  uint32 port = 1;                  // the listener; a persistent machine keeps it across restarts
+  repeated string addresses = 2;    // host:port to dial: own interfaces, or the provider's mapping
+  string fingerprint = 3;           // SHA-256 hex of the certificate its DTLS presents
+  string unavailable_reason = 4;    // why no address is reported (a malformed mapping)
 }
 message Model {
   string repository = 1;            // org/name; org "local" is a local alias

@@ -179,6 +179,9 @@ async fn frame<B: MachineBackend>(
         disk: identity.store.as_deref().and_then(disk),
         models: models.models,
         models_bytes: models.bytes,
+        webrtc: identity.webrtc_port.map(|port| {
+            crate::machine::player::endpoint(port, &identity.player, &identity.cert_der)
+        }),
         ..identity_frame(identity)
     })
 }

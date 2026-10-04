@@ -36,8 +36,11 @@ pub struct MachineIdentity {
     pub updates: Option<Arc<crate::machine::update::Updates>>,
     /// A granted media port: the CLI's machine launcher reads the receipt there.
     pub media: Option<std::net::TcpListener>,
-    /// A granted WebRTC port: `cozy/1` for browsers (ICE-TCP).
+    /// The WebRTC listener: `cozy/1` for browsers (ICE-TCP).
     pub webrtc: Option<std::net::TcpListener>,
+    /// Where browsers reach it; Status reports it with the port `serve` bound.
+    pub player: crate::machine::player::Reach,
+    pub(crate) webrtc_port: Option<u16>,
     /// The store's directory; Status reports its filesystem. None on development front doors.
     pub store: Option<std::path::PathBuf>,
 }
@@ -77,6 +80,8 @@ impl MachineIdentity {
             media: None,
             store: None,
             webrtc: None,
+            player: Default::default(),
+            webrtc_port: None,
         })
     }
 }
@@ -125,11 +130,12 @@ pub async fn serve<B: MachineBackend>(
         }
         None => None,
     };
-    let mut measured = MeasuredIdentity::of(&identity);
-    measured.webrtc_port = match &webrtc {
+    identity.webrtc_port = match &webrtc {
         Some(listener) => Some(listener.local_addr()?.port()),
         None => None,
     };
+    let mut measured = MeasuredIdentity::of(&identity);
+    measured.webrtc_port = identity.webrtc_port;
     tokio::spawn(prove_readiness(port, readiness.clone(), measured));
     let tls =
         ServerTlsConfig::new().identity(Identity::from_pem(&identity.cert_pem, &identity.key_pem));

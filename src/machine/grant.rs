@@ -22,6 +22,7 @@ const NAMES: &[&str] = &[
     "COZY_WORKER_INTERNAL_PORT",
     "COZY_MEDIA_INTERNAL_PORT",
     "COZY_WEBRTC_INTERNAL_PORT",
+    "COZY_WEBRTC_PUBLIC_ADDRESS",
     "COZY_RECORD_OWNER_AUTH_JSON",
     "COZY_AUTHORIZED_KEYS",
     "COZY_REPO_CACHE_ROOT",
@@ -64,6 +65,8 @@ pub struct Grant {
     /// A launcher that still grants a media port reads the receipt there.
     pub media_port: Option<u16>,
     pub webrtc_port: Option<u16>,
+    /// Where browsers reach the WebRTC listener ([`super::player::reach`]).
+    pub webrtc_reach: super::player::Reach,
     pub hub: Option<HubGrant>,
     pub repo_cache_root: Option<PathBuf>,
     pub authorized: Vec<VerifyingKey>,
@@ -246,6 +249,7 @@ impl Grant {
             worker_port,
             media_port,
             webrtc_port,
+            webrtc_reach: super::player::reach(webrtc_port, env),
             hub,
             repo_cache_root: get("COZY_REPO_CACHE_ROOT").map(PathBuf::from),
             authorized,

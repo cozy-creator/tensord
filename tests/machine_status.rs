@@ -51,11 +51,24 @@ fn boot(root: &Path, port: u16, lifetime: &str) -> Machine {
             .env("TENSORHUB_ORIGIN", "https://hub.invalid")
             .env("CUDA_VISIBLE_DEVICES", "")
             .env("COZY_MACHINE_LIFETIME", lifetime)
+            .envs(webrtc(lifetime))
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
             .unwrap(),
     )
+}
+
+/// A rental is granted a WebRTC port and its provider's mapping of it; this computer's
+/// machine takes its own port.
+fn webrtc(lifetime: &str) -> Vec<(String, String)> {
+    if lifetime != "rental" {
+        return vec![];
+    }
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    [("COZY_WEBRTC_INTERNAL_PORT", port.to_string()), ("RUNPOD_PUBLIC_IP", "203.0.113.7".into()), (&format!("RUNPOD_TCP_PORT_{port}"), "30001".into())]
+        .map(|(name, value)| (name.to_string(), value))
+        .to_vec()
 }
 
 /// The HTTPS receipt route the Go-era Hub reads, until it answers.
@@ -219,6 +232,10 @@ async fn status_answers_identity_to_anyone_and_the_machine_to_its_owner() {
     assert_eq!(models, [("acme/base", 1300, 300), ("local/mine", 1050, 50)]);
     assert_eq!(first.models_bytes, 1350);
     assert_eq!(first.models[0].checkpoints[0].lane, "fp8");
+    // Its player endpoint is the provider's mapping of the granted port.
+    let webrtc = first.webrtc.clone().expect("a rental with a WebRTC port plays");
+    assert_eq!(webrtc.addresses, ["203.0.113.7:30001"]);
+    std::net::TcpStream::connect(("127.0.0.1", webrtc.port as u16)).unwrap();
 
     // Holding the stream is not activity: no frame, and the ledger's deadline does not move.
     let before = deadline_on_disk(&root);
@@ -313,6 +330,26 @@ async fn a_persistent_machine_reports_no_idle_deadline() {
             ("ready", 0)
         );
     }
+    // It plays to browsers directly: Status names its WebRTC listener, an address of it that
+    // accepts connections, and the certificate its DTLS presents.
+    let player = |frame: v1::StatusFrame| frame.webrtc.expect("a persistent machine listens for players");
+    let first = client.status(status(false, Some(&owner))).await.unwrap().into_inner().message().await;
+    let webrtc = player(first.unwrap().unwrap());
+    let local = format!("127.0.0.1:{}", webrtc.port);
+    assert!(webrtc.addresses.contains(&local), "{:?}", webrtc.addresses);
+    std::net::TcpStream::connect(&local).unwrap();
+    let leaf = std::fs::read(root.join("run/cozy/bootstrap/tls.crt")).unwrap();
+    let der = rustls_pemfile::certs(&mut &leaf[..]).next().unwrap().unwrap();
+    assert_eq!(webrtc.fingerprint, tensorfs_core::sha256::hex_digest(&der));
+    // A play link outlives a restart: the port is kept.
+    drop(machine);
+    let mut machine = boot(&root, port, "persistent");
+    receipt(&mut machine, &root, port);
+    let pem = std::fs::read(root.join("run/cozy/bootstrap/tls.crt")).unwrap();
+    let tls = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(pem)).domain_name("cozy-worker");
+    let channel = Endpoint::from_shared(format!("https://127.0.0.1:{port}")).unwrap().tls_config(tls).unwrap().connect().await.unwrap();
+    let again = MachineClient::new(channel).status(status(false, Some(&owner))).await.unwrap().into_inner().message().await;
+    assert_eq!(player(again.unwrap().unwrap()).port, webrtc.port);
     drop(machine);
     std::fs::remove_dir_all(&root).unwrap();
 }
