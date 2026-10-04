@@ -486,6 +486,10 @@ pub struct PlaneFacts {
     pub evictions: Option<u64>,
     pub oom_retries: Option<u64>,
     pub modes: BTreeMap<String, String>,
+    /// LoRA'd weights the executor baked into device bytes since it started (a streamed
+    /// copy counts at every acquire), and the wall time of its resident bakes.
+    pub lora_baked: Option<u64>,
+    pub lora_bake_ms: Option<f64>,
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]

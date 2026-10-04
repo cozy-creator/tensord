@@ -27,7 +27,8 @@ const VIEW_PREFIX: &str = "adapters-";
 const PLAIN: &str = "sha256:1fb882a7e46d0aff520f9d8a28cefd643954c19371737443101ba3c5fcc3613f";
 
 /// One caller adapter, in order. An empty `component` is inferred when exactly one base
-/// component fits every factor pair.
+/// component fits every factor pair; an empty `source_component` is the adapter's component
+/// named like `component`, else `adapter`, else its only one.
 #[derive(Clone, Debug)]
 pub struct Selection {
     pub manifest: ObjectRef,
@@ -315,17 +316,32 @@ fn prepare(
         if !selection.strength.is_finite() {
             return Err(refuse("scale", "adapter strength must be finite"));
         }
-        let source_component = if selection.source_component.is_empty() {
-            "adapter"
+        // The factor component: the one the selection names; else the one named like the
+        // selected base component (TensorFS `sdxl.lora/1` names a LoRA's components after
+        // the base's: `unet`, `text_encoder`, `text_encoder_2`), else `adapter`, else the
+        // adapter's only component. Other components are other selections' to read.
+        let named = |name: &str| adapter.components.iter().find(|(n, _)| n == name);
+        let found = if selection.source_component.is_empty() {
+            named(&selection.component).or_else(|| named("adapter")).or(
+                match adapter.components.as_slice() {
+                    [one] => Some(one),
+                    _ => None,
+                },
+            )
         } else {
-            &selection.source_component
+            named(&selection.source_component)
         };
-        if adapter.components.len() != 1 || adapter.components[0].0 != source_component {
+        let Some((source_component, factors)) = found else {
+            let has: Vec<_> = adapter.components.iter().map(|(n, _)| n.as_str()).collect();
             return Err(refuse(
                 "components",
-                "an adapter must contain only its selected factor component",
+                format!(
+                    "the adapter has no factor component for this selection; it has: {}",
+                    has.join(", ")
+                ),
             ));
-        }
+        };
+        let source_component = source_component.as_str();
         if adapter
             .configs
             .iter()
@@ -336,7 +352,6 @@ fn prepare(
                 "adapter introduces a separate inference configuration",
             ));
         }
-        let factors = &adapter.components[0].1;
         if factors.is_empty() {
             return Err(refuse("empty", "adapter contains no factors"));
         }
@@ -685,50 +700,64 @@ mod tests {
         values.iter().flat_map(|v| v.to_le_bytes()).collect()
     }
 
-    /// A real checkpoint written through the TensorFS derived writer (no sources).
+    type Tensors<'a> = [(&'a str, Vec<u64>, Vec<u8>)];
+
+    /// A real one-component checkpoint written through the TensorFS derived writer.
     fn checkpoint(
         store: &Store,
         meta: &Meta,
         component: &str,
-        tensors: &[(&str, Vec<u64>, Vec<u8>)],
+        tensors: &Tensors,
         tag: u8,
     ) -> ObjectRef {
+        model(store, meta, &[(component, tensors)], tag)
+    }
+
+    /// A real checkpoint of several components (no sources).
+    fn model(store: &Store, meta: &Meta, components: &[(&str, &Tensors)], tag: u8) -> ObjectRef {
         let transaction = format!("sha256:{}", format!("{tag:02x}").repeat(32));
+        let all = || {
+            components
+                .iter()
+                .flat_map(|(component, tensors)| tensors.iter().map(move |t| (*component, t)))
+        };
         let declaration = Declaration {
             work_fingerprint: Some(transaction.clone()),
             sources: vec![],
-            components: vec![ComponentDeclaration {
-                target: component.into(),
-                source: None,
-                source_component: None,
-                drop: vec![],
-                add: tensors
-                    .iter()
-                    .map(|(key, shape, _)| TensorDeclaration {
-                        key: (*key).into(),
-                        dtype: Dtype::F32,
-                        shape: shape.clone(),
-                        encoding: PLAIN.into(),
-                        parts: vec![PartDeclaration {
-                            role: "value".into(),
+            components: components
+                .iter()
+                .map(|(component, tensors)| ComponentDeclaration {
+                    target: (*component).into(),
+                    source: None,
+                    source_component: None,
+                    drop: vec![],
+                    add: tensors
+                        .iter()
+                        .map(|(key, shape, _)| TensorDeclaration {
+                            key: (*key).into(),
                             dtype: Dtype::F32,
                             shape: shape.clone(),
-                            source: None,
-                        }],
-                    })
-                    .collect(),
-            }],
+                            encoding: PLAIN.into(),
+                            parts: vec![PartDeclaration {
+                                role: "value".into(),
+                                dtype: Dtype::F32,
+                                shape: shape.clone(),
+                                source: None,
+                            }],
+                        })
+                        .collect(),
+                })
+                .collect(),
             configs: vec![],
             files: vec![],
             objects: vec![],
-            order: tensors
-                .iter()
-                .map(|(key, _, _)| (component.to_string(), key.to_string()))
+            order: all()
+                .map(|(component, (key, _, _))| (component.to_string(), key.to_string()))
                 .collect(),
-            max_new_bytes: tensors.iter().map(|t| t.2.len() as u64).sum(),
+            max_new_bytes: all().map(|(_, t)| t.2.len() as u64).sum(),
         };
         let begun = derived::begin(store, meta, &transaction, 1, declaration, None).unwrap();
-        for (key, _, bytes) in tensors {
+        for (component, (key, _, bytes)) in all() {
             derived::add_part(
                 store,
                 meta,
@@ -1076,6 +1105,88 @@ mod tests {
         )
         .unwrap_err();
         assert!(refused.to_string().starts_with("adapter_key"), "{refused}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
+    fn a_lora_whose_components_are_named_after_the_base_grafts_each_onto_its_own() {
+        // TensorFS `sdxl.lora/1` names a LoRA's components `unet`, `text_encoder`, ...: there
+        // is no `adapter` component, and a LoRA with text towers has several.
+        let root = std::env::temp_dir().join(format!("adapter-views-{}", uuid::Uuid::new_v4()));
+        let store = Store::init(&root).unwrap();
+        let meta = Meta::open(&store).unwrap();
+        let unet: &Tensors = &[("proj.weight", vec![4, 3], f32s(&[0.5; 12]))];
+        let tower: &Tensors = &[("fc.weight", vec![2, 5], f32s(&[0.5; 10]))];
+        let base = model(
+            &store,
+            &meta,
+            &[("unet", unet), ("text_encoder", tower)],
+            0xb1,
+        );
+        let unet_factors: &Tensors = &[
+            ("proj.lora_A.weight", vec![2, 3], f32s(&[0.25; 6])),
+            ("proj.lora_B.weight", vec![4, 2], f32s(&[0.75; 8])),
+        ];
+        let tower_factors: &Tensors = &[
+            ("fc.lora_A.weight", vec![1, 5], f32s(&[0.25; 5])),
+            ("fc.lora_B.weight", vec![2, 1], f32s(&[0.75; 2])),
+        ];
+        let both = model(
+            &store,
+            &meta,
+            &[("unet", unet_factors), ("text_encoder", tower_factors)],
+            0xa1,
+        );
+        let on = |manifest: &ObjectRef, component: &str| Selection {
+            manifest: manifest.clone(),
+            component: component.into(),
+            source_component: String::new(),
+            strength: 1.0,
+        };
+        let composed = compose(
+            &store,
+            &base,
+            &[on(&both, "unet"), on(&both, "text_encoder")],
+        )
+        .unwrap();
+        let view = header(&store, &composed.manifest).unwrap();
+        let keys = |component: &str| -> Vec<String> {
+            tensors(&view, component)
+                .unwrap()
+                .iter()
+                .map(|(k, _)| k.clone())
+                .collect()
+        };
+        assert_eq!(
+            keys("unet"),
+            [
+                "proj.base_layer.weight",
+                "proj.lora_A.adapter_0.weight",
+                "proj.lora_B.adapter_0.weight"
+            ]
+        );
+        assert_eq!(
+            keys("text_encoder"),
+            [
+                "fc.base_layer.weight",
+                "fc.lora_A.adapter_1.weight",
+                "fc.lora_B.adapter_1.weight"
+            ]
+        );
+        // A one-component LoRA named after the base needs no component at all.
+        let only = checkpoint(&store, &meta, "unet", unet_factors, 0xa2);
+        let inferred = compose(&store, &base, &[on(&only, "")]).unwrap();
+        let view = header(&store, &inferred.manifest).unwrap();
+        assert!(lookup(
+            tensors(&view, "unet").unwrap(),
+            "proj.lora_A.adapter_0.weight"
+        )
+        .is_some());
+        // A selection the adapter has no component for names what it has.
+        let refused = compose(&store, &base, &[on(&both, "vae")]).unwrap_err();
+        assert!(
+            refused.to_string().contains("it has: unet, text_encoder"),
+            "{refused}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }
