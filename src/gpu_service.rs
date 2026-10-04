@@ -3063,6 +3063,11 @@ impl Services for Callbacks<'_> {
             device: frame.device.clone(),
             layout: frame.layout.clone(),
         };
+        // This plan names this weight set: its next executor's Degree 2 fit counts it once
+        // when another tenant holds and reads it.
+        self.pool
+            .first()
+            .learn_holding(self.plan, &holding_id(&key, 0));
         // The reader's lease is a connection: the executor keeps one end while it maps the
         // holding, and its close (release or death) ends the lease.
         let (reader, lease) = Reader::lease(self.birth.clone(), self.exit.try_clone()?)?;
