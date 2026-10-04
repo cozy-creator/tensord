@@ -19,7 +19,9 @@ The manifest declares:
   VAE), and `scheduler` per model proved below.
 - `hardware_probe`: command returning actual remote `gpu_uuid`, `driver`,
   `total_bytes` and `remote: true` for this owned rental.
-- `cells`: the six literal authored requests per cell. A reference cell's
+- `cells`: literal authored requests and `kind`. Every `kind: degraded` cell
+  retains all six requests. Cold first-output cells contain one; warm cells
+  contain three consecutive requests. A reference cell's
   `budget` must be `unconstrained`; a pressure cell must retain the same requests.
 - `parity`: measured proof JSON per model; `controls`: assembled reference JSON
   per engine/cell; `quality`: `method: exact`, or predeclared
@@ -27,10 +29,20 @@ The manifest declares:
 
 Each parity proof contains actual logical tensor `name`, `shape`, `dtype`, `bytes`
 and raw-value SHA256 inventories for both engines (`provenance.py` reads actual
-safetensors), actual `sigmas.cozy`/`sigmas.comfy` arrays and a declared absolute
+safetensors), the complete native component tensor census, actual
+`sigmas.cozy`/`sigmas.comfy` arrays and a declared absolute
 tolerance no larger than 1e-5, `prediction`, `comfy_scheduler`, and reviewed
-`source_equations` plus `conditioning_evidence` naming actual source/config and
-precision evidence. Hashing a proof is provenance, not proof that its assertions
+`source_equations`, and saved source artifacts with path, SHA256 and symbol.
+`initialization` records both actual shape, distribution, noise/state dtype,
+noise scale and zero starting latent, with scale tolerance at most 1e-5.
+`numerical_mode` records conditioning, denoiser input/output, timestep, CFG,
+sampler, latent-state and VAE dtype for each arm. Missing or unequal precision
+refuses timing. Both actual decode geometries are retained; different pressure
+strategies still require the independent same-engine fidelity gate.
+`conditioning_evidence` is keyed by the digest of each literal input and records
+both engines' actual positive/negative token IDs, attention masks, encoder layer,
+pooled projection, microconditioning, prompt-weight policy and tokenizer asset
+hashes. These inputs must match. Hashing a proof is provenance, not proof that its assertions
 are true: review the cited sources and inventories before qualification.
 
 `schedules.py --comfy REPO --commit PIN --config ACTUAL_ANIMA_CONFIG --steps 30
@@ -42,6 +54,10 @@ precision still require their own checks. `--model sdxl` compares its actual
 EulerDiscrete config: the verified paul/sdxl1.0 header uses leading/offset1,
 and Comfy ddim_uniform matches within4.77e-6 while normal/simple differ3.5863.
 Unproved configs refuse a match; they are not filled from remembered defaults.
+The SDXL helper also executes stock EPS scaling and the actual `max_denoise`
+decision. Current leading-grid initialization differs despite the matching grid:
+11.07358074 vs11.02833080. This helper is CPU source evidence, not live inference
+parity, and the installed SDXL 2.4 package remains unsupported for matched timing.
 
 `native-source/` is an authored CPU package for supported model metadata custody:
 ordinary `cozy package install ./native-source`, then
@@ -52,6 +68,11 @@ native tensor/part geometry. It constructs no model, opens no Store, and is not
 an inference/quality test. Source tensor export should use bounded
 `capability.read_part_into`, retaining encoded/logical metadata; it must not assume
 all quantized parts are dense logical values or read a foreign Store directly.
+The `inventory` job hashes every admitted native part through one reusable 1 MiB
+buffer. It returns a logical value hash only for the exact native plain encoding
+and value-part geometry. `provenance.py --native inventory.json --out values.json`
+normalizes those actual values; encoded tensors explicitly refuse until their
+logical export is reviewed. CPU checks do not establish a live full-model export.
 
 Collect same-engine unconstrained controls first with `--reference-only`. Repeat
 the exact six requests three times, then run `controls.py ref1/result.json
@@ -75,3 +96,8 @@ Feed all fresh `result.json` rows to the strict #35 reporter. Three complete pai
 measurements in every declared cell, zero failures and upper95% median ratio below
 1 in every cell are required. No smoke image or this harness's CPU checks establish
 a Comfy win.
+
+Every submitted request gets a fsynced `request-result.json`, including failures.
+An unknown CLI/HTTP reply retains that unknown state and leaves remaining requests
+explicitly unsubmitted. The adapter never cancels or resubmits an uncertain run.
+Invalid artifacts or missing quality references retain a failed cell result.

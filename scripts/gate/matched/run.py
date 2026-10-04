@@ -9,11 +9,18 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 from pathlib import Path
 
 from adapters import comfy, cozy
-from evidence import digest, pixels, validate_quality, verify_parity
+from evidence import (
+    digest,
+    pixels,
+    validate_quality,
+    verify_conditioning,
+    verify_parity,
+)
 
 
 def probe(command, path):
@@ -30,19 +37,36 @@ def probe(command, path):
 def run(manifest_path, out, engine, cell, pair, reference_only):
     manifest = json.loads(manifest_path.read_text())
     spec = manifest["arms"][engine]
-    inputs = manifest["cells"][cell]["requests"]
-    if len(inputs) != 6:
+    definition = manifest["cells"][cell]
+    inputs = definition["requests"]
+    if not inputs:
+        raise ValueError("an authored benchmark cell must contain requests")
+    if definition.get("kind") == "degraded" and len(inputs) != 6:
         raise ValueError(
             "the declared pressure cell requires all six unchanged requests"
         )
     out.mkdir(parents=True, exist_ok=False)
     proof = json.loads(Path(manifest["parity"]).read_text())
+    required_components = {
+        "sdxl": {"unet", "text_encoder", "text_encoder_2", "vae"},
+        "anima": {"transformer", "text_encoder", "text_conditioner", "vae"},
+    }
+    for name in {row["model"] for row in inputs}:
+        for arm in ("cozy", "comfy"):
+            if (
+                set(proof[name].get("component_tensors", {}).get(arm, {}))
+                != required_components[name]
+            ):
+                raise ValueError(
+                    "all denoiser, encoder, conditioner and VAE tensors are required"
+                )
     models = {
         name: verify_parity(proof[name]) for name in {row["model"] for row in inputs}
     }
     for row in inputs:
         payload = row["input"]
         model = row["model"]
+        verify_conditioning(proof[model], payload)
         if payload.get("aspect_ratio") != "1:1" or payload.get("megapixels") != 1:
             raise ValueError("unsupported geometry cannot be silently resized")
         if model == "sdxl" and payload.get("hidiffusion") is not False:
@@ -102,11 +126,16 @@ def run(manifest_path, out, engine, cell, pair, reference_only):
     artifacts = [row["artifacts"] for row in paths]
     # Saving is timed equally; decode/reference comparison is outside that boundary.
     for row in paths:
-        row["images"] = [pixels(Path(p))[0] for p in row["artifacts"]]
-        row["smoke_ok"] = all(
-            image["shape"] == [1024, 1024] and image["smoke_nonflat"]
-            for image in row["images"]
-        )
+        try:
+            row["images"] = [pixels(Path(p))[0] for p in row["artifacts"]]
+            row["smoke_ok"] = len(row["images"]) == 1 and all(
+                image["shape"] == [1024, 1024] and image["smoke_nonflat"]
+                for image in row["images"]
+            )
+        except (OSError, ValueError) as error:
+            row["images"] = []
+            row["smoke_ok"] = False
+            row["artifact_error"] = f"{type(error).__name__}: {error}"
     result = {
         "event": "cell",
         "arm": engine,
@@ -126,17 +155,28 @@ def run(manifest_path, out, engine, cell, pair, reference_only):
         "normalized_request": normalized,
     }
     if reference_only:
-        if manifest["cells"][cell].get("budget") not in (None, "unconstrained"):
+        if manifest["cells"][cell].get("budget") != "unconstrained":
             raise ValueError("a constrained cell cannot be its own quality control")
         result["reference_identity"] = identity
         result["reference_only"] = True
     else:
-        controls = json.loads(Path(manifest["controls"][engine][cell]).read_text())
-        result["quality"] = validate_quality(
-            artifacts, controls, manifest["quality"], identity
-        )
+        try:
+            controls = json.loads(Path(manifest["controls"][engine][cell]).read_text())
+            result["quality"] = validate_quality(
+                artifacts, controls, manifest["quality"], identity
+            )
+        except (OSError, ValueError) as error:
+            result["quality"] = {
+                "ok": False,
+                "method": manifest["quality"]["method"],
+                "error": f"{type(error).__name__}: {error}",
+            }
         result["ok"] &= result["quality"]["ok"]
-    (out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+    with (out / "result.json").open("w") as dest:
+        json.dump(result, dest, indent=2)
+        dest.write("\n")
+        dest.flush()
+        os.fsync(dest.fileno())
     print(json.dumps(result))
     return result
 

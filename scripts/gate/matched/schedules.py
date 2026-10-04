@@ -98,7 +98,7 @@ def measure(comfy, commit, config, steps, model="anima"):
         name: scope[name + "_scheduler"](sampling, steps).tolist()
         for name in ("normal", "simple", "ddim")
     }
-    return {
+    result = {
         "model": model,
         "steps": steps,
         "config": actual,
@@ -117,6 +117,33 @@ def measure(comfy, commit, config, steps, model="anima"):
             for name, arr in arrays.items()
         },
     }
+    if model == "sdxl":
+        symbols(sources["comfy/model_sampling.py"], ["reshape_sigma", "EPS"], scope)
+        symbols(sources["comfy/samplers.py"], ["Sampler"], scope)
+        model_wrap = SimpleNamespace(
+            inner_model=SimpleNamespace(model_sampling=sampling)
+        )
+        comfy_sigmas = scope["ddim_scheduler"](sampling, steps)
+        max_denoise = scope["Sampler"]().max_denoise(model_wrap, comfy_sigmas)
+        ones = torch.ones((1, 4, 1, 1), dtype=torch.float32)
+        scaled = scope["EPS"]().noise_scaling(
+            comfy_sigmas[0], ones, torch.zeros_like(ones), max_denoise
+        )
+        cozy_scale, comfy_scale = (
+            float(scheduler.init_noise_sigma),
+            float(scaled.flatten()[0]),
+        )
+        result["initial_noise_scaling"] = {
+            "cozy": cozy_scale,
+            "comfy_ddim_uniform": comfy_scale,
+            "comfy_max_denoise": max_denoise,
+            "comfy_model_sigma_max": float(sampling.sigma_max),
+            "absolute_difference": abs(cozy_scale - comfy_scale),
+            "ratio": cozy_scale / comfy_scale,
+            "matched_at_1e-5": abs(cozy_scale - comfy_scale) <= 1e-5,
+            "scope": "source CPU scalar measurement, not live latent or inference parity",
+        }
+    return result
 
 
 def main():

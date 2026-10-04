@@ -14,6 +14,9 @@ def assemble(paths):
             "at least three actual unconstrained cell repetitions required"
         )
     identity = records[0]["reference_identity"]
+    count = len(records[0]["requests"])
+    if not count:
+        raise ValueError("an empty reference cannot qualify a cell")
     for record in records:
         if (
             not record.get("reference_only")
@@ -23,16 +26,16 @@ def assemble(paths):
             raise ValueError(
                 "reference must be successful, unconstrained and identically authored"
             )
-        if len(record["requests"]) != 6 or any(
+        if len(record["requests"]) != count or any(
             not row["fresh_sampling_evidence"] for row in record["requests"]
         ):
-            raise ValueError("all six references need actual fresh sampling evidence")
+            raise ValueError("all authored references need actual fresh sampling evidence")
     return [
         {
             "identity": identity,
             "artifacts": [record["requests"][n]["artifacts"][0] for record in records],
         }
-        for n in range(6)
+        for n in range(count)
     ]
 
 

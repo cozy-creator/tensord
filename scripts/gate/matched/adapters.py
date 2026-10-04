@@ -17,7 +17,7 @@ def durable(path):
         os.fsync(source.fileno())
 
 
-def cozy(spec, requests, out):
+def _cozy(spec, requests, out):
     rows = []
     first = None
     for index, row in enumerate(requests):
@@ -60,6 +60,8 @@ def cozy(spec, requests, out):
         state = reply.get(
             "status", reply.get("state", (reply.get("run") or {}).get("state"))
         )
+        if state not in ("completed", "succeeded", "failed", "cancelled", "canceled"):
+            state = "unknown"
         cached = bool(reply.get("memo") or reply.get("cached_result"))
         positions = set()
         for line in (root / "events.jsonl").read_text().splitlines():
@@ -88,6 +90,7 @@ def cozy(spec, requests, out):
                 "artifacts": [str(p) for p in paths],
                 "returncode": result.returncode,
                 "state": state,
+                "reply_error": reply.get("error"),
                 "cached_result": cached,
                 "denoise_positions": sorted(positions),
                 "all_denoise_events_observed": set(
@@ -113,7 +116,7 @@ def http(base, path, body=None):
         return json.load(response)
 
 
-def comfy(spec, requests, out):
+def _comfy(spec, requests, out):
     rows = []
     first = None
     for index, row in enumerate(requests):
@@ -175,6 +178,75 @@ def comfy(spec, requests, out):
             }
         )
     return rows, first, max(r["saved_ns"] for r in rows)
+
+
+def collect(adapter, spec, requests, out):
+    """Persist failures; unknown submission state leaves later requests unsubmitted."""
+    rows = []
+    first = None
+    last = None
+    blocked = False
+    for index, request in enumerate(requests):
+        root = out / str(index)
+        root.mkdir(parents=True)
+        if blocked:
+            row = {
+                "model": request["model"],
+                "state": "not_submitted",
+                "artifacts": [],
+                "ok": False,
+                "fresh_sampling_evidence": False,
+                "error": "prior submission has unknown state; root must resolve it",
+            }
+        else:
+            began = time.perf_counter_ns()
+            try:
+                measured, start, end = adapter(spec, [request], root)
+                row = measured[0]
+                first = first or start
+                last = end
+                blocked = row["state"] == "unknown"
+            except (
+                OSError,
+                ValueError,
+                KeyError,
+                TypeError,
+                AttributeError,
+                IndexError,
+                subprocess.SubprocessError,
+            ) as error:
+                # A lost reply is not authority to cancel or resubmit a durable run.
+                last = time.perf_counter_ns()
+                first = first or began
+                row = {
+                    "model": request["model"],
+                    "submit_ns": began,
+                    "saved_ns": last,
+                    "state": "unknown",
+                    "artifacts": [],
+                    "ok": False,
+                    "fresh_sampling_evidence": False,
+                    "error": f"{type(error).__name__}: {error}",
+                }
+                blocked = True
+        row["request_index"] = index
+        row["input"] = request["input"]
+        path = root / "request-result.json"
+        with path.open("w") as dest:
+            json.dump(row, dest, indent=2)
+            dest.write("\n")
+            dest.flush()
+            os.fsync(dest.fileno())
+        rows.append(row)
+    return rows, first, last
+
+
+def cozy(spec, requests, out):
+    return collect(_cozy, spec, requests, out)
+
+
+def comfy(spec, requests, out):
+    return collect(_comfy, spec, requests, out)
 
 
 def node(kind, **inputs):
