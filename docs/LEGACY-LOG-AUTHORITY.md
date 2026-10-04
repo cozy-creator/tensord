@@ -19,3 +19,27 @@ Only if the CPU proof shows future unauthorized polls, wrap this existing stream
 shared StreamAuthority through Api::revocable; do not invent another auth implementation or
 cancel work. Retain normal complete snapshot reads and explicitly bounded test timeouts only
 for fixture failure diagnostics. Root's Hub refusal review is a separate read-only task.
+
+CONFIRMED CPU red on the real NativeBackend: the next stream poll after key revocation
+returned another64KiB chunk with no network buffers involved. On the production TLS router
+with64KiB client receive windows, both the authorized control and revoked observer received
+the entire8MiB snapshot and EOF. Logs: api/legacy-log-authority-red.log.
+
+The sole production change wraps the existing snapshot iterator with Api::revocable, which
+uses shared StreamAuthority. No new authority implementation or execution operation exists.
+The same two CPU controls pass in0.54s: a direct future poll immediately returns
+UNAUTHENTICATED and ends; a nonrevoked TLS reader still receives all8388608 bytes. The
+revoked TLS reader received196608 bytes total (the initial65536 plus131072 in the delivery
+tail), then UNAUTHENTICATED; a fresh read with the removed key also refuses. That tail can
+be buffered before revocation and is not asserted to be a new unauthorized poll. The direct
+poll control isolates the authority boundary. The test bounds total delivery below the
+snapshot size rather than depending on this exact scheduling-sensitive tail count.
+
+Both controls compare the entire accepted queued execution before/after, so transport
+authority loss leaves its durable state unchanged. Snapshot bytes are real owned on-disk
+logs; no mock backend, SDK/model execution, provider, production or personal daemon change
+is part of this proof. Evidence lives under outputs/codex-machine-audit-20261004/api.
+
+All library/test clippy targets pass with -D warnings; git diff --check is clean.
+The targeted test filter is legacy_log_authority_tests (two cases). The only production
+hunk changes the existing ReadMachineLog return to use Api::revocable.
