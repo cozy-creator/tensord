@@ -1208,9 +1208,9 @@ mod v1_api {
             hub: Some(v1::HubAccess {
                 origin,
                 token: EXECUTION_ACCESS.into(),
-                publication: "grant-1".into(),
                 ..Default::default()
             }),
+            publication: "grant-1".into(),
             owner: "alice".into(),
             ..Default::default()
         };

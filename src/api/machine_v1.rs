@@ -144,15 +144,14 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
         let mut identity = spec.clone();
         identity.hub = hub.clone().map(|hub| v1::HubAccess {
             token: String::new(),
-            publication: String::new(),
             ..hub
         });
+        identity.publication.clear();
         format!(
             "sha256:{}",
             tensorfs_core::sha256::hex_digest(&prost::Message::encode_to_vec(&identity))
         )
     };
-    let publication = hub.as_ref().map(|hub| hub.publication.clone()).unwrap_or_default();
     let hub = match hub.filter(|hub| !hub.token.is_empty()) {
         None => None,
         Some(hub) => {
@@ -256,7 +255,7 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
             })
             .unwrap_or_default(),
         weights_destination: spec.weights_destination,
-        publication,
+        publication: spec.publication,
         owner: spec.owner,
         digest: identity_digest,
     })

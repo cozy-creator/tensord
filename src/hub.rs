@@ -354,22 +354,27 @@ impl Catalog {
 }
 
 /// Hub writes under a machine-publication authorization: the Hub mints a short bearer for this
-/// machine's leaf, proven by the run's execution access, and it is renewed at half its life.
-/// Both go to the Hub host only; presigned object hosts see neither.
+/// machine's leaf, proven by its sender proof (the run's execution access, or a rental's own
+/// worker capability), and it is renewed at half its life. Both go to the Hub host only;
+/// presigned object hosts see neither.
 pub struct Publishing {
     catalog: Catalog,
-    sender: String,
+    sender: Vec<(String, String)>,
     authorization: String,
     bearer: Mutex<Option<(String, Instant)>>,
 }
 
 impl Publishing {
     pub fn new(source: &Source, authorization: &str) -> Result<Self, Refusal> {
-        let sender = match source.credential.split_once(' ') {
-            Some(("bearer", token)) if !token.is_empty() => token.to_string(),
+        let sender = match source.credential.split_whitespace().collect::<Vec<_>>()[..] {
+            ["bearer", token] => vec![("x-cozy-execution-access".into(), token.into())],
+            ["worker", id, token] => vec![
+                ("x-cozy-worker-id".into(), id.into()),
+                ("x-cozy-worker-token".into(), token.into()),
+            ],
             _ => {
                 return Err(Refusal(
-                    "publication needs the run's execution access".into(),
+                    "publication needs this machine's Hub access".into(),
                 ))
             }
         };
@@ -396,7 +401,7 @@ impl Publishing {
         );
         let sender = ScopedHeaders {
             hosts: vec![self.catalog.host.clone()],
-            headers: vec![("x-cozy-execution-access".into(), self.sender.clone())],
+            headers: self.sender.clone(),
         };
         let answer =
             transport::hub_call("POST", self.origin(), &path, b"{}", &sender, self.policy())
@@ -430,7 +435,7 @@ impl transport::CredentialProvider for Publishing {
                 Err(Refusal(why)) => eprintln!("{why}"),
             }
         }
-        let mut headers = vec![("x-cozy-execution-access".into(), self.sender.clone())];
+        let mut headers = self.sender.clone();
         if let Some((token, _)) = held.as_ref() {
             headers.push(("authorization".into(), format!("Bearer {token}")));
         }
