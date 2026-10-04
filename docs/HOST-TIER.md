@@ -25,6 +25,19 @@ executor death and model switches. No CUDA or NVML.
   itself.
 - `sealed_prefetch` carries all of a construction's plans: each is opened and queued at once.
 
+## Staged layouts (`host_tiers.staged/1`)
+
+A GPU executor that offers `host_tiers.staged/1` (and is told `Load.staged_tiers`, so it never asks
+an older machine) gets each layout with only the regions it streams every step staged; the rest are holes (`HOLE` in the state page). For the holes it asks
+`object_files`: the machine opens each object of the plan through the store's verification and
+hands the read-only descriptors over (no store, lease or path in the executor). The plane copies a
+hole straight from those files to the GPU (page cache, or O_DIRECT into its pinned staging
+buffers), so resident blocks and idle models cost page cache, which the kernel reclaims, not tier
+RAM. When its stages plan streaming, the executor asks `sealed_stage` for those regions; the
+machine stages each one the tier has room for (`TierLimit::limit` per region; the rest keep
+reading the files) and the executor pins what was staged. An executor that reads no holes (CPU,
+or without the capability) gets every region staged.
+
 ## Size and release
 
 - At every ask the live headroom is read (`host_memory::read`: every cgroup on the path,
@@ -34,13 +47,15 @@ executor death and model switches. No CUDA or NVML.
 - To make room, unheld, complete layouts are released oldest first; such layouts past `ttl` go
   anyway. A layout is held while any executor it was granted to is alive (pidfd). Held or filling
   layouts never go.
-- Charge = the layout's size while filling, then kernel `st_blocks` per memfd. A release records the charged bytes and the fall in
+- Charge = the layout's size (a staged layout: its staged regions) while filling, then kernel
+  `st_blocks` per memfd. A release records the charged bytes and the fall in
   shared memory; if memory did not come back, the bytes stay charged (`stranded_bytes`).
 - `release(want)` and `facts()` are the policy module's handles (see B1 `INTERFACE.md`).
 
 ## Disk rung (streamed layouts)
 
-When admission cannot make room even after releases, the executor gets a streamed layout: a sealed window of as many of the layout's
+For an executor that reads holes, the disk rung is a layout with nothing staged. For one that does
+not, when admission cannot make room even after releases, it gets a streamed layout: a sealed window of as many of the layout's
 largest regions as `TierLimit::staging` allows (one at least, the indivisible working set),
 served on its own thread under a read lease. The executor claims a region while it reads it
 (TensorFS `HostMem::with_region`); the machine stages claimed regions first, reads ahead in
@@ -60,6 +75,8 @@ Components without a plan get their memory reserved from the manifest at spawn.
 
 - One descriptor per layout, plus one pidfd per executor. A fill's read lease (one descriptor per
   object of that component) ends with the fill; `GpuPool` lifts the soft NOFILE limit to the hard one.
+  `object_files` opens one descriptor per object for the answer and closes it once sent; the
+  executor keeps them for its weight sets' life (it lifts its own NOFILE limit).
 - No lock across a fill: other asks, and other models' executors, proceed meanwhile; a second ask
   for a layout being filled gets the same layout.
 - `GpuPool` appends one line per Load to `<state>/gpu/loads.jsonl`: executor load facts and the

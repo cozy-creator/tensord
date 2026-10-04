@@ -105,6 +105,7 @@ fn prepared(version: &str, generation_path: &str) -> (DeviceExecutor, PathBuf) {
                 cap_bytes: None,
                 sealed_tiers: false,
                 model_sources: false,
+                staged_tiers: false,
                 pinned_bytes: None,
             },
             &mut Baseline,

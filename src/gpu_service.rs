@@ -1838,7 +1838,9 @@ impl GpuPool {
             id,
         });
         let sources = Arc::new(ModelSources::open_shared(self.store.clone(), &selections)?);
-        let peer = self.host.register_peer(executor.observer_pidfd()?);
+        // An executor that reads holes from object files gets only what it streams staged.
+        let staged = executor.hello.offers("host_tiers.staged/1");
+        let peer = self.host.register_peer(executor.observer_pidfd()?, staged);
         let grants = selections
             .iter()
             .map(|selected| {
@@ -1850,7 +1852,7 @@ impl GpuPool {
             })
             .collect::<io::Result<Vec<_>>>()?;
         // Start on this model's layouts while the executor imports and constructs.
-        self.host.prepare(grants.clone());
+        self.host.prepare(grants.clone(), staged);
         Ok(Session {
             plan: plan.id.clone(),
             degree: plan.degree,
@@ -2021,6 +2023,7 @@ impl GpuPool {
                     stages: false,
                     sealed_tiers: true,
                     model_sources: true,
+                    staged_tiers: true,
                     pinned_bytes: at_load.then_some(pinned),
                     device_weights: sharing,
                     cap_bytes: load_cap,
@@ -3177,6 +3180,31 @@ struct Callbacks<'a> {
     spool: Option<PathBuf>,
 }
 impl Services for Callbacks<'_> {
+    fn object_files(&mut self, frame: &Frame, plan: Option<File>) -> io::Result<(Answer, Vec<File>)> {
+        let mut answer = Answer::unavailable(frame.seq);
+        let Some(plan) = plan else {
+            return Ok((answer, Vec::new()));
+        };
+        let request = SealedRequest {
+            sha256: &frame.sha256,
+            length: frame.length,
+            stage: None,
+        };
+        match self.host.object_files(self.peer, self.grants, request, plan) {
+            Ok(files) => {
+                answer.ok = true;
+                answer.code.clear();
+                answer.detail.clear();
+                answer.objects_sha256 = crate::host_tier::objects_digest(&files);
+                Ok((answer, files.into_iter().map(|(_, file)| file).collect()))
+            }
+            Err(error) => {
+                answer.code = "object_files_refused".into();
+                answer.detail = error.to_string();
+                Ok((answer, Vec::new()))
+            }
+        }
+    }
     fn device_tier(
         &mut self,
         frame: &Frame,
@@ -3285,6 +3313,7 @@ impl Services for Callbacks<'_> {
             let request = SealedRequest {
                 sha256: &frame.sha256,
                 length: frame.length,
+                stage: None,
             };
             match self.host.prefetch(self.peer, self.grants, request, plans) {
                 Ok(()) => {
@@ -3303,6 +3332,7 @@ impl Services for Callbacks<'_> {
             let request = SealedRequest {
                 sha256: &frame.sha256,
                 length: frame.length,
+                stage: frame.stage_regions.as_deref(),
             };
             // A refusal is an answer: that weight set reads the store, the session goes on.
             match self.host.seal(self.peer, self.grants, request, plan) {
@@ -3318,6 +3348,26 @@ impl Services for Callbacks<'_> {
                     return Ok((answer, None));
                 }
             }
+        }
+        if frame.kind == Kind::SealedStage {
+            let mut answer = Answer::unavailable(frame.seq);
+            let plan =
+                descriptor.ok_or_else(|| io::Error::other("sealed stage omitted its plan"))?;
+            let request = SealedRequest {
+                sha256: &frame.sha256,
+                length: frame.length,
+                stage: frame.stage_regions.as_deref(),
+            };
+            match self.host.stage(self.peer, self.grants, request, plan) {
+                Ok(staged) => {
+                    answer.ok = true;
+                    answer.code.clear();
+                    answer.detail.clear();
+                    answer.staged = staged;
+                }
+                Err(error) => answer.detail = error.to_string(),
+            }
+            return Ok((answer, None));
         }
         if frame.kind == Kind::ModelSource {
             drop(descriptor);
