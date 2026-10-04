@@ -56,6 +56,64 @@ fn refused(code: &'static str, message: impl Into<String>) -> Refused {
     }
 }
 
+/// One member as the object this signer wrote.
+fn written_member(objects: &Objects, actor: &str, m: &Member) -> Result<ObjectRef, Refused> {
+    match objects.path(actor, &m.digest)? {
+        Some((_, length)) if length == m.length => Ok(ObjectRef {
+            sha256: m.digest.trim_start_matches("sha256:").to_string(),
+            length,
+        }),
+        _ => Err(refused(
+            "local_source_incomplete",
+            format!("{} {} was not written to this machine", m.name, m.digest),
+        )),
+    }
+}
+
+/// The manifest `digest` (`sha256:<hex>`) as this signer wrote it.
+fn open_manifest(
+    objects: &Objects,
+    actor: &str,
+    digest: &str,
+) -> Result<(Manifest, ObjectRef), Refused> {
+    let (path, length) = objects.path(actor, digest)?.ok_or_else(|| {
+        refused(
+            "local_source_incomplete",
+            format!("the local package manifest {digest} was not written to this machine"),
+        )
+    })?;
+    if length > 1 << 20 {
+        return Err(refused(
+            "local_source_invalid",
+            "a local package manifest is at most 1 MiB",
+        ));
+    }
+    let manifest = serde_json::from_slice(&fs::read(path)?).map_err(|e| {
+        refused(
+            "local_source_invalid",
+            format!("the local package manifest is invalid: {e}"),
+        )
+    })?;
+    let sha256 = digest.trim_start_matches("sha256:").to_string();
+    Ok((manifest, ObjectRef { sha256, length }))
+}
+
+/// A local source's objects, its manifest and every member: what a run takes custody of when
+/// it is accepted. One the signer did not write is `local_source_incomplete`, naming it.
+pub fn written(objects: &Objects, actor: &str, digest: &str) -> Result<Vec<ObjectRef>, Refused> {
+    let (manifest, own) = open_manifest(objects, actor, digest)?;
+    let members = manifest
+        .source
+        .iter()
+        .chain(&manifest.wheels)
+        .chain(&manifest.requirements);
+    let mut written = vec![own];
+    for m in members {
+        written.push(written_member(objects, actor, m)?);
+    }
+    Ok(written)
+}
+
 impl LocalSources {
     pub fn new(objects: Arc<Objects>, installer: InstallerConfig, store: Arc<Store>) -> Self {
         Self {
@@ -87,36 +145,8 @@ impl LocalSources {
                 return Ok(held);
             }
         }
-        let member = |m: &Member| -> Result<ObjectRef, Refused> {
-            match self.objects.path(actor, &m.digest)? {
-                Some((_, length)) if length == m.length => Ok(ObjectRef {
-                    sha256: m.digest.trim_start_matches("sha256:").to_string(),
-                    length,
-                }),
-                _ => Err(refused(
-                    "local_source_incomplete",
-                    format!("{} {} was not written to this machine", m.name, m.digest),
-                )),
-            }
-        };
-        let (path, length) = self.objects.path(actor, digest)?.ok_or_else(|| {
-            refused(
-                "local_source_incomplete",
-                "the local package manifest was not written to this machine",
-            )
-        })?;
-        if length > 1 << 20 {
-            return Err(refused(
-                "local_source_invalid",
-                "a local package manifest is at most 1 MiB",
-            ));
-        }
-        let manifest: Manifest = serde_json::from_slice(&fs::read(path)?).map_err(|e| {
-            refused(
-                "local_source_invalid",
-                format!("the local package manifest is invalid: {e}"),
-            )
-        })?;
+        let member = |m: &Member| written_member(&self.objects, actor, m);
+        let (manifest, _) = open_manifest(&self.objects, actor, digest)?;
         if !manifest.package.starts_with("local/") || manifest.source.is_none() {
             return Err(refused(
                 "local_source_invalid",

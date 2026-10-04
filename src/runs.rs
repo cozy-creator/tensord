@@ -243,38 +243,10 @@ impl Runs {
                 });
             }
         }
+        // A local source is refused here, not accepted to fail: the run takes custody of its
+        // objects now, and a refused id is free for the client to write them and send again.
         if let Source::Local(digest) = &spec.source {
-            let (path, length) = self
-                .objects
-                .path(actor, digest)?
-                .ok_or_else(|| unwritten("local package manifest"))?;
-            if length > 1 << 20 {
-                return Err(refused(
-                    "local_source_invalid",
-                    "a local package manifest is at most 1 MiB",
-                ));
-            }
-            references.push(ObjectRef {
-                sha256: digest.trim_start_matches("sha256:").into(),
-                length,
-            });
-            let manifest: crate::local_source::Manifest =
-                serde_json::from_slice(&std::fs::read(path)?)
-                    .map_err(|e| refused("local_source_invalid", e.to_string()))?;
-            for member in manifest
-                .source
-                .iter()
-                .chain(&manifest.wheels)
-                .chain(&manifest.requirements)
-            {
-                match self.objects.path(actor, &member.digest)? {
-                    Some((_, length)) if length == member.length => references.push(ObjectRef {
-                        sha256: member.digest.trim_start_matches("sha256:").into(),
-                        length,
-                    }),
-                    _ => return Err(unwritten(&member.name)),
-                }
-            }
+            references.extend(crate::local_source::written(&self.objects, actor, digest)?);
         }
         self.objects.retain(&references)?;
         let package = match &spec.source {
@@ -1069,13 +1041,19 @@ mod tests {
         assert_eq!(warm.state, State::Completed, "{:?}", warm.failure);
         assert_eq!(warm.result.unwrap().value["package"], "local/cozy-machine-cpu-lifecycle");
 
-        // Another signer cannot run code it did not write.
+        // Another signer cannot run code it did not write: refused, naming what is missing,
+        // and nothing is journaled under its id.
         let theirs = runs
-            .submit("bob", "run-1", spec(Source::Local(manifest), false, "d1"))
+            .submit(
+                "bob",
+                "run-1",
+                spec(Source::Local(manifest.clone()), false, "d1"),
+            )
+            .err()
             .unwrap();
-        let theirs = settled(&service.engine, &theirs.id);
-        assert_eq!(theirs.state, State::Failed);
-        assert!(theirs.failure.unwrap().contains("local_source_incomplete"));
+        assert_eq!(theirs.code, "local_source_incomplete");
+        assert!(theirs.message.contains(&manifest), "{}", theirs.message);
+        assert!(service.engine.get_public("bob", "run-1").is_err());
         let _ = fs::remove_dir_all(root);
     }
 
