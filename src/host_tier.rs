@@ -119,6 +119,9 @@ impl SealedPlan {
 pub struct SealedRequest<'a> {
     pub sha256: &'a str,
     pub length: u64,
+    /// The regions to stage (the blocks that stream every step): an executor that reads holes
+    /// from object files (`host_tiers.staged/1`) gets the rest as holes. None: every region.
+    pub stage: Option<&'a [u32]>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -155,6 +158,10 @@ pub struct Ledger {
     /// What the released layouts charged, and what the kernel's shared memory fell by.
     pub released_bytes: u64,
     pub freed_bytes: u64,
+    /// Staged execution's actual object-descriptor seam, independent of feature offers.
+    pub object_file_requests: u64,
+    pub object_file_grants: u64,
+    pub object_files_granted: u64,
     /// Released layouts whose memory did not come back (something still maps them): they
     /// stay charged.
     pub stranded_bytes: u64,
@@ -181,6 +188,8 @@ pub struct HostTierFacts {
 
 struct Entry {
     fd: File,
+    /// A layout staged in part: the owner's mapping, kept to stage more.
+    staging: Option<Staging>,
     charged: u64,
     used: Instant,
     holders: BTreeSet<u64>,
@@ -203,23 +212,38 @@ impl Streamer {
             .sum()
     }
 }
+/// What a layout staged in part needs to stage more of it.
+struct Staging {
+    open: Arc<OpenFill>,
+    layout: Arc<Layout>,
+    manifest: String,
+    staged: BTreeSet<u32>,
+}
 enum Slot {
     /// Admitted, its memfd being created.
     Opening(u64),
     Open(Entry),
 }
-/// One layout's fill, queued for the tier's filler.
-struct Job {
-    key: String,
-    plan: SealedPlan,
-    body: Vec<u8>,
-    read_plan: read::ReadPlan,
-    layout: Layout,
-    open: OpenFill,
-    prefill: bool,
+/// Work for the tier's filler, in order: a layout's first fill (of what it stages), or more
+/// regions staged into a layout staged in part.
+enum Job {
+    Fill {
+        key: String,
+        plan: SealedPlan,
+        body: Vec<u8>,
+        layout: Arc<Layout>,
+        open: Arc<OpenFill>,
+        prefill: bool,
+    },
+    Stage {
+        key: String,
+        regions: Vec<u32>,
+    },
 }
 struct Peer {
     pidfd: File,
+    /// It reads a layout's holes from the object files (`host_tiers.staged/1`).
+    staged: bool,
 }
 /// A component's memory allocated before its plan exists (`prepare`).
 enum Reservation {
@@ -344,7 +368,22 @@ impl HostTier {
     /// layout a remembered plan describes, and for each component without one allocate its
     /// memory now (sized from the manifest) and read its objects ahead. The layout itself
     /// needs the model code's plan; when it arrives the fill mostly copies.
-    pub fn prepare(self: &Arc<Self>, grants: Vec<HostGrant>) {
+    pub fn prepare(self: &Arc<Self>, grants: Vec<HostGrant>, staged: bool) {
+        if staged {
+            // Its executor stages only what streams and reads the rest from the files: warm
+            // the page cache (reclaimable), allocate nothing.
+            let tier = self.clone();
+            std::thread::spawn(move || {
+                for grant in &grants {
+                    for component in &grant.components {
+                        if let Ok(plan) = component_plan(&grant.header, component) {
+                            tier.read_ahead(&plan);
+                        }
+                    }
+                }
+            });
+            return;
+        }
         let plans = self.plans.lock().unwrap().clone();
         let mut bodies = Vec::new();
         let mut unplanned = Vec::new();
@@ -377,7 +416,7 @@ impl HostTier {
             for body in bodies {
                 let filled = serde_json::from_slice::<SealedPlan>(&body)
                     .map_err(failure)
-                    .and_then(|plan| tier.ensure(&plan, &grants, &body, true).map(|_| ()));
+                    .and_then(|plan| tier.ensure(&plan, &grants, &body, true, None).map(|_| ()));
                 if let Err(error) = filled {
                     eprintln!("host tier prefill skipped: {error}");
                 }
@@ -388,18 +427,7 @@ impl HostTier {
     /// Allocate one component's memory before its plan: every byte its tensors declare, plus
     /// room for region padding; a fill frees what its layout does not use.
     fn reserve(&self, manifest: &str, header: &Header, component: &str) -> io::Result<()> {
-        let traversal: Vec<(String, String)> = header
-            .components
-            .iter()
-            .filter(|(name, _)| name == component)
-            .flat_map(|(name, tensors)| {
-                tensors
-                    .iter()
-                    .map(move |(key, _)| (name.clone(), key.clone()))
-            })
-            .collect();
-        let plan = read::plan_for_traversal(header, &traversal, &[component.to_string()], 4 << 20)
-            .map_err(failure)?;
+        let plan = component_plan(header, component)?;
         let bytes = plan.bytes + plan.bytes / 50 + (32 << 20);
         let key = (hex(manifest).to_string(), component.to_string());
         {
@@ -423,16 +451,7 @@ impl HostTier {
                 .insert(key.clone(), Reservation::Allocating(bytes));
         }
         // Read ahead what the page cache lacks; the fill then copies instead of reading disk.
-        for item in &plan.items {
-            if let Item::Object(range) = &item.source {
-                if let Ok(file) = File::open(self.store.blob_path(&range.obj.sha256)) {
-                    // SAFETY: advice on a descriptor we hold.
-                    unsafe {
-                        libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_WILLNEED)
-                    };
-                }
-            }
-        }
+        self.read_ahead(&plan);
         let made = host::reserve(component, bytes, self.config.fill_threads);
         let mut state = self.state.lock().unwrap();
         let result = match made {
@@ -453,13 +472,36 @@ impl HostTier {
         result
     }
 
+    /// Ask the kernel to read `plan`'s objects into the page cache (asynchronous, reclaimable).
+    fn read_ahead(&self, plan: &read::ReadPlan) {
+        for item in &plan.items {
+            if let Item::Object(range) = &item.source {
+                if let Ok(file) = File::open(self.store.blob_path(&range.obj.sha256)) {
+                    // SAFETY: advice on a descriptor we hold.
+                    unsafe {
+                        libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_WILLNEED)
+                    };
+                }
+            }
+        }
+    }
+
     /// An executor, by its pidfd: what it adopted stays held until that exact process exits.
-    pub fn register_peer(&self, pidfd: File) -> u64 {
+    /// `staged`: it reads a layout's holes from object files (`host_tiers.staged/1`), so the
+    /// tier stages only the regions it streams.
+    pub fn register_peer(&self, pidfd: File, staged: bool) -> u64 {
         let mut state = self.state.lock().unwrap();
         state.next_peer += 1;
         let id = state.next_peer;
-        state.peers.insert(id, Peer { pidfd });
+        state.peers.insert(id, Peer { pidfd, staged });
         id
+    }
+
+    fn staged_peer(&self, peer: u64) -> io::Result<bool> {
+        match self.state.lock().unwrap().peers.get(&peer) {
+            Some(p) => Ok(p.staged),
+            None => Err(denied("host tier peer is not a registered live executor")),
+        }
     }
 
     /// One weight set's layout for `peer`, read-only: from the tier, or opened now (whole and
@@ -471,11 +513,32 @@ impl HostTier {
         request: SealedRequest<'_>,
         plan: File,
     ) -> io::Result<Option<File>> {
-        if !self.state.lock().unwrap().peers.contains_key(&peer) {
-            return Err(denied("host tier peer is not a registered live executor"));
-        }
+        // Only an executor that reads holes from object files gets a layout staged in part.
+        let stage = match self.staged_peer(peer)? {
+            true => request.stage.map(<[u32]>::to_vec),
+            false => None,
+        };
         let (plan, body) = Self::plan(request, plan)?;
-        let key = self.ensure(&plan, grants, &body, false)?;
+        let mut key = self.ensure(&plan, grants, &body, false, stage.clone())?;
+        // A layout another executor had staged in part: this one stages what it asked for, or
+        // all of it when it reads no holes (a CPU executor computes on every byte).
+        self.stage_regions(&key, stage.as_deref());
+        if stage.is_none() {
+            // A whole reader cannot consume holes. If staging is no longer fully admitted
+            // (another peer used room), use a bounded window without growing the sparse copy.
+            let fallback = {
+                let state=self.state.lock().unwrap();
+                matches!(state.slots.get(&key),Some(Slot::Open(Entry {staging:Some(s),..}))
+                    if (0..s.layout.regions.len() as u32).any(|r| !s.staged.contains(&r)))
+            };
+            if fallback {
+                let (read_plan,layout)=Self::layout(&plan,grants)?;
+                let state=self.state.lock().unwrap();
+                let staging=self.limit.staging(&crate::host_memory::read(),state.charged());
+                drop(state);
+                key=self.stream(format!("{}.whole",layout.digest),&plan,read_plan,layout,staging)?;
+            }
+        }
         let mut state = self.state.lock().unwrap();
         match state.slots.get(&key) {
             Some(Slot::Open(_)) => self.grant(&mut state, &key, peer).map(Some),
@@ -483,15 +546,8 @@ impl HostTier {
         }
     }
 
-    /// The layout `plan` names, held or opened now: whole (its fill queued) when the tier can
-    /// make room, else streamed through a window. Its key.
-    fn ensure(
-        &self,
-        plan: &SealedPlan,
-        grants: &[HostGrant],
-        body: &[u8],
-        prefill: bool,
-    ) -> io::Result<String> {
+    /// The read plan and layout `plan` names, inside the executor's selection.
+    fn layout(plan: &SealedPlan, grants: &[HostGrant]) -> io::Result<(read::ReadPlan, Layout)> {
         let grant = grants
             .iter()
             .find(|g| hex(&g.manifest) == hex(&plan.manifest))
@@ -516,7 +572,29 @@ impl HostTier {
             read_plan = read_plan.select(&plan.parts).map_err(failure)?;
         }
         let layout = Layout::build(&read_plan, &plan.regions).map_err(failure)?;
+        Ok((read_plan, layout))
+    }
+
+    /// The layout `plan` names, held or opened now: whole, or with only `stage` staged (the
+    /// rest holes, read from object files), its fill queued, when the tier can make room. A
+    /// staged layout that does not fit opens with nothing staged; a whole one streams through
+    /// a window. Its key.
+    fn ensure(
+        &self,
+        plan: &SealedPlan,
+        grants: &[HostGrant],
+        body: &[u8],
+        prefill: bool,
+        mut stage: Option<Vec<u32>>,
+    ) -> io::Result<String> {
+        let (read_plan, layout) = Self::layout(plan, grants)?;
         let key = layout.digest.clone();
+        if let Some(regions)=&mut stage {
+            if regions.iter().any(|&r| r as usize>=layout.regions.len()) {
+                return Err(denied("stage region leaves the declared layout"));
+            }
+            regions.sort_unstable(); regions.dedup();
+        }
         // A one-component plan uses the memory `prepare` allocated for that component.
         let reservation = match plan.components.as_slice() {
             [component] => Some((hex(&plan.manifest).to_string(), component.clone())),
@@ -526,7 +604,21 @@ impl HostTier {
         loop {
             self.reap(&mut state);
             match state.slots.get(&key) {
-                Some(Slot::Open(_)) => {
+                Some(Slot::Open(entry)) => {
+                    if stage.is_none() {
+                        if let Some(staging)=&entry.staging {
+                            let missing=staging.layout.regions.iter().enumerate()
+                                .filter(|(r,_)| !staging.staged.contains(&(*r as u32)))
+                                .map(|(_,region)|region.span).sum::<u64>();
+                            let host=crate::host_memory::read();
+                            let charged=state.charged();
+                            if charged.saturating_add(missing)>self.limit.limit(&host,charged) {
+                                let room=self.limit.staging(&host,charged);
+                                drop(state);
+                                return self.stream(format!("{key}.whole"),plan,read_plan,layout,room);
+                            }
+                        }
+                    }
                     if !prefill {
                         state.ledger.hits += 1;
                     }
@@ -547,7 +639,14 @@ impl HostTier {
             _ => None,
         });
         // Admission over live headroom, read now: release unheld layouts, oldest first.
-        let need = layout.nbytes;
+        let spans = |regions: &[u32]| -> u64 {
+            regions
+                .iter()
+                .filter_map(|&r| layout.regions.get(r as usize))
+                .map(|r| r.span)
+                .sum()
+        };
+        let mut need = stage.as_deref().map_or(layout.nbytes, spans);
         loop {
             let host = crate::host_memory::read();
             let charged = state.charged();
@@ -555,6 +654,12 @@ impl HostTier {
                 break;
             }
             if !self.release_lru(&mut state) {
+                if stage.is_some() {
+                    // Nothing staged: every region reads the object files (the disk rung).
+                    stage = Some(Vec::new());
+                    need = 0;
+                    break;
+                }
                 let staging = self.limit.staging(&host, charged);
                 drop(state);
                 if let Some(fd) = reserved {
@@ -567,14 +672,22 @@ impl HostTier {
         state.slots.insert(key.clone(), Slot::Opening(need));
         drop(state);
         // Sealed now, filled by the filler: adopters wait per region, never for the whole.
-        let opened = host::open_sealed(&plan.name, &layout, reserved, None).map_err(failure);
+        let opened = host::open_sealed(&plan.name, &layout, reserved, stage.as_deref()).map_err(failure);
         let mut state = self.state.lock().unwrap();
         let result = match opened {
             Ok((fd, open)) => {
+                let (open, layout) = (Arc::new(open), Arc::new(layout));
+                let staging = stage.map(|regions| Staging {
+                    open: open.clone(),
+                    layout: layout.clone(),
+                    manifest: hex(&plan.manifest).to_string(),
+                    staged: regions.into_iter().collect(),
+                });
                 state.slots.insert(
                     key.clone(),
                     Slot::Open(Entry {
                         fd: File::from(fd),
+                        staging,
                         charged: need,
                         used: Instant::now(),
                         holders: BTreeSet::new(),
@@ -583,11 +696,10 @@ impl HostTier {
                         granted: false,
                     }),
                 );
-                let job = Job {
+                let job = Job::Fill {
                     key: key.clone(),
                     plan: plan.clone(),
                     body: body.to_vec(),
-                    read_plan,
                     layout,
                     open,
                     prefill,
@@ -643,6 +755,7 @@ impl HostTier {
             key.clone(),
             Slot::Open(Entry {
                 fd: File::from(fd),
+                staging: None,
                 charged,
                 used: Instant::now(),
                 holders: BTreeSet::new(),
@@ -674,16 +787,19 @@ impl HostTier {
     /// The filler: one layout's bytes, then it is complete (charged what it holds) or, failed,
     /// dropped (its adopters see the failure in its Ready words).
     fn run(&self, job: Job) {
-        let Job {
-            key,
-            plan,
-            body,
-            read_plan,
-            layout,
-            open,
-            prefill,
-        } = job;
-        let filled = self.fill(&plan, &read_plan, &layout, open);
+        let (key, plan, body, layout, open, prefill) = match job {
+            Job::Fill {
+                key,
+                plan,
+                body,
+                layout,
+                open,
+                prefill,
+            } => (key, plan, body, layout, open, prefill),
+            Job::Stage { key, regions } => return self.run_stage(&key, &regions),
+        };
+        let filled = self.fill(&plan, &layout, &open);
+        drop(open); // a layout staged in part keeps the mapping in its entry; a whole one lets go
         let mut state = self.state.lock().unwrap();
         match filled {
             Ok(fill) => {
@@ -710,6 +826,170 @@ impl HostTier {
             }
         }
         self.filled.notify_all();
+    }
+
+    /// Stage `regions` of a layout staged in part, in order, as far as the tier has room;
+    /// returns the regions now staged or staging (all of them for a whole layout). The filler
+    /// copies them; adopters wait per region, and a region left a hole reads the files. None:
+    /// every region within admission; a whole adopter uses a window if any remain holes.
+    fn stage_regions(&self, key: &str, regions: Option<&[u32]>) -> Vec<u32> {
+        let mut state = self.state.lock().unwrap();
+        let limit = |state: &State| {
+            let host = crate::host_memory::read();
+            let charged = state.charged();
+            (charged, self.limit.limit(&host, charged))
+        };
+        let (mut charged, ceiling) = limit(&state);
+        let Some(Slot::Open(entry)) = state.slots.get_mut(key) else {
+            return Vec::new();
+        };
+        let Some(staging) = entry.staging.as_mut() else {
+            return regions.map(<[u32]>::to_vec).unwrap_or_default();
+        };
+        let every: Vec<u32>;
+        let regions = match regions {
+            Some(regions) => regions,
+            None => {
+                every = (0..staging.layout.regions.len() as u32).collect();
+                &every
+            }
+        };
+        let mut queued = Vec::new();
+        for &r in regions {
+            let Some(region) = staging.layout.regions.get(r as usize) else {
+                continue;
+            };
+            if staging.staged.contains(&r) {
+                continue;
+            }
+            if charged.saturating_add(region.span) > ceiling {
+                break; // the rest stream from the files
+            }
+            charged += region.span;
+            entry.charged += region.span;
+            staging.staged.insert(r);
+            queued.push(r);
+        }
+        let staged = regions
+            .iter()
+            .copied()
+            .filter(|r| staging.staged.contains(r))
+            .collect();
+        // Taken before the answer: the executor waits for these from now on, never reads them
+        // as holes. The filler copies them.
+        let taken = staging.open.take(&queued);
+        if !taken.is_empty() {
+            let job = Job::Stage {
+                key: key.to_string(),
+                regions: taken,
+            };
+            let _ = self.fills.lock().unwrap().send(job);
+        }
+        staged
+    }
+
+    /// The filler's half of `stage_regions`: a lease over the regions' objects, then copy.
+    fn run_stage(&self, key: &str, regions: &[u32]) {
+        let taken = {
+            let state = self.state.lock().unwrap();
+            match state.slots.get(key) {
+                Some(Slot::Open(Entry {
+                    staging: Some(s), ..
+                })) => Some((s.open.clone(), s.layout.clone(), s.manifest.clone())),
+                _ => None,
+            }
+        };
+        let Some((open, layout, manifest)) = taken else {
+            return;
+        };
+        let mut objects = BTreeMap::new();
+        for &r in regions {
+            for item in &layout.regions[r as usize].items {
+                if let tensorfs_plane::layout::ItemSource::Object(range) = &item.source {
+                    objects.insert(range.obj.sha256.clone(), range.obj.clone());
+                }
+            }
+        }
+        let staged = read::acquire(
+            &self.store,
+            &self.meta,
+            &manifest,
+            objects.into_values().collect(),
+        )
+        .map_err(failure)
+        .and_then(|(lease, _)| {
+            let source = Source::new(self.store.clone(), self.meta.clone(), lease, true, 0);
+            let tally = IoTally::default();
+            open.stage(regions, &layout, &source, self.config.fill_threads, &tally)
+                .map_err(failure)
+        });
+        let mut state = self.state.lock().unwrap();
+        if let Some(Slot::Open(entry)) = state.slots.get_mut(key) {
+            if let Ok(meta) = entry.fd.metadata() {
+                entry.charged = entry.charged.max(meta.blocks() * 512);
+            }
+        }
+        if let Err(error) = staged {
+            eprintln!("host tier staging of {regions:?} failed: {error}");
+            state.ledger.failed += 1;
+        }
+        drop(state);
+        self.filled.notify_all();
+    }
+
+    /// More of a layout staged in part, for `peer`: `regions` it now streams every step
+    /// (`SealedStage`). Returns the regions staged or staging; the rest stay holes.
+    pub fn stage(
+        &self,
+        peer: u64,
+        grants: &[HostGrant],
+        request: SealedRequest<'_>,
+        plan: File,
+    ) -> io::Result<Vec<u32>> {
+        if !self.staged_peer(peer)? {
+            return Err(denied("this executor reads no holes"));
+        }
+        let regions = request.stage.unwrap_or_default().to_vec();
+        let (plan, _) = Self::plan(request, plan)?;
+        let (_, layout) = Self::layout(&plan, grants)?;
+        Ok(self.stage_regions(&layout.digest, Some(&regions)))
+    }
+
+    /// The verified object files behind `plan`, read-only, for `peer`'s holes: the store's
+    /// own descriptors (the file verified is the file read), opened per ask and handed over.
+    pub fn object_files(
+        &self,
+        peer: u64,
+        grants: &[HostGrant],
+        request: SealedRequest<'_>,
+        plan: File,
+    ) -> io::Result<Vec<(tensorfs_core::ids::ObjectRef, File)>> {
+        if !self.staged_peer(peer)? {
+            return Err(denied("this executor reads no holes"));
+        }
+        self.state.lock().unwrap().ledger.object_file_requests += 1;
+        let (plan, _) = Self::plan(request, plan)?;
+        let (read_plan, _) = Self::layout(&plan, grants)?;
+        let mut objects = BTreeMap::new();
+        for item in &read_plan.items {
+            if let Item::Object(range) = &item.source {
+                objects.insert(range.obj.sha256.clone(), range.obj.clone());
+            }
+        }
+        let files: Vec<_> = objects
+            .into_values()
+            .map(|obj| {
+                let verified = self.store.open_verified(&obj.sha256).map_err(failure)?;
+                if verified.len() != obj.length {
+                    return Err(failure(format!("{}: length differs", obj.sha256)));
+                }
+                Ok((obj, verified.into_file()))
+            })
+            .collect::<io::Result<_>>()?;
+        let mut state=self.state.lock().unwrap();
+        state.ledger.object_file_grants += 1;
+        state.ledger.object_files_granted += files.len() as u64;
+        Ok(files)
     }
 
     /// Release unheld layouts, least recently used first, until `want` bytes were charged
@@ -801,10 +1081,13 @@ impl HostTier {
                 body,
             ));
         }
+        // An executor that stages what streams gets layouts with nothing staged yet: it asks
+        // for its streamed regions once its stages plan them.
+        let stage = self.staged_peer(peer)?.then(Vec::new);
         let (tier, grants) = (self.clone(), grants.to_vec());
         std::thread::spawn(move || {
             for (plan, body) in queued {
-                if let Err(error) = tier.ensure(&plan, &grants, &body, true) {
+                if let Err(error) = tier.ensure(&plan, &grants, &body, true, stage.clone()) {
                     eprintln!("host tier prefetch skipped: {error}");
                 }
             }
@@ -839,20 +1122,30 @@ impl HostTier {
         Ok(body)
     }
 
-    fn fill(
-        &self,
-        plan: &SealedPlan,
-        read_plan: &read::ReadPlan,
-        layout: &Layout,
-        open: OpenFill,
-    ) -> io::Result<Fill> {
+    fn fill(&self, plan: &SealedPlan, layout: &Layout, open: &OpenFill) -> io::Result<Fill> {
+        // A lease over the objects of what this layout stages, not its holes.
         let mut objects = BTreeMap::new();
-        for item in &read_plan.items {
-            if let Item::Object(range) = &item.source {
-                objects.insert(range.obj.sha256.clone(), range.obj.clone());
+        for (r, region) in layout.regions.iter().enumerate() {
+            if open.hole(r as u32) {
+                continue;
+            }
+            for item in &region.items {
+                if let tensorfs_plane::layout::ItemSource::Object(range) = &item.source {
+                    objects.insert(range.obj.sha256.clone(), range.obj.clone());
+                }
             }
         }
         let started = (Instant::now(), disk_read_bytes());
+        let tally = IoTally::default();
+        if objects.is_empty() {
+            // Nothing staged (or only inline bytes): no lease to take.
+            let source = Source::files(Vec::new(), false, 0);
+            open.fill(layout, &source, 1, &tally).map_err(failure)?;
+            return Ok(Fill {
+                name: plan.name.clone(),
+                ..Fill::default()
+            });
+        }
         let (lease, _) = read::acquire(
             &self.store,
             &self.meta,
@@ -861,14 +1154,17 @@ impl HostTier {
         )
         .map_err(failure)?;
         let source = Source::new(self.store.clone(), self.meta.clone(), lease, true, 0);
-        let tally = IoTally::default();
-        open.run(layout, &source, self.config.fill_threads, &tally)
+        open.fill(layout, &source, self.config.fill_threads, &tally)
             .map_err(failure)?;
         drop(source); // ends the lease and its descriptors: one descriptor per layout stays
         let read = |n: &std::sync::atomic::AtomicU64| n.load(std::sync::atomic::Ordering::Relaxed);
+        let bytes = (0..layout.regions.len() as u32)
+            .filter(|&r| !open.hole(r))
+            .map(|r| layout.regions[r as usize].span)
+            .sum();
         Ok(Fill {
             name: plan.name.clone(),
-            bytes: layout.nbytes,
+            bytes,
             ms: started.0.elapsed().as_secs_f64() * 1e3,
             cached_bytes: read(&tally.cached_bytes),
             direct_bytes: read(&tally.direct_bytes),
@@ -1009,5 +1305,31 @@ fn serve(
         read::acquire(store, meta, manifest, objects.into_values().collect()).map_err(failure)?;
     let source = Source::new(store.clone(), meta.clone(), lease, true, 0);
     open.serve(layout, &source, threads, tally, stop)
+        .map_err(failure)
+}
+
+/// The SHA-256 (hex) of `files`' objects in order, one `<sha256>:<length>\n` line each: what an
+/// `object_files` answer names, checked against the list the executor derives from its plan.
+pub fn objects_digest(files: &[(tensorfs_core::ids::ObjectRef, File)]) -> String {
+    let lines: String = files
+        .iter()
+        .map(|(obj, _)| format!("{}:{}\n", obj.sha256, obj.length))
+        .collect();
+    format!("{:x}", Sha256::digest(lines.as_bytes()))
+}
+
+/// One component's whole read plan, from its header.
+fn component_plan(header: &Header, component: &str) -> io::Result<read::ReadPlan> {
+    let traversal: Vec<(String, String)> = header
+        .components
+        .iter()
+        .filter(|(name, _)| name == component)
+        .flat_map(|(name, tensors)| {
+            tensors
+                .iter()
+                .map(move |(key, _)| (name.clone(), key.clone()))
+        })
+        .collect();
+    read::plan_for_traversal(header, &traversal, &[component.to_string()], 4 << 20)
         .map_err(failure)
 }
