@@ -25,7 +25,9 @@ def symbols(source, names, namespace):
     selected = [node for node in tree.body if getattr(node, "name", None) in names]
     if {node.name for node in selected} != set(names):
         raise ValueError("required source symbols absent")
-    exec(
+    # Like importing Comfy, this diagnostic executes the caller's reviewed Git source.
+    # Keep the actual scheduler definitions instead of writing a lookalike algorithm.
+    exec(  # noqa: S102
         compile(ast.Module(body=selected, type_ignores=[]), "<pinned-comfy>", "exec"),
         namespace,
     )
