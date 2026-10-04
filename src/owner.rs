@@ -80,6 +80,9 @@ impl Owner {
         })?;
         std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
         let store = Arc::new(Store::ensure(store).map_err(io::Error::other)?);
+        // The machine is the store's owner: its read leases pin in memory, so its GC can make
+        // room while layouts are served.
+        tensorfs_core::meta::own(&store);
         let incarnation = format!(
             "{}-{}",
             std::process::id(),
@@ -360,4 +363,30 @@ fn control_socket(root: &Path, name: &str) -> io::Result<PathBuf> {
     let path = directory.join(format!("{}.{name}.sock", &identity[..24]));
     std::os::unix::net::SocketAddr::from_pathname(&path)?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tensorfs_core::{meta::Meta, read, store::Fault};
+
+    /// The machine owns its store: a layout's live read lease no longer stops TensorFS GC,
+    /// which keeps the leased bytes and takes what nothing holds.
+    #[test]
+    fn the_machines_gc_runs_while_a_layout_is_leased() {
+        let root = std::env::temp_dir().join(format!("cm-owner-gc-{}", uuid::Uuid::new_v4()));
+        let owner = Owner::new(&root, &root.join("tensorfs"), 1 << 20, Duration::from_secs(60)).unwrap();
+        let store = owner.lock().unwrap().store();
+        let meta = Meta::open(&store).unwrap();
+        let put = |bytes: &[u8]| store.put_stream(&mut &bytes[..], None, &Fault::default()).unwrap().obj;
+        let leased = put(b"weights a served layout reads");
+        let garbage = put(b"weights nothing references");
+        let (lease, _) = read::acquire(&store, &meta, "layout", vec![leased.clone()]).unwrap();
+        tensorfs_core::gc::collect(store.root(), false).unwrap();
+        assert!(store.object_path(&leased.sha256).is_file());
+        assert!(!store.object_path(&garbage.sha256).exists());
+        lease.release(&meta).unwrap();
+        drop(owner);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

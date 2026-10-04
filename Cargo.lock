@@ -1687,21 +1687,26 @@ dependencies = [
 [[package]]
 name = "tensorfs-core"
 version = "0.3.93"
-source = "git+https://github.com/cozy-creator/tensorfs.git?rev=e3c13563a9252bc94102ec16682c28e497260f3b#e3c13563a9252bc94102ec16682c28e497260f3b"
+source = "git+https://github.com/cozy-creator/tensorfs.git?rev=53fbb1756b2cbcc529ba8affef706577deef0db8#53fbb1756b2cbcc529ba8affef706577deef0db8"
 dependencies = [
+ "base64 0.22.1",
  "fs2",
  "minicbor",
  "nix",
  "rusqlite",
  "rustix",
  "rustls",
+ "serde",
+ "serde_json",
+ "serde_json_canonicalizer",
+ "sha2",
  "webpki-roots 0.26.11",
 ]
 
 [[package]]
 name = "tensorfs-plane"
 version = "0.3.93"
-source = "git+https://github.com/cozy-creator/tensorfs.git?rev=e3c13563a9252bc94102ec16682c28e497260f3b#e3c13563a9252bc94102ec16682c28e497260f3b"
+source = "git+https://github.com/cozy-creator/tensorfs.git?rev=53fbb1756b2cbcc529ba8affef706577deef0db8#53fbb1756b2cbcc529ba8affef706577deef0db8"
 dependencies = [
  "libc",
  "libloading",
