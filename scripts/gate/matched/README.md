@@ -38,8 +38,20 @@ are true: review the cited sources and inventories before qualification.
 with installed Diffusers. On the checked local source, normal differs by only
 1.19e-7; inherited simple differs by 0.08658. This is schedule evidence only.
 Published package source/config, exported model tensors, conditioning and decode
-precision still require their own checks. Unproved SDXL scheduler config refuses
-a match; it is not filled from a remembered default.
+precision still require their own checks. `--model sdxl` compares its actual
+EulerDiscrete config: the verified paul/sdxl1.0 header uses leading/offset1,
+and Comfy ddim_uniform matches within4.77e-6 while normal/simple differ3.5863.
+Unproved configs refuse a match; they are not filled from remembered defaults.
+
+`native-source/` is an authored CPU package for supported model metadata custody:
+ordinary `cozy package install ./native-source`, then
+`cozy run local/codex-memory-metadata/metadata source.model=paul/sdxl@1.0.0
+--rental=OWNED --await --json`. It calls `ctx.tensorfs_source(source).inspect()`
+under the admitted model capability and returns exact source/config hashes and
+native tensor/part geometry. It constructs no model, opens no Store, and is not
+an inference/quality test. Source tensor export should use bounded
+`capability.read_part_into`, retaining encoded/logical metadata; it must not assume
+all quantized parts are dense logical values or read a foreign Store directly.
 
 Collect same-engine unconstrained controls first with `--reference-only`. Repeat
 the exact six requests three times, then run `controls.py ref1/result.json

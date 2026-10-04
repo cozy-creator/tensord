@@ -1,4 +1,4 @@
-"""Measure actual Anima scheduler grids from pinned Comfy source and Diffusers.
+"""Measure actual SDXL/Anima grids from pinned Comfy source and Diffusers.
 
 This produces schedule evidence only. Tensor, conditioning, equation and precision
 parity still require separate evidence before run.py will admit a scored row.
@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 import diffusers
 import torch
-from diffusers import FlowMatchEulerDiscreteScheduler
+from diffusers import EulerDiscreteScheduler, FlowMatchEulerDiscreteScheduler
 
 
 def symbols(source, names, namespace):
@@ -33,7 +33,7 @@ def symbols(source, names, namespace):
     )
 
 
-def measure(comfy, commit, config, steps):
+def measure(comfy, commit, config, steps, model="anima"):
     torch.set_num_threads(2)
     sources = {
         path: subprocess.check_output(
@@ -43,30 +43,63 @@ def measure(comfy, commit, config, steps):
     }
     scope = {"torch": torch, "math": math}
     symbols(
-        sources["comfy/model_sampling.py"],
-        ["time_snr_shift", "ModelSamplingDiscreteFlow"],
+        sources["comfy/samplers.py"],
+        ["normal_scheduler", "simple_scheduler", "ddim_scheduler"],
         scope,
     )
-    symbols(
-        sources["comfy/samplers.py"], ["normal_scheduler", "simple_scheduler"], scope
-    )
     actual = json.loads(config.read_text())
-    if actual.get("use_dynamic_shifting") or actual.get("num_train_timesteps") != 1000:
-        raise ValueError(
-            "this reviewed Anima grid requires static shift and1000training steps"
+    if model == "anima":
+        symbols(
+            sources["comfy/model_sampling.py"],
+            ["time_snr_shift", "ModelSamplingDiscreteFlow"],
+            scope,
         )
-    sampling = scope["ModelSamplingDiscreteFlow"](
-        SimpleNamespace(sampling_settings={"shift": actual["shift"]})
-    )
-    scheduler = FlowMatchEulerDiscreteScheduler.from_config(actual)
+        if (
+            actual.get("use_dynamic_shifting")
+            or actual.get("num_train_timesteps") != 1000
+        ):
+            raise ValueError(
+                "reviewed Anima grid requires static shift and1000 training steps"
+            )
+        sampling = scope["ModelSamplingDiscreteFlow"](
+            SimpleNamespace(sampling_settings={"shift": actual["shift"]})
+        )
+        scheduler = FlowMatchEulerDiscreteScheduler.from_config(actual)
+    elif model == "sdxl":
+        if (
+            actual.get("beta_schedule") != "scaled_linear"
+            or actual.get("trained_betas") is not None
+        ):
+            raise ValueError(
+                "reviewed SDXL grid requires its actual scaled_linear beta configuration"
+            )
+        path = "comfy/ldm/modules/diffusionmodules/util.py"
+        sources[path] = subprocess.check_output(
+            ["git", "-C", str(comfy), "show", f"{commit}:{path}"], text=True
+        )
+        symbols(sources[path], ["make_beta_schedule"], scope)
+        symbols(sources["comfy/model_sampling.py"], ["ModelSamplingDiscrete"], scope)
+        sampling = scope["ModelSamplingDiscrete"](
+            SimpleNamespace(
+                sampling_settings={
+                    "beta_schedule": "linear",
+                    "linear_start": actual["beta_start"],
+                    "linear_end": actual["beta_end"],
+                    "timesteps": actual["num_train_timesteps"],
+                }
+            )
+        )
+        scheduler = EulerDiscreteScheduler.from_config(actual)
+    else:
+        raise ValueError("only actual SDXL/Anima grids are reviewed here")
     scheduler.set_timesteps(steps, device="cpu")
     cozy = scheduler.sigmas.tolist()
     arrays = {
         name: scope[name + "_scheduler"](sampling, steps).tolist()
-        for name in ("normal", "simple")
+        for name in ("normal", "simple", "ddim")
     }
     return {
-        "model": "anima",
+        "model": model,
         "steps": steps,
         "config": actual,
         "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
@@ -76,8 +109,11 @@ def measure(comfy, commit, config, steps):
             p: hashlib.sha256(s.encode()).hexdigest() for p, s in sources.items()
         },
         "sigmas": {"cozy": cozy, **arrays},
+        "array_lengths": {name: len(arr) for name, arr in arrays.items()},
         "max_absolute_difference": {
             name: max(abs(x - y) for x, y in zip(cozy, arr, strict=True))
+            if len(cozy) == len(arr)
+            else None
             for name, arr in arrays.items()
         },
     }
@@ -89,10 +125,12 @@ def main():
     p.add_argument("--commit", required=True)
     p.add_argument("--config", type=Path, required=True)
     p.add_argument("--steps", type=int, required=True)
+    p.add_argument("--model", choices=["sdxl", "anima"], default="anima")
     p.add_argument("--out", type=Path, required=True)
     a = p.parse_args()
     a.out.write_text(
-        json.dumps(measure(a.comfy, a.commit, a.config, a.steps), indent=2) + "\n"
+        json.dumps(measure(a.comfy, a.commit, a.config, a.steps, a.model), indent=2)
+        + "\n"
     )
 
 
