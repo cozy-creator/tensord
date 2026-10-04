@@ -66,7 +66,11 @@ def monitor(spec, receipt, root, stopped, errors):
                 stream.flush()
             except BaseException as error:
                 errors.append(repr(error))
-                stream.write(json.dumps({"probe_error": repr(error), "unix_ns": time.time_ns()}) + "\n")
+                stream.write(json.dumps({
+                    "probe_error": repr(error), "unix_ns": time.time_ns(),
+                    "stderr": error.stderr if isinstance(error, subprocess.CalledProcessError) else None,
+                    "stdout": error.stdout if isinstance(error, subprocess.CalledProcessError) else None,
+                }) + "\n")
                 stream.flush()
                 return
             stopped.wait(2)

@@ -40,8 +40,14 @@ def capture(receipt_path):
                 "status": (process_path / "status").read_text(),
                 "smaps_rollup": (process_path / "smaps_rollup").read_text(),
             }
-        except FileNotFoundError:
-            process_memory[process_id] = {"observation": "exited_between_gpu_and_proc_read"}
+        except (FileNotFoundError, ProcessLookupError, PermissionError) as error:
+            # GPU process rows and /proc are independent observations. An executor may
+            # exit or become nondumpable between them. Its optional host RSS/PSS stays
+            # unknown; the holder's identity, physical allocation and ceiling checks
+            # above remain mandatory.
+            process_memory[process_id] = {
+                "observation": "host_memory_unavailable", "error": repr(error)
+            }
     return {
         "remote": True, "rental": receipt["rental"], "rental_id": receipt["rental_id"],
         "operation": receipt["operation"], "gpu_uuid": gpu[0], "driver": receipt["driver"],
