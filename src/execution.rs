@@ -415,19 +415,26 @@ impl Engine {
         Ok((record, new))
     }
 
-    /// The preparing run names its code and models and becomes dispatchable.
+    /// The preparing run names its code and models and becomes dispatchable. Its observation
+    /// ends under the lock a dispatcher claims under: a claim made the moment the run is
+    /// queued keeps its ownership (else `reconcile` takes the attempt for an orphan).
     pub fn bind_prepared(
         &self,
         id: &str,
         invocation: Invocation,
         preparation: &str,
     ) -> io::Result<Execution> {
+        let mut owned = self.owned.lock().unwrap();
+        let mut progress = self.progress.lock().unwrap();
         let record = self
             .journal
             .lock()
             .unwrap()
             .bind_prepared(id, invocation, preparation);
-        self.end_observation(id);
+        progress.remove(id);
+        owned.remove(id);
+        drop((progress, owned));
+        self.notify_activity();
         record
     }
 
