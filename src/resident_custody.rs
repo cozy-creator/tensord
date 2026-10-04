@@ -414,6 +414,17 @@ mod tests {
     fn fds(n: usize) -> Vec<OwnedFd> {
         (0..n).map(|_| devnull()).collect()
     }
+    /// A lease end's close is seen once every copy is closed, and another test's spawn holds
+    /// one between its fork and exec: `seen` is asked again until then.
+    fn eventually(mut seen: impl FnMut() -> bool) -> bool {
+        for _ in 0..500 {
+            if seen() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
 
     #[test]
     fn a_crashed_readers_lease_ends_with_its_connection_and_the_holding_stays() {
@@ -436,10 +447,9 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(
-            custody.collect().is_empty(),
+            eventually(|| custody.collect().is_empty() && custody.holdings()[0].readers.is_empty()),
             "a Ready holding outlives its readers"
         );
-        assert!(custody.holdings()[0].readers.is_empty());
 
         // A replacement attaches duplicates under a lease of its own.
         let (reader, end) = mine();
@@ -457,16 +467,12 @@ mod tests {
         assert!(custody.collect().is_empty());
         assert_eq!(custody.charged_bytes("GPU-1"), total);
         drop(end);
-        // Another test's spawn holds a copy of the end between its fork and exec: the close
-        // is seen once that child has exec'd.
-        let collected = (0..500).find_map(|_| {
-            let ended = custody.collect();
-            if ended.is_empty() {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            Some(ended).filter(|ended| !ended.is_empty())
-        });
-        assert_eq!(collected, Some(vec![(key("a"), total)]));
+        let mut ended = Vec::new();
+        assert!(eventually(|| {
+            ended = custody.collect();
+            !ended.is_empty()
+        }));
+        assert_eq!(ended, vec![(key("a"), total)]);
         assert_eq!(custody.charged_bytes("GPU-1"), 0);
     }
 
