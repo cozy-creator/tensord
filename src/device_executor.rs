@@ -495,6 +495,8 @@ pub struct LoadFacts {
     pub rss_bytes: Option<i64>,
     pub plane: Option<PlaneFacts>,
     pub layouts: BTreeMap<String, Layout>,
+    /// The attention kernel each component's sites were given, and what was skipped and why.
+    pub attention: Option<Value>,
 }
 
 /// One weight set as the plane holds it; `planned_*` count decoded copies (Runtime 0.18.103+).

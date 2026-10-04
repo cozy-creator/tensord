@@ -571,7 +571,9 @@ impl Publisher {
         )?;
         let held = service.catalog.resolve(&identity).map_err(io_failure)?;
         if let Some(gpu) = service.gpu() {
-            gpu.prespawn(held.clone()); // its imports overlap the model download
+            // Its kernel compiles and its imports overlap the model download.
+            gpu.kernel_boot(held.clone());
+            gpu.prespawn(held.clone());
         }
         service
             .engine

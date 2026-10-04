@@ -182,6 +182,7 @@ impl Service {
                 .any(|r| r.record.identity == held.record.identity)
         });
         for held in recent.clone().into_iter().chain(others) {
+            gpu.kernel_boot(held.clone());
             gpu.prespawn(held);
         }
         // A previous run's executors still exiting fence it, as they fence requests.

@@ -395,6 +395,8 @@ pub struct GpuPool {
     /// Per generation, the import-only executor sessions fork from. Declared after
     /// `sessions`: executors end before the parent they were forked from.
     zygotes: Mutex<BTreeMap<String, Arc<Zygote>>>,
+    /// Each generation's kernel boot of this machine run: its process while it runs.
+    kernel_boots: Mutex<BTreeMap<String, Option<crate::process::Exact>>>,
     /// Each envelope GPU with its own memory decisions, in envelope order.
     devices: Vec<Device>,
     host: Arc<HostTier>,
@@ -494,6 +496,7 @@ impl GpuPool {
             reserved: AtomicBool::new(false),
             sessions: Mutex::new(BTreeMap::new()),
             zygotes: Mutex::new(BTreeMap::new()),
+            kernel_boots: Mutex::new(BTreeMap::new()),
             host,
             host_ledger,
             custody,
@@ -510,15 +513,22 @@ impl GpuPool {
         manifests.dedup();
         manifests
     }
-    /// The kernel store and the namespaces live executors use. The pool's executors share
-    /// one identity; a call in progress (the sessions lock is held) counts as live.
+    /// The kernel store and the namespaces live executors and kernel boots use. The pool's
+    /// executors share one identity; a call in progress (the sessions lock is held) counts
+    /// as live.
     pub fn kernel_caches(&self) -> crate::reclaim::KernelCaches {
         let uid = self
             .config
             .identity
             .map_or_else(|| unsafe { libc::geteuid() }, |identity| identity.uid);
-        let live = match (self.sessions.try_lock(), self.zygotes.try_lock()) {
-            (Ok(sessions), Ok(zygotes)) => !sessions.is_empty() || !zygotes.is_empty(),
+        let live = match (
+            self.sessions.try_lock(),
+            self.zygotes.try_lock(),
+            self.kernel_boots.try_lock(),
+        ) {
+            (Ok(sessions), Ok(zygotes), Ok(boots)) => {
+                !sessions.is_empty() || !zygotes.is_empty() || boots.values().any(Option::is_some)
+            }
             _ => true,
         };
         crate::reclaim::KernelCaches {
@@ -1169,7 +1179,146 @@ impl GpuPool {
                 parent.shutdown()?;
             }
         }
+        let boots = std::mem::take(&mut *self.kernel_boots.lock().unwrap());
+        for boot in boots.into_values().flatten() {
+            boot.kill()?;
+        }
         Ok(())
+    }
+
+    /// Compile a generation's kernels for every card of the envelope in the background
+    /// (machine start, after an install, so beside the model download): the Runtime's
+    /// `machine_kernels` under the generation's own seal, so each key is its executors' and
+    /// a kernel already in the store is not built again. Once per generation and machine
+    /// run. It opens no device; its builds are niced and as wide as the host memory free
+    /// when each starts. An executor that needs a kernel still compiling waits for it.
+    pub fn kernel_boot(self: &Arc<Self>, held: HeldGeneration) {
+        let generation = held.record.identity.clone();
+        if !binds_models(&held.record.interface) {
+            return;
+        }
+        {
+            let mut boots = self.kernel_boots.lock().unwrap();
+            if boots.contains_key(&generation) {
+                return;
+            }
+            boots.insert(generation.clone(), None);
+        }
+        let pool = Arc::downgrade(self);
+        let started = std::thread::Builder::new()
+            .name("kernel-boot".into())
+            .spawn(move || {
+                let began = Instant::now();
+                let Some(launched) = pool.upgrade().map(|pool| pool.launch_kernel_boot(&held))
+                else {
+                    return;
+                };
+                // Ended by its exit; killed only on a measured wedge of its process group.
+                let ended = launched.and_then(|(mut child, boot, log)| {
+                    let liveness = crate::process::Liveness::default();
+                    let reaped = crate::process::reap(&boot, Some(&mut child), liveness)?;
+                    Ok((reaped, log))
+                });
+                if let Some(pool) = pool.upgrade() {
+                    if let Some(boot) = pool.kernel_boots.lock().unwrap().get_mut(&generation) {
+                        *boot = None;
+                    }
+                    pool.note_kernel_boot(&generation, began.elapsed(), ended);
+                }
+            });
+        if let Err(error) = started {
+            eprintln!("kernel boot: {error}");
+        }
+    }
+
+    fn launch_kernel_boot(
+        &self,
+        held: &HeldGeneration,
+    ) -> io::Result<(std::process::Child, crate::process::Exact, PathBuf)> {
+        let generation = &held.record.identity;
+        let devices: Vec<_> = self.devices.iter().map(|d| d.entry.as_str()).collect();
+        let seal = Seal::prepare(
+            &self.root,
+            self.config.identity,
+            &self.incarnation,
+            generation,
+            &devices.join(","),
+        )?;
+        let log = self.root.join(format!("kernel-boot.{generation}.log"));
+        let output = File::create(&log)?;
+        let scope = Arc::new(crate::scope::Scope::create(&crate::scope::namespace(
+            self.root.parent().unwrap_or(&self.root),
+        ))?);
+        let launch = || {
+            let mut command = crate::launch_identity::trampoline(
+                &held.record.python,
+                self.config.identity,
+                Some(&scope),
+            )?;
+            command
+                .args(["-I", "-m", "cozy_runtime.internal.machine_kernels"])
+                .env_clear()
+                .envs(seal.environment(&self.config.environment))
+                .envs(scope.environment())
+                .stdin(std::process::Stdio::null())
+                .stdout(output.try_clone()?)
+                .stderr(output.try_clone()?);
+            let child = self.launcher.spawn(command)?;
+            let birth = crate::execution::process_birth(child.id())?;
+            let boot = crate::process::Exact::open(&birth)?
+                .ok_or_else(|| io::Error::other("launched kernel boot has no exact birth"))?;
+            io::Result::Ok((child, boot))
+        };
+        match launch() {
+            Ok((child, boot)) => {
+                let boot = boot.with_scope(Some(scope));
+                let mut boots = self.kernel_boots.lock().unwrap();
+                boots.insert(generation.clone(), Some(boot.try_clone()?));
+                Ok((child, boot, log))
+            }
+            Err(error) => {
+                let _ = scope.end();
+                Err(error)
+            }
+        }
+    }
+
+    /// One line per kernel boot in `kernel-boot.jsonl`: how it ended and what each kernel
+    /// said last (`kernel-boot.<generation>.log` holds its progress too).
+    fn note_kernel_boot(
+        &self,
+        generation: &str,
+        took: std::time::Duration,
+        ended: io::Result<(crate::process::Reaped, PathBuf)>,
+    ) {
+        let mut line = serde_json::json!({
+            "generation": generation,
+            "took_ms": took.as_secs_f64() * 1e3,
+        });
+        match ended {
+            Ok((reaped, log)) => {
+                let kernels: Vec<serde_json::Value> = fs::read_to_string(log)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter_map(|row| serde_json::from_str::<serde_json::Value>(row).ok())
+                    .filter(|row| row.is_object() && row["state"] != "compiling")
+                    .collect();
+                line["status"] = reaped.status.to_string().into();
+                line["killed"] = reaped.killed.into();
+                line["stragglers"] = reaped.stragglers.into();
+                line["kernels"] = kernels.into();
+            }
+            Err(error) => line["failed"] = error.to_string().into(),
+        }
+        eprintln!("kernel boot: {line}");
+        let written = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root.join("kernel-boot.jsonl"))
+            .and_then(|mut file| writeln!(file, "{line}"));
+        if let Err(error) = written {
+            eprintln!("kernel-boot.jsonl: {error}");
+        }
     }
 
     /// Start a generation's import-only executor in the background (machine start, after
