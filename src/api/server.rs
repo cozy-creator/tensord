@@ -145,6 +145,7 @@ pub async fn serve<B: MachineBackend>(
     let (post_access, delete_access) = (service.clone(), service.clone());
     let (output, listed) = (service.clone(), service.clone());
     let (state_api, stage_api, update_api) = (service.clone(), service.clone(), service.clone());
+    let reclaim_api = service.clone();
     let machine = super::machine_v1::MachineV1 {
         identity: service.identity.clone(),
         backend: service.backend.clone(),
@@ -206,6 +207,13 @@ pub async fn serve<B: MachineBackend>(
                     async move { api.output(headers, run, name, Some(index)).await }
                 },
             ),
+        )
+        .route(
+            "/v1/machine/memory/reclaim",
+            axum::routing::post(move |headers: HeaderMap| {
+                let api = reclaim_api.clone();
+                async move { api.reclaim_idle_memory(headers).await }
+            }),
         )
         .route(
             "/v1/machine/runtime",
@@ -343,6 +351,85 @@ impl<B> Clone for Api<B> {
     }
 }
 impl<B: MachineBackend> Api<B> {
+    async fn reclaim_idle_memory(&self, headers: HeaderMap) -> HttpResponse {
+        let reply = |status: StatusCode, value: serde_json::Value| {
+            (
+                status,
+                [
+                    ("content-type", "application/json"),
+                    ("cache-control", "no-store"),
+                ],
+                value.to_string(),
+            )
+                .into_response()
+        };
+        let token = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Cozy-Cap "))
+            .unwrap_or_default();
+        let authority = &self.identity.authority;
+        let verified = super::capability::verify_signer(
+            token,
+            &authority.worker_id,
+            &authority.keys.admitted(),
+            now_ms() as i64 / 1000,
+            "",
+        );
+        let (grant, signer) = match verified {
+            Ok((grant, signer))
+                if grant.action == super::capability::MACHINE
+                    && grant.run.is_empty()
+                    && grant.outputs.is_empty() =>
+            {
+                (grant, signer)
+            }
+            _ => {
+                return reply(
+                    StatusCode::FORBIDDEN,
+                    serde_json::json!({"code":"memory_reclaim_authority","message":"a current machine-scope owner capability is required"}),
+                )
+            }
+        };
+        let actor = super::auth::VerifiedActor {
+            public_key: signer.to_bytes(),
+        };
+        let authorization =
+            super::auth::StreamAuthority::new(authority.keys.clone(), actor, Some(grant.expires));
+        let admission = match self.admit() {
+            Ok(admission) => admission,
+            Err(error) => return reply(StatusCode::CONFLICT, serde_json::json!({"code":"memory_reclaim_busy","message":error.message()})),
+        };
+        let backend = self.backend.clone();
+        let answer = tokio::task::spawn_blocking(move || {
+            let _admission = admission;
+            authorization.check()?;
+            backend.reclaim_idle_memory(actor, grant.expires)
+        })
+        .await;
+        match answer {
+            Ok(Ok(receipt)) => reply(StatusCode::OK, serde_json::to_value(receipt).unwrap()),
+            Ok(Err(error)) => {
+                let status = match error.code() {
+                    tonic::Code::FailedPrecondition => StatusCode::CONFLICT,
+                    tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => {
+                        StatusCode::FORBIDDEN
+                    }
+                    tonic::Code::Unimplemented => StatusCode::NOT_FOUND,
+                    _ => StatusCode::SERVICE_UNAVAILABLE,
+                };
+                reply(
+                    status,
+                    serde_json::json!({"code":"memory_reclaim_refused","message":error.message()}),
+                )
+            }
+            Err(_) => reply(
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({"code":"memory_reclaim_failed","message":"the maintenance task stopped"}),
+            ),
+        }
+    }
+
     fn auth(&self, claim: Option<&pb::Claim>) -> Result<super::auth::VerifiedActor, Status> {
         self.identity.authority.verify(claim)
     }

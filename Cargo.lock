@@ -2047,7 +2047,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -2056,7 +2056,7 @@ dependencies = [
 [[package]]
 name = "tensorfs-core"
 version = "0.3.93"
-source = "git+https://github.com/cozy-creator/tensorfs.git?rev=3fc31b3814e35e5c79033ddf2b820219c0fe7acd#3fc31b3814e35e5c79033ddf2b820219c0fe7acd"
+source = "git+https://github.com/cozy-creator/tensorfs.git?rev=ce9c54a8ff90029e322852c72daaeb11a3f0071d#ce9c54a8ff90029e322852c72daaeb11a3f0071d"
 dependencies = [
  "base64 0.22.1",
  "fs2",
@@ -2075,7 +2075,7 @@ dependencies = [
 [[package]]
 name = "tensorfs-plane"
 version = "0.3.93"
-source = "git+https://github.com/cozy-creator/tensorfs.git?rev=3fc31b3814e35e5c79033ddf2b820219c0fe7acd#3fc31b3814e35e5c79033ddf2b820219c0fe7acd"
+source = "git+https://github.com/cozy-creator/tensorfs.git?rev=ce9c54a8ff90029e322852c72daaeb11a3f0071d#ce9c54a8ff90029e322852c72daaeb11a3f0071d"
 dependencies = [
  "libc",
  "libloading",

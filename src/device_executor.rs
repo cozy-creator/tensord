@@ -876,6 +876,7 @@ pub struct DeviceExecutor {
     _generation_hold: Option<Arc<File>>,
     codec: Arc<Codec>,
     retained: Vec<Box<dyn Send>>,
+    require_source_scope_proof: bool,
     identity: Option<LaunchIdentity>,
     watched: Watched,
     /// Longest gap between frames this executor has shown during invocations.
@@ -1554,6 +1555,7 @@ impl DeviceExecutor {
             _generation_hold: config.generation_hold,
             codec,
             retained: Vec::new(),
+            require_source_scope_proof: false,
             identity: config.identity,
             watched,
             worst_gap: Duration::ZERO,
@@ -1622,6 +1624,13 @@ impl DeviceExecutor {
     /// Observer lifetimes must never own the DeviceExecutor handle.
     pub fn retain_until_exit(&mut self, resource: impl Send + 'static) {
         self.retained.push(Box::new(resource));
+    }
+
+    /// Native source custody requires a supported, proven empty receiver scope.
+    /// Generic resources keep their existing exact-exit behavior.
+    pub fn retain_source_until_exit(&mut self, resource: impl Send + 'static) {
+        self.require_source_scope_proof = true;
+        self.retain_until_exit(resource);
     }
 
     fn offered(&self, command: &DeviceCommand) -> io::Result<()> {
@@ -1856,6 +1865,12 @@ impl DeviceExecutor {
         Ok(())
     }
 
+    /// Recovery of this receiver's supported containment scope; None is unavailable.
+    pub fn scope_recovery(&self) -> Option<crate::scope::Recovery> {
+        let uid = self.identity.map_or_else(|| unsafe { libc::geteuid() }, |identity| identity.uid);
+        self.exact.scope_recovery(uid)
+    }
+
     /// Attempt-keyed cooperative cancellation; observer teardown never calls this.
     pub fn cancel(&self, request_id: &str) -> io::Result<()> {
         self.cancellation().cancel(request_id)
@@ -1875,6 +1890,13 @@ impl DeviceExecutor {
         Ok(())
     }
 
+    /// Retire an already quiescent retained executor through its exact exit fence.
+    pub fn retire_quiescent(mut self) -> io::Result<Ended> {
+        self.require_source_scope_proof = true;
+        let _ = self.command(&DeviceCommand::Shutdown, &mut Baseline);
+        self.terminate()
+    }
+
     /// Close the channel, let the executor stop at its next exchange, kill it only on a
     /// measured wedge, then reap it and release what it held. Blocks until it is gone.
     pub fn terminate(mut self) -> io::Result<Ended> {
@@ -1883,9 +1905,12 @@ impl DeviceExecutor {
     }
 
     fn parts(&mut self) -> Ending {
+        retain_generation(&mut self._generation_hold, &mut self.retained);
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
         Ending {
             exact: self.exact.try_clone(),
+            recovery: self.scope_recovery(),
+            require_source_scope_proof: self.require_source_scope_proof,
             child: self.child.take(),
             forked: std::mem::take(&mut self.forked),
             retained: std::mem::take(&mut self.retained),
@@ -1947,6 +1972,8 @@ impl Drop for Unready {
 /// Everything an executor's teardown must hold until its exit is observed.
 struct Ending {
     exact: io::Result<Exact>,
+    recovery: Option<crate::scope::Recovery>,
+    require_source_scope_proof: bool,
     child: Option<Child>,
     forked: bool,
     retained: Vec<Box<dyn Send>>,
@@ -1975,6 +2002,19 @@ impl Ending {
         };
         if self.forked {
             ended.status = zombie_status(&exact.birth).unwrap_or(ended.status);
+        }
+        if self.require_source_scope_proof {
+            let proof = match &self.recovery {
+                Some(recovery) => recovery.empty(),
+                None => Err(io::Error::new(io::ErrorKind::Unsupported, "executor source scope recovery is unavailable")),
+            };
+            match proof {
+                Ok(true) => (),
+                proof => {
+                    std::mem::forget(std::mem::take(&mut self.retained));
+                    return Err(io::Error::other(format!("executor source scope exit unproven: {proof:?}")));
+                }
+            }
         }
         if !self.socket.as_os_str().is_empty() {
             let _ = fs::remove_file(&self.socket);
@@ -2180,5 +2220,67 @@ mod codec_tests {
         codec.encode(&spool, &reply(4, 24)).unwrap();
         drop(codec);
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+fn retain_generation(hold: &mut Option<Arc<File>>, retained: &mut Vec<Box<dyn Send>>) {
+    if let Some(held) = hold.take() {
+        retained.push(Box::new(held));
+    }
+}
+
+#[cfg(test)]
+mod generation_custody_tests {
+    use super::*;
+
+    #[test]
+    fn strict_native_scope_is_opt_in_and_unavailable_proof_keeps_resources() {
+        use fs2::FileExt;
+        use std::os::unix::process::CommandExt;
+        for strict in [false, true] {
+            let mut child = std::process::Command::new("sh").args(["-c", "read line"]).stdin(Stdio::piped()).process_group(0).spawn().unwrap();
+            let birth = process_birth(child.id()).unwrap();
+            let exact = Exact::open(&birth).unwrap().unwrap();
+            let path = std::env::temp_dir().join(format!("cm-scope-resource-{}", uuid::Uuid::new_v4()));
+            let file = Arc::new(File::create(&path).unwrap());
+            file.lock_exclusive().unwrap();
+            let observer = File::open(&path).unwrap();
+            drop(child.stdin.take());
+            let ended = Ending { exact: Ok(exact), recovery: None, require_source_scope_proof: strict, child: Some(child), forked: false, retained: vec![Box::new(file)], socket: path.with_extension("socket"), liveness: Liveness::default() }.end();
+            assert_eq!(ended.is_err(), strict);
+            assert_eq!(observer.try_lock_exclusive().is_err(), strict);
+            assert!(crate::execution::process_ended(&birth).unwrap());
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    #[test]
+    fn generation_hold_stays_quarantined_when_exact_exit_is_unobservable() {
+        use fs2::FileExt;
+        let path =
+            std::env::temp_dir().join(format!("cm-generation-fence-{}", uuid::Uuid::new_v4()));
+        let file = Arc::new(File::create(&path).unwrap());
+        file.lock_exclusive().unwrap();
+        let mut generation = Some(file);
+        let mut retained: Vec<Box<dyn Send>> = vec![];
+        retain_generation(&mut generation, &mut retained);
+        assert!(generation.is_none());
+        let observer = File::open(&path).unwrap();
+        assert!(observer.try_lock_exclusive().is_err());
+        let ending = Ending {
+            exact: Err(io::Error::other("unknown exact process birth")),
+            recovery: None,
+            require_source_scope_proof: false,
+            child: None,
+            forked: false,
+            retained,
+            socket: path.with_extension("socket"),
+            liveness: Liveness::default(),
+        };
+        assert!(ending.end().is_err());
+        assert!(
+            observer.try_lock_exclusive().is_err(),
+            "unknown process exit freed generation custody"
+        );
+        std::fs::remove_file(path).unwrap();
     }
 }

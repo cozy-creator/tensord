@@ -1328,6 +1328,7 @@ fn resolve_adapter(
 
 /// A slot's caller adapters applied to its resolved base: each adapter downloaded, then one
 /// adapter view composed (`adapter_views`); the grant then names the view.
+#[allow(clippy::too_many_arguments)] // Concrete model/adapter inputs and their custody receiver.
 fn apply_adapters(
     store: &Store,
     catalog: &Catalog,

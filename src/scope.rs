@@ -2,7 +2,7 @@
 //! below the machine's where the host delegates one, else a process-tree token. Either
 //! reaches descendants that call `setsid` or double-fork. Lifecycle containment, not a
 //! sandbox: same-UID code can move out of a delegated cgroup or scrub its token.
-use crate::process::{gone, process_birth, process_ended, Exact};
+use crate::process::{Exact, gone, process_birth, process_ended};
 use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
@@ -31,6 +31,102 @@ enum Backend {
     /// keeps it. An escaped one is adopted and reaped by the machine's supervisor (the
     /// subreaper); a `/proc` census finds it by its token wherever it is parented.
     Tree { token: String },
+}
+
+/// Durable facts for one already-created containment scope, not sandbox authority.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Recovery {
+    Cgroup {
+        relative: String,
+        inode: u64,
+    },
+    /// Supported token descendants keep their launched UID and inherited token.
+    /// A token-scrubbing/UID-changing process is outside this best-effort boundary.
+    Tree {
+        token: String,
+        uid: u32,
+    },
+}
+
+impl Recovery {
+    /// Strict observed emptiness. An unreadable relevant census is not an empty scope.
+    pub fn empty(&self) -> io::Result<bool> {
+        match self {
+            Self::Cgroup { relative, inode } => {
+                if !relative.starts_with('/')
+                    || Path::new(relative).components().any(|part| {
+                        !matches!(
+                            part,
+                            std::path::Component::RootDir | std::path::Component::Normal(_)
+                        )
+                    })
+                {
+                    return Err(io::Error::other("invalid recovered cgroup path"));
+                }
+                let expected = Path::new(ROOT).join(relative.trim_start_matches('/'));
+                let path = match fs::metadata(&expected) {
+                    Ok(metadata) if metadata.ino() == *inode => Some(expected),
+                    Ok(_) => find_cgroup_inode(Path::new(ROOT), *inode)?,
+                    Err(error) if gone(&error) => find_cgroup_inode(Path::new(ROOT), *inode)?,
+                    Err(error) => return Err(error),
+                };
+                // The old inode is absent in a complete census. Kernel cgroups can only
+                // be removed empty; scanning avoids mistaking a renamed group for gone.
+                path.map_or(Ok(true), |path| count_cgroup(&path).map(|count| count == 0))
+            }
+            Self::Tree { token, uid } => {
+                if token.is_empty()
+                    || token.len() > 128
+                    || !token
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                {
+                    return Err(io::Error::other("invalid recovered scope token"));
+                }
+                let (rows, unknown) = census_partial(Path::new("/proc"), *uid)?;
+                if members(&rows, |value| value == token).any(|row| row.alive) {
+                    return Ok(false); // A known live reader is enough to prohibit release.
+                }
+                match unknown {
+                    Some(error) => Err(error),
+                    None => Ok(true),
+                }
+            }
+        }
+    }
+}
+
+fn count_cgroup(path: &Path) -> io::Result<usize> {
+    let mut total = fs::read_to_string(path.join("cgroup.procs"))?
+        .lines()
+        .filter(|line| !line.is_empty())
+        .count();
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            total += count_cgroup(&entry.path())?;
+        }
+    }
+    Ok(total)
+}
+
+fn find_cgroup_inode(path: &Path, inode: u64) -> io::Result<Option<PathBuf>> {
+    if fs::metadata(path)?.ino() == inode {
+        return Ok(Some(path.into()));
+    }
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            match find_cgroup_inode(&entry.path(), inode) {
+                Ok(Some(path)) => return Ok(Some(path)),
+                Ok(None) => (),
+                Err(error) if gone(&error) => (),
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Opaque, stable per state root, so a machine only ever sweeps its own scopes.
@@ -97,6 +193,20 @@ impl Scope {
         })))
     }
 
+    /// Snapshot after the receiver's launch UID is fixed. No process is created here.
+    pub fn recovery(&self, uid: u32) -> Recovery {
+        match &self.0 {
+            Backend::Cgroup { relative, inode } => Recovery::Cgroup {
+                relative: relative.clone(),
+                inode: *inode,
+            },
+            Backend::Tree { token } => Recovery::Tree {
+                token: token.clone(),
+                uid,
+            },
+        }
+    }
+
     /// Its cgroup (`/…`, as `0::` lines name it), when it is one.
     pub fn cgroup_relative(&self) -> Option<&str> {
         match &self.0 {
@@ -141,24 +251,13 @@ impl Scope {
 
     /// Live processes in the scope.
     pub fn processes(&self) -> io::Result<usize> {
-        fn count(path: &Path) -> io::Result<usize> {
-            let mut total = fs::read_to_string(path.join("cgroup.procs"))?
-                .lines()
-                .filter(|line| !line.is_empty())
-                .count();
-            for entry in fs::read_dir(path)? {
-                let entry = entry?;
-                if entry.file_type()?.is_dir() {
-                    total += count(&entry.path())?;
-                }
-            }
-            Ok(total)
-        }
         match &self.0 {
-            Backend::Cgroup { relative, inode } => count(&Self::path(relative, *inode)?),
+            Backend::Cgroup { relative, inode } => count_cgroup(&Self::path(relative, *inode)?),
             Backend::Tree { token } => {
                 let rows = census()?;
-                Ok(members(&rows, |t| t == token).filter(|row| row.alive).count())
+                Ok(members(&rows, |t| t == token)
+                    .filter(|row| row.alive)
+                    .count())
             }
         }
     }
@@ -210,7 +309,9 @@ impl Scope {
                 let stragglers = end_members(|t| t == token)?;
                 LIVE.lock().unwrap().remove(token);
                 // Anything of this machine's that no live scope claims goes now too.
-                let namespace = token.rsplit_once('-').map_or("", |(namespace, _)| namespace);
+                let namespace = token
+                    .rsplit_once('-')
+                    .map_or("", |(namespace, _)| namespace);
                 Ok(stragglers + end_members(unclaimed(namespace))?)
             }
         }
@@ -307,7 +408,11 @@ fn census() -> io::Result<Vec<Row>> {
     let own = std::process::id();
     let mut rows = Vec::new();
     for entry in fs::read_dir("/proc")? {
-        let Some(pid) = entry?.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+        let Some(pid) = entry?
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
             continue;
         };
         if pid == own || pid == 1 {
@@ -333,7 +438,9 @@ fn census() -> io::Result<Vec<Row>> {
             .flatten()
             .and_then(|environ| {
                 environ.split(|b| *b == 0).find_map(|entry| {
-                    let value = entry.strip_prefix(TOKEN_ENV.as_bytes())?.strip_prefix(b"=")?;
+                    let value = entry
+                        .strip_prefix(TOKEN_ENV.as_bytes())?
+                        .strip_prefix(b"=")?;
                     String::from_utf8(value.to_vec()).ok()
                 })
             });
@@ -346,6 +453,96 @@ fn census() -> io::Result<Vec<Row>> {
         });
     }
     Ok(rows)
+}
+
+/// Strict proof only: ordinary best-effort containment teardown retains its existing
+/// census. Read foreign UID metadata but do not require unrelated foreign environments.
+#[cfg(test)]
+fn census_strict(proc_root: &Path, uid: u32) -> io::Result<Vec<Row>> {
+    let (rows, unknown) = census_partial(proc_root, uid)?;
+    match unknown {
+        Some(error) => Err(error),
+        None => Ok(rows),
+    }
+}
+
+fn census_partial(proc_root: &Path, uid: u32) -> io::Result<(Vec<Row>, Option<io::Error>)> {
+    let mut rows = Vec::new();
+    let mut unknown = None;
+    for entry in fs::read_dir(proc_root)? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == std::process::id() || pid == 1 {
+            continue;
+        }
+        let read = |name: &str| fs::read(entry.path().join(name));
+        let inspect = || -> io::Result<Row> {
+            let stat = String::from_utf8(read("stat")?).map_err(io::Error::other)?;
+            let (_, suffix) = stat
+                .rsplit_once(") ")
+                .ok_or_else(|| io::Error::other("invalid scope process stat"))?;
+            let fields: Vec<_> = suffix.split_whitespace().collect();
+            let field = |index| {
+                fields
+                    .get(index)
+                    .copied()
+                    .ok_or_else(|| io::Error::other("scope process stat truncated"))
+            };
+            let alive = !matches!(field(0)?, "Z" | "X");
+            let ppid = field(1)?.parse().map_err(io::Error::other)?;
+            let start_ticks = field(19)?.parse().map_err(io::Error::other)?;
+            let token = if alive {
+                let status = String::from_utf8(read("status")?).map_err(io::Error::other)?;
+                let actual = status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Uid:"))
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .ok_or_else(|| io::Error::other("scope process status has no effective UID"))?
+                    .parse::<u32>()
+                    .map_err(io::Error::other)?;
+                if actual == uid {
+                    let environment = read("environ")?;
+                    environment
+                        .split(|byte| *byte == 0)
+                        .find_map(|entry| {
+                            entry.strip_prefix(TOKEN_ENV.as_bytes())?.strip_prefix(b"=")
+                        })
+                        .map(|value| String::from_utf8(value.to_vec()).map_err(io::Error::other))
+                        .transpose()?
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            Ok(Row {
+                pid,
+                ppid,
+                start_ticks,
+                alive,
+                token,
+            })
+        };
+        match inspect() {
+            Ok(row) => rows.push(row),
+            Err(error) if gone(&error) => (),
+            Err(error) => {
+                if unknown.is_none() {
+                    unknown = Some(io::Error::new(
+                        error.kind(),
+                        format!("scope census process {pid} is unreadable: {error}"),
+                    ));
+                }
+            }
+        }
+    }
+    Ok((rows, unknown))
 }
 
 /// Processes whose token `owned` accepts, and every descendant still parented below one.
@@ -431,7 +628,10 @@ mod tests {
     fn detach(scope: &Scope) -> u32 {
         let mut command = Command::new("/bin/sh");
         command
-            .args(["-c", "read go; setsid sleep 1000 </dev/null >/dev/null 2>&1 & echo $!"])
+            .args([
+                "-c",
+                "read go; setsid sleep 1000 </dev/null >/dev/null 2>&1 & echo $!",
+            ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped());
         if let Some((name, value)) = scope.environment() {
@@ -441,7 +641,12 @@ mod tests {
         scope.adopt(leader.id()).unwrap();
         leader.stdin.take().unwrap().write_all(b"go\n").unwrap();
         let mut daemon = String::new();
-        leader.stdout.take().unwrap().read_to_string(&mut daemon).unwrap();
+        leader
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut daemon)
+            .unwrap();
         assert!(leader.wait().unwrap().success());
         daemon.trim().parse().unwrap()
     }
@@ -453,6 +658,67 @@ mod tests {
             LIVE.lock().unwrap().insert(token.clone());
         }
         Scope(Backend::Tree { token })
+    }
+
+    #[test]
+    fn a_recovered_token_observes_a_setsid_reader_after_its_leader_ends() {
+        let scope = tree("strict", true);
+        let reader = process_birth(detach(&scope)).unwrap();
+        struct EndReader(crate::journal::ProcessBirth);
+        impl Drop for EndReader {
+            fn drop(&mut self) {
+                if let Ok(Some(exact)) = Exact::open(&self.0) {
+                    let _ = exact.kill();
+                    let _ = exact.wait();
+                }
+            }
+        }
+        let _cleanup = EndReader(reader.clone());
+        let recovery = scope.recovery(unsafe { libc::geteuid() });
+        let encoded = serde_json::to_vec(&recovery).unwrap();
+        let recovered: Recovery = serde_json::from_slice(&encoded).unwrap();
+        assert!(!recovered.empty().unwrap());
+        scope.end().unwrap();
+        assert!(process_ended(&reader).unwrap());
+        match recovered.empty() {
+            Ok(empty) => assert!(empty),
+            Err(error) => eprintln!(
+                "strict empty proof unavailable on this host; no release authority: {error}"
+            ),
+        }
+    }
+
+    #[test]
+    fn strict_scope_census_refuses_unreadable_relevant_environment() {
+        let root = std::env::temp_dir().join(format!("scope-unknown-{}", id()));
+        let process = root.join("424242");
+        fs::create_dir_all(&process).unwrap();
+        let mut fields = vec!["0"; 20];
+        fields[0] = "S";
+        fields[1] = "1";
+        fields[19] = "10";
+        fs::write(
+            process.join("stat"),
+            format!("424242 (fixture) {}", fields.join(" ")),
+        )
+        .unwrap();
+        let uid = unsafe { libc::geteuid() };
+        fs::write(
+            process.join("status"),
+            format!("Uid: {uid} {uid} {uid} {uid}\n"),
+        )
+        .unwrap();
+        // A directory makes the attempted environment read fail even for privileged tests.
+        fs::create_dir(process.join("environ")).unwrap();
+        assert!(census_strict(&root, uid).is_err());
+        // An unrelated foreign UID cannot carry this supported same-UID scope token.
+        fs::write(
+            process.join("status"),
+            format!("Uid: {} {} {} {}\n", uid + 1, uid + 1, uid + 1, uid + 1),
+        )
+        .unwrap();
+        assert_eq!(census_strict(&root, uid).unwrap().len(), 1);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
