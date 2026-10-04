@@ -94,6 +94,19 @@ def consume(executor: Executor, root: Path, manifest: str) -> dict[str, Any]:
                     raise AssertionError("the machine granted a writable object")
             held_files.extend(files)
         assert plane.stats(opened).host.fill_bytes == 0
+        # Metadata presence grants no object authority: this component is in the header
+        # and materialized store, but outside the machine's selected HostGrant.
+        denied_plan = checkpoint.read_plan((("denied", "weight"),), 4 << 20, ("denied",))
+        denied_objects = sorted({
+            (item["object"].removeprefix("sha256:"), item["object_length"])
+            for item in denied_plan.items()
+        })
+        denied = SealedPlan(
+            manifest=manifest, name="rank-source/denied", layout="sha256:" + "0" * 64,
+            window=4 << 20, traversal=(("denied", "weight"),), components=("denied",),
+            regions=(("denied/weight#value",),),
+        )
+        assert executor._object_files(denied, denied_objects) == []
         refused = []
         for requested, name in [("sha256:" + "0" * 64, ""), (manifest, "../tfs.sqlite")]:
             try:
