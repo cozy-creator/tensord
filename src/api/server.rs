@@ -1124,8 +1124,12 @@ impl<B: MachineBackend> pb::pod_host_server::PodHost for Api<B> {
         request: Request<pb::MachineExecutionSubmit>,
     ) -> Result<Response<pb::MachineExecutionReceipt>, Status> {
         let actor = self.auth(request.get_ref().claim.as_ref())?;
-        let _held = self.admit()?;
         let request = request.into_inner();
+        let replay = request.clone();
+        if let Some(receipt) = self.call(move |backend| backend.replay_submit(actor, &replay)).await?.into_inner() {
+            return Ok(Response::new(receipt));
+        }
+        let _held = self.admit()?;
         let receipt = self
             .call(move |backend| backend.submit(actor, request))
             .await?;

@@ -111,6 +111,7 @@ fn published_models_alternate_on_one_gpu_under_the_memory_policy() {
             payload_digest: digest(&input),
             publication_authorization_id: String::new(),
             preparation_id: prepared.id.clone(),
+            legacy_intent: String::new(),
         };
         let mut ballast = plan
             .squeeze

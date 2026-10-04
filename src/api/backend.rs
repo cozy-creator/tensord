@@ -87,6 +87,10 @@ pub trait MachineBackend: Send + Sync + 'static {
         _: VerifiedActor,
         _: pb::MachineExecutionWorkspaceQuery,
     ) -> Result<pb::MachineExecutionWorkspace, Status>;
+    /// Validate and return an already accepted legacy submission before fresh admission.
+    /// An existing record never requires renewed source/preparation authority.
+    fn replay_submit(&self, _: VerifiedActor, _: &pb::MachineExecutionSubmit)
+        -> Result<Option<pb::MachineExecutionReceipt>, Status> { Ok(None) }
     fn submit(
         &self,
         _: VerifiedActor,

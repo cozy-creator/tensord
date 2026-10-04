@@ -321,6 +321,7 @@ fn public_context(
         payload_digest: "sha256:payload".into(),
         publication_authorization_id: "publication-authority-id".into(),
         preparation_id: String::new(),
+        legacy_intent: String::new(),
     }
 }
 

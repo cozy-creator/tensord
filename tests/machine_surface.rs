@@ -2757,3 +2757,142 @@ async fn actual_listener_legacy_control_and_collection_preserve_actor_and_exact_
     let replay = machine.client.collect_machine_execution(collect).await.unwrap().into_inner();
     assert_eq!(replay, terminal);
 }
+
+fn hold_intent_root(state: &Path, actor: &str) {
+    let identity = "c".repeat(32);
+    let directory = state.join("generations").join(&identity);
+    let python = directory.join("env/bin/python");
+    fs::create_dir_all(python.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink("/usr/bin/python3", &python).unwrap();
+    let interface = serde_json::json!({"entrypoints":[{"name":"run","models":[],"invocable":{}}],"jobs":[]});
+    let generation = cozy_machine::catalog::Generation { identity: identity.clone(), package: "fixture/intent".into(),
+        version: "1.0.0".into(), application: "fixture:app".into(), python, dependencies: vec![], interface: interface.clone(),
+        // This is acceptance/reattachment proof, not an SDK or model execution fixture.
+        cpu_bridge: "intent fixture performs no model execution".into() };
+    fs::write(directory.join("generation.json"), serde_json::to_vec(&generation).unwrap()).unwrap();
+    fs::write(directory.join(".hold"), []).unwrap();
+    Journal::open(&state.join("execution")).unwrap().bind_installation(cozy_machine::journal::Installation {
+        actor: actor.into(), alias: "intent-install".into(), generation: identity, package: "fixture/intent".into(),
+        release: "1.0.0".into(), interface: serde_json::to_vec(&interface).unwrap()
+    }).unwrap();
+}
+
+#[tokio::test]
+async fn legacy_submit_replay_rejects_changed_ids_and_intent_but_preserves_semantic_payload() {
+    let mut machine = Machine::start_with(hold_intent_root).await;
+    let workspace = machine.client.get_machine_execution_workspace(pb::MachineExecutionWorkspaceQuery {
+        claim: Some(machine.claim.clone()), ..Default::default()
+    }).await.unwrap().into_inner();
+    let original = pb::MachineExecutionSubmit {
+        claim: Some(machine.claim.clone()), submission_id: "legacy-submit".into(),
+        expected_execution_workspace_id: workspace.execution_workspace_id.clone(),
+        release_root: Some(pb::ReleaseRoot { installation_id: "intent-install".into(), entrypoint: "run".into(),
+            package: "fixture/intent".into(), owner: "fixture".into(), ..Default::default() }),
+        offer: Some(pb::AttemptOffer { request_id: "legacy-request".into(), attempt_ordinal: 1, ..Default::default() }),
+        payload_canonical_bytes: br#"{"seed":18446744073709551615,"nested":{"a":1,"b":2}}"#.to_vec(),
+        ..Default::default()
+    };
+    let accepted = machine.client.submit_machine_execution(original.clone()).await.unwrap().into_inner();
+    assert_eq!(machine.client.submit_machine_execution(original.clone()).await.unwrap().into_inner(), accepted);
+    let mut equivalent = original.clone();
+    equivalent.payload_canonical_bytes = br#" {"nested":{"b":2,"a":1},"seed":18446744073709551615} "#.to_vec();
+    equivalent.release_root.as_mut().unwrap().package.clear();
+    equivalent.owner_memo = true;
+    equivalent.source_credentials = vec![pb::SourceCredential { provider: 0, credential: "fixture-rotated-credential".into() }];
+    assert_eq!(machine.client.submit_machine_execution(equivalent.clone()).await.unwrap().into_inner(), accepted);
+    let mut changed_request = original.clone();
+    changed_request.offer.as_mut().unwrap().request_id = "another-request".into();
+    let mut changed_submission = original.clone();
+    changed_submission.submission_id = "another-submission".into();
+    let mut changed_payload = original.clone();
+    changed_payload.payload_canonical_bytes = br#"{"seed":18446744073709551614,"nested":{"a":1,"b":2}}"#.to_vec();
+    let mut changed_root = original.clone();
+    changed_root.release_root.as_mut().unwrap().installation_id = "another-install".into();
+    let mut changed_entrypoint = original.clone();
+    changed_entrypoint.release_root.as_mut().unwrap().entrypoint = "other".into();
+    let mut changed_release = original.clone();
+    changed_release.release_root.as_mut().unwrap().release = "2.0.0".into();
+    let mut changed_kind = original.clone();
+    changed_kind.payload_canonical_bytes = br#"{"seed":18446744073709551615,"nested":{"a":1.0,"b":2}}"#.to_vec();
+    for (name, changed) in [ ("request", changed_request), ("submission", changed_submission), ("payload", changed_payload),
+        ("root", changed_root), ("entrypoint", changed_entrypoint), ("release", changed_release), ("number-kind", changed_kind) ] {
+        let result = machine.client.submit_machine_execution(changed).await;
+        assert!(result.is_err(), "changed {name} incorrectly returned the original receipt: {result:?}");
+        assert_eq!(result.unwrap_err().metadata().get("cozy-error-code").unwrap(), "execution_intent_conflict", "{name}");
+    }
+    // Existing accepted work remains visible; replay never needs the installation to exist.
+    machine.client.control_machine_execution(pb::MachineExecutionControl {
+        execution: Some(pb::MachineExecutionQuery { claim: Some(machine.claim.clone()), request_id: "legacy-request".into(),
+            expected_execution_workspace_id: workspace.execution_workspace_id }), command_id: "fixture-done".into(),
+        action: pb::MachineExecutionAction::Cancel as i32, ..Default::default()
+    }).await.unwrap();
+    machine.stop();
+    fs::rename(machine.root.join("state/generations"), machine.root.join("original-generations")).unwrap();
+    let (child, client, claim, address) = launch(&machine.root, &[]).await;
+    machine.child = child; machine.client = client; machine.claim = claim; machine.address = address;
+    equivalent.claim = Some(machine.claim.clone());
+    assert_eq!(machine.client.submit_machine_execution(equivalent).await.unwrap().into_inner(), accepted);
+}
+
+#[tokio::test]
+async fn legacy_old_record_replay_requires_provable_retained_intent_and_keeps_readback() {
+    let mut machine = Machine::start_with(hold_intent_root).await;
+    let workspace = machine.client.get_machine_execution_workspace(pb::MachineExecutionWorkspaceQuery {
+        claim: Some(machine.claim.clone()), ..Default::default()
+    }).await.unwrap().into_inner();
+    let mut request = pb::MachineExecutionSubmit {
+        claim: Some(machine.claim.clone()), submission_id: "old-submit".into(), expected_execution_workspace_id: workspace.execution_workspace_id.clone(),
+        offer: Some(pb::AttemptOffer { request_id: "old-request".into(), attempt_ordinal: 1, ..Default::default() }),
+        release_root: Some(pb::ReleaseRoot { installation_id: "intent-install".into(), entrypoint: "run".into(),
+            package: "fixture/intent".into(), owner: "fixture".into(), ..Default::default() }),
+        payload_canonical_bytes: br#"{"seed":18446744073709551615}"#.to_vec(), ..Default::default()
+    };
+    let mut accepted = machine.client.submit_machine_execution(request.clone()).await.unwrap().into_inner();
+    let mut query = pb::MachineExecutionQuery { claim: Some(machine.claim.clone()), request_id: "old-request".into(),
+        expected_execution_workspace_id: workspace.execution_workspace_id };
+    machine.client.control_machine_execution(pb::MachineExecutionControl {
+        execution: Some(query.clone()), command_id: "done".into(), action: pb::MachineExecutionAction::Cancel as i32, ..Default::default()
+    }).await.unwrap();
+    machine.stop();
+    // Old JSON records omit this new field. Retained capture/spec/interface facts stay intact.
+    let db = rusqlite::Connection::open(machine.root.join("state/execution/executions.sqlite3")).unwrap();
+    let raw: String = db.query_row("SELECT record FROM executions WHERE id=1", [], |row| row.get(0)).unwrap();
+    let mut old_record: cozy_machine::journal::Execution = serde_json::from_str(&raw).unwrap();
+    let wire_hash = |value: &serde_json::Value| format!("sha256:{}", tensorfs_core::sha256::hex_digest(
+        &serde_json_canonicalizer::to_vec(value).unwrap()));
+    // Recreate the earlier release-root producer's protocol-JCS payload/spec hashes.
+    // The original exact integer still exists in its retained Invocation, so the
+    // fallback must reject a neighboring seed even though those old hashes collide.
+    let context = old_record.submission.as_mut().unwrap();
+    context.legacy_intent.clear();
+    context.payload_digest = wire_hash(&old_record.invocation.input);
+    let entry = serde_json::json!({"name":"run","models":[],"invocable":{}});
+    let binding = wire_hash(&entry);
+    context.invocation_digest = wire_hash(&serde_json::json!({"format":"cozy.worker.v1.InvocationSpec/1",
+        "installation_id":"intent-install","payload_digest":context.payload_digest,
+        "serving":{"entrypoint_binding_digest":binding,"attempt_binding_id":binding,"bindings_digest":binding}}));
+    accepted.invocation_spec_digest = (0..32).map(|index| u8::from_str_radix(&context.invocation_digest[7+index*2..9+index*2],16).unwrap()).collect();
+    db.execute("UPDATE executions SET record=?1 WHERE id=1", [serde_json::to_string(&old_record).unwrap()]).unwrap();
+    drop(db);
+    fs::rename(machine.root.join("state/generations"), machine.root.join("original-generations")).unwrap();
+    let (child, client, claim, address) = launch(&machine.root, &[]).await;
+    machine.child = child; machine.client = client; machine.claim = claim; machine.address = address;
+    request.claim = Some(machine.claim.clone()); query.claim = Some(machine.claim.clone());
+    assert_eq!(machine.client.submit_machine_execution(request.clone()).await.unwrap().into_inner(), accepted);
+    let mut changed = request.clone(); changed.payload_canonical_bytes = br#"{"seed":18446744073709551614}"#.to_vec();
+    assert_eq!(machine.client.submit_machine_execution(changed).await.unwrap_err().metadata().get("cozy-error-code").unwrap(), "execution_intent_conflict");
+    // Missing originally authored GPU model choices cannot be reconstructed from a hash.
+    // This is an old-metadata migration control, not a real GPU-source proof.
+    machine.stop();
+    let db = rusqlite::Connection::open(machine.root.join("state/execution/executions.sqlite3")).unwrap();
+    db.execute("UPDATE executions SET record=json_set(record,'$.submission.preparation_id','old-model-plan') WHERE id=1", []).unwrap();
+    drop(db);
+    let (child, client, claim, address) = launch(&machine.root, &[]).await;
+    machine.child = child; machine.client = client; machine.claim = claim; machine.address = address;
+    request.claim = Some(machine.claim.clone()); query.claim = Some(machine.claim.clone());
+    let unknown = machine.client.submit_machine_execution(request).await.unwrap_err();
+    assert_eq!(unknown.metadata().get("cozy-error-code").unwrap(), "execution_replay_intent_unavailable");
+    assert_eq!(machine.client.get_machine_execution(query.clone()).await.unwrap().into_inner().request_id, "old-request");
+    assert_eq!(machine.client.collect_machine_execution(pb::MachineExecutionCollect { execution: Some(query), attempt_ordinal: 1 })
+        .await.unwrap().into_inner().request_id, "old-request");
+}
