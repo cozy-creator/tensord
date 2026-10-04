@@ -249,8 +249,6 @@ struct Session {
     invoked: bool,
     /// Regions its plane had evicted when its last call ended (a running total).
     evictions: u64,
-    /// Its manifests stay out of every download's GC while it lives.
-    _serving: ServingHold,
 }
 
 /// How a session's executor came to exist, for the load record.
@@ -374,7 +372,7 @@ struct Serving {
     next: std::sync::atomic::AtomicU64,
     held: Mutex<BTreeMap<u64, Vec<String>>>,
 }
-/// One session's entry in `Serving`, removed when the session ends.
+/// One executor's entry in `Serving`, removed when its process has exited.
 struct ServingHold {
     serving: Arc<Serving>,
     id: u64,
@@ -1833,10 +1831,12 @@ impl GpuPool {
             id,
             selections.iter().map(|s| s.manifest.clone()).collect(),
         );
-        let serving = ServingHold {
+        // Kept until the process is seen to exit, not until its session is dropped: an
+        // executor whose exit is unproven may still read these files.
+        executor.retain_until_exit(ServingHold {
             serving: self.serving.clone(),
             id,
-        };
+        });
         let sources = Arc::new(ModelSources::open_shared(self.store.clone(), &selections)?);
         let peer = self.host.register_peer(executor.observer_pidfd()?);
         let grants = selections
@@ -1865,7 +1865,6 @@ impl GpuPool {
             launch,
             invoked: false,
             evictions: 0,
-            _serving: serving,
         })
     }
 
