@@ -71,7 +71,7 @@ async fn post(
 #[tokio::test]
 async fn owner_http_reclaim_rejects_scoped_expired_revoked_and_busy_without_canceling_work() {
     let signer = SigningKey::from_bytes(&[87; 32]);
-    let identity = MachineIdentity::ephemeral(
+    let mut identity = MachineIdentity::ephemeral(
         "reclaim-owner".into(),
         vec![signer.verifying_key()],
         vec![7; 32],
@@ -95,6 +95,8 @@ async fn owner_http_reclaim_rejects_scoped_expired_revoked_and_busy_without_canc
     );
     let root = std::env::temp_dir().join(format!("cm-http-reclaim-{}", uuid::Uuid::new_v4()));
     let engine = Engine::open(&root).unwrap();
+    let lifecycle = cozy_machine::machine::lifecycle::Lifecycle::open(root.join("idle.json"), false, true).unwrap();
+    identity.lifecycle = Some(lifecycle.clone());
     let run = engine
         .submit(
             "accepted",
@@ -149,6 +151,9 @@ async fn owner_http_reclaim_rejects_scoped_expired_revoked_and_busy_without_canc
     assert_eq!(post(address, config.clone(), "invalid").await, 403);
     assert_eq!(backend.calls.load(Ordering::Acquire), 0);
     let token = capability::mint(&signer, owner);
+    let activation = lifecycle.begin_activation().unwrap();
+    assert_eq!(post(address, config.clone(), &token).await, 409);
+    drop(activation);
     backend.busy.store(true, Ordering::Release);
     assert_eq!(post(address, config.clone(), &token).await, 409);
     backend.busy.store(false, Ordering::Release);
