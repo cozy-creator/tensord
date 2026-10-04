@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Matched old-stack vs Rust-machine gate on one rental, through ordinary `cozy run`.
+"""Matched ComfyUI vs Rust-machine measurements, through ordinary `cozy run`.
 
   gate.py run MANIFEST OUT    alternate arms per the manifest; append to OUT/results.jsonl
   gate.py report OUT          medians, spread and the pre-declared verdict -> OUT/summary.json
@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -626,13 +627,114 @@ def spread(values: list[float]) -> dict | None:
             "max": round(max(values), 3), "n": len(values)}
 
 
+def comparison(rows: list[dict], manifest: dict) -> dict:
+    """A complete declared matrix, paired by recorded pair id. Memory savings are not speed.
+
+    Structural image checks alone do not establish correct inference. Each paired cell
+    must carry its matched normalized request digest and validated reference evidence.
+    Missing evidence makes the result inconclusive rather than a passing qualification.
+    """
+    plan = manifest.get("comparison")
+    result = {"pass": False, "timing_win": False, "status": "inconclusive", "reasons": [], "cells": []}
+    if not plan:
+        result["reasons"].append("No ComfyUI comparison matrix was declared.")
+        return result
+    reference, candidate = plan.get("reference"), plan.get("candidate")
+    required = plan.get("cells", [])
+    minimum = plan.get("min_pairs", 3)
+    if (not reference or not candidate or reference == candidate or not required
+            or len(set(required)) != len(required) or not isinstance(minimum, int) or minimum < 3):
+        result["reasons"].append("Declare distinct arms, unique required cells and at least three pairs.")
+        return result
+    result.update(reference=reference, candidate=candidate)
+    failed = [r for r in rows if r.get("arm") == candidate and r.get("ok") is False
+              and r.get("scenario") != "kill_proof"]
+    if failed:
+        result["status"] = "failed"
+        result["reasons"].append("The candidate has failed requests or cells; no cells may be omitted.")
+    observed = {r.get("cell") for r in rows if r.get("event") == "cell"
+                and r.get("arm") in (reference, candidate)}
+    complete, quality = observed <= set(required), True
+    if not complete:
+        result["reasons"].append("Observed cells were left out of the declared matrix.")
+    for name in required:
+        arms = {arm: {} for arm in (reference, candidate)}
+        duplicate = False
+        for row in rows:
+            if row.get("event") != "cell" or row.get("cell") != name or row.get("arm") not in arms:
+                continue
+            pair = row.get("pair")
+            if not isinstance(pair, str) or not pair:
+                complete = False
+                continue
+            duplicate |= pair in arms[row["arm"]]
+            arms[row["arm"]][pair] = row
+        paired = sorted(set(arms[reference]) & set(arms[candidate]))
+        cell = {"cell": name, "pairs": len(paired), "status": "inconclusive"}
+        result["cells"].append(cell)
+        if duplicate or len(paired) < minimum or set(arms[reference]) != set(arms[candidate]):
+            complete = False
+            cell["reason"] = "Missing, duplicate or insufficient paired measurements."
+            continue
+        ratios, valid = [], True
+        for pair in paired:
+            before, after = (arms[arm][pair] for arm in (reference, candidate))
+            if not before.get("ok") or not after.get("ok"):
+                valid = False
+                cell["status"] = "failed"
+                cell["reason"] = "A paired request failed."
+                continue
+            if (not before.get("request_digest") or before.get("request_digest") != after.get("request_digest")
+                    or not before.get("hardware_key") or before.get("hardware_key") != after.get("hardware_key")
+                    or before.get("timing_boundary") != "submit_to_saved_output"
+                    or before.get("timing_boundary") != after.get("timing_boundary")
+                    or before.get("output_location") != after.get("output_location")
+                    or before.get("output_location") not in ("controller", "pod")):
+                valid = False
+                cell["reason"] = "Matched requests and equal saved-output boundaries are unproven."
+            for measured in (before, after):
+                checked = measured.get("quality", {})
+                quality &= bool(checked.get("ok") and checked.get("reference_digest")
+                                and checked.get("method") in ("exact", "declared_tolerance"))
+            a, b = before.get("total_s"), after.get("total_s")
+            if (not isinstance(a, (int, float)) or not isinstance(b, (int, float))
+                    or not math.isfinite(a) or not math.isfinite(b) or a <= 0 or b <= 0):
+                valid = False
+                cell["reason"] = "A measured duration is absent, nonfinite or nonpositive."
+            else:
+                ratios.append(b / a)
+        if not valid:
+            complete = False
+            continue
+        # Deterministic paired bootstrap: report uncertainty, not an unpaired best run.
+        rng = random.Random(0)
+        boot = sorted(statistics.median(rng.choices(ratios, k=len(ratios))) for _ in range(2000))
+        median = statistics.median(ratios)
+        low, high = boot[49], boot[1949]
+        cell.update(ratio=round(median, 5), ratio_ci95=[round(low, 5), round(high, 5)])
+        cell["status"] = "faster" if high < 1 else "slower" if low >= 1 else "inconclusive"
+    if not complete:
+        result["reasons"].append("The declared matrix or its matched measurement evidence is incomplete.")
+    if not quality:
+        result["reasons"].append("Output quality has only smoke checks or lacks its validated reference.")
+    result["timing_win"] = bool(complete and not failed and result["cells"]
+                                and all(c["status"] == "faster" for c in result["cells"]))
+    result["pass"] = result["timing_win"] and quality
+    if result["pass"]:
+        result["status"] = "passed"
+    elif any(c["status"] in ("failed", "slower") for c in result["cells"]):
+        result["status"] = "failed"
+    return result
+
+
 def report(out: Path) -> dict:
     rows = [json.loads(line) for line in (out / "results.jsonl").read_text().splitlines()]
     samples = [json.loads(line) for line in (out / "samples.jsonl").read_text().splitlines() if line.strip()]
     requests = [r for r in rows if "wall_s" in r]
     for r in requests:   # older rows measured to the harness's decode check; the CLI exit is the user's boundary
         r["wall_s"] = r["t_cli_done"] - r["t_start"]
-    rental = bool(json.loads((out / "manifest.json").read_text()).get("rental"))
+    manifest = json.loads((out / "manifest.json").read_text())
+    rental = bool(manifest.get("rental"))
     proof = [r for r in requests if r["scenario"] == "kill_proof"]
     summary: dict = {"kill_proof": {a: {"cycles": sum(r["arm"] == a for r in proof), "failed": sum(r["arm"] == a and not r["ok"] for r in proof)}
                                     for a in sorted({r["arm"] for r in proof})},
@@ -677,7 +779,8 @@ def report(out: Path) -> dict:
         done = sorted(q.get("outcome_pod") or q.get("done") for q in r["requests"] if q.get("outcome_pod") or q.get("done"))
         summary["cells"].append({
             "arm": r["arm"], "cell": r["cell"], "budget": r.get("budget"), "cold": r.get("cold"), "ok": r["ok"],
-            "total_s": round(r["total_s"], 2), "startup_s": r.get("startup_s"), "engine_pss_peak_gib": round(r["engine_pss_peak"] / 2**30, 2) if r.get("engine_pss_peak") else None,
+            "total_s": round(r["total_s"], 2), "startup_s": r.get("startup_s"),
+            "engine_rss_peak_gib": round(r["engine"]["engine_rss_peak_bytes"] / 2**30, 2) if r.get("engine", {}).get("engine_rss_peak_bytes") else None,
             "machine_total_s": round(r["machine_total_s"], 2) if r.get("machine_total_s") else None,
             "spans_s": [round(b - a, 2) for a, b in zip(done, done[1:])],
             "host_peak_gib": round(max(x["cg"]["host"] for x in window) / 2**30, 2) if window else None,
@@ -687,19 +790,7 @@ def report(out: Path) -> dict:
             "max_temp_c": max((x["gpu"]["temp_c"] or 0) for x in window) if window else None,
             "throttled": sorted({x["gpu"]["throttle"] for x in window}) if window else None,
             "disk_read_gib": round(r["disk_read_bytes"] / 2**30, 2), "controller_load": r.get("controller_load")})
-    old, new = summary["arms"].get("old"), summary["arms"].get("rust")
-    if old and new:
-        def gain(key: str) -> float | None:
-            return round(1 - new[key]["median"] / old[key]["median"], 4) if old.get(key) and new.get(key) else None
-        v = {"first_image_gain": gain("warm_first"), "cold_first_gain": gain("cold_first"),
-             "switch_gain": gain("switch_pair"), "host_peak_gain": gain("host_peak_gib"),
-             "kill_next_gain": gain("kill_next"), "gpu_peak_gain": gain("gpu_peak_gib")}
-        v["warm_gain"] = gain("warm")
-        v["warm_regression"] = -v["warm_gain"] if v["warm_gain"] is not None else None
-        benefit = (v["first_image_gain"] or 0) >= .20 or (v["switch_gain"] or 0) >= .20 or (v["host_peak_gain"] or 0) >= .25
-        v["pass"] = bool(benefit and v["warm_regression"] is not None and v["warm_regression"] <= .02
-                         and not summary["failed"].get("rust"))
-        summary["verdict"] = v
+    summary["verdict"] = comparison(rows, manifest)
     (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     return summary
 
