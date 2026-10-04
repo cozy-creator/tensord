@@ -81,9 +81,11 @@ impl MachineBackend for Events {
                 sequence: if self.private { 5 } else { 3 },
                 kind: "outcome".into(),
                 outcome: Some(pb::AttemptOutcome {
-                    outcome_canonical_bytes:
-                        br#"{"status":1,"result":{"inline_result":"c2VjcmV0"},"triage_bundle":{}}"#
-                            .to_vec(),
+                    outcome_canonical_bytes: if self.private {
+                        br#"{"status":3,"safe_message":"private_password: private inputs","result":{"inline_result":"c2VjcmV0"},"triage_bundle":{}}"#.to_vec()
+                    } else {
+                        br#"{"status":1,"result":{"inline_result":"c2VjcmV0"},"triage_bundle":{}}"#.to_vec()
+                    },
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -355,6 +357,7 @@ async fn output_limited_cap_hides_private_products_result_and_triage() {
     assert_eq!(outcome.outputs[0].output, "image");
     assert!(outcome.result.is_empty());
     assert!(!outcome.triage);
+    assert!(outcome.reason.is_none());
     assert!(outcome.measurements.is_empty());
     let refusal = client
         .read(authorized(
