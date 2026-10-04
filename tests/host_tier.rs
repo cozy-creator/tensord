@@ -391,13 +391,20 @@ fn unheld_layouts_go_oldest_first_and_held_ones_never() {
     drop(other_tier_ask(&tier, a).unwrap().expect("streamed"));
     assert_eq!(tier.facts().windows, 1);
     // Unheld once its executor exits: the window goes with it, the small layout on demand,
-    // and the other model then gets a whole layout.
+    // and the other model then gets the whole layout or a bounded window if released
+    // pages still count as stranded host bytes in the kernel observation.
     first.exit();
     let (_second, b) = Executor::spawn(&tier);
     let granted = other_tier_ask(&tier, b).unwrap().expect("room");
-    other.adopt(&granted);
+    let streamed = tensorfs_plane::host::HostMem::adopt_sealed(
+        granted.as_raw_fd(), &other.layout()).unwrap().window().is_some();
+    if streamed {
+        assert_eq!(stream_through(&other, &granted, 1), 8 * MIB as u64);
+    } else {
+        other.adopt(&granted);
+    }
     let facts = settled(&tier);
-    assert_eq!((facts.windows, facts.ledger.released), (0, 2), "{facts:?}");
+    assert_eq!((facts.windows, facts.ledger.released), (usize::from(streamed), 2), "{facts:?}");
     assert!(facts.ledger.released_bytes >= 8 * MIB as u64, "{facts:?}");
     assert_eq!(facts.entries, 1);
 }
@@ -998,4 +1005,55 @@ fn a_whole_reader_uses_a_window_when_a_sparse_copy_cannot_grow_within_admission(
     let facts=tier.facts();
     assert_eq!(facts.windows,1,"{facts:?}");
     assert!(facts.charged_bytes<=limit,"{facts:?}");
+}
+
+#[test]
+fn concurrent_windows_reserve_buffers_and_headers_before_allocating() {
+    let a=Fixture::new("window-a",&[8*MIB;4]);
+    let b=Fixture::new("window-b",&[8*MIB;4]);
+    // The shared daemon store holds both exact source selections.
+    for (_,tensors) in &b.header.components {
+        for (_,tensor) in tensors {
+            for (_,part) in &tensor.parts {
+                if let tensorfs_core::header::Body::Segments(objects)=&part.body {
+                    for object in objects {
+                        a.store.put_file(&b.store.object_path(&object.sha256),Some(object),&Fault::default()).unwrap();
+                    }
+                }
+            }
+        }
+    }
+    let limit=24*MIB as u64;
+    let tier=tier(&a,limit);
+    let (_first,p1)=Executor::spawn(&tier);
+    let (_second,p2)=Executor::spawn(&tier);
+    tensorfs_plane::faults::arm_stall("window-create",100);
+    let (first,second)=std::thread::scope(|scope| {
+        let left=scope.spawn(||ask(&tier,p1,&a).unwrap());
+        let right=scope.spawn(||ask(&tier,p2,&b).unwrap());
+        (left.join().unwrap(),right.join().unwrap())
+    });
+    tensorfs_plane::faults::arm_stall("window-create",0);
+    let facts=tier.facts();
+    assert_eq!((facts.windows,facts.filling_bytes),(2,0),"{facts:?}");
+    // One mandatory region per whole reader remains available even at zero optional
+    // cache room; only their metadata can overhang this artificial 24MiB cache ceiling.
+    assert!(facts.window_bytes<=limit+8192,"opener reservations overlap: {facts:?}");
+    assert_eq!(stream_through(&a,&first,1),32*MIB as u64);
+    assert_eq!(stream_through(&b,&second,1),32*MIB as u64);
+}
+
+#[test]
+fn failed_window_allocation_releases_its_opening_reservation() {
+    let fx=Fixture::new("failed-window",&[8*MIB;4]);
+    let tier=tier(&fx,24*MIB as u64);
+    let (_executor,peer)=Executor::spawn(&tier);
+    let doc=serde_json::json!({"manifest":fx.manifest,"name":"invalid\u{0}name","window":4<<20,
+        "traversal":fx.traversal(),"components":["unet"],"regions":fx.regions(),"parts":[]});
+    let body=serde_json::to_vec(&doc).unwrap();
+    let request=SealedRequest {sha256:&format!("{:x}",Sha256::digest(&body)),length:body.len() as u64,stage:None};
+    assert!(tier.seal(peer,&[fx.grant()],request,sealed(&body)).is_err());
+    let facts=tier.facts();
+    assert_eq!((facts.entries,facts.charged_bytes,facts.filling_bytes),(0,0,0),"{facts:?}");
+    assert!(ask(&tier,peer,&fx).is_some(),"a valid retry can use the same layout");
 }

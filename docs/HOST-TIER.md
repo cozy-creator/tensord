@@ -98,3 +98,13 @@ be `selected_rows`; parse the read/host-peak counters as integers from the modes
 Selected-row host peak must stay within its bounded row buffer (normally at most 1 MiB).
 Feature advertisement alone is not activation proof. GPU/ordinary CLI qualification
 remains separate from CPU host-tier correctness controls.
+
+## Window accounting
+
+Window admission reserves its exact native footprint (all selected buffers plus state and
+claim metadata) as an Opening slot before allocating. Concurrent requests observe that
+reservation; an allocation or worker-launch failure releases it and wakes waiting peers.
+A one-region buffer is the current whole-reader working set, distinct from optional
+read-ahead buffers. That minimum can exceed the optional cache ceiling; admission does
+not turn the ceiling into a model-size refusal. Physical headroom for an indivisible
+region larger than available RAM remains an operation/grain qualification boundary.
