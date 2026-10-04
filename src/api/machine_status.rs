@@ -179,6 +179,7 @@ async fn frame<B: MachineBackend>(
         disk: identity.store.as_deref().and_then(disk),
         models: models.models,
         models_bytes: models.bytes,
+        webrtc: crate::machine::media::descriptor(identity),
         ..identity_frame(identity)
     })
 }
