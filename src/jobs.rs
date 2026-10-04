@@ -677,13 +677,7 @@ impl Jobs {
         let mut calls = parent.calls.lock().unwrap();
         let inputs = child_inputs(&input, parent, &calls.received);
         let request = format!("{}/{}", parent.request, frame.call_index);
-        let intent = format!(
-            "sha256:{}",
-            tensorfs_core::sha256::hex_digest(
-                &serde_json_canonicalizer::to_vec(&json!([frame.module, frame.export, input]))
-                    .map_err(|e| ("child_call_refused", e.to_string()))?
-            )
-        );
+        let intent = child_intent(&frame.module, &frame.export, &input);
         let job = service
             .engine
             .get(&parent.id)
@@ -1205,8 +1199,14 @@ fn grant(
             "media_type": binding.media_type,
         }));
     }
-    let canonical = serde_json_canonicalizer::to_string(&value).map_err(io::Error::other)?;
-    Ok((canonical, grants))
+    let exact = String::from_utf8(crate::boundary_json::exact(&value)).map_err(io::Error::other)?;
+    Ok((exact, grants))
+}
+
+/// A child call's intent: its callable and its input, numbers exact.
+fn child_intent(module: &str, export: &str, input: &Value) -> String {
+    let semantic = crate::boundary_json::exact(&json!([module, export, input]));
+    format!("sha256:{}", tensorfs_core::sha256::hex_digest(&semantic))
 }
 
 
@@ -1244,5 +1244,25 @@ fn state_name(state: State) -> &'static str {
         State::Completed => "succeeded",
         State::Failed => "failed",
         _ => "been canceled",
+    }
+}
+
+#[cfg(test)]
+mod exact_tests {
+    use super::*;
+
+    /// Seeds past 2^53 name distinct child calls and come back from a child exact.
+    #[test]
+    fn large_integers_stay_exact() {
+        let seed = |text: &str| crate::boundary_json::parse(text.as_bytes()).unwrap();
+        let intent = |input: &Value| child_intent("package", "call", input);
+        let first = seed(r#"{"seed":9007199254740992,"nested":{"b":2,"a":1}}"#);
+        assert_eq!(intent(&first), intent(&seed(r#" {"nested":{"a":1,"b":2}, "seed":9007199254740992} "#)));
+        assert_ne!(intent(&first), intent(&seed(r#"{"seed":9007199254740993,"nested":{"b":2,"a":1}}"#)));
+        let result = crate::journal::ResultRecord { value: json!({"seed": u64::MAX, "float": 1.0}), artifacts: vec![], asset_bindings: vec![] };
+        let (sent, _) = grant(Path::new("unused"), &result, Path::new("unused"), None).unwrap();
+        let received = crate::boundary_json::parse(sent.as_bytes()).unwrap();
+        assert_eq!(received["seed"].as_u64(), Some(u64::MAX));
+        assert!(received["float"].is_f64());
     }
 }

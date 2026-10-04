@@ -171,31 +171,36 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
             ))
         }
     };
-    let hub = spec.hub.take();
+    let input: Value = if spec.payload.is_empty() {
+        serde_json::json!({})
+    } else {
+        crate::boundary_json::parse(&spec.payload)
+            .map_err(|_| Status::invalid_argument("the payload is not JSON"))?
+    };
+    let hub = spec.hub.take().filter(|hub| !hub.token.is_empty());
     let providers = spec.providers.take();
+    // What the run is, not how it reaches its sources: a spec re-sent with refreshed access,
+    // binding hints, known results or a reformatted payload names the same run.
     let identity_digest = {
         let mut identity = spec.clone();
-        identity.hub = hub.clone().map(|hub| v1::HubAccess {
-            token: String::new(),
-            ..hub
+        identity.payload = crate::boundary_json::exact(&input);
+        identity.hub = hub.as_ref().map(|hub| v1::HubAccess {
+            origin: hub.origin.trim_end_matches('/').into(),
+            ..Default::default()
         });
+        identity.binding_revision.clear();
+        identity.known_results.clear();
         identity.publication.clear();
         format!(
             "sha256:{}",
             tensorfs_core::sha256::hex_digest(&prost::Message::encode_to_vec(&identity))
         )
     };
-    let hub = match hub.filter(|hub| !hub.token.is_empty()) {
+    let hub = match hub {
         None => None,
         Some(hub) => {
             if !crate::hub::valid_origin(&hub.origin) {
                 return Err(Status::invalid_argument("the run's Hub origin is invalid"));
-            }
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |since| since.as_secs() as i64);
-            if hub.expires_at != 0 && hub.expires_at <= now {
-                return Err(refused("hub_access_expired", "the run's Hub access has expired"));
             }
             Some(crate::hub::Source {
                 origin: hub.origin.trim_end_matches('/').to_string(),
@@ -215,12 +220,6 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
         // A warm run of model choices alone makes them (and uploads to its destination).
         None if warm => crate::runs::Source::Models,
         None => return Err(Status::invalid_argument("a run spec names its source")),
-    };
-    let input: Value = if spec.payload.is_empty() {
-        serde_json::json!({})
-    } else {
-        crate::boundary_json::parse(&spec.payload)
-            .map_err(|_| Status::invalid_argument("the payload is not JSON"))?
     };
     let models = spec
         .models
@@ -746,6 +745,15 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
     }
 }
 
+/// Accepts a run, or answers the one a re-sent spec already names whatever its access now
+/// says: expired Hub access refuses only a run not yet accepted.
+fn accept(runs: &Arc<crate::runs::Runs>, actor: &str, id: &str, spec: crate::runs::Spec, expired: bool) -> Result<(), Status> {
+    if expired && runs.existing(actor, id, &spec.digest).map_err(refusal)?.is_none() {
+        return Err(refused("hub_access_expired", "the run's Hub access has expired"));
+    }
+    runs.submit(actor, id, spec).map(drop).map_err(refusal)
+}
+
 /// Submit when asked, then follow the log until the outcome or the caller leaves. An
 /// output-limited grant (`limit`) sees only what [`visible`] keeps.
 pub(super) async fn stream_run<B: MachineBackend>(
@@ -760,13 +768,16 @@ pub(super) async fn stream_run<B: MachineBackend>(
         let runs = backend
             .runs()
             .ok_or_else(|| Status::unimplemented("this machine takes no runs"))?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs() as i64);
+        let expired = spec.hub.as_ref().is_some_and(|hub| {
+            !hub.token.is_empty() && hub.expires_at != 0 && hub.expires_at <= now
+        });
         let (id, spec) = (id.clone(), spec_of(spec)?);
         tokio::task::spawn_blocking(move || {
-            runs.submit(&crate::machine_api::actor_id(actor), &id, spec)
+            accept(&runs, &crate::machine_api::actor_id(actor), &id, spec, expired)
         })
         .await
-        .map_err(|_| Status::internal("machine operation stopped"))?
-        .map_err(refusal)?;
+        .map_err(|_| Status::internal("machine operation stopped"))??;
     }
     // The log is read from its start, so a reattach numbers each output's revisions and lists
     // the outcome's outputs as the run made them; only entries past the cursor are sent.
@@ -834,6 +845,83 @@ pub(super) async fn stream_run<B: MachineBackend>(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn authored() -> v1::RunSpec {
+        let input = |field: &str, hex: &str, order| v1::InputFile {
+            field: field.into(), digest: format!("sha256:{}", hex.repeat(64)), length: 4, order, ..Default::default()
+        };
+        let model = |parameter: &str, repository: &str| v1::ModelChoice {
+            parameter: parameter.into(), repository: repository.into(), release: "1".into(), ..Default::default()
+        };
+        v1::RunSpec {
+            source: Some(v1::run_spec::Source::Release(v1::Release { package: "org/package".into(), release: "1.0.0".into() })),
+            entrypoint: "render".into(),
+            payload: br#" { "seed":9007199254740993, "nested":{"b":2,"a":1} } "#.to_vec(),
+            inputs: vec![input("reference", "a", 0), input("reference", "b", 1)],
+            models: vec![model("model", "org/first"), model("other", "org/second")],
+            binding_revision: "7".into(),
+            known_results: vec![v1::MemoResult::default()],
+            publication: "p1".into(),
+            hub: Some(v1::HubAccess {
+                origin: "https://hub.example.test/".into(), token: "t1".into(), expires_at: i64::MAX,
+                ca_der: vec![1], object_hosts: vec!["objects-1.example.test".into()],
+            }),
+            providers: Some(v1::ProviderAccess { huggingface: "h1".into(), civitai: "c1".into() }),
+            ..Default::default()
+        }
+    }
+
+    /// A spec re-sent after a daemon crash, with refreshed (even expired) access, new hints and
+    /// a reformatted payload, names the run it named; what the run is still tells runs apart.
+    #[test]
+    fn a_resent_spec_names_the_run_it_named() {
+        let original = authored();
+        let digest = spec_of(original.clone()).unwrap().digest;
+        let mut resent = original.clone();
+        resent.payload = br#"{"nested":{"a":1,"b":2},"seed":9007199254740993}"#.to_vec();
+        resent.hub = Some(v1::HubAccess {
+            origin: "https://hub.example.test".into(), token: "t2".into(), expires_at: 1,
+            ca_der: vec![2], object_hosts: vec!["objects-2.example.test".into()],
+        });
+        (resent.binding_revision, resent.publication, resent.providers) = ("8".into(), "p2".into(), None);
+        resent.known_results.clear();
+        assert_eq!(spec_of(resent).unwrap().digest, digest);
+        let changes: [fn(&mut v1::RunSpec); 6] = [
+            |s| s.payload = br#"{"seed":9007199254740992,"nested":{"a":1,"b":2}}"#.to_vec(),
+            |s| s.payload = br#"{"seed":9007199254740993.0,"nested":{"a":1,"b":2}}"#.to_vec(),
+            |s| s.inputs.reverse(),
+            |s| s.models.reverse(),
+            |s| s.entrypoint = "other".into(),
+            |s| s.hub.as_mut().unwrap().origin = "https://other.example.test".into(),
+        ];
+        for change in changes {
+            let mut changed = original.clone();
+            change(&mut changed);
+            assert_ne!(spec_of(changed).unwrap().digest, digest);
+        }
+    }
+
+    /// Expired access refuses a new run, never the accepted run a re-sent spec names.
+    #[test]
+    fn expired_access_refuses_only_a_new_run() {
+        let root = std::env::temp_dir().join(format!("cm-accept-{}", uuid::Uuid::new_v4()));
+        let service = crate::service::Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
+        let store = Arc::new(tensorfs_core::store::Store::ensure(&root.join("store")).unwrap());
+        let objects = Arc::new(crate::objects::Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap());
+        let runs = Arc::new(crate::runs::Runs {
+            service: service.clone(), objects, publisher: None, local: None, own_hub: None, jobs: Default::default(),
+        });
+        let spec = spec_of(authored()).unwrap();
+        let invocation = crate::journal::Invocation { package: "org/package".into(), input: spec.input.clone(), ..Default::default() };
+        let accepted = service.engine.accept_run("alice", "run-1", &spec.digest, invocation).unwrap().0;
+        accept(&runs, "alice", "run-1", spec_of(authored()).unwrap(), true).unwrap();
+        assert_eq!(service.engine.get_public("alice", "run-1").unwrap().id, accepted.id);
+        let refusal = accept(&runs, "alice", "run-2", spec, true).unwrap_err();
+        assert_eq!(refusal.metadata().get("cozy-error-code").unwrap(), "hub_access_expired");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// A digest of 64 non-hex bytes is refused, not sliced mid-character.
     #[test]
     fn a_digest_is_ascii_hex() {

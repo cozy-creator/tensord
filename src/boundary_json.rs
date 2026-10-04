@@ -8,6 +8,12 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Value, serde_json::Error> {
     serde_json::from_slice::<Unique>(bytes).map(|value| value.0)
 }
 
+/// A value's exact JSON: keys sorted (serde_json's map is ordered) and every number as parsed.
+/// JCS routes numbers through f64, which merges distinct seeds above 2^53.
+pub(crate) fn exact(value: &Value) -> Vec<u8> {
+    serde_json::to_vec(value).expect("a JSON value serializes")
+}
+
 struct Unique(Value);
 impl<'de> Deserialize<'de> for Unique {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {

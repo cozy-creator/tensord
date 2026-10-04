@@ -358,7 +358,7 @@ impl NativeBackend {
             body["output_manifest"] = json!({"outputs":output_entries});
         }
         if let Some(value) = value {
-            body["result"] = json!({"result_schema_digest":schema_digest, "inline_result":STANDARD.encode(canonical(&value)?)});
+            body["result"] = json!({"result_schema_digest":schema_digest, "inline_result":STANDARD.encode(crate::boundary_json::exact(&value))});
         }
         let bytes = canonical(&body)?;
         let digest = sha256::digest(&bytes);

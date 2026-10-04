@@ -180,8 +180,22 @@ fn captured_child_job(interface: &[u8], name: &str) -> Result<bool, Refused> {
 }
 
 impl Runs {
+    /// The run this id already names, if its spec is `digest`; another spec is a conflict.
+    pub(crate) fn existing(&self, actor: &str, id: &str, digest: &str) -> Result<Option<Execution>, Refused> {
+        match self.service.engine.get_public(actor, id) {
+            Ok(run) if run.submission.as_ref().map(|s| s.invocation_digest.as_str()) == Some(digest) => Ok(Some(run)),
+            Ok(_) => Err(refused("run_id_conflict", "this run id already names another run spec")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Accepts the run (or answers the one this id already names) and starts its preparation.
+    /// An accepted run is answered before its inputs are checked: they may be gone since.
     pub fn submit(self: &Arc<Self>, actor: &str, id: &str, spec: Spec) -> Result<Execution, Refused> {
+        if let Some(run) = self.existing(actor, id, &spec.digest)? {
+            return Ok(run);
+        }
         if !spec.input.is_object() {
             return Err(refused(
                 "invalid_request",
@@ -581,16 +595,8 @@ impl Runs {
     ) -> Result<Execution, Refused> {
         let actor = parent.submission.as_ref().map(|s| s.actor.clone()).unwrap_or_default();
         // An earlier attempt's call is already its run (a resumed job): nothing prepares.
-        match self.service.engine.get_public(&actor, request) {
-            Ok(existing) => {
-                let same = existing.submission.as_ref().map(|s| s.invocation_digest.as_str());
-                if same != Some(intent) {
-                    return Err(refused("run_id_conflict", "this run id already names another run spec"));
-                }
-                return Ok(existing);
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
-            Err(error) => return Err(error.into()),
+        if let Some(existing) = self.existing(&actor, request, intent)? {
+            return Ok(existing);
         }
         let spec = self.child_spec(&actor, &parent.id, entrypoint, input, inputs, intent)?;
         self.submit(&actor, request, spec)
