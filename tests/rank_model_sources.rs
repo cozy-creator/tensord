@@ -351,6 +351,10 @@ fn two_plane_only_ranks_relay_native_sources_and_keep_a_scope_after_leader_exit(
                 answer.descriptor = true;
                 files.push(file);
             }
+            Kind::SealedStage => {
+                answer.staged = host.stage(peer, &grants, request, plan.unwrap()).unwrap();
+                answer.ok = true;
+            }
             Kind::ObjectFiles => match host.object_files(peer, &grants, request, plan.unwrap()) {
                 Ok(objects) => {
                     answer.ok = true;
