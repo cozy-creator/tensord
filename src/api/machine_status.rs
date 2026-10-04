@@ -9,7 +9,16 @@ use tonic::Status;
 pub(super) type Frames = Pin<Box<dyn Stream<Item = Result<v1::StatusFrame, Status>> + Send>>;
 
 /// What this machine serves on `cozy.machine.v1`, for clients that adapt to it.
-pub const CAPABILITIES: &[&str] = &["status/1", "run/1", "control/1", "read/1"];
+/// `warm/1`: a warm run with no entrypoint installs its code and makes its model choices
+/// present. `upload/1`: a warm run of one provider source puts it in its weights destination.
+pub const CAPABILITIES: &[&str] = &[
+    "status/1",
+    "run/1",
+    "control/1",
+    "read/1",
+    "warm/1",
+    "upload/1",
+];
 
 const LIVE: [&str; 4] = ["queued", "starting", "running", "paused"];
 

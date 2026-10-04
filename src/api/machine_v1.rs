@@ -146,6 +146,7 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
             token: String::new(),
             ..hub
         });
+        identity.publication.clear();
         format!(
             "sha256:{}",
             tensorfs_core::sha256::hex_digest(&prost::Message::encode_to_vec(&identity))
@@ -178,6 +179,8 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
         },
         Some(v1::run_spec::Source::Installation(alias)) => crate::runs::Source::Installation(alias),
         Some(v1::run_spec::Source::Local(local)) => crate::runs::Source::Local(local.manifest),
+        // A warm run of model choices alone makes them (and uploads to its destination).
+        None if warm => crate::runs::Source::Models,
         None => return Err(Status::invalid_argument("a run spec names its source")),
     };
     let input: Value = if spec.payload.is_empty() {
@@ -251,6 +254,8 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
                 civitai: p.civitai,
             })
             .unwrap_or_default(),
+        weights_destination: spec.weights_destination,
+        publication: spec.publication,
         owner: spec.owner,
         digest: identity_digest,
     })
