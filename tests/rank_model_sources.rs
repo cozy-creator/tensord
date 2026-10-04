@@ -81,6 +81,13 @@ impl Fixture {
             .unwrap()
             .obj;
         objects.push(asset.clone());
+        let denied_bytes = vec![0x77; 1024];
+        objects.push(
+            store
+                .put_stream(&mut denied_bytes.as_slice(), None, &Fault::default())
+                .unwrap()
+                .obj,
+        );
         let header = Header {
             configs: vec![(
                 "model".into(),
@@ -95,8 +102,25 @@ impl Fixture {
                     segments: vec![asset],
                 },
             )],
-            encodings: vec![plain],
-            components: vec![("allowed".into(), tensors)],
+            encodings: vec![plain.clone()],
+            components: vec![
+                ("allowed".into(), tensors),
+                (
+                    "denied".into(),
+                    vec![(
+                        "weight".into(),
+                        Tensor {
+                            dtype: Dtype::U8,
+                            shape: vec![1024],
+                            encoding: plain.object_id(),
+                            parts: vec![(
+                                "value".into(),
+                                Part::plan(Dtype::U8, vec![1024], &denied_bytes),
+                            )],
+                        },
+                    )],
+                ),
+            ],
         };
         let bytes = header.canonical_bytes().unwrap();
         let header_ref = store
@@ -327,15 +351,19 @@ fn two_plane_only_ranks_relay_native_sources_and_keep_a_scope_after_leader_exit(
                 answer.descriptor = true;
                 files.push(file);
             }
-            Kind::ObjectFiles => {
-                let objects = host
-                    .object_files(peer, &grants, request, plan.unwrap())
-                    .unwrap();
-                answer.ok = true;
-                answer.objects_sha256 = cozy_machine::host_tier::objects_digest(&objects);
-                answer.descriptors = objects.len() as u64;
-                files.extend(objects.into_iter().map(|(_, file)| file));
-            }
+            Kind::ObjectFiles => match host.object_files(peer, &grants, request, plan.unwrap()) {
+                Ok(objects) => {
+                    answer.ok = true;
+                    answer.objects_sha256 = cozy_machine::host_tier::objects_digest(&objects);
+                    answer.descriptors = objects.len() as u64;
+                    files.extend(objects.into_iter().map(|(_, file)| file));
+                }
+                Err(error) => {
+                    answer.code = "object_files_refused".into();
+                    answer.detail = error.to_string();
+                    refusals += 1;
+                }
+            },
             _ => panic!("unexpected source exchange: {:?}", frame.kind),
         }
         write_answer(&mut channel, &answer).unwrap();
@@ -345,7 +373,7 @@ fn two_plane_only_ranks_relay_native_sources_and_keep_a_scope_after_leader_exit(
     }
     assert!(receiver.wait().unwrap().success());
     assert_eq!(model_reads, 4);
-    assert_eq!(refusals, 4);
+    assert_eq!(refusals, 6);
     assert_eq!(host.facts().ledger.object_file_grants, 4);
     assert_eq!(
         host.facts().entries,
