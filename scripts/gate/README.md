@@ -1,4 +1,4 @@
-# Matched gate: old stack vs Rust machine
+# Matched ComfyUI and Rust machine measurements
 
 `gate.py` drives ordinary `cozy run --rental=<pod> --await` from the controller against one rented
 pod, alternating two machine arms on the same GPU, and writes one row per request. Nothing private:
@@ -9,17 +9,30 @@ python3 gate.py run manifest.json OUT     # alternate arms; append OUT/results.j
 python3 gate.py report OUT                # OUT/summary.json with medians, spread and the verdict
 ```
 
-## Threshold, declared before the run
+## Qualification declared before the run
 
-The Rust machine passes when, with every output correct, at least one of these holds and warm
-per-image is no more than 2% slower (median):
+`report` evaluates a complete paired ComfyUI matrix. A lower memory peak cannot substitute
+for faster inference, and failed constrained-memory cells cannot be omitted. Without the
+declaration or supporting evidence the verdict is inconclusive.
 
-- stopped-machine first image (warm page cache) median at least 20% lower, or
-- SDXL→Anima→SDXL switch (sum of the two switch requests) median at least 20% lower, or
-- host peak at least 25% lower.
+```json
+{"comparison":{"reference":"comfy","candidate":"rust",
+ "cells":["cold-sdxl","cold-anima","warm","switch","1gib-grouped"],"min_pairs":3}}
+```
 
-Reported whichever way it lands. Gains that come from shared Runtime/TensorFS fixes both arms run are
-not Rust-machine gains: every row records the Runtime/TensorFS versions the run reports.
+Each cell row needs a stable `pair` id, equal `request_digest` for normalized model bytes
+and requests, and equal measured `hardware_key`. Both arms record
+`timing_boundary: "submit_to_saved_output"` and the same `output_location` (`controller`
+or `pod`). Three pairs is the minimum; declare more before running when variance warrants it.
+The deterministic paired bootstrap reports the median candidate/reference ratio and its
+95% interval. Every declared cell must have an upper interval below one, with no failed
+candidate requests, for `timing_win`.
+
+Qualification also needs `quality: {ok, method, reference_digest}` produced by actual
+reference validation: method is `exact` or `declared_tolerance`. Shape/nonflat checks are
+smoke checks and do not qualify model output. `timing_win` may be true while `pass` remains
+false for missing quality evidence. Existing historical datasets remain reportable but
+do not acquire missing proof retroactively. Keep measured RSS distinct from PSS.
 
 ## One cycle (per arm, order from the manifest, e.g. old, rust, old, rust, ...)
 
