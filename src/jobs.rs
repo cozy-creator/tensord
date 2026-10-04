@@ -584,12 +584,14 @@ impl Jobs {
     }
 
     /// The job's root has stopped: its children follow, and unless it rests paused its
-    /// children prepare no more. A root deferred before it started runs again: nothing ends.
+    /// children prepare no more. A root deferred before it started, or resumed since this
+    /// attempt stopped, runs again: nothing ends, and its children are the new attempt's.
     fn ended(&self, id: &str) {
         let Some(service) = self.service.upgrade() else {
             return;
         };
-        if service.engine.get(id).is_ok_and(|r| r.state == State::Queued) {
+        let again = |r: Execution| matches!(r.state, State::Queued | State::Starting | State::Running);
+        if service.engine.get(id).is_ok_and(again) {
             return;
         }
         self.stop_children(id);
