@@ -684,6 +684,12 @@ def comparison(rows: list[dict], manifest: dict) -> dict:
                 cell["status"] = "failed"
                 cell["reason"] = "A paired request failed."
                 continue
+            if (before.get("engine", {}).get("name") != "ComfyUI"
+                    or not before.get("engine", {}).get("commit")
+                    or after.get("engine", {}).get("name") != "cozy-machine"
+                    or not after.get("engine", {}).get("commit")):
+                valid = False
+                cell["reason"] = "The reference/candidate engine revisions are unproven."
             if (not before.get("request_digest") or before.get("request_digest") != after.get("request_digest")
                     or not before.get("hardware_key") or before.get("hardware_key") != after.get("hardware_key")
                     or before.get("timing_boundary") != "submit_to_saved_output"
