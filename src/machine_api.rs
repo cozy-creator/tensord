@@ -297,6 +297,19 @@ impl NativeBackend {
         // the log does not already show, after them.
         let mut events = self.product_events(record)?;
         let shown: Vec<_> = events.iter().filter_map(|e| e.product.clone()).collect();
+        if record.running_revision > 0 {
+            // An observer may have last seen queued and next read this terminal page.
+            // Replay the actual journaled start before its later progress; samples never
+            // authorize or infer running, and preparation-only work has no such revision.
+            events.push(pb::MachineExecutionEvent {
+                sequence: record.running_revision,
+                attempt_ordinal: record.attempt.max(1) as u64,
+                at_ms: record.started_at_ms,
+                kind: "running".into(),
+                body_canonical_bytes: canonical(&json!({"generation":record.attempt.max(1)}))?,
+                ..Default::default()
+            });
+        }
         events.extend(self.progress_events(record)?);
         events.sort_by_key(|event| event.sequence);
         let first_sequence = record

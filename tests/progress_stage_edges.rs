@@ -266,6 +266,10 @@ async fn burst_stage_endpoint_survives_real_tls_observer_and_terminal_journal_re
     let mut terminal = client.run(request(0)).await.unwrap().into_inner();
     let mut replay = vec![];
     while let Some(event) = terminal.message().await.unwrap() {
+        assert!(
+            !matches!(&event.event, Some(v1::run_event::Event::State(state)) if state.state == "running"),
+            "preparation-only work acquired an invented running fact"
+        );
         if let Some(v1::run_event::Event::Progress(progress)) = event.event {
             replay.push((event.sequence, event.at_ms, progress));
         }
