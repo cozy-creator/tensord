@@ -1,4 +1,4 @@
-"""Reads one input tree the machine materialized and reports its files."""
+"""A job reads one input tree the machine materialized and reports its files."""
 from __future__ import annotations
 
 import hashlib
@@ -19,11 +19,13 @@ class Response(msgspec.Struct):
     sha256: str
 
 
-@app.entrypoint
-def count(payload: Request, ctx: Context) -> Response:
+async def count(ctx: Context, payload: Request) -> Response:
     files = payload.data.files()
     digest = hashlib.sha256()
     for path in files:
         digest.update(path.read_bytes())
     root = payload.data.path
     return Response([str(path.relative_to(root)) for path in files], digest.hexdigest())
+
+
+app.job(count, accelerator=False)

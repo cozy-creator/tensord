@@ -1496,7 +1496,7 @@ mod v1_api {
         assert_eq!(uploaded, declared);
     }
 
-    /// An input tree (`--input-tree ref=dir`, a `Tree` field): each file and the tree's manifest
+    /// A job's input tree (`--asset field=dir`, a `Tree` field): each file and the tree's manifest
     /// written with Write, the manifest named as an input of the tree media type under the
     /// payload's ref; the machine materializes the directory and the callable reads it.
     #[tokio::test]
@@ -1522,6 +1522,7 @@ mod v1_api {
         let size = tree.len() as u64;
         assert_eq!(write(&mut client, &all, &tree_digest, size, 0, &tree).await.unwrap(), size);
         let spec = v1::RunSpec {
+            kind: v1::RunKind::Job as i32,
             source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
             entrypoint: "count".into(),
             payload: br#"{"data":"asset:data"}"#.to_vec(),
