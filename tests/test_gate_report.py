@@ -16,6 +16,7 @@ def measurements(ratio=0.9):
     for pair in range(3):
         for arm, time in (("comfy", 10), ("rust", 10 * ratio)):
             rows.append({"event": "cell", "cell": "warm", "arm": arm, "pair": str(pair),
+                         "engine": {"name": "ComfyUI" if arm == "comfy" else "cozy-machine", "commit": "fixture-revision"},
                          "total_s": time, "ok": True, "request_digest": f"sha256:{pair:064x}",
                          "hardware_key": "same-card-and-driver", "timing_boundary": "submit_to_saved_output",
                          "output_location": "controller", "quality": {"ok": True, "method": "exact",
@@ -56,6 +57,9 @@ def test_different_inputs_hardware_or_saved_output_boundary_cannot_pass():
         rows, plan = measurements()
         rows[1][field] = "different"
         assert not gate.comparison(rows, plan)["pass"]
+    rows, plan = measurements()
+    rows[0]["engine"] = {"name": "old-python-worker", "commit": "another-revision"}
+    assert not gate.comparison(rows, plan)["pass"]
 
 
 def test_smoke_checks_do_not_qualify_inference_outputs():
