@@ -242,7 +242,12 @@ impl Jobs {
                 Arc::new(move || {
                     let canceled = cancel.cancel(&request);
                     if let Some(jobs) = jobs.upgrade() {
-                        jobs.stop_children(&request);
+                        // The root is still running: no resume can change this answer.
+                        let hold = jobs
+                            .service
+                            .upgrade()
+                            .is_some_and(|s| Self::holding(&s.engine, &request));
+                        jobs.stop_children(&request, hold);
                     }
                     canceled
                 }),
@@ -553,12 +558,11 @@ impl Jobs {
     }
 
     /// Whether `parent` is pausing or paused (not canceled): its children are held, not ended.
+    fn holds(parent: &Execution) -> bool {
+        parent.pause_actor.is_some() && parent.cancel_actor.is_none() && !parent.state.terminal()
+    }
     fn holding(engine: &Engine, parent: &str) -> bool {
-        engine.get(parent).is_ok_and(|record| {
-            record.pause_actor.is_some()
-                && record.cancel_actor.is_none()
-                && !record.state.terminal()
-        })
+        engine.get(parent).is_ok_and(|record| Self::holds(&record))
     }
 
     /// One child follows its parent's stop: held while unstarted if the parent pauses (started
@@ -578,12 +582,11 @@ impl Jobs {
         }
     }
 
-    /// Every unfinished child of `parent` follows its stop (cancel, pause, or its end).
-    fn stop_children(&self, parent: &str) {
+    /// Every unfinished child of `parent` follows its stop: held (`hold`), else canceled.
+    fn stop_children(&self, parent: &str, hold: bool) {
         let Some(service) = self.service.upgrade() else {
             return;
         };
-        let hold = Self::holding(&service.engine, parent);
         let Ok(children) = service.engine.children(parent) else {
             return;
         };
@@ -593,18 +596,21 @@ impl Jobs {
     }
 
     /// The job's root has stopped: its children follow, and unless it rests paused its
-    /// children prepare no more. A root deferred before it started, or resumed since this
-    /// attempt stopped, runs again: nothing ends, and its children are the new attempt's.
+    /// children prepare no more. A root that is queued again runs again and nothing ends: it
+    /// was deferred before it started, or resumed since this attempt stopped (its next
+    /// attempt waits for this thread, `Engine::dispatch_managed`). The run is read once: a
+    /// resume between two reads would cancel the children its next attempt needs.
     fn ended(&self, id: &str) {
         let Some(service) = self.service.upgrade() else {
             return;
         };
-        let again = |r: Execution| matches!(r.state, State::Queued | State::Starting | State::Running);
-        if service.engine.get(id).is_ok_and(again) {
+        let record = service.engine.get(id).ok();
+        if record.as_ref().is_some_and(|r| r.state == State::Queued) {
             return;
         }
-        self.stop_children(id);
-        if let (false, Some(runs)) = (Self::holding(&service.engine, id), self.runs.upgrade()) {
+        let hold = record.as_ref().is_some_and(Self::holds);
+        self.stop_children(id, hold);
+        if let (false, Some(runs)) = (hold, self.runs.upgrade()) {
             runs.end_job(id);
         }
     }
@@ -619,7 +625,7 @@ impl Jobs {
             ));
         }
         let paused = service.engine.pause(&record.id, actor, false)?;
-        self.stop_children(&record.id);
+        self.stop_children(&record.id, Self::holds(&paused));
         Ok(paused)
     }
 

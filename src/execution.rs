@@ -589,12 +589,17 @@ impl Engine {
 
     /// Trusted adapters share one claim, supervisor reservation and journal. They
     /// register the exact process birth before authorizing any authored code.
+    ///
+    /// A run rests paused before its stopped attempt has ended (its executor still exits,
+    /// its thread still cleans up), and a resume queues it at once. Its next attempt is not
+    /// claimed until that thread is done, which wakes the dispatcher: otherwise the old
+    /// thread's cleanup would disown the new attempt and end its children.
     pub(crate) fn dispatch_managed<F>(self: &Arc<Self>, id: &str, run: F) -> io::Result<bool>
     where
         F: FnOnce(Arc<Self>, String) -> io::Result<()> + Send + 'static,
     {
         let mut owned = self.owned.lock().unwrap();
-        if !self.journal.lock().unwrap().claim(id)? {
+        if owned.contains(id) || !self.journal.lock().unwrap().claim(id)? {
             return Ok(false);
         }
         owned.insert(id.into());
@@ -1510,4 +1515,63 @@ pub(crate) fn open_artifact(root: &Path, path: &Path) -> io::Result<File> {
         directory = file;
     }
     unreachable!()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{sync::mpsc, time::Duration};
+
+    #[test]
+    fn a_resumed_run_is_not_dispatched_until_its_stopped_attempt_has_ended() {
+        let root = std::env::temp_dir().join(format!("cm-resume-{}", uuid::Uuid::new_v4()));
+        let engine = Engine::open(&root).unwrap();
+        let invocation = Invocation {
+            package: "audit/job".into(),
+            input: serde_json::json!({}),
+            job: true,
+            ..Default::default()
+        };
+        let run = engine.submit("resumed", invocation).unwrap();
+        // The first attempt rests paused, then goes on ending until the test lets it.
+        let (rested, rests) = mpsc::channel();
+        let (end, ends) = mpsc::channel::<()>();
+        let first = engine.dispatch_managed(&run.id, move |engine, id| {
+            engine.pause(&id, "alice", false)?;
+            engine.finish_stopped(&id)?;
+            rested.send(()).unwrap();
+            ends.recv().unwrap();
+            Ok(())
+        });
+        assert!(first.unwrap());
+        rests.recv().unwrap();
+        assert_eq!(engine.resume(&run.id).unwrap().state, State::Queued);
+        let second = |engine: Arc<Engine>, id: String| {
+            engine
+                .finish(&id, Outcome::Failed("the second attempt ran".into()))
+                .map(drop)
+        };
+        assert!(
+            !engine.dispatch_managed(&run.id, second).unwrap(),
+            "the next attempt was claimed while the stopped one was still ending"
+        );
+        assert_eq!(engine.get(&run.id).unwrap().state, State::Queued);
+        // Once it has ended, the run is dispatched, and stays this engine's own.
+        end.send(()).unwrap();
+        let mut seen = engine.activity_epoch();
+        while !engine.dispatch_managed(&run.id, second).unwrap() {
+            seen = engine.wait_activity(seen, Some(Duration::from_millis(50)));
+        }
+        loop {
+            engine.reconcile().unwrap();
+            let record = engine.get(&run.id).unwrap();
+            assert_eq!(record.waiting_reason, None);
+            if record.state.terminal() {
+                assert_eq!((record.state, record.attempt), (State::Failed, 2));
+                break;
+            }
+            seen = engine.wait_activity(seen, Some(Duration::from_millis(50)));
+        }
+        let _ = fs::remove_dir_all(root);
+    }
 }
