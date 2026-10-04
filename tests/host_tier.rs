@@ -404,7 +404,7 @@ fn unheld_layouts_go_oldest_first_and_held_ones_never() {
         other.adopt(&granted);
     }
     let facts = settled(&tier);
-    assert_eq!((facts.windows, facts.ledger.released), (u64::from(streamed), 2), "{facts:?}");
+    assert_eq!((facts.windows, facts.ledger.released), (usize::from(streamed), 2), "{facts:?}");
     assert!(facts.ledger.released_bytes >= 8 * MIB as u64, "{facts:?}");
     assert_eq!(facts.entries, 1);
 }
