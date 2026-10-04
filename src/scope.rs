@@ -664,7 +664,7 @@ mod tests {
     fn a_recovered_token_observes_a_setsid_reader_after_its_leader_ends() {
         let scope = tree("strict", true);
         let reader = process_birth(detach(&scope)).unwrap();
-        struct EndReader(ProcessBirth);
+        struct EndReader(crate::journal::ProcessBirth);
         impl Drop for EndReader {
             fn drop(&mut self) {
                 if let Ok(Some(exact)) = Exact::open(&self.0) {
