@@ -91,6 +91,7 @@ impl Pod {
             payload_digest: digest(&input),
             publication_authorization_id: String::new(),
             preparation_id: prepared.id.clone(),
+            legacy_intent: String::new(),
         };
         let call = Call {
             entrypoint: self.plan.entrypoint.clone(),

@@ -55,6 +55,9 @@ pub struct SubmissionContext {
     pub payload_digest: String,
     pub publication_authorization_id: String,
     pub preparation_id: String,
+    /// Registered legacy Submit authored intent; older records are validated from retained facts.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub legacy_intent: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1164,6 +1167,7 @@ impl Journal {
             payload_digest: String::new(),
             publication_authorization_id: String::new(),
             preparation_id: String::new(),
+            legacy_intent: String::new(),
         };
         let execution = insert(&tx, &key, invocation, Some(context), "", Some(PREPARING))?;
         reference_objects(&tx, &execution.id, objects)?;

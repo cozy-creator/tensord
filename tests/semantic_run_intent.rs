@@ -4,7 +4,7 @@ use cozy_machine::{
     api::{
         self,
         capability::{self, Grant},
-        v1, MachineIdentity,
+        pb, v1, MachineIdentity,
     },
     journal::{Invocation, Outcome, ResultRecord},
     machine_api::NativeBackend,
@@ -12,7 +12,7 @@ use cozy_machine::{
     runs::Runs,
     service::Service,
 };
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use std::{
     fs,
     path::PathBuf,
@@ -28,6 +28,8 @@ struct Machine {
     store: Arc<tensorfs_core::store::Store>,
     client: v1::machine_client::MachineClient<Channel>,
     token: String,
+    legacy: pb::pod_host_client::PodHostClient<Channel>,
+    claim: pb::Claim,
     task: tokio::task::JoinHandle<()>,
     actor: String,
     lifecycle: Arc<cozy_machine::machine::lifecycle::Lifecycle>,
@@ -59,6 +61,8 @@ impl Machine {
                 .unwrap();
         identity.lifecycle = Some(lifecycle.clone());
         let pem = identity.cert_pem.clone();
+        let claim = pb::Claim { worker_id: identity.authority.worker_id.clone(), worker_boot_id: identity.authority.boot_id.clone(),
+            record_owner_epoch: 1, proof: signer.sign(&identity.authority.transcript(1).unwrap()).to_bytes().to_vec(), ..Default::default() };
         let uploads =
             api::workspaces::WorkspaceUploads::open(&root.join("uploads"), store.clone()).unwrap();
         let mut backend = NativeBackend::new(
@@ -107,7 +111,9 @@ impl Machine {
             service,
             objects,
             store,
-            client: v1::machine_client::MachineClient::new(channel),
+            client: v1::machine_client::MachineClient::new(channel.clone()),
+            legacy: pb::pod_host_client::PodHostClient::new(channel),
+            claim,
             token,
             task,
             actor,
@@ -311,4 +317,43 @@ async fn native_outcome_preserves_exact_application_uint64_and_float_kind() {
     let result: serde_json::Value = serde_json::from_slice(&outcome.result).unwrap();
     assert_eq!(result["seed"].as_u64(), Some(u64::MAX));
     assert!(result["float"].as_number().unwrap().is_f64());
+}
+
+
+#[tokio::test]
+async fn legacy_existing_intent_replays_during_activation_but_fresh_work_cannot_enter() {
+    let mut machine = Machine::open().await;
+    let generation = "d".repeat(32);
+    let directory = machine.service.catalog.root().join(&generation);
+    let python = directory.join("env/bin/python");
+    fs::create_dir_all(python.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink("/usr/bin/python3", &python).unwrap();
+    let interface = serde_json::json!({"entrypoints":[{"name":"run","models":[],"invocable":{}}]});
+    fs::write(directory.join(".hold"), []).unwrap();
+    fs::write(directory.join("generation.json"), serde_json::to_vec(&cozy_machine::catalog::Generation {
+        identity: generation.clone(), package: "fixture/legacy".into(), version: "1.0.0".into(), application: "fixture:app".into(),
+        python, dependencies: vec![], interface: interface.clone(), cpu_bridge: "CPU intent fixture has no model execution".into()
+    }).unwrap()).unwrap();
+    machine.service.engine.bind_installation(cozy_machine::journal::Installation { actor: machine.actor.clone(),
+        alias: "legacy".into(), generation, package: "fixture/legacy".into(), release: "1.0.0".into(),
+        interface: serde_json::to_vec(&interface).unwrap() }).unwrap();
+    let original = pb::MachineExecutionSubmit {
+        claim: Some(machine.claim.clone()), submission_id: "legacy-submission".into(),
+        expected_execution_workspace_id: machine.service.engine.workspace_id(),
+        offer: Some(pb::AttemptOffer { request_id: "legacy-run".into(), attempt_ordinal: 1, ..Default::default() }),
+        release_root: Some(pb::ReleaseRoot { installation_id: "legacy".into(), entrypoint: "run".into(), ..Default::default() }),
+        payload_canonical_bytes: b"{}".to_vec(), ..Default::default()
+    };
+    let accepted = machine.legacy.submit_machine_execution(original.clone()).await.unwrap().into_inner();
+    let activation = machine.lifecycle.begin_activation().unwrap();
+    assert_eq!(machine.legacy.submit_machine_execution(original.clone()).await.unwrap().into_inner(), accepted);
+    let mut changed = original.clone(); changed.payload_canonical_bytes = br#"{"seed":1}"#.to_vec();
+    assert_eq!(machine.legacy.submit_machine_execution(changed).await.unwrap_err().metadata().get("cozy-error-code").unwrap(), "execution_intent_conflict");
+    let mut fresh = original; fresh.submission_id = "fresh-submission".into();
+    fresh.offer.as_mut().unwrap().request_id = "fresh-run".into();
+    let refused = machine.legacy.submit_machine_execution(fresh).await.unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::Unavailable);
+    assert!(refused.message().contains("machine_updating"));
+    assert_eq!(machine.service.engine.list().unwrap().len(), 1);
+    drop(activation);
 }

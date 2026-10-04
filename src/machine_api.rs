@@ -60,6 +60,51 @@ impl NativeBackend {
             installation: Mutex::new(()),
         }
     }
+    /// Old records contain resolved hashes rather than the originally authored root. Prove
+    /// only what retained metadata fully reconstructs; never resolve mutable source authority.
+    fn prove_legacy_replay(&self, record: &Execution, request: &pb::MachineExecutionSubmit) -> Result<(), Status> {
+        let root = request.release_root.as_ref().expect("submit validated a release root");
+        let context = record.submission.as_ref().expect("submit validated retained context");
+        let unavailable = || refusal("execution_replay_intent_unavailable",
+            "this older accepted record cannot prove the supplied root intent; observe or collect the original execution");
+        if root.installation_id.is_empty() || !root.models.is_empty() || !context.preparation_id.is_empty() {
+            return Err(unavailable());
+        }
+        if (!root.package.is_empty() && root.package != record.invocation.package) || !root.release.is_empty()
+            || root.job || root.deadline_unix_ms != 0 || root.capture.is_some() || !root.weights_destination.is_empty()
+            || !request.publication_authorization_id.is_empty() {
+            return Err(intent_conflict());
+        }
+        let installed = self.service.engine.installation(&context.actor, &root.installation_id)
+            .map_err(problem)?.ok_or_else(unavailable)?;
+        if installed.generation != record.invocation.generation || installed.package != record.invocation.package {
+            return Err(intent_conflict());
+        }
+        let interface: Value = serde_json::from_slice(&installed.interface)
+            .map_err(|_| Status::data_loss("retained installation interface corrupt"))?;
+        let entry = entrypoint(&interface, &root.entrypoint, false).map_err(|_| intent_conflict())?;
+        let payload = crate::boundary_json::parse(&request.payload_canonical_bytes)
+            .map_err(|_| Status::invalid_argument("payload is invalid JSON"))?;
+        let payload_digest = identity(&payload)?;
+        let binding = identity(entry)?;
+        let mut spec = json!({"format":"cozy.worker.v1.InvocationSpec/1","installation_id":installed.alias,
+            "payload_digest":payload_digest,"serving":{"entrypoint_binding_digest":binding,"attempt_binding_id":binding,"bindings_digest":binding}});
+        if !root.attention_kernel.is_empty() { spec["attention_kernel"] = json!(root.attention_kernel); }
+        let mut inputs = root.inputs.iter().map(|input| crate::journal::InputFile {
+            input_id: input.input_id.clone(), digest: input.digest.clone(), length: input.length,
+            media_type: input.kind_mime.clone(), order: input.order,
+        }).collect::<Vec<_>>();
+        inputs.sort_by(|a,b| a.input_id.cmp(&b.input_id));
+        if !inputs.is_empty() { spec["inputs"] = serde_json::to_value(&inputs).map_err(|_| Status::internal("input intent encoding failed"))?; }
+        let capture = json!({"installation":installed.alias,"generation":record.invocation.generation,
+            "entrypoint":root.entrypoint,"owner":root.owner,"hub":root.hub});
+        if context.capture_digest != identity(&capture)? || context.invocation_digest != identity(&spec)?
+            || context.payload_digest != payload_digest || record.invocation.input != payload
+            || record.invocation.inputs != inputs || record.invocation.attention_kernel != root.attention_kernel {
+            return Err(intent_conflict());
+        }
+        Ok(())
+    }
     fn workspace_id(&self) -> String {
         self.service.engine.workspace_id()
     }
@@ -1023,19 +1068,12 @@ impl MachineBackend for NativeBackend {
             ..Default::default()
         })
     }
-    fn submit(
-        &self,
-        actor: VerifiedActor,
-        request: pb::MachineExecutionSubmit,
-    ) -> Result<pb::MachineExecutionReceipt, Status> {
-        let root = request.release_root.as_ref().ok_or_else(|| {
-            Status::unimplemented("captured offers are not qualified by this CPU build")
-        })?;
-        let offer = request
-            .offer
-            .as_ref()
-            .ok_or_else(|| Status::invalid_argument("request offer absent"))?;
+    fn replay_submit(&self, actor: VerifiedActor, request: &pb::MachineExecutionSubmit)
+        -> Result<Option<pb::MachineExecutionReceipt>, Status> {
+        if request.release_root.is_none() { return Ok(None); }
+        let offer = request.offer.as_ref().ok_or_else(|| Status::invalid_argument("request offer absent"))?;
         let actor = actor_id(actor);
+        let legacy_intent = legacy_intent(request)?;
         // A replay of accepted work needs nothing from the Hub, even after access expired.
         if let Some(prior) = self
             .service
@@ -1049,8 +1087,37 @@ impl MachineBackend for NativeBackend {
                     "the requested execution journal is not this workspace",
                 ));
             }
-            return self.receipt(&prior);
+            let context = prior.submission.as_ref().ok_or_else(|| Status::data_loss("accepted submission context absent"))?;
+            let root = request.release_root.as_ref().expect("replay validated a release root");
+            if (!root.installation_id.is_empty() && !root.package.is_empty() && root.package != prior.invocation.package)
+                || context.request_id != offer.request_id || context.submission_id != request.submission_id {
+                return Err(intent_conflict());
+            }
+            if context.legacy_intent.is_empty() {
+                self.prove_legacy_replay(&prior, request)?;
+            } else if context.legacy_intent != legacy_intent {
+                return Err(intent_conflict());
+            }
+            return self.receipt(&prior).map(Some);
         }
+        Ok(None)
+    }
+    fn submit(
+        &self,
+        actor: VerifiedActor,
+        request: pb::MachineExecutionSubmit,
+    ) -> Result<pb::MachineExecutionReceipt, Status> {
+        let root = request.release_root.as_ref().ok_or_else(|| {
+            Status::unimplemented("captured offers are not qualified by this CPU build")
+        })?;
+        let offer = request
+            .offer
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("request offer absent"))?;
+        let actor_key = actor;
+        let actor = actor_id(actor);
+        let legacy_intent = legacy_intent(&request)?;
+        if let Some(receipt) = self.replay_submit(actor_key, &request)? { return Ok(receipt); }
         if root.job
             || root.deadline_unix_ms != 0
             || root.capture.is_some()
@@ -1195,7 +1262,8 @@ impl MachineBackend for NativeBackend {
                 "the payload must be a JSON object of the function's parameters",
             ));
         }
-        let canonical_input = canonical(&input)?;
+        let canonical_input = crate::boundary_json::intent_bytes(&input)
+            .map_err(|_| Status::invalid_argument("payload cannot be encoded"))?;
         let payload_digest = format!("sha256:{}", sha256::hex(&sha256::digest(&canonical_input)));
         let binding = identity(entry)?;
         let mut spec = json!({"format":"cozy.worker.v1.InvocationSpec/1","installation_id":installed.alias,"payload_digest":payload_digest,"serving":{"entrypoint_binding_digest":binding,"attempt_binding_id":binding,"bindings_digest":binding}});
@@ -1226,6 +1294,7 @@ impl MachineBackend for NativeBackend {
             invocation_digest: identity(&spec)?,
             payload_digest,
             publication_authorization_id: String::new(),
+            legacy_intent,
             preparation_id: gpu_plan
                 .as_ref()
                 .map(|plan| plan.id.clone())
@@ -1753,6 +1822,47 @@ impl Iterator for ByteReader {
         Some(Ok(pb::NativeByteReadChunk { offset, data }))
     }
 }
+
+fn intent_conflict() -> Status {
+    refusal("execution_intent_conflict", "these request/submission IDs already name another accepted authored intent")
+}
+
+/// Typed source choices and exact application values, not transport protobuf serialization.
+fn legacy_intent(request: &pb::MachineExecutionSubmit) -> Result<String, Status> {
+    let root = request.release_root.as_ref().ok_or_else(|| Status::invalid_argument("release root absent"))?;
+    let payload = crate::boundary_json::parse(&request.payload_canonical_bytes)
+        .map_err(|_| Status::invalid_argument("payload is invalid JSON"))?;
+    if !payload.is_object() { return Err(Status::invalid_argument("payload must be an object")); }
+    let mut models = root.models.iter().collect::<Vec<_>>();
+    models.sort_by(|a,b| a.parameter.cmp(&b.parameter));
+    let models = models.into_iter().map(|choice| {
+        let adapters = choice.adapters.iter().map(|adapter| {
+            let scale = if adapter.scale.is_empty() { 1.0 } else { adapter.scale.parse::<f64>()
+                .map_err(|_| Status::invalid_argument("adapter scale is not a finite decimal"))? };
+            if !scale.is_finite() { return Err(Status::invalid_argument("adapter scale is not finite")); }
+            Ok(json!({"component":adapter.component,"model":adapter.model,"release":adapter.release,"lane":adapter.lane,
+                "manifest":adapter.manifest,"source_component":adapter.source_component,"source":adapter.source,
+                "profiles":adapter.profiles,"scale":scale}))
+        }).collect::<Result<Vec<_>,Status>>()?;
+        Ok(json!({"parameter":choice.parameter,"repository":choice.repository,"release":choice.release,"lane":choice.lane,
+            "manifest":choice.manifest.as_ref().map(|reference| json!({"digest":sha256::hex(&reference.digest),"length":reference.length})),
+            "source":choice.source,"profiles":choice.profiles,"adapters":adapters}))
+    }).collect::<Result<Vec<_>,Status>>()?;
+    let mut inputs = root.inputs.iter().collect::<Vec<_>>();
+    inputs.sort_by(|a,b| a.input_id.cmp(&b.input_id));
+    let inputs = inputs.into_iter().map(|input| json!({"input_id":input.input_id,"digest":input.digest,
+        "length":input.length,"media_type":input.kind_mime,"order":input.order})).collect::<Vec<_>>();
+    let intent = json!({"format":"cozy.machine.legacy-submit-intent/1", "root":{
+        "package":if root.installation_id.is_empty() { root.package.as_str() } else { "" },"release":root.release,"installation":root.installation_id,"entrypoint":root.entrypoint,
+        "owner":root.owner,"hub":root.hub,"models":models,"inputs":inputs,"attention_kernel":root.attention_kernel,
+        "job":root.job,"deadline_unix_ms":root.deadline_unix_ms,"capture_present":root.capture.is_some(),
+        "weights_destination":root.weights_destination,"publication_authorization_id":request.publication_authorization_id
+    },"payload":payload});
+    let bytes = crate::boundary_json::intent_bytes(&intent)
+        .map_err(|_| Status::invalid_argument("legacy authored intent cannot be encoded"))?;
+    Ok(format!("sha256:{}", sha256::hex(&sha256::digest(&bytes))))
+}
+
 pub fn actor_id(actor: VerifiedActor) -> String {
     sha256::hex(&actor.public_key)
 }
@@ -2763,5 +2873,70 @@ print(json.dumps({"identity": generation.identity}))
             },
         );
         assert_eq!(later.unwrap_err().code(), tonic::Code::NotFound);
+    }
+}
+
+#[cfg(test)]
+mod legacy_replay_intent_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_parameter_order_is_a_set_but_input_order_and_adapter_stack_are_intent() {
+        let mut request = pb::MachineExecutionSubmit {
+            payload_canonical_bytes: br#"{"seed":18446744073709551615}"#.to_vec(),
+            release_root: Some(pb::ReleaseRoot {
+                package: "org/package".into(), release: "1.0.0".into(), entrypoint: "run".into(),
+                models: vec![pb::ModelChoice { parameter: "b".into(), repository: "org/b".into(), ..Default::default() },
+                    pb::ModelChoice { parameter: "a".into(), repository: "org/a".into(), adapters: vec![
+                        pb::DownloadAdapterRef { model: "org/one".into(), scale: "1".into(), ..Default::default() },
+                        pb::DownloadAdapterRef { model: "org/two".into(), scale: "-0.5".into(), ..Default::default() }
+                    ], ..Default::default() }],
+                inputs: vec![pb::InputBinding { input_id: "b".into(), digest: "sha256:b".into(), order: 1, ..Default::default() },
+                    pb::InputBinding { input_id: "a".into(), digest: "sha256:a".into(), order: 0, ..Default::default() }],
+                ..Default::default()
+            }), ..Default::default()
+        };
+        let original = legacy_intent(&request).unwrap();
+        request.release_root.as_mut().unwrap().models.reverse();
+        request.release_root.as_mut().unwrap().inputs.reverse();
+        assert_eq!(legacy_intent(&request).unwrap(), original);
+        request.release_root.as_mut().unwrap().models[0].adapters[0].scale = "1.0".into();
+        assert_eq!(legacy_intent(&request).unwrap(), original);
+        let ordered = request.clone();
+        request.release_root.as_mut().unwrap().models[0].adapters.reverse();
+        assert_ne!(legacy_intent(&request).unwrap(), original);
+        request = ordered;
+        request.release_root.as_mut().unwrap().inputs[0].order = 2;
+        assert_ne!(legacy_intent(&request).unwrap(), original);
+    }
+
+    #[test]
+    fn concurrent_legacy_intents_cannot_share_one_acceptance() {
+        use crate::journal::{Invocation, Journal, SubmissionContext};
+        let root = std::env::temp_dir().join(format!("legacy-intent-tx-{}", uuid::Uuid::new_v4()));
+        let first = Journal::open(&root).unwrap();
+        let second = Journal::open(&root).unwrap();
+        let workspace = first.workspace_id().to_string();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let attempts = [first, second].into_iter().enumerate().map(|(index, mut journal)| {
+            let workspace = workspace.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let context = SubmissionContext { actor: "fixture".into(), request_id: "request".into(),
+                    submission_id: "submission".into(), expected_workspace_id: workspace,
+                    legacy_intent: format!("intent-{index}"), ..Default::default() };
+                barrier.wait();
+                journal.accept_public(context, Invocation { input: json!({}), ..Default::default() })
+            })
+        }).collect::<Vec<_>>();
+        let results = attempts.into_iter().map(|thread| thread.join().unwrap()).collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let error = results.iter().find_map(|result| result.as_ref().err()).unwrap();
+        assert!(matches!(error.get_ref().and_then(|error| error.downcast_ref::<crate::journal::AdmissionError>()),
+            Some(crate::journal::AdmissionError::BindingConflict)));
+        let journal = Journal::open(&root).unwrap();
+        assert_eq!(journal.list().unwrap().len(), 1);
+        drop(journal);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
