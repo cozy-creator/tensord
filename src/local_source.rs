@@ -245,6 +245,7 @@ mod tests {
             client_wheel: client,
             staging_root: root.join("staging"),
             sdk: vec![],
+            uv: "uv".into(),
         };
         let sources = LocalSources::new(objects.clone(), installer.clone(), store.clone());
         let mut archive = tar::Builder::new(Vec::new());

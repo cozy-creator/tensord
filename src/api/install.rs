@@ -22,6 +22,8 @@ pub struct InstallerConfig {
     pub staging_root: PathBuf,
     /// The machine's own Runtime/TensorFS wheels: a local package runs this pair too.
     pub sdk: Vec<PathBuf>,
+    /// The machine's uv (`machine::client::uv`): the helper runs it, whatever PATH the machine had.
+    pub uv: PathBuf,
 }
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 pub struct Dependency {
@@ -182,6 +184,7 @@ pub fn prepare_uploaded(
     command
         .env_clear()
         .envs(crate::launch_identity::inherited())
+        .env("PATH", helper_path(&config.uv))
         .arg("-m")
         .arg("cozy_machine_client.packages")
         .arg("install-captured")
@@ -321,4 +324,39 @@ fn storage(error: std::io::Error) -> Status {
     Status::unavailable(format!(
         "package installation storage/process unavailable: {error}"
     ))
+}
+
+/// The helper's PATH: the machine's uv's directory first, then the machine's own PATH. The helper
+/// calls `uv` by name, and a machine started with no PATH still installs local packages.
+fn helper_path(uv: &Path) -> std::ffi::OsString {
+    let mut dirs: Vec<PathBuf> = uv
+        .parent()
+        .filter(|d| d.is_absolute())
+        .map(Path::to_path_buf)
+        .into_iter()
+        .collect();
+    dirs.extend(
+        std::env::var_os("PATH")
+            .iter()
+            .flat_map(std::env::split_paths),
+    );
+    std::env::join_paths(dirs).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_helper_finds_the_machines_uv_first() {
+        let path = super::helper_path(std::path::Path::new("/machine/usr/local/bin/uv"));
+        let first = std::env::split_paths(&path).next();
+        assert_eq!(
+            first.as_deref(),
+            Some(std::path::Path::new("/machine/usr/local/bin"))
+        );
+        // A bare `uv` (no root copy) leaves the machine's own PATH as it is.
+        assert_eq!(
+            super::helper_path(std::path::Path::new("uv")),
+            std::env::var_os("PATH").unwrap_or_default()
+        );
+    }
 }

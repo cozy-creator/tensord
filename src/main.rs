@@ -314,7 +314,10 @@ fn start_api(
 ) -> io::Result<()> {
     use cozy_machine::{api, machine_api::NativeBackend};
     sdk.client_wheel = wheel.clone();
-    let pair: Vec<PathBuf> = sdk.requirements.iter().map(PathBuf::from).collect();
+    let (pair, uv): (Vec<PathBuf>, _) = (
+        sdk.requirements.iter().map(PathBuf::from).collect(),
+        sdk.uv.clone(),
+    );
     let store = owner.lock().unwrap().store();
     let uploads = api::workspaces::WorkspaceUploads::open(&root.join("uploads"), store.clone())
         .map_err(io::Error::other)?;
@@ -338,6 +341,7 @@ fn start_api(
             generations: generations.to_path_buf(),
             staging_root: root.join("package-staging"),
             sdk: pair,
+            uv: uv.clone(),
         }),
         (Some(_), None) => {
             return Err(io::Error::other(

@@ -751,6 +751,7 @@ mod tests {
                 client_wheel: client,
                 staging_root: root.join("staging"),
                 sdk: vec![],
+                uv: "uv".into(),
             },
             store.clone(),
         );

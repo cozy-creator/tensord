@@ -390,6 +390,15 @@ fn seed_run(state: &Path, actor: &str) {
     assert!(journal.claim("1").unwrap());
     // The run's executor: a process of its own (a starting machine ends orphaned executors).
     let mut executor = Command::new("sleep").arg("600").spawn().unwrap();
+    // Killed when the test ends however it ends: a leaked sleep keeps every inherited
+    // descriptor open (the caller's pipes, a build lock) for ten minutes.
+    struct Reap(i32);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            unsafe { libc::kill(self.0, libc::SIGKILL) };
+        }
+    }
+    let _reap = Reap(executor.id() as i32);
     let birth = cozy_machine::execution::process_birth(executor.id()).unwrap();
     journal
         .register_process("1", ProcessBirth { ..birth })
