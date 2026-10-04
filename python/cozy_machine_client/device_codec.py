@@ -14,7 +14,13 @@ from pathlib import Path
 
 from cozy_runtime.author._assets import digest_bytes
 from cozy_runtime.author._codec import FRAME_MEDIA_TYPES, encode_frame
-from cozy_runtime.internal.worker.attempts import AttemptEngine
+
+
+def blob_path(spool, ref):
+    tail = ref.rsplit("/", 2)
+    if len(tail) < 3 or not tail[-1] or tail[-1] != Path(tail[-1]).name:
+        return None
+    return spool / f"{tail[-2]}-{tail[-1]}"
 
 
 def read_regular(directory, name):
@@ -36,7 +42,7 @@ def encode(request, directory):
         raw = read_regular(directory, frame["raw"])
         if len(raw) != frame["raw_bytes"]:
             raise ValueError("registered raw frame length changed")
-        destination = AttemptEngine._blob_path(spool, frame["handle"])
+        destination = blob_path(spool, frame["handle"])
         if destination is None:
             raise ValueError("SDK frame has no owned output binding")
         encoded = encode_frame(frame["codec"], frame["facts"], raw)
@@ -53,7 +59,7 @@ def encode(request, directory):
     frames = {frame["handle"]: frame for frame in request["frames"]}
     total = 0
     for output in request["outputs"]:
-        destination = AttemptEngine._blob_path(spool, output["asset_ref"])
+        destination = blob_path(spool, output["asset_ref"])
         if destination is None:
             raise ValueError("SDK output has no owned spool binding")
         encoded = read_regular(directory, destination.name)

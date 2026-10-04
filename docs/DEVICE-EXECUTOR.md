@@ -85,8 +85,8 @@ Observations never authorize kills.
 - `result.canonical` in the spool, opened `O_PATH`/`NOFOLLOW`, matching `result_ref` SHA-256 and length.
 
 `postprocess(codec, spool, reply)` runs `device_codec.py` with the generation's Python (`-I`, env
-cleared, spool passed as an fd). It reuses the SDK's `encode_frame` and the
-`AttemptEngine._blob_path` resolver to encode deferred host frames and bind outputs. Each
+cleared, spool passed as an fd). It reuses the SDK's `encode_frame` and its own
+`blob_path` resolver to encode deferred host frames and bind outputs. Each
 `AssetBinding` carries `output_id`, `asset_ref`, spool `name`, `kind`, `media_type`, `length`,
 `producer_digest` (SDK BLAKE2b) and `sha256`. Rust re-hashes every bound file before returning.
 The root must then take durable custody before reporting success.
