@@ -2,31 +2,28 @@
 
 `model_sources.rs` (`ModelSources`) exports read-only model bytes from the machine's TensorFS store
 to a device executor. Only an explicit selection grants authority, never presence in the store.
-`model_source_driver.rs` answers executor `model_source_read` frames with it.
+GPU service callbacks answer executor `model_source` frames with it. RankGroup forwards a
+follower's request through rank 0 on the same seam; every rank remains a plane-only consumer.
 
 ## API
 
 `open_shared(store, &[SelectedManifest { manifest, components }])` reads the native header.
 The native read plan over the selected components defines the allowed objects.
 
-`read(SourceRequest { manifest, role, name, length }) -> SourceGrant { sha256, length, file }`:
-- `header`: the verified header file;
-- `object`: must be in the selected plan, with an exact `length`;
-- `asset`: must be declared by the selected header. It is returned as a sealed read-only memfd;
-- other roles: `Unsupported`, failing only this request.
+`source(manifest, name) -> Vec<u8>` returns the verified header when name is empty,
+or one exact header-declared asset. `serve(&Frame) -> (Answer, File)` wraps those bytes
+in a sealed readonly memfd with their digest and length. A manifest outside the session's
+selection or an undeclared asset is refused. HostTier's separate ObjectFiles exchange
+checks the selected components and exact read plan before granting verified readonly files.
 
-The answer carries `sha256`, `length` and one `SCM_RIGHTS` fd. It is used only after the executor
-offers `model_sources.descriptors/1`. Descriptors outlive the broker.
-
-## Closure transfer
-
-`model-source-check [--verify] STORE MANIFEST COMPONENTS OUTPUT` writes `closure-files.txt`. With
-`--verify` it admits copied paths into the target's own catalog. No foreign SQLite is copied.
+The answer carries `sha256`, `length` and one `SCM_RIGHTS` fd. The receiver verifies those bytes
+and closes the temporary descriptor. No Store path or credentials are delegated.
 
 ## Known gaps
 
 - Cooperative same-user contract, not a sandbox.
-- The lease keeps one fd per selected object and can hit the hard fd limit.
+- Each ObjectFiles consumer holds descriptors for the objects behind its live layout;
+  that consumer can hit its hard fd limit. ModelSources' durable roots hold no object fds.
 - Assets are buffered whole in memory.
 
 
@@ -50,3 +47,6 @@ token-scrubbing descendants are outside that boundary. Unrelated unreadable same
 can make strict Tree emptiness unavailable; keep custody/charge and visibly refuse reclamation.
 Scoped pressure qualification therefore requires delegated cgroups or an isolated readable
 provider PID/UID scope. Group exit alone does not prove setsid descendants gone.
+
+See [RANK-MODEL-SOURCES.md](RANK-MODEL-SOURCES.md) for the inherited relay audit and the
+plane-only two-rank CPU/hardware qualification gates.
