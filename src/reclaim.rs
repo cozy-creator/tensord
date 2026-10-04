@@ -1,6 +1,7 @@
 //! The machine's caches manage themselves: a TTL, plus the host's storage-pressure policy
-//! (TensorFS `ensure::admission`): pressure starts below 1/10 of the filesystem free and
-//! ends above 1/5; below the reserve, max(1 GiB, 1/50), optional cache writes are skipped.
+//! (TensorFS `ensure::admission`): pressure starts at the reserve, max(1 GiB, 1/50).
+//! Pressure removes a covering set of releasable local bytes or nothing. TTL expiration
+//! remains independent; optional cache writes are skipped at the reserve.
 //! Never evicted: uncollected results (durable outputs), journal rows, an environment
 //! generation any queued, running or retained run holds, or one an installation names.
 use crate::{catalog::Catalog, execution::Engine};
@@ -9,6 +10,7 @@ use std::{
     collections::HashSet,
     fs::{self, File},
     io,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
@@ -38,15 +40,23 @@ impl Disk {
             available: stat.f_bavail.saturating_mul(unit),
         })
     }
+    pub fn reserve(&self) -> u64 {
+        (1u64 << 30).max(self.capacity / 50)
+    }
+    pub fn short(&self) -> u64 {
+        self.reserve()
+            .saturating_add(1)
+            .saturating_sub(self.available)
+    }
     pub fn pressure(&self) -> bool {
-        self.available < self.capacity / 10
+        self.available <= self.reserve()
     }
     pub fn relieved(&self) -> bool {
-        self.available > self.capacity / 5
+        self.available > self.reserve()
     }
     /// Optional cache writes are skipped below this.
     pub fn below_reserve(&self) -> bool {
-        self.available < (1u64 << 30).max(self.capacity / 50)
+        self.pressure()
     }
 }
 
@@ -69,7 +79,8 @@ pub struct Swept {
 }
 
 /// The persistent compiled-kernel store (`Seal::prepare`'s `<root>/u<uid>/`). Recompiling is
-/// cheaper than reinstalling, so it goes before generations, and only under pressure.
+/// more valuable than inactive environments: pressure takes it after eligible generations.
+/// TTL expiration still applies independently of pressure.
 pub struct KernelCaches {
     pub root: PathBuf,
     /// Namespaces (`u<uid>`) a live executor uses: never touched.
@@ -81,6 +92,9 @@ fn last_use(path: &Path) -> SystemTime {
     let own = fs::symlink_metadata(path)
         .and_then(|m| m.modified())
         .unwrap_or(SystemTime::UNIX_EPOCH);
+    if !fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
+        return own;
+    }
     match fs::read_dir(path) {
         Ok(entries) => entries
             .flatten()
@@ -98,15 +112,25 @@ fn kernel_entries(caches: &KernelCaches) -> Vec<PathBuf> {
         return entries;
     };
     for namespace in namespaces.flatten() {
+        if !namespace.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
         if caches
             .busy
             .contains(&*namespace.file_name().to_string_lossy())
         {
             continue;
         }
-        for child in fs::read_dir(namespace.path()).into_iter().flatten().flatten() {
+        for child in fs::read_dir(namespace.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
             let name = child.file_name();
             if matches!(name.to_str(), Some("triton" | "flash-attn4")) {
+                if !child.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    continue;
+                }
                 entries.extend(
                     fs::read_dir(child.path())
                         .into_iter()
@@ -119,15 +143,12 @@ fn kernel_entries(caches: &KernelCaches) -> Vec<PathBuf> {
             }
         }
     }
-    let mut dated: Vec<_> = entries.into_iter().map(|path| (last_use(&path), path)).collect();
+    let mut dated: Vec<_> = entries
+        .into_iter()
+        .map(|path| (last_use(&path), path))
+        .collect();
     dated.sort();
     dated.into_iter().map(|(_, path)| path).collect()
-}
-
-fn older_than(path: &Path, age: Duration) -> bool {
-    fs::metadata(path)
-        .and_then(|m| m.modified())
-        .is_ok_and(|modified| SystemTime::now().duration_since(modified).is_ok_and(|a| a > age))
 }
 
 fn remove(path: &Path) -> bool {
@@ -146,19 +167,31 @@ fn remove(path: &Path) -> bool {
     }
 }
 
-/// TTL always; under pressure each tier in turn, stopping once the disk is relieved.
-/// `bound`: generations installations or configured packages still name.
+/// TTL always; under pressure only a covering plan on the machine-state filesystem.
+/// TensorFS model caches plan independently against their own filesystem. We never add
+/// another mount's bytes or an in-use generation's size to this plan.
 pub fn sweep(
     engine: &Engine,
     catalog: &Catalog,
     bound: &HashSet<String>,
     kernels: Option<&KernelCaches>,
 ) -> io::Result<Swept> {
+    sweep_with_disk(engine, catalog, bound, kernels, &|| {
+        Disk::measure(&engine.root)
+    })
+}
+
+#[doc(hidden)]
+pub fn sweep_with_disk(
+    engine: &Engine,
+    catalog: &Catalog,
+    bound: &HashSet<String>,
+    kernels: Option<&KernelCaches>,
+    disk: &dyn Fn() -> io::Result<Disk>,
+) -> io::Result<Swept> {
     let mut swept = Swept::default();
     let root = &engine.root;
-    let disk = || Disk::measure(root);
-    let mut pressure = disk()?.pressure();
-    // Spools of settled or unknown runs are leftovers of a crash, never needed again.
+    let filesystem = fs::metadata(root)?.dev();
     for entry in fs::read_dir(root.join("staging"))?.flatten() {
         let id = entry.file_name().to_string_lossy().into_owned();
         let settled = match engine.get(&id) {
@@ -169,69 +202,158 @@ pub fn sweep(
             swept.staging += 1;
         }
     }
-    // Runner logs of settled runs: diagnostics, kept for the TTL.
+    let mut candidates = Vec::new();
     if let Ok(entries) = fs::read_dir(root.join("logs")) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             let id = name.split('.').next().unwrap_or_default();
-            let settled = engine.get(id).map_or(true, |record| record.state.terminal());
-            if settled && (pressure || older_than(&entry.path(), TTL)) && remove(&entry.path()) {
-                swept.logs += 1;
+            let settled = match engine.get(id) {
+                Ok(record) => record.state.terminal(),
+                Err(error) => error.kind() == io::ErrorKind::NotFound,
+            };
+            if settled {
+                candidates.push((Kind::Log, entry.path()));
             }
         }
     }
-    pressure = pressure && !disk()?.relieved();
-    // Result copies the client already collected; uncollected ones are durable outputs.
     for entry in fs::read_dir(root.join("results"))?.flatten() {
         let id = entry.file_name().to_string_lossy().into_owned();
-        let collected = engine.get(&id).is_ok_and(|record| record.collected);
-        if collected && (pressure || older_than(&entry.path(), TTL)) && remove(&entry.path()) {
-            swept.results += 1;
+        if engine.get(&id).is_ok_and(|record| record.collected) {
+            candidates.push((Kind::Result, entry.path()));
         }
     }
-    pressure = pressure && !disk()?.relieved();
-    if let Some(kernels) = kernels.filter(|_| pressure) {
-        for entry in kernel_entries(kernels) {
-            if remove(&entry) {
-                swept.kernels += 1;
-            }
-            if disk()?.relieved() {
-                pressure = false;
-                break;
-            }
-        }
-    }
-    // Generations: unbound, unheld, and unused for the TTL (or the disk is short).
-    let mut candidates: Vec<_> = fs::read_dir(catalog.root())?
-        .flatten()
-        .filter(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with(".collect-") {
-                return true; // an interrupted collection
-            }
-            name.len() == 32 && name.bytes().all(|b| b.is_ascii_hexdigit()) && !bound.contains(&name)
-        })
-        .collect();
-    // Least recently used first: a resolve touches `.hold`.
-    candidates.sort_by_key(|entry| {
-        fs::metadata(entry.path().join(".hold"))
-            .and_then(|m| m.modified())
-            .unwrap_or(SystemTime::UNIX_EPOCH)
-    });
-    for entry in candidates {
-        let path = entry.path();
-        if entry.file_name().to_string_lossy().starts_with(".collect-") {
-            remove(&path);
+    for entry in fs::read_dir(catalog.root())?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(".collect-") {
+            remove(&entry.path());
             continue;
         }
-        let hold = path.join(".hold");
-        let expired = older_than(&hold, TTL) || (pressure && older_than(&hold, IDLE));
-        if expired && collect(&path)? {
-            swept.generations += 1;
-            pressure = pressure && !disk()?.relieved();
+        if name.len() == 32 && name.bytes().all(|b| b.is_ascii_hexdigit()) && !bound.contains(&name)
+        {
+            candidates.push((Kind::Generation, entry.path()));
+        }
+    }
+    if let Some(kernels) = kernels {
+        candidates.extend(
+            kernel_entries(kernels)
+                .into_iter()
+                .map(|path| (Kind::Kernel, path)),
+        );
+    }
+    // Last use of a generation is its .hold; kernel entries consider all their files.
+    let used = |kind: Kind, path: &Path| match kind {
+        Kind::Generation => last_use(&path.join(".hold")),
+        Kind::Kernel => last_use(path),
+        _ => fs::metadata(path)
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH),
+    };
+    candidates.sort_by_key(|(kind, path)| (*kind, used(*kind, path)));
+    let mut plan = Vec::new();
+    for (kind, path) in candidates {
+        let old = SystemTime::now()
+            .duration_since(used(kind, &path))
+            .is_ok_and(|age| age > TTL);
+        if old && kind.remove(&path, None)? {
+            kind.count(&mut swept);
+            continue;
+        }
+        if kind == Kind::Generation
+            && SystemTime::now()
+                .duration_since(used(kind, &path))
+                .is_ok_and(|age| age <= IDLE)
+        {
+            continue;
+        }
+        // Generation locks are eligibility evidence and stay held through plan/deletion.
+        let hold = if kind == Kind::Generation {
+            let Ok(hold) = File::open(path.join(".hold")) else {
+                continue;
+            };
+            if hold.try_lock_exclusive().is_err() {
+                continue;
+            }
+            Some(hold)
+        } else {
+            None
+        };
+        let Some(bytes) = releasable(&path, filesystem) else {
+            continue;
+        };
+        if bytes > 0 {
+            plan.push((kind, path, bytes, hold));
+        }
+    }
+    let need = disk()?.short();
+    if need == 0 || plan.iter().map(|(_, _, bytes, _)| bytes).sum::<u64>() < need {
+        return Ok(swept);
+    }
+    for (kind, path, _, hold) in plan {
+        if disk()?.relieved() {
+            break;
+        }
+        if kind.remove(&path, hold.as_ref())? {
+            kind.count(&mut swept);
         }
     }
     Ok(swept)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Kind {
+    Result,
+    Log,
+    Generation,
+    Kernel,
+}
+impl Kind {
+    fn count(self, swept: &mut Swept) {
+        *match self {
+            Self::Result => &mut swept.results,
+            Self::Log => &mut swept.logs,
+            Self::Generation => &mut swept.generations,
+            Self::Kernel => &mut swept.kernels,
+        } += 1;
+    }
+    fn remove(self, path: &Path, hold: Option<&File>) -> io::Result<bool> {
+        if self == Self::Generation {
+            match hold {
+                Some(hold) => collect_held(path, hold),
+                None => collect(path),
+            }
+        } else {
+            Ok(remove(path))
+        }
+    }
+}
+
+/// Count only allocated blocks this unlink can release on the measured filesystem.
+/// Multiply linked files are conservatively excluded (uv environments commonly share
+/// their payload with an external cache). Never follow symlinks or descend another mount.
+fn releasable(path: &Path, filesystem: u64) -> Option<u64> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if metadata.dev() != filesystem {
+        return None;
+    }
+    if metadata.file_type().is_symlink() {
+        return Some(0);
+    }
+    if metadata.is_dir() {
+        let children = fs::read_dir(path).ok()?.try_fold(0u64, |total, entry| {
+            let bytes = releasable(&entry.ok()?.path(), filesystem)?;
+            Some(total.saturating_add(bytes))
+        })?;
+        Some(
+            metadata
+                .blocks()
+                .saturating_mul(512)
+                .saturating_add(children),
+        )
+    } else if metadata.is_file() && metadata.nlink() == 1 {
+        Some(metadata.blocks().saturating_mul(512))
+    } else {
+        Some(0)
+    }
 }
 
 /// Remove one generation only while nothing holds it: a run or executor keeps a shared
@@ -245,6 +367,10 @@ fn collect(path: &Path) -> io::Result<bool> {
     if hold.try_lock_exclusive().is_err() {
         return Ok(false);
     }
+    collect_held(path, &hold)
+}
+
+fn collect_held(path: &Path, _hold: &File) -> io::Result<bool> {
     let name = path.file_name().unwrap().to_string_lossy();
     let doomed = path.with_file_name(format!(".collect-{name}"));
     // Once renamed no resolve can find it; the lock is held until it is gone.

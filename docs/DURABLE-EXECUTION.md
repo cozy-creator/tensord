@@ -119,13 +119,16 @@ before the run's terminal state is written. `results/<id>` is removed when the c
 retention and the store holds the public products. The caches manage themselves (`reclaim.rs`, at
 start and every 10 minutes; no purge verb): crash-leftover spools of settled runs go at once;
 logs, collected results and generations go after a 7-day TTL (a generation's last use is its
-`.hold` mtime) or, least recently used first, under the host's storage pressure (below 1/10 of
-the filesystem free, until above 1/5: TensorFS's thresholds). Never evicted: uncollected results,
-journal rows, a generation any run or executor holds (its `.hold` lock) or an installation or
-configured package names. Under pressure the persistent kernel store goes too, least recently
-used first (one compiled kernel, or one generation's torch kernels), before generations and never
-while an executor of that identity is alive. Below the reserve, max(1 GiB, 1/50), an executor's
-compiled kernels go to its run-scoped JIT directory instead of the persistent store.
+`.hold` mtime). Pressure begins at TensorFS's reserve, max(1 GiB, 1/50), and ends above it.
+Each filesystem is measured independently: model-store GC runs first, and local pressure
+then uses observed remaining free space. A local pressure plan counts only allocated,
+single-link bytes on the measured filesystem, excludes held/recent generations and live
+kernel namespaces, and holds generation eligibility locks through deletion. Without a
+covering local plan, useful kernels stay. Generations precede compiled kernels; every kind
+still expires by TTL. Native model-GC byte reports are logical diagnostics; actual filesystem
+remeasurement decides whether pressure is relieved. Uncollected results, journal rows,
+queued/paused/unknown generations, installed/configured generations and live reader custody
+remain protected. Below the reserve, compiled kernels use run-scoped JIT directories.
 
 Triage: every failed CPU run, and every GPU run whose executor ended, failed to start or was killed
 without writing its own terminal, keeps a bundle (`triage.rs`) before it settles: the reason, which

@@ -352,6 +352,14 @@ impl Service {
                 eprintln!("reclaim object roots: {error}");
             }
         }
+        // Store pressure belongs to the store's own filesystem. If it shares this mount,
+        // local caches then see actual remaining pressure rather than an estimated sum.
+        let publisher = self.publisher.lock().unwrap().clone();
+        let store_swept = match publisher.map(|publisher| publisher.reclaim(self)) {
+            Some(Ok(swept)) => swept,
+            Some(Err(error)) => { eprintln!("reclaim store: {error}"); (0, 0) },
+            None => (0, 0),
+        };
         let bound = self.engine.bound_generations().map(|mut bound| {
             if let Some(gpu) = self.gpu() {
                 bound.extend(gpu.config().packages.iter().map(|p| p.generation.clone()));
@@ -367,20 +375,12 @@ impl Service {
                     swept.scratch = jobs.sweep_scratch(&self.engine);
                 }
                 if let Some(gpu) = self.gpu() {
-                    let disk = || crate::reclaim::Disk::measure(&self.engine.root);
-                    let pressure = disk().is_ok_and(|disk| disk.pressure());
-                    let relieved = || disk().is_ok_and(|disk| disk.relieved());
-                    swept.memo = gpu.memo().sweep(pressure, relieved);
+                    // Memo's cap/TTL are independent policies. Do not purge it against
+                    // another filesystem's shortage or count it as physical relief.
+                    swept.memo = gpu.memo().sweep(false, || true);
                 }
-                let publisher = self.publisher.lock().unwrap().clone();
-                match publisher.map(|publisher| publisher.reclaim(self)) {
-                    Some(Ok((views, bytes))) => {
-                        swept.adapter_views = views;
-                        swept.store_bytes = bytes;
-                    }
-                    Some(Err(error)) => eprintln!("reclaim store: {error}"),
-                    None => {}
-                }
+                swept.adapter_views = store_swept.0;
+                swept.store_bytes = store_swept.1;
                 if swept != crate::reclaim::Swept::default() {
                     eprintln!("reclaimed {swept:?}");
                 }

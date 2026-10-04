@@ -1266,16 +1266,11 @@ fn caches_expire_but_held_named_and_uncollected_work_stays() {
     };
     let swept = reclaim::sweep(&fixture.engine, &catalog, &bound, Some(&caches)).unwrap();
     assert_eq!((swept.staging, swept.results, swept.generations), (1, 1, 1), "{swept:?}");
-    // Kernels go only under storage pressure, least recently used first, never a live
-    // executor's namespace.
-    let pressure = reclaim::Disk::measure(&fixture.root).unwrap().pressure();
+    // Kernels expire by TTL independently of pressure, never a live executor's namespace.
     assert!(kernels.join("u2/triton/busy").exists());
-    if pressure {
-        assert!(!kernels.join("u1/triton/old").exists(), "{swept:?}");
-    } else {
-        assert_eq!(swept.kernels, 0);
-        assert!(kernels.join("u1/triton/old").exists());
-    }
+    assert_eq!(swept.kernels, 1);
+    assert!(!kernels.join("u1/triton/old").exists(), "{swept:?}");
+    assert!(kernels.join("u1/triton/new").exists());
     assert!(!state.join("staging").join(&collected).exists());
     assert!(state.join("staging").join(&queued).exists());
     assert!(!state.join("results").join(&collected).exists());
