@@ -418,3 +418,42 @@ proved; no timer-based release or permanent opaque crash pin is accepted as a so
 Logs and output references are in `memory/qualification/` beneath the audit evidence folder.
 The current source candidates, component proofs and remaining gates are recorded in tracker
 319–324 and the associated draft PRs.
+
+## Qualification checkpoint, 2026-10-04 16:25 UTC
+
+The repaired physical3GiB pool completed all12 original requests: six grouped and six
+alternating. All saved1024-square images pass the declared same-engine quality rule.
+Grouped PSNR values are36.31–49.80dB; alternating SDXL is63.05–63.72dB and all three
+alternating Anima outputs are pixel-exact. Actual invocations and the unchanged ballast
+process/birth establish fresh work under pressure. The observer's missing final Anima
+step is retained as an observability limitation, supplemented by native invocation evidence.
+The earlier negative DeviceRoom failure remains preserved; it was not overwritten by success.
+
+Fresh1.5GiB qualification exposed another failure. Run4280 completed20 SDXL denoise steps
+but VAE upsampling needed512MiB with503MB allocatable. The decoder was correctly poisoned
+without whole-forward replay. RuntimePR1168 selects cold native decoder tiles from actual
+geometry/dtype and separates owner estimates from completed untiled measurements. Its
+final2aaac54e/H0c wheel passes14 focused CPU cases. Run4281 then completes and saves an
+image with native tiled512 mode, but PSNR30.111dB fails the unchanged35dB quality minimum.
+This is an open fidelity failure, not a qualified1.5GiB cell. An authored diagnostic
+captures the final128KiB latent for independent untiled/tiled decodes, preserving both runs.
+
+The exact machine91524d9 candidate passes148 top-level CPU cases, with seven ignored
+entries. Two of the host-test passes are conditional delegation wrappers whose children
+could not run on the rental; they do not prove constrained host memory there. Existing
+separate delegated192/256MiB proofs retain their earlier source limits. Clippy and the
+CPU-service binary build pass. Runtime de40 passes36 CPU cases with one GPU case skipped.
+These tests include scoped reader/GC recovery and authority; they do not qualify GPU reclaim.
+
+Storage follow-ups now have real consumer proof: native source-channel defaults pass;
+machine51/native342 execute an accepted CPU job resolving a logical model through its
+authenticated Hub, reading the native source, and retaining it across independent GC.
+Generation-only disk pressure passes seven controls and24 durable controls. Open HTTP
+outputs and unheld kernel namespaces cannot justify a deletion plan. Correct native plane
+checks pass29 store-backed controls, one plane-only footprint control and plane-only build.
+Initial fixture/setup failures are preserved with their corrections in the evidence folder.
+
+ComfyUI timing wins,1.25/1GiB pools, the1.5GiB fidelity repair, actual idle GPU reclaim,
+plane-only follower/source proof, H3/group qualification, LoRA, final composition and release
+consumers remain open. No implementation has been promoted to production or the personal
+machine. Tracker319–324 and the component PRs record the current source and evidence.
