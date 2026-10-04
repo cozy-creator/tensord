@@ -515,10 +515,25 @@ impl HostTier {
             false => None,
         };
         let (plan, body) = Self::plan(request, plan)?;
-        let key = self.ensure(&plan, grants, &body, false, stage.clone())?;
-        // A layout another executor had staged in part: this one stages what it asked for, or
-        // all of it when it reads no holes (a CPU executor computes on every byte).
-        self.stage_regions(&key, stage.as_deref());
+        let mut key = self.ensure(&plan, grants, &body, false, stage.clone())?;
+        match stage.as_deref() {
+            // A layout another executor had staged in part: this one stages what it asked for.
+            Some(regions) => {
+                self.stage_regions(&key, regions);
+            }
+            // It reads no holes (a CPU executor, an older Runtime): the rest is staged when the
+            // tier has room for all of it; else it reads through a window of its own.
+            None if !self.stage_rest(&key) => {
+                let (read_plan, layout) = Self::layout(&plan, grants)?;
+                let staging = {
+                    let state = self.state.lock().unwrap();
+                    self.limit
+                        .staging(&crate::host_memory::read(), state.charged())
+                };
+                key = self.stream(format!("{key}.whole"), &plan, read_plan, layout, staging)?;
+            }
+            None => {}
+        }
         let mut state = self.state.lock().unwrap();
         match state.slots.get(&key) {
             Some(Slot::Open(_)) => self.grant(&mut state, &key, peer).map(Some),
@@ -791,9 +806,8 @@ impl HostTier {
 
     /// Stage `regions` of a layout staged in part, in order, as far as the tier has room;
     /// returns the regions now staged or staging (all of them for a whole layout). The filler
-    /// copies them; adopters wait per region, and a region left a hole reads the files. None:
-    /// every region, room or not (an adopter that reads no holes needs them all).
-    fn stage_regions(&self, key: &str, regions: Option<&[u32]>) -> Vec<u32> {
+    /// copies them; adopters wait per region, and a region left a hole reads the files.
+    fn stage_regions(&self, key: &str, regions: &[u32]) -> Vec<u32> {
         let mut state = self.state.lock().unwrap();
         let limit = |state: &State| {
             let host = crate::host_memory::read();
@@ -804,17 +818,8 @@ impl HostTier {
         let Some(Slot::Open(entry)) = state.slots.get_mut(key) else {
             return Vec::new();
         };
-        let forced = regions.is_none();
         let Some(staging) = entry.staging.as_mut() else {
-            return regions.map(<[u32]>::to_vec).unwrap_or_default();
-        };
-        let every: Vec<u32>;
-        let regions = match regions {
-            Some(regions) => regions,
-            None => {
-                every = (0..staging.layout.regions.len() as u32).collect();
-                &every
-            }
+            return regions.to_vec();
         };
         let mut queued = Vec::new();
         for &r in regions {
@@ -824,7 +829,7 @@ impl HostTier {
             if staging.staged.contains(&r) {
                 continue;
             }
-            if !forced && charged + region.span > ceiling {
+            if charged + region.span > ceiling {
                 break; // the rest stream from the files
             }
             charged += region.span;
@@ -848,6 +853,35 @@ impl HostTier {
             let _ = self.fills.lock().unwrap().send(job);
         }
         staged
+    }
+
+    /// Every remaining region of a layout staged in part, for an adopter that reads no holes:
+    /// all of them when the tier has room, else none (the sparse copy does not grow). False:
+    /// the layout keeps holes.
+    fn stage_rest(&self, key: &str) -> bool {
+        let rest: Vec<u32> = {
+            let state = self.state.lock().unwrap();
+            let Some(Slot::Open(Entry {
+                staging: Some(staging),
+                ..
+            })) = state.slots.get(key)
+            else {
+                return true; // whole, or a window
+            };
+            let rest: Vec<u32> = (0..staging.layout.regions.len() as u32)
+                .filter(|r| !staging.staged.contains(r))
+                .collect();
+            let need: u64 = rest
+                .iter()
+                .map(|&r| staging.layout.regions[r as usize].span)
+                .sum();
+            let charged = state.charged();
+            if charged + need > self.limit.limit(&crate::host_memory::read(), charged) {
+                return false;
+            }
+            rest
+        };
+        self.stage_regions(key, &rest).len() == rest.len()
     }
 
     /// The filler's half of `stage_regions`: a lease over the regions' objects, then copy.
@@ -914,7 +948,7 @@ impl HostTier {
         let regions = request.stage.unwrap_or_default().to_vec();
         let (plan, _) = Self::plan(request, plan)?;
         let (_, layout) = Self::layout(&plan, grants)?;
-        Ok(self.stage_regions(&layout.digest, Some(&regions)))
+        Ok(self.stage_regions(&layout.digest, &regions))
     }
 
     /// The verified object files behind `plan`, read-only, for `peer`'s holes: the store's

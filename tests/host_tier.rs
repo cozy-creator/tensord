@@ -974,3 +974,26 @@ fn without_room_a_staged_executor_reads_every_region_from_the_files() {
     assert_eq!((facts.windows, facts.ledger.windows_opened), (0, 0), "{facts:?}");
     assert!(facts.charged_bytes < MIB as u64, "{facts:?}");
 }
+
+/// A staged executor holds a layout with one region staged; an executor that reads no holes
+/// adopts it where the rest does not fit. It reads through a window inside the tier's limit,
+/// and the sparse copy stays sparse (it used to stage every region, room or not).
+#[test]
+fn a_whole_reader_takes_a_window_when_a_layout_staged_in_part_cannot_grow() {
+    let fx = Fixture::new("sparse-to-whole", &[8 * MIB; 4]);
+    let limit = 24 * MIB as u64;
+    let tier = tier(&fx, limit);
+    let (_staged, a) = Executor::spawn_staged(&tier);
+    let sparse = staged_ask(&tier, a, &fx, &[0]);
+    let layout = fx.layout();
+    let host = tensorfs_plane::host::HostMem::adopt_sealed(sparse.as_raw_fd(), &layout).unwrap();
+    host.wait_ready(0).unwrap();
+    settled(&tier);
+    let (_whole, b) = Executor::spawn(&tier);
+    let granted = ask(&tier, b, &fx).expect("a window, not every region and not a refusal");
+    assert_eq!(stream_through(&fx, &granted, 1), 32 * MIB as u64);
+    assert!((1..4).all(|r| host.hole(r)), "the sparse copy grew");
+    let facts = tier.facts();
+    assert_eq!(facts.windows, 1, "{facts:?}");
+    assert!(facts.charged_bytes <= limit, "{facts:?}");
+}

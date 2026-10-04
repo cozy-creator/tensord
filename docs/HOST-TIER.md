@@ -36,7 +36,8 @@ buffers), so resident blocks and idle models cost page cache, which the kernel r
 RAM. When its stages plan streaming, the executor asks `sealed_stage` for those regions; the
 machine stages each one the tier has room for (`TierLimit::limit` per region; the rest keep
 reading the files) and the executor pins what was staged. An executor that reads no holes (CPU,
-or without the capability) gets every region staged.
+or without the capability) gets every region staged when the tier has room for all of them;
+adopting a layout staged in part that cannot grow, it reads through a window of its own.
 
 ## Size and release
 
