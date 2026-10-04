@@ -213,7 +213,21 @@ mod tests {
     fn truncated_descriptor_batch_closes_delivered_prefix() {
         let (send, receive) = UnixStream::pair().unwrap();
         let file = crate::os::memfd().unwrap();
-        let baseline = std::fs::read_dir("/proc/self/fd").unwrap().count();
+        // Other tests open files concurrently. Count only this unique memfd's
+        // descriptors so unrelated activity cannot hide a leak or fail this check.
+        use std::os::unix::fs::MetadataExt;
+        let original = file.metadata().unwrap();
+        let copies = || {
+            std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter_map(|entry| std::fs::metadata(entry.path()).ok())
+                .filter(|metadata| {
+                    metadata.dev() == original.dev() && metadata.ino() == original.ino()
+                })
+                .count()
+        };
+        assert_eq!(copies(), 1);
         let rights = vec![file.as_raw_fd(); 32];
         sendmsg::<()>(
             send.as_raw_fd(),
@@ -224,9 +238,6 @@ mod tests {
         )
         .unwrap();
         assert!(recv_fd(&receive).is_err());
-        assert_eq!(
-            std::fs::read_dir("/proc/self/fd").unwrap().count(),
-            baseline
-        );
+        assert_eq!(copies(), 1);
     }
 }
