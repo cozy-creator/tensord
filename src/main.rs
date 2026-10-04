@@ -155,12 +155,13 @@ fn run_machine(
     let service = cozy_machine::service::Service::open(&engine, &generations, 1)?;
     let paths = cozy_machine::machine::update::Paths::new(&engine, &layout.root);
     let updates = {
-        let (service, lifecycle) = (service.clone(), lifecycle.clone());
-        let idle = move || service.idle().unwrap_or(false) && lifecycle.admitted() == 0;
+        let (service, admitted) = (service.clone(), lifecycle.clone());
+        let idle = move || service.idle().unwrap_or(false) && admitted.admitted() == 0;
         cozy_machine::machine::update::Updates::open(
             paths.clone(),
             identity.readiness.clone(),
             Box::new(idle),
+            Some(lifecycle.clone()),
         )?
     };
     identity.updates = Some(updates.clone());

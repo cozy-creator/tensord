@@ -166,6 +166,7 @@ pub struct Updates {
     readiness: Arc<Readiness>,
     status: Mutex<Option<Status>>,
     idle: Box<dyn Fn() -> bool + Send + Sync>,
+    lifecycle: Option<Arc<super::lifecycle::Lifecycle>>,
 }
 
 impl Updates {
@@ -173,16 +174,25 @@ impl Updates {
         paths: Paths,
         readiness: Arc<Readiness>,
         idle: Box<dyn Fn() -> bool + Send + Sync>,
+        lifecycle: Option<Arc<super::lifecycle::Lifecycle>>,
     ) -> io::Result<Arc<Self>> {
         fs::create_dir_all(paths.update("staged"))?;
-        let status = fs::read(paths.update("status.json"))
+        let mut status = fs::read(paths.update("status.json"))
             .ok()
             .and_then(|raw| serde_json::from_slice::<Status>(&raw).ok());
+        // An update the service stopped during before activation ran no further: it failed.
+        let pending = paths.update("pending.json").is_file();
+        if let Some(stopped) = status.as_mut().filter(|s| !s.terminal() && !pending) {
+            stopped.error = "machine_restarted: the machine stopped before the update activated".into();
+            stopped.enter("failed");
+            write_json(&paths.update("status.json"), stopped)?;
+        }
         Ok(Arc::new(Self {
             paths,
             readiness,
             status: Mutex::new(status),
             idle,
+            lifecycle,
         }))
     }
 
@@ -325,6 +335,9 @@ impl Updates {
                 ));
             }
         }
+        // Preparing holds idle release; activation then closes admission.
+        let admitted = self.lifecycle.as_ref().map(|l| l.admit()).transpose()
+            .map_err(|refused| (503, refused.message().to_string()))?;
         let mut status = Status {
             operation: request.operation.clone(),
             from: pair_in(&self.paths.sdk()),
@@ -339,7 +352,7 @@ impl Updates {
         std::thread::Builder::new()
             .name("runtime-update".into())
             .spawn(move || {
-                if let Err(error) = updates.run(&request, exit) {
+                if let Err(error) = updates.run(&request, exit, admitted) {
                     updates.set(|s| {
                         s.error = error.to_string();
                         s.enter("failed");
@@ -360,7 +373,7 @@ impl Updates {
         }
     }
 
-    fn run(&self, request: &Request, exit: fn(i32)) -> io::Result<()> {
+    fn run(&self, request: &Request, exit: fn(i32), admitted: Option<super::lifecycle::Admission>) -> io::Result<()> {
         self.set(|s| s.enter("preparing"));
         let candidate = self.paths.engine.join("sdk").join(&request.operation);
         let _ = fs::remove_dir_all(&candidate);
@@ -387,6 +400,10 @@ impl Updates {
         }
         let to = pair_in(&candidate);
         self.set(|s| s.to = to.clone());
+        // No new work is admitted from here; work admitted before drains first.
+        let _activation = self.lifecycle.as_ref().map(|l| l.activate()).transpose()
+            .map_err(|refused| io::Error::other(refused.message().to_string()))?;
+        drop(admitted);
         if !(self.idle)() {
             self.set(|s| s.enter("waiting_activation"));
             while !(self.idle)() {
@@ -680,5 +697,65 @@ mod tests {
         );
         assert!(!rollback_pending(&paths, "again").unwrap());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn state(updates: &Updates, id: &str, until: &str) {
+        loop {
+            let status = updates.update(id).unwrap();
+            if status.state == until {
+                return;
+            }
+            assert!(!status.terminal(), "{}: {}", status.state, status.error);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Activation admits nothing new while work admitted before it drains, so no run is
+    /// accepted while the service exits; it reopens once the update is done.
+    #[test]
+    fn activation_closes_admission_while_admitted_work_drains() {
+        let root = std::env::temp_dir().join(format!("cm-activation-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::new(&root.join("engine"), &root);
+        fs::create_dir_all(&paths.image_wheels).unwrap();
+        wheel(&paths.image_wheels, "cozy_runtime", "0.1.0", None);
+        wheel(&paths.image_wheels, "tensorfs", "0.1.0", None);
+        let lifecycle = super::super::lifecycle::Lifecycle::open(root.join("idle.json"), false, true).unwrap();
+        let earlier = lifecycle.admit().unwrap();
+        let drained = lifecycle.clone();
+        let readiness = Readiness::open(None, Some(vec![7; 32]), false).unwrap();
+        let idle = Box::new(move || drained.admitted() == 0);
+        let updates = Updates::open(paths.clone(), readiness, idle, Some(lifecycle.clone())).unwrap();
+        let candidate = wheel(&root, "cozy_runtime", "0.2.0", None);
+        let file = candidate.file_name().unwrap().to_str().unwrap().to_owned();
+        let (sha256, _) = updates.stage(&file, &mut fs::File::open(&candidate).unwrap()).unwrap();
+        let runtime = Some(Choice { file, sha256, ..Default::default() });
+        let request = Request { operation: "u1".into(), agent: "explicit".into(), pin: None, runtime, tensorfs: None };
+        updates.request(request, |code| assert_eq!(code, REPLACE_EXIT)).unwrap();
+        state(&updates, "u1", "waiting_activation");
+        assert!(lifecycle.admit().is_err(), "a new run was admitted during activation");
+        assert!(!paths.update("pending.json").is_file());
+        drop(earlier);
+        state(&updates, "u1", "starting");
+        while lifecycle.admit().is_err() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// An update the service stopped during before activation is failed, not left running.
+    #[test]
+    fn an_update_stopped_before_activation_fails() {
+        let root = std::env::temp_dir().join(format!("cm-stopped-update-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::new(&root.join("engine"), &root);
+        let mut status = Status { operation: "u1".into(), ..Default::default() };
+        status.enter("preparing");
+        fs::create_dir_all(paths.update("")).unwrap();
+        write_json(&paths.update("status.json"), &status).unwrap();
+        let readiness = Readiness::open(None, Some(vec![7; 32]), false).unwrap();
+        let updates = Updates::open(paths, readiness, Box::new(|| true), None).unwrap();
+        let stopped = updates.update("u1").unwrap();
+        assert_eq!(stopped.state, "failed");
+        assert!(stopped.error.starts_with("machine_restarted"));
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -983,12 +983,7 @@ async fn serve_follow<B: MachineBackend>(
         let _ = work.send(Work::Stop { number, message });
     };
     let (events_tx, mut events) = mpsc::channel(256);
-    let request = v1::RunRequest {
-        id: target.run.clone(),
-        after: 0,
-        spec: None,
-    };
-    let log = tokio::spawn(stream_run(backend.clone(), actor, request, None, events_tx));
+    let log = tokio::spawn(stream_run(backend.clone(), actor, target.run.clone(), 0, None, events_tx));
     let mut held = target.offset;
     let mut pending: Vec<(u64, v1::Product)> = vec![];
     let mut terminal = None;

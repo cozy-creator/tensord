@@ -93,6 +93,11 @@ impl<B: MachineBackend> MachineV1<B> {
         StreamAuthority::new(self.identity.authority.keys.clone(), caller.actor, None)
     }
 
+    /// Holds idle release, and an update's activation, while a call that may start work runs.
+    fn admit(&self) -> Result<Option<crate::machine::lifecycle::Admission>, Status> {
+        self.identity.lifecycle.as_ref().map(|l| l.admit()).transpose()
+    }
+
     fn caller(&self, metadata: &MetadataMap) -> Result<Caller, Status> {
         let token = metadata
             .get("authorization")
@@ -511,15 +516,32 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
                 .await
                 .map(|events| Response::new(self.authority(&caller).wrap(events)));
         }
-        match &request.spec {
-            Some(_) => caller.machine()?,
-            None => caller.run(&request.id, None)?,
-        }
+        let mut request = request;
+        let spec = request.spec.take();
+        // A new run is admitted before it is accepted: an update's activation and a rental's
+        // idle release wait for it. The observer that follows holds no admission.
+        let admitted = match &spec {
+            Some(_) => {
+                caller.machine()?;
+                self.admit()?
+            }
+            None => {
+                caller.run(&request.id, None)?;
+                None
+            }
+        };
         let (sender, receiver) = tokio::sync::mpsc::channel(16);
         let (backend, actor, limit) = (self.backend.clone(), caller.actor, caller.limit());
         tokio::spawn(async move {
-            let result = stream_run(backend, actor, request, limit, sender.clone()).await;
-            if let Err(status) = result {
+            let events = sender.clone();
+            let followed = async move {
+                if let Some(spec) = spec {
+                    submit(&backend, actor, &request.id, spec).await?;
+                }
+                drop(admitted);
+                stream_run(backend, actor, request.id, request.after, limit, events).await
+            };
+            if let Err(status) = followed.await {
                 let _ = sender.send(Err(status)).await;
             }
         });
@@ -534,6 +556,7 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
     ) -> Result<Response<v1::WriteResult>, Status> {
         let caller = self.caller(request.metadata())?;
         caller.machine()?;
+        let _admitted = self.admit()?;
         let runs = self
             .backend
             .runs()
@@ -588,6 +611,10 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
             Ok(v1::Action::Pause) => pb::MachineExecutionAction::Pause,
             Ok(v1::Action::Resume) => pb::MachineExecutionAction::Resume,
             _ => return Err(Status::invalid_argument("control names an action")),
+        };
+        let _admitted = match action {
+            pb::MachineExecutionAction::Resume => self.admit()?,
+            _ => None,
         };
         let actor = caller.actor;
         let id = request.id.clone();
@@ -754,34 +781,32 @@ fn accept(runs: &Arc<crate::runs::Runs>, actor: &str, id: &str, spec: crate::run
     runs.submit(actor, id, spec).map(drop).map_err(refusal)
 }
 
-/// Submit when asked, then follow the log until the outcome or the caller leaves. An
+/// Accepts the run `spec` names under `id`.
+async fn submit<B: MachineBackend>(backend: &Arc<B>, actor: VerifiedActor, id: &str, spec: v1::RunSpec) -> Result<(), Status> {
+    let runs = backend.runs().ok_or_else(|| Status::unimplemented("this machine takes no runs"))?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs() as i64);
+    let expired = spec.hub.as_ref().is_some_and(|hub| {
+        !hub.token.is_empty() && hub.expires_at != 0 && hub.expires_at <= now
+    });
+    let (id, spec, actor) = (id.to_string(), spec_of(spec)?, crate::machine_api::actor_id(actor));
+    tokio::task::spawn_blocking(move || accept(&runs, &actor, &id, spec, expired))
+        .await
+        .map_err(|_| Status::internal("machine operation stopped"))?
+}
+
+/// Follows a run's log until its outcome or the caller leaves; it holds no admission. An
 /// output-limited grant (`limit`) sees only what [`visible`] keeps.
 pub(super) async fn stream_run<B: MachineBackend>(
     backend: Arc<B>,
     actor: VerifiedActor,
-    request: v1::RunRequest,
+    id: String,
+    cursor: u64,
     limit: Option<Grant>,
     sender: tokio::sync::mpsc::Sender<Result<v1::RunEvent, Status>>,
 ) -> Result<(), Status> {
-    let id = request.id.clone();
-    if let Some(spec) = request.spec {
-        let runs = backend
-            .runs()
-            .ok_or_else(|| Status::unimplemented("this machine takes no runs"))?;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs() as i64);
-        let expired = spec.hub.as_ref().is_some_and(|hub| {
-            !hub.token.is_empty() && hub.expires_at != 0 && hub.expires_at <= now
-        });
-        let (id, spec) = (id.clone(), spec_of(spec)?);
-        tokio::task::spawn_blocking(move || {
-            accept(&runs, &crate::machine_api::actor_id(actor), &id, spec, expired)
-        })
-        .await
-        .map_err(|_| Status::internal("machine operation stopped"))??;
-    }
     // The log is read from its start, so a reattach numbers each output's revisions and lists
     // the outcome's outputs as the run made them; only entries past the cursor are sent.
-    let (mut log, mut after, cursor) = (Log::default(), 0, request.after);
+    let (mut log, mut after) = (Log::default(), 0);
     let (first_backend, first_id) = (backend.clone(), id.clone());
     let current = tokio::task::spawn_blocking(move || {
         first_backend.get(actor, query(&*first_backend, actor, &first_id)?)

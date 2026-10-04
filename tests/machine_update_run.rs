@@ -60,7 +60,7 @@ fn wheel(distribution: &str, version: &str, script: Option<&[u8]>) -> (String, V
 /// object; answers its digest.
 fn hold(root: &Path, bytes: &[u8]) -> String {
     let engine = root.join("var/lib/cozy/rust-machine");
-    let store = tensorfs_core::store::Store::ensure(&engine.join("tensorfs")).unwrap();
+    let store = tensorfs_core::store::Store::ensure(&root.join("var/lib/tensorfs")).unwrap();
     let sha256 = tensorfs_core::sha256::hex(&tensorfs_core::sha256::digest(bytes));
     let object = tensorfs_core::ids::ObjectRef {
         sha256: sha256.clone(),

@@ -24,6 +24,9 @@ struct IdleState {
     released: bool,
     work_observed: bool,
     unknown: bool,
+    /// An update is activating: no new work is admitted until it exits or fails.
+    #[serde(skip)]
+    activating: bool,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     keepalives: BTreeMap<String, [i64; 2]>,
 }
@@ -37,6 +40,15 @@ pub struct Lifecycle {
 
 /// Holds idle release while a call that may start work is in flight.
 pub struct Admission(Arc<Lifecycle>);
+
+/// Closes admission while an update waits for admitted work to drain and replaces the
+/// service. Dropping it (a failed activation) reopens admission.
+pub struct Activation(Arc<Lifecycle>);
+impl Drop for Activation {
+    fn drop(&mut self) {
+        self.0.state.lock().unwrap().0.activating = false;
+    }
+}
 impl Drop for Admission {
     fn drop(&mut self) {
         self.0.admissions.fetch_sub(1, Ordering::AcqRel);
@@ -84,6 +96,11 @@ impl Lifecycle {
 
     pub fn admit(self: &Arc<Self>) -> Result<Admission, Status> {
         let state = self.state.lock().unwrap();
+        if state.0.activating {
+            return Err(Status::unavailable(
+                "machine_updating: the machine is activating an update; submit again once it is back",
+            ));
+        }
         if self.rental && Self::due(&state, now_ms()) {
             return Err(Status::unavailable(
                 "machine_released: this rental released itself after its idle deadline",
@@ -91,6 +108,17 @@ impl Lifecycle {
         }
         self.admissions.fetch_add(1, Ordering::AcqRel);
         Ok(Admission(self.clone()))
+    }
+
+    /// Closes admission under the lock `admit` takes: a call is either admitted (and counted)
+    /// before activation or refused after it, never accepted while the service exits.
+    pub fn activate(self: &Arc<Self>) -> Result<Activation, Status> {
+        let mut state = self.state.lock().unwrap();
+        if state.0.activating || state.0.released {
+            return Err(Status::unavailable("the machine is already activating or released"));
+        }
+        state.0.activating = true;
+        Ok(Activation(self.clone()))
     }
 
     /// Accepted work renews the deadline.
@@ -184,7 +212,7 @@ impl Lifecycle {
         if state.0.released {
             return Ok(true);
         }
-        if self.admissions.load(Ordering::Acquire) > 0 || !Self::due(&state, now_ms()) {
+        if state.0.activating || self.admissions.load(Ordering::Acquire) > 0 || !Self::due(&state, now_ms()) {
             return Ok(false);
         }
         state.0.released = true;
@@ -280,6 +308,21 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(raw["released"], true);
         assert!(raw["deadline_ms"].is_i64());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A rental due for release does not release while an update activates.
+    #[test]
+    fn activation_holds_the_release() {
+        let dir = std::env::temp_dir().join(format!("cozy-activation-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lifecycle = Lifecycle::open(dir.join("idle.json"), true, true).unwrap();
+        let activation = lifecycle.activate().unwrap();
+        lifecycle.state.lock().unwrap().0.deadline_ms = 0;
+        assert!(!lifecycle.claim().unwrap());
+        drop(activation);
+        assert!(lifecycle.claim().unwrap());
+        assert!(lifecycle.activate().is_err(), "a released rental activates nothing");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
