@@ -1304,7 +1304,10 @@ impl<B: MachineBackend> pb::pod_host_server::PodHost for Api<B> {
                 })
             })
             .collect();
-        Ok(Response::new(Box::pin(tokio_stream::iter(chunks))))
+        Ok(Response::new(self.revocable(
+            Box::pin(tokio_stream::iter(chunks)),
+            actor,
+        )))
     }
     async fn read_byte_tree_object(
         &self,
@@ -1574,4 +1577,130 @@ fn no_delay(
             let _ = stream.set_nodelay(true);
         })
     })
+}
+
+#[cfg(test)]
+mod legacy_log_authority_tests {
+    use super::*;
+    use crate::{journal::Invocation, machine_api::NativeBackend, service::Service};
+    use ed25519_dalek::{Signer, SigningKey};
+    use std::{fs, path::PathBuf, time::Duration};
+    use tokio_stream::StreamExt;
+    use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
+
+    const CHUNK_BYTES: usize = 64 << 10;
+    const SNAPSHOT_BYTES: usize = 8 << 20;
+
+    struct Fixture {
+        root: PathBuf,
+        service: Arc<Service>,
+        backend: Arc<NativeBackend>,
+        run: String,
+        before: Vec<u8>,
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = self.service.stop();
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+    impl Fixture {
+        fn open() -> (Self, MachineIdentity, pb::Claim) {
+            let root = std::env::temp_dir().join(format!("legacy-log-authority-{}", uuid::Uuid::new_v4()));
+            let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
+            // No package is dispatched; this accepted queued row proves observer safety.
+            assert!(service.stop().unwrap());
+            let signer = SigningKey::from_bytes(&[76; 32]);
+            let identity = MachineIdentity::ephemeral("legacy-log-probe".into(), vec![signer.verifying_key()], vec![7; 32]).unwrap();
+            let actor = crate::machine_api::actor_id(super::super::auth::VerifiedActor { public_key: signer.verifying_key().to_bytes() });
+            let (record, fresh) = service.engine.accept_run(&actor, "accepted-run", "intent", Invocation::default()).unwrap();
+            assert!(fresh);
+            let before = serde_json::to_vec(&record).unwrap();
+            let store = Arc::new(tensorfs_core::store::Store::ensure(&root.join("store")).unwrap());
+            let logs = store.root().join("logs");
+            fs::create_dir_all(&logs).unwrap();
+            let mut bytes = Vec::with_capacity(SNAPSHOT_BYTES);
+            for index in 0..SNAPSHOT_BYTES / CHUNK_BYTES {
+                bytes.extend(std::iter::repeat_n(b'a' + (index % 26) as u8, CHUNK_BYTES - 1));
+                bytes.push(b'\n');
+            }
+            fs::write(logs.join("transport.log"), bytes).unwrap();
+            let uploads = super::super::workspaces::WorkspaceUploads::open(&root.join("uploads"), store.clone()).unwrap();
+            let backend = Arc::new(NativeBackend::new(service.clone(), identity.authority.clone(), store, uploads));
+            let claim = pb::Claim { worker_id: identity.authority.worker_id.clone(), worker_boot_id: identity.authority.boot_id.clone(),
+                record_owner_epoch: 1, proof: signer.sign(&identity.authority.transcript(1).unwrap()).to_bytes().to_vec(), ..Default::default() };
+            (Self { root, service, backend, run: record.id, before }, identity, claim)
+        }
+        fn unchanged(&self) {
+            assert_eq!(serde_json::to_vec(&self.service.engine.get(&self.run).unwrap()).unwrap(), self.before,
+                "log observer authority loss must not mutate the accepted execution");
+        }
+    }
+    fn query(claim: &pb::Claim) -> pb::MachineLogQuery {
+        pb::MachineLogQuery { claim: Some(claim.clone()), log: pb::MachineLog::TensorfsTransport as i32, tail_bytes: 0 }
+    }
+
+    #[tokio::test]
+    async fn legacy_log_next_poll_after_revocation_is_refused_without_canceling_work() {
+        let (fixture, identity, claim) = Fixture::open();
+        let keys = identity.authority.keys.clone();
+        let api = Api { identity: Arc::new(identity), backend: fixture.backend.clone(), control_epoch: Arc::new(AtomicU64::new(0)) };
+        let mut stream = pb::pod_host_server::PodHost::read_machine_log(&api, Request::new(query(&claim))).await.unwrap().into_inner();
+        assert_eq!(stream.next().await.unwrap().unwrap().data.len(), CHUNK_BYTES);
+        keys.revoke();
+        // No network/client buffers participate: this exact next poll is after revocation.
+        let next = stream.next().await.unwrap();
+        assert!(next.is_err(), "a future log stream poll returned another snapshot chunk after revocation");
+        assert_eq!(next.unwrap_err().code(), tonic::Code::Unauthenticated);
+        assert!(stream.next().await.is_none());
+        fixture.unchanged();
+    }
+
+    #[tokio::test]
+    async fn legacy_log_backpressured_tls_snapshot_ends_after_revocation_and_complete_reads_work() {
+        for revoke in [false, true] {
+            let (fixture, identity, claim) = Fixture::open();
+            let keys = identity.authority.keys.clone();
+            let pem = identity.cert_pem.clone();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let backend = fixture.backend.clone();
+            let server = tokio::spawn(async move { serve(listener, identity, backend).await.unwrap() });
+            let channel = Endpoint::from_shared(format!("https://{address}")).unwrap()
+                .tls_config(ClientTlsConfig::new().ca_certificate(Certificate::from_pem(pem)).domain_name("localhost")).unwrap()
+                .initial_stream_window_size(CHUNK_BYTES as u32)
+                .initial_connection_window_size(CHUNK_BYTES as u32)
+                .http2_adaptive_window(false).connect().await.unwrap();
+            let mut client = pb::pod_host_client::PodHostClient::new(channel);
+            let mut stream = client.read_machine_log(query(&claim)).await.unwrap().into_inner();
+            let first = stream.message().await.unwrap().unwrap();
+            assert_eq!(first.data.len(), CHUNK_BYTES);
+            let mut received = first.data.len();
+            if revoke { keys.revoke(); }
+            let ended = loop {
+                // Only a harness bound to diagnose a stuck owned fixture, never a product timeout.
+                let next = tokio::time::timeout(Duration::from_secs(5), stream.message()).await.expect("snapshot observer did not make progress");
+                match next {
+                    Ok(Some(chunk)) => {
+                        assert!(!chunk.data.is_empty() && chunk.data.len() <= CHUNK_BYTES);
+                        received += chunk.data.len();
+                    }
+                    Ok(None) => break None,
+                    Err(status) => break Some(status),
+                }
+            };
+            eprintln!("legacy log snapshot: revoke={revoke}, first={CHUNK_BYTES}, total={received}, snapshot={SNAPSHOT_BYTES}, end={:?}", ended.as_ref().map(|status| status.code()));
+            if revoke {
+                assert_eq!(ended.as_ref().map(|status| status.code()), Some(tonic::Code::Unauthenticated));
+                assert!(received < SNAPSHOT_BYTES, "HTTP/2 backpressure must leave unpolled snapshot data");
+                assert_eq!(client.read_machine_log(query(&claim)).await.unwrap_err().code(), tonic::Code::Unauthenticated);
+            } else {
+                assert!(ended.is_none());
+                assert_eq!(received, SNAPSHOT_BYTES);
+            }
+            fixture.unchanged();
+            server.abort();
+            let _ = server.await;
+        }
+    }
 }
