@@ -571,6 +571,38 @@ impl NativeBackend {
     }
 }
 impl MachineBackend for NativeBackend {
+    fn reclaim_idle_memory(
+        &self,
+        actor: VerifiedActor,
+        expires: i64,
+    ) -> Result<crate::gpu_service::IdleReclaim, Status> {
+        if self.service.gpu_startup_fences() != 0 {
+            return Err(Status::failed_precondition(
+                "memory_reclaim_busy: unknown startup GPU process births remain reserved",
+            ));
+        }
+        let pool = self.service.gpu().ok_or_else(|| {
+            Status::unimplemented("memory_reclaim_unavailable: this machine has no GPU pool")
+        })?;
+        let authority = crate::api::auth::StreamAuthority::new(
+            self.authority.keys.clone(),
+            actor,
+            Some(expires),
+        );
+        pool.reclaim_idle(&self.service.engine, || {
+            authority
+                .check()
+                .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error.message()))
+        })
+        .map_err(|error| match error.kind() {
+            io::ErrorKind::WouldBlock => {
+                Status::failed_precondition(format!("memory_reclaim_busy: {error}"))
+            }
+            io::ErrorKind::PermissionDenied => Status::unauthenticated(error.to_string()),
+            _ => Status::internal(format!("memory_reclaim_failed: {error}")),
+        })
+    }
+
     fn runs(&self) -> Option<Arc<crate::runs::Runs>> {
         self.runs.clone()
     }
