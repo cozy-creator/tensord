@@ -12,7 +12,7 @@ checks the same authority for incoming frames and before finalizing an object. A
 upload retains resumable staging bytes and does not make an object available to new runs.
 
 A run grant with output restrictions may see only matching product events and terminal
-output inventory. Inline results, logs, triage documents, measurements and arbitrary failure
+output inventory. Inline results, author progress/log text, waiting details, triage documents, measurements and arbitrary failure
 text are private to unrestricted run and machine grants. Product list indexes stay one-based;
 `name` grants every index and `name/i` grants that item. Machine grants preserve the full
 owner's view.

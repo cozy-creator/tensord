@@ -70,9 +70,15 @@ impl MachineBackend for Events {
                 let mut hidden = product(3, 3);
                 hidden.product.as_mut().unwrap().output = "private".into();
                 log.push(hidden);
+                log.push(pb::MachineExecutionEvent {
+                    sequence: 4,
+                    kind: "progress".into(),
+                    body_canonical_bytes: br#"{"payload":{"stage":"private prompt"}}"#.to_vec(),
+                    ..Default::default()
+                });
             }
             log.push(pb::MachineExecutionEvent {
-                sequence: if self.private { 4 } else { 3 },
+                sequence: if self.private { 5 } else { 3 },
                 kind: "outcome".into(),
                 outcome: Some(pb::AttemptOutcome {
                     outcome_canonical_bytes:
@@ -338,6 +344,9 @@ async fn output_limited_cap_hides_private_products_result_and_triage() {
         match event.event {
             Some(v1::run_event::Event::Product(product)) => assert_eq!(product.output, "image"),
             Some(v1::run_event::Event::Outcome(value)) => outcome = Some(value),
+            Some(v1::run_event::Event::Progress(_)) => {
+                panic!("author-provided private progress leaked")
+            }
             _ => (),
         }
     }
