@@ -2416,10 +2416,10 @@ impl GpuPool {
             .collect();
         let shape = metrics.shape_cell.as_deref().unwrap_or(shape);
         // Every rank of a group runs the same shape on its own GPU.
-        for device in self.lane(degree).unwrap_or_default() {
+        for (rank, device) in self.lane(degree).unwrap_or_default().into_iter().enumerate() {
             device
                 .memory
-                .learn_call(plan, shape, peak, &methods, known(plane.context_bytes));
+                .learn_call(plan, shape, peak, &methods, rank_context(reply, rank));
         }
         if let Ok(host) = crate::host_memory::process(pid) {
             self.first()
@@ -2537,12 +2537,29 @@ fn known(value: Option<i64>) -> Option<u64> {
 
 fn plane_facts(plane: Option<&device_executor::PlaneFacts>) -> Facts {
     plane.map_or_else(Facts::default, |plane| Facts {
-        context: known(plane.context_bytes),
+        context: trusted_context(Some(plane)),
         process: known(plane.process_bytes),
         activation: known(plane.activation_peak_bytes).filter(|v| *v > 0),
         pinned: known(plane.pinned_bytes),
         pinned_budget: known(plane.pinned_budget_bytes),
         ..Facts::default()
+    })
+}
+
+/// Old peers may report a device-wide delta as context. Keep serving them, but only an
+/// attributable measurement may train this or a future executor's context estimate.
+fn trusted_context(plane: Option<&device_executor::PlaneFacts>) -> Option<u64> {
+    let plane = plane?;
+    (plane.context_measurement.as_deref() == Some("process_driver"))
+        .then(|| known(plane.context_bytes))
+        .flatten()
+}
+
+fn rank_context(frame: &Frame, rank: usize) -> Option<u64> {
+    trusted_context(if rank == 0 {
+        frame.plane.as_ref()
+    } else {
+        frame.rank_planes.get(rank - 1).and_then(Option::as_ref)
     })
 }
 
@@ -2557,6 +2574,7 @@ fn rank_facts(
     degree: u32,
 ) -> Vec<Facts> {
     let host = Facts {
+        context: None,
         pinned: None,
         pinned_budget: None,
         ..facts
@@ -3352,6 +3370,30 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn only_attributable_contexts_are_learned_for_the_rank_that_measured_them() {
+        let reply: Frame = serde_json::from_value(json!({
+            "plane": {"context_bytes": 100, "context_measurement": "process_driver"},
+            "rank_planes": [
+                {"context_bytes": 200, "context_measurement": "process_driver"},
+                {"context_bytes": 7000},
+                null
+            ]
+        })).unwrap();
+        assert_eq!(rank_context(&reply, 0), Some(100));
+        assert_eq!(rank_context(&reply, 1), Some(200));
+        assert_eq!(rank_context(&reply, 2), None);
+        assert_eq!(rank_context(&reply, 3), None);
+        assert_eq!(rank_context(&reply, 4), None);
+        // Older peers keep their valid process facts while the unknown context does not
+        // train future admissions. Absence is not a baseline compatibility refusal.
+        let old: device_executor::PlaneFacts = serde_json::from_value(json!({
+            "context_bytes": 7000, "process_bytes": 8000
+        })).unwrap();
+        assert_eq!(plane_facts(Some(&old)).context, None);
+        assert_eq!(plane_facts(Some(&old)).process, Some(8000));
+    }
+
+    #[test]
     fn every_rank_of_a_group_gets_its_own_gpus_cap() {
         let (cap, group) = rank_grant(&[Some(30), Some(20)]);
         assert_eq!((cap, group.rank_caps), (Some(30), vec![30, 20]));
@@ -3377,6 +3419,7 @@ mod tests {
         let follower = device_executor::PlaneFacts {
             process_bytes: Some(7),
             context_bytes: Some(2),
+            context_measurement: Some("process_driver".into()),
             pinned_bytes: Some(4),
             pinned_budget_bytes: Some(5),
             ..Default::default()
@@ -3400,6 +3443,7 @@ mod tests {
         );
         // A follower that has not stated its own yet is charged rank 0's.
         assert_eq!((each[2].process, each[2].pinned), (Some(9), None));
+        assert_eq!(each[2].context, None);
         assert_eq!(rank_facts(rank0, &[], 1), vec![rank0]);
     }
 

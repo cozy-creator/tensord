@@ -467,6 +467,8 @@ pub struct PlaneFacts {
     pub pinned_budget_bytes: Option<i64>,
     pub pinned_bytes: Option<i64>,
     pub context_bytes: Option<i64>,
+    /// Per-device, attributable driver row. Missing on older peers, which remain supported.
+    pub context_measurement: Option<String>,
     pub reserved_bytes: Option<i64>,
     /// Context + torch reserved + the plane's own maps.
     pub process_bytes: Option<i64>,

@@ -66,6 +66,8 @@ pub struct Plan {
 pub struct Learned {
     /// GPU UUID and driver version -> the largest context an executor measured there.
     pub contexts: BTreeMap<String, u64>,
+    /// Provenance for context estimates; legacy device-wide deltas must not train admission.
+    pub context_measurements: BTreeMap<String, String>,
     pub plans: BTreeMap<String, Plan>,
     #[serde(skip)]
     path: Option<PathBuf>,
@@ -121,6 +123,12 @@ impl Learned {
             .unwrap_or_default();
         let horizon = now_ms().saturating_sub(TTL.as_millis() as u64);
         learned.plans.retain(|_, plan| plan.used_ms >= horizon);
+        learned.contexts.retain(|device, _| {
+            learned.context_measurements.get(device).map(String::as_str) == Some("process_driver")
+        });
+        learned
+            .context_measurements
+            .retain(|device, _| learned.contexts.contains_key(device));
         learned.path = Some(path.to_path_buf());
         learned
     }
@@ -137,6 +145,8 @@ impl Learned {
     pub fn context(&mut self, device: &str, measured: u64) {
         let entry = self.contexts.entry(device.into()).or_default();
         *entry = (*entry).max(measured);
+        self.context_measurements
+            .insert(device.into(), "process_driver".into());
     }
 
     /// One call's measurements for `plan` at `shape`; estimates only grow.
@@ -217,6 +227,24 @@ impl Learned {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_contexts_leave_without_discarding_valid_plan_or_attributed_context_data() {
+        let path = std::env::temp_dir().join(format!("learned-{}.json", uuid::Uuid::new_v4()));
+        let mut learned = Learned::open(&path);
+        learned.call("anima", "height=512,width=512", 400, &BTreeMap::from([("render".into(), 500)]));
+        learned.load("anima", 600, 100);
+        learned.context("trusted/driver", 200);
+        learned.contexts.insert("legacy/driver".into(), 7000);
+        learned.save().unwrap();
+        let restored = Learned::open(&path);
+        assert_eq!(restored.contexts, BTreeMap::from([("trusted/driver".into(), 200)]));
+        assert_eq!(restored.plans["anima"].weights, 600);
+        assert_eq!(restored.plans["anima"].weights_floor, 100);
+        assert_eq!(restored.peak("anima"), Some(500));
+        assert_eq!(restored.shape("anima", "height=512,width=512").unwrap().peak, 400);
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn a_shape_never_seen_takes_the_least_larger_one_and_survives_a_restart() {
