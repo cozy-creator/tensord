@@ -305,3 +305,63 @@ integrated candidate, preserve the request, collect its output and trace each pr
 executor lifetime, resource peak and byte movement. Repeat paired ComfyUI measurements on
 the declared GPU matrix. A regression pass, CPU proof, private pilot or one successful
 image does not close the program. Every unresolved gate remains in tracker 319–322.
+
+## Remediation checkpoint 2026-10-04
+
+The candidate is reviewable in [machine PR41](https://github.com/cozy-creator/cozy-machine/pull/41).
+Its CPU boundary run at cea2e36 passed 18 top-level tests, plus one separately reported
+store-lock subprocess case. This includes actual native collection, process locks and TLS/HTTP
+transport. These tests establish component behavior, not successful model inference.
+
+| Finding | Current evidence | Remaining gate |
+|---|---|---|
+| Accepted input custody and one Store owner | CPU: four storage cases, including another process and restart | Ordinary inference with concurrent native collection |
+| Model custody and download handoff | CPU: three model cases, independent empty-keep GC, restart, paused/unknown state; native ensure callback controls | Actual published model preparation and sustained inference |
+| Cursor projection and stream authorization | CPU: eight real TLS cases and one revoking HTTP-body case | Ordinary CLI delivery and browser/WebRTC |
+| Exact run intent and application integers | CPU: four focused unit cases and two TLS cases, including observation during activation | Combined consumer/restart qualification |
+| Atomic update admission and history | Earlier integrated CPU: activation, history and interrupted-update cases | Exact final cohort update/failure proof |
+| Recovery and selected-row embedding | CPU: 22 Runtime cases; GPU mechanisms described below | Ordinary constrained inference, real grants and retained-executor replacement |
+| Context attribution and poison fencing | Reviewed candidate source and focused CPU checks | Foreign allocation during CUDA startup and current retained-executor/group proof |
+| Inline weight identity | TensorFS CPU: three cases, two red controls | Matching integrated plane and inference |
+| Sparse staged host tiers | Source fix in progress; active-mode/admission controls pending | All unchanged constrained cells |
+| Useful low-disk reclamation | Fresh policy implementation in progress | Covering plan, locked/hardlinked/cross-mount controls |
+| Honest benchmark verdict | CPU: seven reporter cases, false-pass red arm retained | Actual matched matrix, output references and timing wins |
+
+The combined full library run passed 92 cases and exposed three failures. Two storage fixtures
+still expected the prior async rejection/pressure policy and are being corrected against the
+actual acceptance and native reserve contract. The descriptor leak test compared every file
+descriptor in a process shared with parallel tests; it passes alone. Its proof must count the
+specific transferred object's descriptors so unrelated concurrent files cannot mask a leak or
+fail the test. These are recorded findings, not an all-green suite.
+
+### New rented GPU mechanism proof
+
+The owned RunPod gogeta (pr-da22b9fd544af4d70428), RTX3070
+GPU-81163de1-7b41-5986-32c1-1f164b59dd5b, driver580.65.06, ran isolated diagnostics
+using the verified Runtime6e3cc11e candidate and plane4ef714b. Torch was2.14.1+cu130.
+The H3-shape selected-row test passed under a1GiB allocator limit. A real stock ATen OOM
+reclaimed an owned64MiB reservoir through the owner callback and retried with identical
+output. A CUDA mutate-then-OOM operation executed once, latched poison and refused the next
+recovery scope. These are CONFIRMED GPU mechanisms. They do not prove actual machine grants,
+ordinary model inference, degree2 custody or a ComfyUI speed win.
+
+The rental was explicitly ended and an all-Hubs readback showed zero live rentals. The
+pre-end estimated bill was$0.016059; settled billing was not yet available. Evidence is in
+`outputs/codex-machine-audit-20261004/memory/gpu-diagnostics/evidence/`.
+
+### Cohort and consumer follow-up
+
+[Tracker324](https://github.com/cozy-creator/tracker/issues/324) records reproducible image
+composition and the remaining consumer/release gates. The private CUDA base image actually
+has `/usr/local/bin/cozy-machine` as its entrypoint; its inspected digest is
+sha256:b84c469ec9a4592fd74c71795ce4e89217bebd6e67f7c41be6cc8786bda0e79c.
+This deployed artifact observation is distinct from the older Dockerfile source noted above.
+The new candidate will replace that executable with the audited Rust binary and its own SDK
+wheels, with no Go arm participating in qualification.
+
+The public consumer census found `publicrequests.OpenWorker` binds one explicitly configured,
+existing worker address and certificate. It does not select rental images or buy capacity.
+The earlier possibility of global image selection silently moving this consumer is therefore
+unproven. Its legacy API dependency is confirmed: it cannot execute on the Rust server and
+needs migration or explicit operation-specific isolation before replacing that public worker.
+No production or personal machine has been changed.
