@@ -123,9 +123,11 @@ logs, collected results and generations go after a 7-day TTL (a generation's las
 Each filesystem is measured independently: model-store GC runs first, and local pressure
 then uses observed remaining free space. A local pressure plan counts only allocated,
 single-link bytes on the measured filesystem, excludes held/recent generations and live
-kernel namespaces, and holds generation eligibility locks through deletion. Without a
-covering local plan, useful kernels stay. Generations precede compiled kernels; every kind
-still expires by TTL. Native model-GC byte reports are logical diagnostics; actual filesystem
+kernel namespaces, and holds generation eligibility locks through deletion. Raw log/result body readers have no
+held unlink exclusion, so those copies expire by TTL and do not cover local pressure. Kernel
+busy snapshots and per-key compiler locks are not a namespace deletion lease, so compiled
+kernels remain; neither pressure nor TTL may infer kernel deletion authority. Local pressure
+coverage therefore contains only eligible locked generations. Native model-GC byte reports are logical diagnostics; actual filesystem
 remeasurement decides whether pressure is relieved. Uncollected results, journal rows,
 queued/paused/unknown generations, installed/configured generations and live reader custody
 remain protected. Below the reserve, compiled kernels use run-scoped JIT directories.

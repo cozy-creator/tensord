@@ -170,7 +170,7 @@ fn a_covering_local_plan_takes_generation_before_compiled_kernels() {
 }
 
 #[test]
-fn kernel_ttl_runs_without_pressure_and_live_namespaces_stay() {
+fn a_kernel_namespace_snapshot_does_not_grant_deletion_authority() {
     let mut fixture = Fixture::new();
     let old = fixture.kernel("expired", 8192);
     let at = std::time::SystemTime::now() - std::time::Duration::from_secs(9 * 24 * 3600);
@@ -194,8 +194,8 @@ fn kernel_ttl_runs_without_pressure_and_live_namespaces_stay() {
             available: 50 << 30,
         })
     });
-    assert_eq!(swept.kernels, 1);
-    assert!(!old.exists() && busy.exists());
+    assert_eq!(swept.kernels, 0);
+    assert!(old.exists() && busy.exists());
 }
 
 #[test]
@@ -267,4 +267,50 @@ fn paused_and_unknown_runs_keep_their_named_generations_without_a_live_handle() 
         fixture.engine.bound_generations().is_err(),
         "unreadable obligations cannot supply a destructive keep set"
     );
+}
+
+#[test]
+fn a_collected_output_with_a_live_http_body_cannot_cover_kernel_pressure() {
+    let fixture = Fixture::new();
+    let (run, _) = fixture
+        .engine
+        .accept_run(
+            "alice",
+            "body",
+            "body",
+            cozy_machine::journal::Invocation {
+                package: "audit/package".into(),
+                input: serde_json::json!({}),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    fixture
+        .engine
+        .end_preparation(
+            &run.id,
+            cozy_machine::journal::Outcome::Failed("fixture settled".into()),
+        )
+        .unwrap();
+    fixture.engine.acknowledge_collection(&run.id).unwrap();
+    let path = fixture.engine.root.join("results").join(&run.id);
+    fs::create_dir_all(&path).unwrap();
+    fs::write(path.join("body"), vec![0x42; 1 << 20]).unwrap();
+    let snapshot = cozy_machine::api::backend::OutputSnapshot {
+        parts: vec![(fs::File::open(path.join("body")).unwrap(), 1 << 20)],
+        length: 1 << 20,
+        rev: 1,
+        media_type: "application/octet-stream".into(),
+        sha256: None,
+    };
+    let kernel = fixture.kernel("valuable", 4096);
+    let disk = || {
+        Ok(Disk {
+            capacity: 100 << 30,
+            available: (2 << 30) - (512 << 10),
+        })
+    };
+    assert_eq!(fixture.sweep(&disk), reclaim::Swept::default());
+    assert!(path.exists() && kernel.exists());
+    assert_eq!(snapshot.parts[0].0.metadata().unwrap().len(), 1 << 20);
 }
