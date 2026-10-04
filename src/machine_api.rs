@@ -277,6 +277,18 @@ impl NativeBackend {
         // the log does not already show, after them.
         let mut events = self.product_events(record)?;
         let shown: Vec<_> = events.iter().filter_map(|e| e.product.clone()).collect();
+        // An observer that last saw it queued still sees it start before it ends.
+        if record.running_revision > 0 {
+            events.push(pb::MachineExecutionEvent {
+                sequence: record.running_revision,
+                attempt_ordinal: record.attempt.max(1) as u64,
+                at_ms: record.started_at_ms,
+                kind: "running".into(),
+                body_canonical_bytes: canonical(&json!({"generation":record.attempt.max(1)}))?,
+                ..Default::default()
+            });
+            events.sort_by_key(|event| event.sequence);
+        }
         let first_sequence = record
             .revision
             .checked_add(1)
@@ -2689,5 +2701,57 @@ print(json.dumps({"identity": generation.identity}))
             },
         );
         assert_eq!(later.unwrap_err().code(), tonic::Code::NotFound);
+    }
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::*;
+    use crate::journal::{Invocation, Outcome};
+
+    /// A run seen queued and next read finished still shows it ran, before its outcome.
+    #[test]
+    fn a_finished_run_shows_its_start() {
+        let root = std::env::temp_dir().join(format!("cm-terminal-{}", uuid::Uuid::new_v4()));
+        let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
+        assert!(service.stop().unwrap(), "the test moves the run itself");
+        let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[44; 32]);
+        let machine =
+            crate::api::MachineIdentity::ephemeral("terminal".into(), vec![signer.verifying_key()], vec![7; 32]).unwrap();
+        let actor = VerifiedActor { public_key: signer.verifying_key().to_bytes() };
+        let uploads = WorkspaceUploads::open(&root.join("uploads"), store.clone()).unwrap();
+        let backend = NativeBackend::new(service.clone(), machine.authority.clone(), store, uploads);
+        let engine = &service.engine;
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let (queued, started) = engine.with_journal(|journal| {
+            let context = SubmissionContext {
+                actor: actor_id(actor),
+                request_id: "request-1".into(),
+                submission_id: "submission-1".into(),
+                expected_workspace_id: journal.workspace_id().into(),
+                capture_digest: digest.clone(),
+                invocation_digest: digest.clone(),
+                payload_digest: digest.clone(),
+                ..Default::default()
+            };
+            let invocation = Invocation { package: "org/pkg".into(), entrypoint: "run".into(), input: json!({}), ..Default::default() };
+            let queued = journal.accept_public(context, invocation)?;
+            assert!(journal.claim(&queued.id)?);
+            journal.register_process(&queued.id, crate::execution::process_birth(std::process::id())?)?;
+            let started = journal.running(&queued.id, None)?;
+            journal.finish(&queued.id, Outcome::Failed("author_failed: it stopped".into()))?;
+            Ok((queued, started))
+        }).unwrap();
+        let execution = pb::MachineExecutionQuery {
+            request_id: "request-1".into(),
+            expected_execution_workspace_id: engine.workspace_id(),
+            ..Default::default()
+        };
+        let query = pb::MachineExecutionEventsQuery { execution: Some(execution), after: queued.revision, limit: 0, wait: false };
+        let kinds: Vec<_> = backend.events(actor, query).unwrap().events.into_iter().map(|e| (e.kind, e.sequence)).collect();
+        assert_eq!(kinds.first(), Some(&("running".to_string(), started.running_revision)), "{kinds:?}");
+        assert_eq!(kinds.last().map(|(kind, _)| kind.as_str()), Some("outcome"));
+        let _ = std::fs::remove_dir_all(root);
     }
 }
