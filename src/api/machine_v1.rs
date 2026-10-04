@@ -119,9 +119,7 @@ impl Caller {
                 outcome.result.clear();
                 outcome.triage = false;
                 outcome.measurements.clear();
-                if let Some(reason) = &mut outcome.reason {
-                    reason.message.clear();
-                }
+                outcome.reason = None;
                 true
             }
             Some(v1::run_event::Event::State(state)) => {
@@ -407,7 +405,7 @@ fn refusal(refused_: crate::objects::Refused) -> Status {
 fn digest(text: &str) -> Result<Vec<u8>, Status> {
     let hex = text
         .strip_prefix("sha256:")
-        .filter(|hex| hex.len() == 64)
+        .filter(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
         .ok_or_else(|| Status::invalid_argument("a digest is sha256:<64 hex>"))?;
     (0..64)
         .step_by(2)
@@ -966,5 +964,28 @@ async fn stream_run_scoped<B: MachineBackend>(
             return Ok(());
         }
         after = after.max(page.next_after);
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    #[test]
+    fn a_non_ascii_manifest_digest_is_refused_without_panicking() {
+        for invalid in [
+            "é".repeat(32),
+            format!("a{}a", "é".repeat(31)),
+            "z".repeat(64),
+        ] {
+            assert_eq!(
+                super::digest(&format!("sha256:{invalid}"))
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::InvalidArgument
+            );
+        }
+        assert_eq!(
+            super::digest(&format!("sha256:{}", "A".repeat(64))).unwrap(),
+            vec![0xaa; 32]
+        );
     }
 }
