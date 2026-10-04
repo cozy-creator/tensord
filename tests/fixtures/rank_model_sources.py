@@ -67,13 +67,18 @@ def consume(executor: Executor, root: Path, manifest: str) -> dict[str, Any]:
             )
             # Production _tiers chooses the machine's sealed callback on every rank.
             tiers = executor._tiers(False, True, True)
-            assert tiers is not None and tiers.seal is not None and tiers.files is not None
+            assert tiers is not None and tiers.seal is not None
+            assert tiers.files is not None and tiers.stage is not None
             fd = tiers.seal(doc)
             assert fd is not None and plane.is_sealed(fd)
             try:
                 ws = opened.register_sealed(doc.name, read_plan, grouping, fd)
             finally:
                 os.close(fd)
+            # Staged registration deliberately starts with holes. CPU byte observation
+            # consumes only regions explicitly taken and filled by the native owner.
+            regions = list(range(len(grouping)))
+            assert tiers.stage(doc, regions) == regions
             opened.set_pinned_budget(32 << 20)
             opened.want(ws, "pinned").wait()
             actual = {
