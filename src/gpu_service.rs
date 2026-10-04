@@ -2416,7 +2416,7 @@ impl GpuPool {
             .collect();
         let shape = metrics.shape_cell.as_deref().unwrap_or(shape);
         // Every rank of a group runs the same shape on its own GPU.
-        for (rank, device) in self.lane(degree).unwrap_or_default().into_iter().enumerate() {
+        for (rank, device) in self.lane(degree).unwrap_or_default().iter().enumerate() {
             device
                 .memory
                 .learn_call(plan, shape, peak, &methods, rank_context(reply, rank));
