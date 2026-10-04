@@ -186,6 +186,7 @@ impl NativeBackend {
         record.progress_samples.iter()
             .skip(record.progress_samples.len()
                 .saturating_sub(crate::journal::MAX_PROGRESS_STAGE_EDGES + 1))
+            .filter(|sample| sample.revision > 0 && sample.revision <= record.revision)
             .map(|sample| {
                 let payload = serde_json::from_str::<Value>(&sample.detail)
                     .ok().filter(Value::is_object)

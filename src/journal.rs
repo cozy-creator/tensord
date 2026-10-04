@@ -223,7 +223,7 @@ pub struct Execution {
     pub progress: Option<String>,
     /// Bounded genuine stage endpoints plus the latest sample. Authoritative transitions
     /// persist this projection with the record; progress itself never begins a write.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, deserialize_with = "read_progress_samples", skip_serializing_if = "Vec::is_empty")]
     pub progress_samples: Vec<ProgressSample>,
     /// The cursor at which the attempt started running: its `running` event.
     #[serde(default)]
@@ -272,6 +272,23 @@ pub struct ProgressSample {
 }
 
 pub const MAX_PROGRESS_STAGE_EDGES: usize = 8;
+
+fn read_progress_samples<'de, D>(deserializer: D) -> Result<Vec<ProgressSample>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let Some(samples) = value.as_array() else { return Ok(vec![]) };
+    // This optional observation projection cannot make an accepted run unreadable.
+    // Drop unsupported entries instead of manufacturing their missing data.
+    let mut retained: Vec<ProgressSample> = samples.iter().rev()
+        .filter_map(|sample| serde_json::from_value::<ProgressSample>(sample.clone()).ok())
+        .filter(|sample| sample.revision > 0 && sample.detail.len() <= 2048)
+        .take(MAX_PROGRESS_STAGE_EDGES + 1)
+        .collect();
+    retained.reverse();
+    Ok(retained)
+}
 
 impl ProgressSample {
     pub fn stage(&self) -> Option<String> {
