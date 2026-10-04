@@ -45,6 +45,7 @@ def parity(tmp_path):
     mode = {
         field: "float32"
         for field in (
+            "text_encoder_compute_dtype",
             "conditioning_dtype",
             "denoiser_input_dtype",
             "denoiser_output_dtype",
@@ -53,6 +54,11 @@ def parity(tmp_path):
             "sampler_compute_dtype",
             "latent_state_dtype",
             "vae_dtype",
+            "latent_inverse_scale_dtype",
+            "pixel_normalization_dtype",
+            "image_quantization_dtype",
+            "attention_precision",
+            "math_flags",
         )
     }
     mode["decode_geometry"] = {"tiling": False}

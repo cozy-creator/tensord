@@ -160,6 +160,7 @@ def verify_parity(proof):
         raise ValueError("initial noise scales differ")
     numerical = proof.get("numerical_mode", {})
     mode_fields = {
+        "text_encoder_compute_dtype",
         "conditioning_dtype",
         "denoiser_input_dtype",
         "denoiser_output_dtype",
@@ -168,6 +169,11 @@ def verify_parity(proof):
         "sampler_compute_dtype",
         "latent_state_dtype",
         "vae_dtype",
+        "latent_inverse_scale_dtype",
+        "pixel_normalization_dtype",
+        "image_quantization_dtype",
+        "attention_precision",
+        "math_flags",
         "decode_geometry",
     }
     left, right = numerical.get("cozy"), numerical.get("comfy")
