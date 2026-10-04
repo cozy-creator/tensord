@@ -17,7 +17,8 @@ use crate::{
     },
     execution::Engine,
     gpu_service::{
-        command_ok, keep_triage, output_bindings, settle, stage_inputs, WakeOnExit,
+        command_ok, keep_triage, output_bindings, record_measurements, settle, stage_inputs,
+        WakeOnExit,
     },
     journal::{Execution, ExecutorFacts, Failure, InputFile, Outcome, State},
     launch_identity::{LaunchIdentity, Seal},
@@ -933,6 +934,7 @@ fn conclude(
     spool: &Path,
     reply: Frame,
 ) -> io::Result<()> {
+    record_measurements(engine, id, &reply);
     let outcome = reply
         .outcome
         .as_ref()

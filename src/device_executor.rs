@@ -600,6 +600,12 @@ pub struct Frame {
     pub parts: Vec<PublishPart>,
     /// `start`: the executor's legs, `[[name, ms], ...]`; read leniently.
     pub stages: Value,
+    /// `invoke`: the executor's stage and step tracks, its ranks' execution records (GPU,
+    /// attention served) and its observation tail; read leniently, kept as the run's
+    /// measurements.
+    pub attribution: Value,
+    pub execution: Value,
+    pub observations: Value,
     // `child_*` (a job's managed calls): the call's index, callee and canonical request.
     pub call_index: u64,
     pub module: String,

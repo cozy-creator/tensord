@@ -1272,6 +1272,15 @@ mod v1_api {
         assert_eq!(done.status, "succeeded", "{done:?}");
         let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
         assert_eq!(result["segments"], 3, "{result}");
+        // What the job's executor measured comes with its outcome, as `run show` lists it: the
+        // stage it bracketed and its steps, each with a count and a time.
+        let measured: serde_json::Value = serde_json::from_slice(&done.measurements).unwrap();
+        let assemble = &measured["attribution"]["stages"]["assemble"];
+        assert_eq!(assemble["count"], 3, "{measured}");
+        assert!(assemble["total_ms"].as_f64().unwrap() > 0.0, "{measured}");
+        let steps = &measured["attribution"]["steps"]["segments"];
+        assert_eq!(steps["count"], 3, "{measured}");
+        assert_eq!(steps["series"].as_array().unwrap().len(), 3, "{measured}");
 
         // Each segment saw the job's reference and continued the previous segment's context.
         let seen = tensorfs_core::sha256::hex_digest(&reference);
@@ -1336,7 +1345,11 @@ mod v1_api {
             )
             .await
             .unwrap();
-            assert_eq!(outcome(&child).status, "succeeded", "{child:?}");
+            let child = outcome(&child);
+            assert_eq!(child.status, "succeeded", "{child:?}");
+            // A call's measurements name the process that executed it.
+            let measured: serde_json::Value = serde_json::from_slice(&child.measurements).unwrap();
+            assert!(measured["execution"]["ranks"][0]["pid"].as_u64() > Some(0), "{measured}");
         }
 
         // A canceled job ends its running child with it.

@@ -102,6 +102,7 @@ async def long_form(
     attempts = int(counted.read_text()) + 1 if counted.exists() else 1
     counted.write_text(str(attempts))
     film, context, replayed, parts = b"", "", 0, []
+    on_segment = tel.step_callback(len(payload.segments), stage="segments")
     for index, prompt in enumerate(payload.segments):
         ctx.raise_if_cancelled()
         try:
@@ -124,15 +125,17 @@ async def long_form(
                 f"{str(failure)[:512]}",
                 code="segment_failed",
             ) from failure
-        film += result.video.read_bytes()
-        context = result.context
-        parts.append(out.save_bytes(result.video.read_bytes(), media_type="video/mp4"))
-        out.publish("parts", parts[-1], label=f"Segment {index + 1}")
-        kept = state / f"film-{index}"
-        kept.write_bytes(film)
-        replayed += checkpoints.declare(f"film-{index}", kept).replayed
-        revision = out.save_bytes(film, media_type="video/mp4")
-        out.publish("video", revision, label=f"Video (segments 1-{index + 1})")
+        with tel.stage("assemble"):
+            film += result.video.read_bytes()
+            context = result.context
+            parts.append(out.save_bytes(result.video.read_bytes(), media_type="video/mp4"))
+            out.publish("parts", parts[-1], label=f"Segment {index + 1}")
+            kept = state / f"film-{index}"
+            kept.write_bytes(film)
+            replayed += checkpoints.declare(f"film-{index}", kept).replayed
+            revision = out.save_bytes(film, media_type="video/mp4")
+            out.publish("video", revision, label=f"Video (segments 1-{index + 1})")
+        on_segment(index)
     ctx.release_gpus()
     return LongFormOutput(
         video=out.save_bytes(film, media_type="video/mp4"),
