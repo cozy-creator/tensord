@@ -254,6 +254,17 @@ impl Runs {
         if let Source::Local(digest) = &spec.source {
             references.extend(crate::local_source::written(&self.objects, actor, digest)?);
         }
+        // A written file a warm run makes into a model (`object://sha256:<hex>/<file>`).
+        for choice in &spec.models {
+            let Some(hex) = choice.source.strip_prefix("object://").and_then(|rest| rest.split('/').next()) else {
+                continue;
+            };
+            let sha256 = hex.trim_start_matches("sha256:").to_string();
+            match self.objects.path(actor, &format!("sha256:{sha256}"))? {
+                Some((_, length)) => references.push(ObjectRef { sha256, length }),
+                None => return Err(unwritten(&choice.source)),
+            }
+        }
         self.objects.retain(&references)?;
         let package = match &spec.source {
             Source::Release { package, .. } => package.clone(),
@@ -325,9 +336,10 @@ impl Runs {
 
     /// A warm run's model choices made present when it names no entrypoint (`cozy package
     /// install`, `cozy model download`) or no code (`cozy model upload`, `cozy run upload`): a
-    /// Hub checkpoint downloaded, a provider source made, a checkpoint this machine holds (a
-    /// run's weights output) found; with a weights destination, the one choice is put there
-    /// under the run's machine-publication authorization.
+    /// Hub checkpoint downloaded, a provider source or a written file (`object://`) made, a
+    /// checkpoint this machine holds (a run's weights output, a `local/` alias) found. With a
+    /// weights destination the one choice is put there: a `local/` alias held by name, or a
+    /// Hub repository under the run's machine-publication authorization.
     fn warm_models(
         &self,
         actor: &str,
@@ -359,6 +371,14 @@ impl Runs {
                     "resolved": made.resolved, "profiles": made.profiles,
                     "repository": made.repository, "manifest": made.manifest.id()});
                 (made.manifest, row)
+            } else if let (Some(name), None) = (choice.repository.strip_prefix("local/"), &choice.manifest) {
+                // A local alias: the model this machine's store holds under that name.
+                let (manifest, _) = tensorfs_core::source_model::held(publisher.store(), name)
+                    .map_err(|e| refused("checkpoint_absent", e.to_string()))?
+                    .ok_or_else(|| refused("checkpoint_absent", format!("this machine holds no local/{name}")))?;
+                let row = json!({"parameter": choice.parameter,
+                    "repository": choice.repository, "manifest": manifest.id()});
+                (manifest, row)
             } else {
                 let digest = choice.manifest.as_ref().ok_or_else(|| {
                     refused(
@@ -382,7 +402,22 @@ impl Runs {
                     "repository": choice.repository, "manifest": manifest});
                 (ObjectRef { sha256, length: length.len() }, row)
             };
-            if !destination.is_empty() {
+            if let Some(name) = destination.strip_prefix("local/") {
+                // A local alias (`cozy model download … local/name`): the model, held by name.
+                let repo = tensorfs_core::repository::RepositoryName::new("local", name)
+                    .map_err(|e| refused("invalid_request", e.to_string()))?;
+                let current = std::fs::read(publisher.store().repository_path(&repo)).ok();
+                let mutation = tensorfs_core::repository::Mutation::ReplaceLocal {
+                    repo,
+                    version: manifest.sha256.clone(),
+                    manifest: manifest.clone(),
+                };
+                publisher
+                    .store()
+                    .apply_repository(current.as_deref(), &mutation, &Default::default())
+                    .map_err(|e| refused("local_alias_refused", e.to_string()))?;
+                row["published"] = json!({"destination": destination, "checkpoint": manifest.id(), "converged": false});
+            } else if !destination.is_empty() {
                 if spec.publication.is_empty() {
                     return Err(refused(
                         "publication_unauthorized",

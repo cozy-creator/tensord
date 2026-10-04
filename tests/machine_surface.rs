@@ -1364,9 +1364,10 @@ mod v1_api {
 
     /// `cozy model quantize`'s shape on CPU: a job writes its declared weights output through
     /// the machine's native writer channel and adopts it; the output is a product of its log
-    /// (the manifest), and `cozy run upload` puts that held checkpoint in a destination.
+    /// (the manifest). A warm run keeps that held checkpoint under a local alias, and another
+    /// puts the alias's checkpoint in a Hub destination.
     #[tokio::test]
-    async fn a_job_writes_a_weights_output_and_a_warm_run_publishes_it() {
+    async fn a_job_writes_a_weights_output_kept_under_a_local_alias_that_a_warm_run_publishes() {
         let (origin, hub) = publication_hub().await;
         let (machine, tools) = installing_machine().await;
         let mut client = client(&machine).await;
@@ -1408,13 +1409,53 @@ mod v1_api {
         };
         held.read_manifest(&reference).unwrap();
 
-        // `cozy run upload <run>#model acme/tiny`: the held checkpoint, published.
-        let upload = v1::RunSpec {
+        // The held checkpoint kept under a local alias, as `cozy model download … local/tiny`
+        // keeps a model: no Hub, no publication.
+        let keep = v1::RunSpec {
             kind: v1::RunKind::Warm as i32,
             models: vec![v1::ModelChoice {
                 parameter: "model".into(),
                 manifest: written.digest.clone(),
                 manifest_length: written.length,
+                ..Default::default()
+            }],
+            weights_destination: "local/tiny".into(),
+            owner: "alice".into(),
+            ..Default::default()
+        };
+        let events = collect(client.run(authorized(run("keep", keep), &all)).await.unwrap().into_inner())
+            .await
+            .unwrap();
+        let done = outcome(&events);
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        assert_eq!(result["models"][0]["published"]["destination"], "local/tiny", "{result}");
+        assert_eq!(result["models"][0]["published"]["checkpoint"], written.digest, "{result}");
+
+        // A file that was never written is refused at submit: the run takes custody of none.
+        let unwritten = v1::RunSpec {
+            kind: v1::RunKind::Warm as i32,
+            models: vec![v1::ModelChoice {
+                parameter: "model".into(),
+                source: format!("object://sha256:{}/stray.safetensors", "0".repeat(64)),
+                ..Default::default()
+            }],
+            weights_destination: "local/stray".into(),
+            owner: "alice".into(),
+            ..Default::default()
+        };
+        let refused = match client.run(authorized(run("unwritten", unwritten), &all)).await {
+            Ok(stream) => collect(stream.into_inner()).await.unwrap_err(),
+            Err(status) => status,
+        };
+        assert!(refused.message().contains("was not written to this machine"), "{refused:?}");
+
+        // `cozy model upload local/tiny acme/tiny`: the alias's checkpoint, published.
+        let upload = v1::RunSpec {
+            kind: v1::RunKind::Warm as i32,
+            models: vec![v1::ModelChoice {
+                parameter: "model".into(),
+                repository: "local/tiny".into(),
                 ..Default::default()
             }],
             weights_destination: "acme/tiny".into(),
@@ -1494,6 +1535,58 @@ mod v1_api {
         uploaded.sort();
         declared.sort();
         assert_eq!(uploaded, declared);
+    }
+
+    /// `cozy model upload <file>` and `cozy model download … local/name` on the serve process:
+    /// a file the client wrote is made into a model with no provider and kept under a local
+    /// alias. Real network for the fixture and its profile's reference configs.
+    #[tokio::test]
+    #[ignore = "real network: huggingface.co"]
+    async fn a_written_file_is_made_and_kept_under_a_local_alias() {
+        let machine = Machine::start().await;
+        let mut client = client(&machine).await;
+        let all = cap(Grant {
+            action: MACHINE.into(),
+            ..Default::default()
+        });
+        let file = Command::new("curl")
+            .args(["-sSfL", "https://huggingface.co/hf-internal-testing/tiny-sdxl-pipe/resolve/20594cbc343cfcfe447af5c87cdaf6c436b453f2/unet/diffusion_pytorch_model.safetensors"])
+            .output()
+            .unwrap();
+        assert!(file.status.success());
+        let sha256 = tensorfs_core::sha256::hex_digest(&file.stdout);
+        let length = file.stdout.len() as u64;
+        let held = write(&mut client, &all, &format!("sha256:{sha256}"), length, 0, &file.stdout)
+            .await
+            .unwrap();
+        assert_eq!(held, length);
+        let spec = v1::RunSpec {
+            kind: v1::RunKind::Warm as i32,
+            models: vec![v1::ModelChoice {
+                parameter: "model".into(),
+                source: format!("object://sha256:{sha256}/unet.safetensors"),
+                ..Default::default()
+            }],
+            weights_destination: "local/unet".into(),
+            owner: "alice".into(),
+            ..Default::default()
+        };
+        let request = v1::RunRequest {
+            id: "keep-file".into(),
+            after: 0,
+            spec: Some(spec),
+        };
+        let events = collect(client.run(authorized(request, &all)).await.unwrap().into_inner())
+            .await
+            .unwrap();
+        let done = outcome(&events);
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        let model = &result["models"][0];
+        assert_eq!(model["published"]["destination"], "local/unet", "{result}");
+        let store = tensorfs_core::store::Store::open(&machine.store()).unwrap();
+        let (manifest, _) = tensorfs_core::source_model::held(&store, "unet").unwrap().unwrap();
+        assert_eq!(model["manifest"], manifest.id());
     }
 
     /// A job's input tree (`--asset field=dir`, a `Tree` field): each file and the tree's manifest
