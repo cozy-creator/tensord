@@ -4,7 +4,7 @@ use cozy_machine::{
     execution::Engine,
     host_memory::HostMemory,
     host_tier::{HostGrant, HostTier, HostTierConfig, SealedRequest, TierLimit},
-    journal::{Invocation, Outcome},
+    journal::Invocation,
     model_sources::{ModelSources, SelectedManifest},
     process::{self, Exact},
     protocol,
@@ -400,7 +400,7 @@ fn two_plane_only_ranks_relay_native_sources_and_keep_a_scope_after_leader_exit(
         "the actual owned scope still holds a reader"
     );
     drop(sources);
-    engine.finish(&run.id, Outcome::Canceled).unwrap();
+    engine.cancel(&run.id, "alice").unwrap();
     rusqlite::Connection::open(fixture.root.join("state/executions.sqlite3"))
         .unwrap()
         .execute("UPDATE model_roots SET used_ms=0", [])
