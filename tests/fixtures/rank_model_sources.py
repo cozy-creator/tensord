@@ -76,11 +76,14 @@ def consume(executor: Executor, root: Path, manifest: str) -> dict[str, Any]:
                 os.close(fd)
             opened.set_pinned_budget(32 << 20)
             opened.want(ws, "pinned").wait()
-            actual = [
-                hashlib.sha256(os.pread(ws.host_fd, part["nbytes"], part["offset"])).hexdigest()
+            actual = {
+                part["what"]: hashlib.sha256(os.pread(ws.host_fd, part["nbytes"], part["offset"])).hexdigest()
                 for part in ws.parts
-            ]
-            assert actual == [item["object"].removeprefix("sha256:") for item in read_plan.items()]
+            }
+            expected = {
+                item["what"]: item["object"].removeprefix("sha256:") for item in read_plan.items()
+            }
+            assert actual == expected, (actual, expected)
             layouts.append(ws.digest)
             files = tiers.files(doc, objects)
             assert len(files) == len(objects)
