@@ -2415,11 +2415,12 @@ impl GpuPool {
             .filter_map(|(method, bytes)| Some((method.clone(), u64::try_from(*bytes).ok()?)))
             .collect();
         let shape = metrics.shape_cell.as_deref().unwrap_or(shape);
-        // Every rank of a group runs the same shape on its own GPU.
-        for device in self.lane(degree).unwrap_or_default() {
+        // Every rank of a group runs the same shape on its own GPU, and learns only the context
+        // its own process measured there.
+        for (rank, device) in self.lane(degree).unwrap_or_default().iter().enumerate() {
             device
                 .memory
-                .learn_call(plan, shape, peak, &methods, known(plane.context_bytes));
+                .learn_call(plan, shape, peak, &methods, rank_context(reply, rank));
         }
         if let Ok(host) = crate::host_memory::process(pid) {
             self.first()
@@ -2533,6 +2534,15 @@ fn holding_id(key: &HoldingKey, generation: u64) -> String {
 
 fn known(value: Option<i64>) -> Option<u64> {
     value.and_then(|v| u64::try_from(v).ok())
+}
+
+/// The context rank `rank`'s own process measured: rank 0's plane, else its `rank_planes` row.
+fn rank_context(reply: &Frame, rank: usize) -> Option<u64> {
+    let own = match rank {
+        0 => reply.plane.as_ref(),
+        _ => reply.rank_planes.get(rank - 1).and_then(Option::as_ref),
+    };
+    own.and_then(|plane| known(plane.context_bytes))
 }
 
 fn plane_facts(plane: Option<&device_executor::PlaneFacts>) -> Facts {
@@ -3361,6 +3371,17 @@ mod tests {
         let (cap, group) = rank_grant(&[Some(30)]);
         assert_eq!((cap, group.is_empty()), (Some(30), true));
         assert_eq!(rank_grant(&[]).0, None);
+    }
+
+    #[test]
+    fn a_gpu_learns_only_the_context_its_own_rank_measured() {
+        let reply: Frame = serde_json::from_value(json!({
+            "plane": {"context_bytes": 100},
+            "rank_planes": [{"context_bytes": 200}, null]
+        }))
+        .unwrap();
+        let each: Vec<_> = (0..4).map(|rank| rank_context(&reply, rank)).collect();
+        assert_eq!(each, vec![Some(100), Some(200), None, None]);
     }
 
     #[test]

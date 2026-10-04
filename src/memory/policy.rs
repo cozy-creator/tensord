@@ -320,7 +320,12 @@ impl Gpu {
     /// here or in an earlier run (taken after its libraries' first launches), else twice the
     /// largest measured this run, else `UNMEASURED_CONTEXT`.
     pub fn context_estimate(&self) -> u64 {
-        if let Some(learned) = self.learned.contexts.get(&self.device).filter(|c| **c > 0) {
+        if let Some(learned) = self
+            .learned
+            .process_contexts
+            .get(&self.device)
+            .filter(|c| **c > 0)
+        {
             return learned + MARGIN;
         }
         match self.facts.values().filter_map(|f| f.context).max() {

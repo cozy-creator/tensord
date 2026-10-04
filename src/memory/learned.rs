@@ -64,8 +64,9 @@ pub struct Plan {
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Learned {
-    /// GPU UUID and driver version -> the largest context an executor measured there.
-    pub contexts: BTreeMap<String, u64>,
+    /// GPU UUID and driver version -> the largest context an executor's own driver row showed
+    /// there. Renamed from `contexts`, whose device-wide deltas could hold foreign memory.
+    pub process_contexts: BTreeMap<String, u64>,
     pub plans: BTreeMap<String, Plan>,
     #[serde(skip)]
     path: Option<PathBuf>,
@@ -135,7 +136,7 @@ impl Learned {
     }
 
     pub fn context(&mut self, device: &str, measured: u64) {
-        let entry = self.contexts.entry(device.into()).or_default();
+        let entry = self.process_contexts.entry(device.into()).or_default();
         *entry = (*entry).max(measured);
     }
 
@@ -263,7 +264,7 @@ mod tests {
             .unwrap()
             .estimated_from
             .is_none());
-        assert_eq!(learned.contexts["GPU-1/580"], 220 << 20);
+        assert_eq!(learned.process_contexts["GPU-1/580"], 220 << 20);
         fs::remove_file(path).unwrap();
     }
 
