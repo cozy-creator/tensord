@@ -15,5 +15,5 @@ tasks:
         cargo fetch --locked  # the host reads the private TensorFS; the container builds offline
         docker run --rm --runtime=runc --user "$(id -u):$(id -g)" -e HOME=/tmp -e COZY_MACHINE_COMMIT="$(git rev-parse HEAD)" \
           -v "$home/registry:/cargo/registry" -v "$home/git:/cargo/git" -v "$PWD:/src:ro" -v "$target:/target" -w /src quay.io/pypa/manylinux_2_28_x86_64:2026.10.03-1 \
-          sh -c 'curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal --default-toolchain 1.91.1 && CARGO_HOME=/cargo /tmp/.cargo/bin/cargo build --release --locked --offline --target-dir /target --bin cozy-machine'
+          sh -c 'curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal --default-toolchain 1.91.1 >&2 && PATH=/tmp/.cargo/bin:$PATH CARGO_HOME=/cargo cargo build --release --locked --offline --target-dir /target --bin cozy-machine'
         install -m 0755 "$target/release/cozy-machine" "{{.OUT}}/cozy-machine-linux-x86_64" && "{{.OUT}}/cozy-machine-linux-x86_64" version --json
