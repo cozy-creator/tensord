@@ -1108,7 +1108,7 @@ mod tests {
             }
         };
         let sdk=std::env::var("COZY_TEST_SDK_REQUIREMENTS").map(|value|
-            serde_json::from_str::<Vec<String>>(&value).expect("test SDK requirements must be a JSON string array")
+            serde_json::from_str::<Vec<std::path::PathBuf>>(&value).expect("test SDK requirements must be a JSON string array")
         ).unwrap_or_default();
         let client=fs::read_dir(root.join("client")).unwrap().map(|entry|entry.unwrap().path()).find(|path|path.extension().is_some_and(|value|value=="whl")).unwrap();
         let objects=Arc::new(Objects::new(&root.join("writes"),store.clone(),service.engine.clone()).unwrap());
