@@ -490,6 +490,8 @@ pub struct PlaneFacts {
     /// copy counts at every acquire), and the wall time of its resident bakes.
     pub lora_baked: Option<u64>,
     pub lora_bake_ms: Option<f64>,
+    /// LoRA'd weights whose baked bytes came from custody: no bake in this executor.
+    pub lora_attached: Option<u64>,
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -618,6 +620,9 @@ pub struct Frame {
     pub descriptors: u32,
     pub device: String,
     pub regions: Vec<crate::resident_custody::SharedRegion>,
+    /// `device_tier`: what the regions hold beside the stored bytes ("": nothing; in an ask
+    /// "*": the layout's latest baked variant).
+    pub variant: String,
     pub shared_bytes: u64,
     pub released_bytes: u64,
     // `publish` (Outputs.publish): one product of a declared output.
@@ -697,6 +702,11 @@ pub struct Answer {
     /// `device_tier`: the last fd after the answer is the reader's lease socket.
     #[serde(skip_serializing_if = "is_false")]
     pub lease: bool,
+    /// `device_tier`: this machine keys holdings by variant, and the answered holding's.
+    #[serde(skip_serializing_if = "is_false")]
+    pub variants: bool,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub variant: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub digest: String,
     #[serde(skip_serializing_if = "is_zero")]
@@ -765,6 +775,8 @@ impl Answer {
             descriptors: 0,
             layout: String::new(),
             lease: false,
+            variants: false,
+            variant: String::new(),
             digest: String::new(),
             sequence: 0,
             state: String::new(),
