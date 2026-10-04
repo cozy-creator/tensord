@@ -2145,6 +2145,14 @@ impl GpuPool {
         for device in self.lane(plan.degree)? {
             device.memory.with(|gpu| gpu.set_shape(&plan.id, &shape));
         }
+        if let Some((from, ratio)) = self
+            .first()
+            .with(|gpu| gpu.shape(&plan.id))
+            .and_then(|learned| learned.estimated_from)
+        {
+            crate::memory::note(serde_json::json!({"event": "estimate", "plan": plan.id,
+                "shape": shape, "from": from, "ratio": ratio}));
+        }
         let spool = if let Some(identity) = self.config.identity {
             // Keep Journal/results/admin paths private to the core. A separate peer-owned
             // spool lives only inside this executor's already authorized output directory.

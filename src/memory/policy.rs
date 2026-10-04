@@ -342,7 +342,7 @@ impl Gpu {
             .shapes
             .get(plan)
             .and_then(|shape| self.learned.shape(plan, shape))
-            .map(super::learned::Shape::bytes)
+            .map(|shape| shape.bytes())
             .filter(|peak| *peak > 0);
         shaped.or_else(|| {
             [self.facts(plan).activation, self.learned.peak(plan)]
@@ -354,11 +354,14 @@ impl Gpu {
 
     /// Per-method activation growth learned for `plan`'s next shape: the executor's seeds.
     pub fn seeds(&self, plan: &str) -> BTreeMap<String, u64> {
+        self.shape(plan).map(|shape| shape.methods).unwrap_or_default()
+    }
+
+    /// What was learned for `plan`'s next shape, measured or estimated (`estimated_from`).
+    pub fn shape(&self, plan: &str) -> Option<super::learned::Shape> {
         self.shapes
             .get(plan)
             .and_then(|shape| self.learned.shape(plan, shape))
-            .map(|measured| measured.methods.clone())
-            .unwrap_or_default()
     }
 
     /// Holdings `plan`'s executor maps (Degree 2): weights already on the GPU, counted once
@@ -982,6 +985,11 @@ mod tests {
         // The next shape, once known, takes its own measurement.
         gpu.set_shape("sdxl", "height=512,width=512");
         assert_eq!(gpu.activation("sdxl"), Some(GIB / 4));
+        // A shape larger than any measured: the executor's seeds and the activation are the
+        // largest measured shape's, scaled by its tokens (4x the pixels of 1024).
+        gpu.set_shape("sdxl", "height=2048,width=2048");
+        assert_eq!(gpu.seeds("sdxl")["decode"], 12 * GIB);
+        assert_eq!(gpu.activation("sdxl"), Some(12 * GIB));
     }
 
     #[test]

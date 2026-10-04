@@ -12,19 +12,37 @@ use std::{
 
 const TTL: Duration = Duration::from_secs(30 * 24 * 3600);
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Shape {
     /// The call's peak activation growth.
     pub peak: u64,
     /// Each stage method's.
     pub methods: BTreeMap<String, u64>,
+    /// An estimate, never a measurement: the measured shape it was scaled from, and the ratio
+    /// of their token counts. Never written back (`call` stores measurements only).
+    #[serde(skip)]
+    pub estimated_from: Option<(String, f64)>,
 }
 impl Shape {
     /// What the call grows by at its worst: its own peak or a stage's (a stage counts the
     /// segments torch reserved for it), whichever is more.
     pub fn bytes(&self) -> u64 {
         self.methods.values().copied().fold(self.peak, u64::max)
+    }
+
+    /// This shape's peaks scaled by `ratio`, as an estimate from `cell`.
+    fn scaled(&self, cell: &str, ratio: f64) -> Self {
+        let scale = |bytes: u64| (bytes as f64 * ratio).ceil() as u64;
+        Self {
+            peak: scale(self.peak),
+            methods: self
+                .methods
+                .iter()
+                .map(|(method, bytes)| (method.clone(), scale(*bytes)))
+                .collect(),
+            estimated_from: Some((cell.into(), ratio)),
+        }
     }
 }
 
@@ -68,6 +86,17 @@ fn axes(cell: &str) -> Option<BTreeMap<&str, i64>> {
             Some((axis, value.parse().ok()?))
         })
         .collect()
+}
+
+/// The tokens a shape puts through a model: frames times pixels (else width times height) times
+/// listed inputs. Steps change time, not memory, so they are not counted.
+fn tokens(axes: &BTreeMap<&str, i64>) -> f64 {
+    let axis = |name| axes.get(name).copied().unwrap_or(1).max(1) as f64;
+    let pixels = match axes.get("pixels") {
+        Some(_) => axis("pixels"),
+        None => axis("width") * axis("height"),
+    };
+    axis("frames") * pixels * axis("assets")
 }
 
 /// The request's shape cell from PrepareRequest `features` (Runtime `worker.plan.shape_cell`).
@@ -153,25 +182,35 @@ impl Learned {
     }
 
     /// `plan`'s measurements for `shape`: exactly that shape, else the least among measured
-    /// shapes at least as large on every axis (memory does not shrink as a shape grows).
-    pub fn shape(&self, plan: &str, shape: &str) -> Option<&Shape> {
+    /// shapes at least as large on every axis (memory does not shrink as a shape grows), else
+    /// an estimate: the largest measured shape no larger on any axis, its peaks scaled by the
+    /// ratio of token counts (segment 2 of a long-form holds 384 frames where segment 1 held
+    /// 362, run 4074). Linear in tokens; a kernel that grows faster is caught by recovery, and
+    /// its first measurement replaces the estimate.
+    pub fn shape(&self, plan: &str, shape: &str) -> Option<Shape> {
         let plan = self.plans.get(plan)?;
         if let Some(exact) = plan.shapes.get(shape) {
-            return Some(exact);
+            return Some(exact.clone());
         }
         let mine = axes(shape)?;
-        plan.shapes
-            .iter()
-            .filter(|(other, _)| {
-                axes(other).is_some_and(|theirs| {
-                    theirs.len() == mine.len()
-                        && mine
-                            .iter()
-                            .all(|(axis, value)| theirs.get(axis).is_some_and(|t| t >= value))
-                })
+        let measured = || {
+            plan.shapes.iter().filter_map(|(cell, measured)| {
+                let theirs = axes(cell)?;
+                (theirs.len() == mine.len() && mine.keys().all(|axis| theirs.contains_key(axis)))
+                    .then_some((cell, theirs, measured))
             })
-            .map(|(_, measured)| measured)
-            .min_by_key(|measured| measured.bytes())
+        };
+        let larger = measured()
+            .filter(|(_, theirs, _)| mine.iter().all(|(axis, value)| theirs[axis] >= *value))
+            .map(|(_, _, measured)| measured)
+            .min_by_key(|measured| measured.bytes());
+        if let Some(larger) = larger {
+            return Some(larger.clone());
+        }
+        let (cell, theirs, measured) = measured()
+            .filter(|(_, theirs, _)| mine.iter().all(|(axis, value)| theirs[axis] <= *value))
+            .max_by(|a, b| tokens(&a.1).total_cmp(&tokens(&b.1)))?;
+        Some(measured.scaled(cell, tokens(&mine) / tokens(&theirs)))
     }
 }
 
@@ -210,9 +249,43 @@ mod tests {
                 .methods,
             methods
         );
-        assert!(learned.shape("anima", "height=4096,width=4096").is_none());
+        // Larger than anything measured: the largest shape below it, scaled by its pixels.
+        let estimate = learned.shape("anima", "height=4096,width=4096").unwrap();
+        assert_eq!(estimate.peak, 20 << 30);
+        assert_eq!(estimate.methods["transformer"], 12 << 30);
+        assert_eq!(
+            estimate.estimated_from,
+            Some(("height=2048,width=2048".to_string(), 4.0))
+        );
+        // A measured shape is never an estimate.
+        assert!(learned
+            .shape("anima", "height=2048,width=2048")
+            .unwrap()
+            .estimated_from
+            .is_none());
         assert_eq!(learned.contexts["GPU-1/580"], 220 << 20);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_longer_segment_scales_by_frames_and_never_by_steps() {
+        let mut learned = Learned::default();
+        let methods = BTreeMap::from([("base_model.sample_ref2va_turbo".to_string(), 362)]);
+        learned.call("h3", "assets=1,frames=362,steps=8", 100, &methods);
+        let estimate = learned.shape("h3", "assets=1,frames=384,steps=8").unwrap();
+        assert_eq!(estimate.methods["base_model.sample_ref2va_turbo"], 384);
+        assert_eq!(estimate.peak, 107); // ceil(100 * 384 / 362)
+        // More steps alone: tokens are equal, so the estimate is the measurement's own size.
+        let steps = learned.shape("h3", "assets=1,frames=362,steps=30").unwrap();
+        assert_eq!((steps.peak, steps.estimated_from.unwrap().1), (100, 1.0));
+        // A smaller shape takes the measurement itself, never a scaled-down estimate.
+        let smaller = learned.shape("h3", "assets=1,frames=300,steps=8").unwrap();
+        assert_eq!((smaller.peak, smaller.estimated_from), (100, None));
+        // Larger on one axis and smaller on another, or other axes: no estimate.
+        assert!(learned.shape("h3", "assets=2,frames=384,steps=4").is_none());
+        assert!(learned.shape("h3", "frames=384").is_none());
+        // Estimates are read-side only: nothing new was stored.
+        assert_eq!(learned.plans["h3"].shapes.len(), 1);
     }
 
     #[test]
