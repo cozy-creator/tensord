@@ -150,6 +150,14 @@ impl Durable {
     }
 }
 
+/// The manifests of a journaled job context's model inputs (`sha256:<hex>`): the store keeps
+/// them while the job is unfinished.
+pub(crate) fn job_models(journaled: &[u8]) -> io::Result<Vec<String>> {
+    let context: Durable = serde_json::from_slice(journaled).map_err(io::Error::other)?;
+    let manifests = context.inputs.into_values();
+    Ok(manifests.map(|(_, sha256, _)| format!("sha256:{sha256}")).collect())
+}
+
 /// A job's own model input: a bare parameter, or one under the job's own name.
 fn own_input(choice: &pb::ModelChoice, job: &str) -> bool {
     match choice.parameter.split_once(".models.") {
@@ -880,6 +888,56 @@ mod tests {
     use crate::{api::install::InstallerConfig, execution::Engine, journal::State};
     use std::{fs, path::Path, process::Command, time::Duration};
     use tensorfs_core::{sha256, store::Store};
+
+    #[test]
+    fn unfinished_jobs_keep_their_model_inputs_and_an_unreadable_one_stops_store_gc_for_a_pass() {
+        let root = std::env::temp_dir().join(format!("cm-keep-list-{}", uuid::Uuid::new_v4()));
+        let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
+        let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
+        let publisher = Publisher::new(&root.join("published"), Default::default(), store).unwrap();
+        service.configure_publisher(publisher.clone());
+        let context = |model: &str| Durable {
+            installation: String::new(),
+            owner: "alice".into(),
+            binding_revision: String::new(),
+            attention_kernel: String::new(),
+            models: vec![],
+            inputs: BTreeMap::from([("model".into(), ("Model".into(), model.repeat(64), 1))]),
+            weights_destination: String::new(),
+            publication: String::new(),
+        };
+        let bind = |id: &str, context: &[u8]| {
+            let bound = service.engine.with_journal(|journal| journal.bind_job_context(id, context));
+            bound.unwrap()
+        };
+        let job = |name: &str, model: &str| {
+            let invocation = crate::journal::Invocation {
+                package: "audit/job".into(),
+                input: json!({}),
+                job: true,
+                ..Default::default()
+            };
+            let (run, _) = service.engine.accept_run("alice", name, name, invocation).unwrap();
+            bind(&run.id, &serde_json::to_vec(&context(model)).unwrap());
+            run.id
+        };
+        let (paused, unknown, ended) = (job("paused", "a"), job("unknown", "b"), job("ended", "c"));
+        service.engine.pause(&paused, "alice", true).unwrap();
+        // A state a newer machine wrote is unfinished to this one.
+        let journal = rusqlite::Connection::open(root.join("state/execution/executions.sqlite3")).unwrap();
+        let future = "UPDATE executions SET state='future-state' WHERE id=?1";
+        journal.execute(future, [&unknown]).unwrap();
+        service.engine.end_preparation(&ended, Outcome::Failed("ended".into())).unwrap();
+        let kept = |model: &str| format!("sha256:{}", model.repeat(64));
+        assert_eq!(publisher.caches(&service).unwrap().keep, [kept("a"), kept("b")]);
+        // An unreadable context is no list at all, for this pass only.
+        bind(&paused, b"not a context");
+        assert!(publisher.caches(&service).is_err());
+        assert_eq!(service.reclaim(), crate::reclaim::Swept::default());
+        bind(&paused, &serde_json::to_vec(&context("a")).unwrap());
+        assert_eq!(publisher.caches(&service).unwrap().keep, [kept("a"), kept("b")]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn write(objects: &Objects, actor: &str, bytes: &[u8]) -> (String, u64) {
         let digest = format!("sha256:{}", sha256::hex_digest(bytes));

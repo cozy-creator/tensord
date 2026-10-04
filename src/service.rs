@@ -359,7 +359,14 @@ impl Service {
                 bound: &bound,
                 kernels: kernels.as_ref(),
                 memo: gpu.as_ref().map(|gpu| gpu.memo()),
-                store: publisher.as_ref().map(|publisher| publisher.caches(self)),
+                store: match publisher.as_ref().map(|publisher| publisher.caches(self)) {
+                    Some(Ok(caches)) => Some(caches),
+                    Some(Err(error)) => {
+                        eprintln!("reclaim: no store GC this pass, its keep list failed: {error}");
+                        None
+                    }
+                    None => None,
+                },
                 disk: &|| crate::reclaim::measure(&self.engine.root),
             })?;
             if let Some(jobs) = self.jobs() {
