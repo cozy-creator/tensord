@@ -2503,3 +2503,257 @@ mod v1_api {
         let _ = fs::remove_dir_all(tools);
     }
 }
+
+/// Census of the actually registered production listener, not the isolated retired router.
+/// Publicowner can authenticate/discover its journal, but its captured serving path still
+/// needs the absent PreparePackageSet and captured-submit implementations.
+#[tokio::test]
+async fn actual_listener_legacy_discovery_preserves_workspace_but_publicowner_capture_is_unsupported(
+) {
+    let mut machine = Machine::start().await;
+    let discover = pb::MachineExecutionWorkspaceQuery {
+        claim: Some(machine.claim.clone()),
+        ..Default::default()
+    };
+    let description = machine
+        .client
+        .describe_machine(pb::DescribeMachineQuery {
+            claim: Some(machine.claim.clone()),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(description.worker_id, WORKER);
+    assert_eq!(description.worker_boot_id, machine.claim.worker_boot_id);
+    let first = machine
+        .client
+        .get_machine_execution_workspace(discover.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!first.execution_workspace_id.is_empty());
+    assert_eq!(
+        description.runtime.unwrap().execution_workspace_id,
+        first.execution_workspace_id
+    );
+
+    let ready: serde_json::Value =
+        serde_json::from_slice(&fs::read(machine.root.join("state/api-ready.json")).unwrap())
+            .unwrap();
+    let refused = machine
+        .client
+        .get_machine_execution_workspace(pb::MachineExecutionWorkspaceQuery {
+            claim: Some(claim_by(&ready, &[99; 32])),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::Unauthenticated);
+    let stale_boot = machine
+        .client
+        .get_machine_execution_workspace(pb::MachineExecutionWorkspaceQuery {
+            claim: Some(pb::Claim {
+                worker_boot_id: "different-boot".into(),
+                ..machine.claim.clone()
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(stale_boot.code(), tonic::Code::Unauthenticated);
+
+    let unsupported = machine
+        .client
+        .prepare_package_set(pb::PreparePackageSetCall {
+            claim: Some(machine.claim.clone()),
+            application: "authored_public_application".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(unsupported.code(), tonic::Code::Unimplemented);
+    let captured = machine
+        .client
+        .submit_machine_execution(pb::MachineExecutionSubmit {
+            claim: Some(machine.claim.clone()),
+            submission_id: "public-request".into(),
+            expected_execution_workspace_id: first.execution_workspace_id.clone(),
+            capture_canonical_bytes: b"{}".to_vec(),
+            payload_canonical_bytes: b"{}".to_vec(),
+            prepared_state: Some(pb::DesiredWorkerState::default()),
+            offer: Some(pb::AttemptOffer {
+                request_id: "public-request".into(),
+                attempt_ordinal: 1,
+                ..Default::default()
+            }),
+            // Real publicowner submissions use a captured prepared offer, never release_root.
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(captured.code(), tonic::Code::Unimplemented);
+    assert!(captured.message().contains("captured offers"));
+
+    // WorkerControl is registered too, but its handshake is only boot observation.
+    let channel = Endpoint::from_shared(format!("https://{}", machine.address))
+        .unwrap()
+        .tls_config(
+            ClientTlsConfig::new()
+                .ca_certificate(Certificate::from_pem(ready["cert_pem"].as_str().unwrap()))
+                .domain_name("localhost"),
+        )
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut control = pb::worker_control_client::WorkerControlClient::new(channel);
+    let worker_workspace = control
+        .get_machine_execution_workspace(discover)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        worker_workspace.execution_workspace_id,
+        first.execution_workspace_id
+    );
+    let mut observation = control
+        .control(tokio_stream::iter([pb::RecordOwnerFrame {
+            msg: Some(pb::record_owner_frame::Msg::Claim(machine.claim.clone())),
+        }]))
+        .await
+        .unwrap()
+        .into_inner();
+    let ack = observation.message().await.unwrap().unwrap().msg.unwrap();
+    let pb::worker_frame::Msg::ClaimAck(ack) = ack else {
+        panic!("first frame must acknowledge Claim")
+    };
+    assert!(ack.accepted);
+    assert_eq!(ack.worker_instance_id, machine.claim.worker_boot_id);
+    assert!(
+        observation.message().await.unwrap().is_none(),
+        "there is no publicowner snapshot handshake"
+    );
+    drop(observation);
+    drop(control);
+
+    machine.stop();
+    let journal = Journal::open(&machine.root.join("state/execution")).unwrap();
+    assert!(
+        journal.list().unwrap().is_empty(),
+        "unsupported public preparation/submission accepts no work"
+    );
+    drop(journal);
+    let (child, client, claim, address) = launch(&machine.root, &[]).await;
+    machine.child = child;
+    machine.client = client;
+    machine.claim = claim;
+    machine.address = address;
+    let same = machine
+        .client
+        .get_machine_execution_workspace(pb::MachineExecutionWorkspaceQuery {
+            claim: Some(machine.claim.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(same.execution_workspace_id, first.execution_workspace_id);
+    machine.stop();
+
+    // Simulate replacement of only this owned fixture's entire journal, retaining leaf
+    // and machine identity. It must produce a distinct workspace and refuse a prior pin.
+    fs::rename(
+        machine.root.join("state/execution"),
+        machine.root.join("original-execution"),
+    )
+    .unwrap();
+    let (child, client, claim, address) = launch(&machine.root, &[]).await;
+    machine.child = child;
+    machine.client = client;
+    machine.claim = claim;
+    machine.address = address;
+    let replacement = machine
+        .client
+        .get_machine_execution_workspace(pb::MachineExecutionWorkspaceQuery {
+            claim: Some(machine.claim.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(
+        replacement.execution_workspace_id,
+        first.execution_workspace_id
+    );
+    let changed = machine
+        .client
+        .get_machine_execution(pb::MachineExecutionQuery {
+            claim: Some(machine.claim.clone()),
+            request_id: "public-request".into(),
+            expected_execution_workspace_id: first.execution_workspace_id,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        changed.metadata().get("cozy-error-code").unwrap(),
+        "execution_workspace_changed"
+    );
+}
+
+/// Actual legacy read/control/collection handlers share journal custody with machine/v1.
+/// The fixture authors an accepted queued record; cancellation is a real API mutation.
+#[tokio::test]
+async fn actual_listener_legacy_control_and_collection_preserve_actor_and_exact_outcome() {
+    let mut machine = Machine::start_with(|state, actor| {
+        use cozy_machine::journal::{Invocation, SubmissionContext};
+        let mut journal = Journal::open(&state.join("execution")).unwrap();
+        let digest = format!("sha256:{}", "b".repeat(64));
+        let record = journal.accept_public(SubmissionContext {
+            actor: actor.into(), request_id: "queued-public".into(), submission_id: "submit-public".into(),
+            expected_workspace_id: journal.workspace_id().into(), capture_digest: digest.clone(),
+            invocation_digest: digest.clone(), payload_digest: digest, ..Default::default()
+        }, Invocation { package: "fixture/public".into(), generation: "fixture-generation".into(),
+            module: "fixture:app".into(), entrypoint: "cpu".into(), input: serde_json::json!({}),
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(record.state, cozy_machine::journal::State::Queued);
+    }).await;
+    let workspace = machine.client.get_machine_execution_workspace(pb::MachineExecutionWorkspaceQuery {
+        claim: Some(machine.claim.clone()), ..Default::default()
+    }).await.unwrap().into_inner();
+    let query = pb::MachineExecutionQuery { claim: Some(machine.claim.clone()),
+        request_id: "queued-public".into(), expected_execution_workspace_id: workspace.execution_workspace_id };
+    let queued = machine.client.get_machine_execution(query.clone()).await.unwrap().into_inner();
+    assert_eq!(queued.state, "queued");
+    let ready: serde_json::Value = serde_json::from_slice(
+        &fs::read(machine.root.join("state/api-ready.json")).unwrap(),
+    ).unwrap();
+    let other = pb::MachineExecutionQuery { claim: Some(claim_by(&ready, &OTHER)), ..query.clone() };
+    assert_eq!(machine.client.get_machine_execution(other).await.unwrap_err().code(), tonic::Code::NotFound);
+    let canceled = machine.client.control_machine_execution(pb::MachineExecutionControl {
+        execution: Some(query.clone()), command_id: "explicit-cancel".into(),
+        action: pb::MachineExecutionAction::Cancel as i32, ..Default::default()
+    }).await.unwrap().into_inner();
+    assert_eq!(canceled.state, "canceled");
+    let events = machine.client.list_machine_execution_events(pb::MachineExecutionEventsQuery {
+        execution: Some(query.clone()), ..Default::default()
+    }).await.unwrap().into_inner();
+    assert!(events.events.iter().any(|event| event.outcome.is_some()));
+    let collect = pb::MachineExecutionCollect { execution: Some(query.clone()), attempt_ordinal: 1 };
+    let terminal = machine.client.collect_machine_execution(collect.clone()).await.unwrap().into_inner();
+    let ack = pb::AttemptOutcomeAck {
+        request_id: terminal.request_id.clone(), attempt_ordinal: terminal.attempt_ordinal,
+        invocation_spec_digest: terminal.invocation_spec_digest.clone(), outcome_id: terminal.outcome_id.clone(),
+        outcome_digest: terminal.outcome_digest.clone(), ..Default::default()
+    };
+    let wrong = machine.client.acknowledge_machine_execution_collection(pb::MachineExecutionCollectionAck {
+        execution: Some(query.clone()), outcome: Some(pb::AttemptOutcomeAck { outcome_id: "different-outcome".into(), ..ack.clone() })
+    }).await.unwrap_err();
+    assert_eq!(wrong.code(), tonic::Code::InvalidArgument);
+    let kept = machine.client.acknowledge_machine_execution_collection(pb::MachineExecutionCollectionAck {
+        execution: Some(query), outcome: Some(ack)
+    }).await.unwrap().into_inner();
+    assert!(kept.collected);
+    let replay = machine.client.collect_machine_execution(collect).await.unwrap().into_inner();
+    assert_eq!(replay, terminal);
+}
