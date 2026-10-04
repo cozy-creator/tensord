@@ -476,11 +476,30 @@ impl Gpu {
             + MARGIN
     }
 
-    /// What a spawn of `plan` reserves: a context and its first working set when known.
+    /// Holdings `plan`'s next executor attaches at its load: named by an earlier executor of
+    /// it and held now, read or not.
+    fn attachable(&self, plan: &str) -> u64 {
+        let Some(learned) = self.learned.plans.get(plan) else {
+            return 0;
+        };
+        self.holdings
+            .iter()
+            .filter(|h| !h.revoking && learned.holdings.contains(holding_name(&h.id)))
+            .map(|h| h.bytes)
+            .sum()
+    }
+
+    /// What a spawn of `plan` reserves: a context and its first working set when known. The
+    /// weights it attaches are resident already, so the spawn asks no room for them (H3 on
+    /// an RTX PRO 6000: 79.9 GB held and 21.8 GB free; a replacement's 22.6 GB with its
+    /// 1.5 GB floor would have revoked a holding it was about to map).
     pub fn spawn_need(&self, plan: &str) -> u64 {
         let facts = self.facts(plan);
         self.context_estimate()
-            + facts.weights_floor.unwrap_or(0)
+            + facts
+                .weights_floor
+                .unwrap_or(0)
+                .saturating_sub(self.attachable(plan))
             + self.activation(plan).unwrap_or(0)
     }
 
@@ -847,6 +866,44 @@ mod tests {
         gpu.holdings[0].revoking = false;
         gpu.holdings[0].id = "GPU-1/sha256:other#1".into();
         assert!(!gpu.fits_resident("img2img", &s));
+    }
+
+    #[test]
+    fn a_replacement_spawns_beside_the_holdings_it_attaches() {
+        // 16 GiB card. An executor of SDXL (7 GiB of weights, 1 GiB floor, 7 GiB of activations)
+        // was killed: custody keeps its weights, nobody reads them, 8.75 GiB are free.
+        let mut gpu = Gpu::default();
+        gpu.learned.load("sdxl", 7 * GIB, GIB);
+        gpu.learned
+            .call("sdxl", "height=1024,width=1024", 7 * GIB, &BTreeMap::new());
+        gpu.learned.holding("sdxl", "GPU-1/sha256:sdxl");
+        let held = |id: &str| Holding {
+            id: id.into(),
+            bytes: 7 * GIB,
+            readers: vec![],
+            idle_ms: 1_000,
+            revoking: false,
+        };
+        gpu.holdings = vec![held("GPU-1/sha256:sdxl#1")];
+        let s = sample(16 * GIB, 9 * GIB, &[]);
+        // Its floor is part of what is held: the spawn asks for a context and activations.
+        let need = gpu.spawn_need("sdxl");
+        assert_eq!(need, gpu.context_estimate() + 7 * GIB);
+        let mut round = Round::default();
+        let room = gpu.room("sdxl", &s);
+        assert_eq!(
+            gpu.decide("sdxl", Some(need), need, &s, &mut round),
+            Decision::Go(room),
+            "the holding it maps next is not revoked for its spawn"
+        );
+        // Another checkpoint's holding is no part of its floor: it makes room as before.
+        gpu.holdings = vec![held("GPU-1/sha256:other#1")];
+        let need = gpu.spawn_need("sdxl");
+        assert_eq!(need, gpu.context_estimate() + GIB + 7 * GIB);
+        assert_eq!(
+            gpu.decide("sdxl", Some(need), need, &s, &mut round),
+            Decision::Step(Step::Revoke("GPU-1/sha256:other#1".into()))
+        );
     }
 
     #[test]
