@@ -213,11 +213,11 @@ impl GpuMemory {
             return false;
         };
         let held = holdings();
-        let fits = self.with(|gpu| {
+        let (fits, want) = self.with(|gpu| {
             gpu.holdings = held;
-            gpu.fits_resident(plan, &sample)
+            (gpu.fits_resident(plan, &sample), gpu.want(plan))
         });
-        note(serde_json::json!({"event": "degree2", "plan": plan, "fits": fits}));
+        note(serde_json::json!({"event": "degree2", "plan": plan, "fits": fits, "want": want}));
         fits
     }
 
@@ -321,9 +321,13 @@ impl GpuMemory {
         peak: u64,
         methods: &std::collections::BTreeMap<String, u64>,
         context: Option<u64>,
+        mapped: Option<u64>,
     ) {
         self.with(|gpu| {
             gpu.learned.call(plan, shape, peak, methods);
+            if let Some(mapped) = mapped {
+                gpu.learned.mapped(plan, mapped);
+            }
             if let Some(context) = context.filter(|c| *c > 0) {
                 let device = gpu.device.clone();
                 gpu.learned.context(&device, context);

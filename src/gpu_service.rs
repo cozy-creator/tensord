@@ -247,6 +247,8 @@ struct Session {
     launch: Launch,
     /// It has served a call: its next one is not its first.
     invoked: bool,
+    /// Regions its plane had evicted when its last call ended (a running total).
+    evictions: u64,
     /// Its manifests stay out of every download's GC while it lives.
     _serving: ServingHold,
 }
@@ -1882,6 +1884,7 @@ impl GpuPool {
             sharing: false,
             launch,
             invoked: false,
+            evictions: 0,
             _serving: serving,
         })
     }
@@ -2225,12 +2228,25 @@ impl GpuPool {
             &group,
             &mut callbacks,
         )?;
+        // A call that evicted nothing kept every weight it uses mapped: that is what it maps.
+        let evictions = reply.plane.as_ref().and_then(|p| p.evictions);
+        let mapped = reply
+            .plane
+            .as_ref()
+            .filter(|_| plan.degree == 1 && evictions == Some(session.evictions))
+            .and_then(|p| {
+                let own = u64::try_from(p.committed_bytes?).ok()?;
+                Some(own + p.shared_bytes.and_then(|b| u64::try_from(b).ok()).unwrap_or(0))
+            })
+            .filter(|bytes| *bytes > 0);
+        session.evictions = evictions.unwrap_or(session.evictions);
         self.learn(
             &plan.id,
             plan.degree,
             &shape,
             &reply,
             session.executor.birth.pid,
+            mapped,
         );
         self.record_invoke(&plan.id, first, invoked.elapsed(), &reply);
         record_measurements(engine, id, &reply);
@@ -2403,7 +2419,15 @@ impl GpuPool {
 
     /// What a call measured, for later executors and runs: its shape's activation growth
     /// (the call's peak and each stage method's), its context, its private host bytes.
-    fn learn(&self, plan: &str, degree: u32, shape: &str, reply: &Frame, pid: u32) {
+    fn learn(
+        &self,
+        plan: &str,
+        degree: u32,
+        shape: &str,
+        reply: &Frame,
+        pid: u32,
+        mapped: Option<u64>,
+    ) {
         let metrics = reply.metrics.clone().unwrap_or_default();
         let plane = reply.plane.clone().unwrap_or_default();
         let peak = known(plane.activation_peak_bytes)
@@ -2420,7 +2444,7 @@ impl GpuPool {
         for (rank, device) in self.lane(degree).unwrap_or_default().iter().enumerate() {
             device
                 .memory
-                .learn_call(plan, shape, peak, &methods, rank_context(reply, rank));
+                .learn_call(plan, shape, peak, &methods, rank_context(reply, rank), mapped);
         }
         if let Ok(host) = crate::host_memory::process(pid) {
             self.first()

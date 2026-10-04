@@ -422,13 +422,20 @@ impl Gpu {
             .is_some_and(|want| self.room(plan, sample) + unread + self.shared(plan) >= want)
     }
 
-    /// Everything resident beside what it already maps: context, every weight byte,
+    /// The weights a call of `plan` puts on the GPU: what one kept mapped with nothing evicted
+    /// (an entrypoint may use only part of its construction), else every weight it registers.
+    fn call_weights(&self, plan: &str) -> Option<u64> {
+        let mapped = self.learned.plans.get(plan).map(|learned| learned.mapped);
+        mapped.filter(|m| *m > 0).or(self.facts(plan).weights)
+    }
+
+    /// Everything resident beside what it already maps: context, the weights its calls map,
     /// activations. None: not known yet.
     pub fn want(&self, plan: &str) -> Option<u64> {
         let facts = self.facts(plan);
         Some(
             facts.context.unwrap_or(self.context_estimate())
-                + facts.weights?.saturating_sub(self.attached(plan))
+                + self.call_weights(plan)?.saturating_sub(self.attached(plan))
                 + self.activation(plan)?
                 + MARGIN,
         )
@@ -450,7 +457,7 @@ impl Gpu {
                 .max()?;
             Some(
                 facts.context.unwrap_or(self.context_estimate())
-                    + facts.weights?.saturating_sub(self.attached(plan))
+                    + self.call_weights(plan)?.saturating_sub(self.attached(plan))
                     + largest
                     + MARGIN,
             )
@@ -960,6 +967,35 @@ mod tests {
             ),
             Decision::Step(Step::Unmap("sdxl".into()))
         );
+    }
+
+    #[test]
+    fn a_plan_is_priced_by_the_weights_its_calls_map() {
+        // H3 on one RTX PRO 6000 (run 4285): the construction registers two denoisers and a
+        // call maps one. Priced whole, Degree 2 never fits; priced as mapped, it does.
+        let mut gpu = Gpu {
+            device: "GPU-1/595".into(),
+            ..Gpu::default()
+        };
+        gpu.learned.load("h3", 102 * GIB, 2 * GIB);
+        gpu.learned
+            .call("h3", "frames=362", 20 * GIB, &BTreeMap::new());
+        gpu.learned.context("GPU-1/595", 700 * MIB);
+        gpu.set_shape("h3", "frames=362");
+        let free = sample(102 * GIB, 102 * GIB, &[]);
+        assert_eq!(
+            gpu.want("h3"),
+            Some(700 * MIB + MARGIN + 102 * GIB + 20 * GIB + MARGIN)
+        );
+        assert!(!gpu.fits_resident("h3", &free));
+        gpu.learned.mapped("h3", 80 * GIB);
+        assert_eq!(
+            gpu.want("h3"),
+            Some(700 * MIB + MARGIN + 80 * GIB + 20 * GIB + MARGIN)
+        );
+        assert!(gpu.fits_resident("h3", &free));
+        // The lowest rung is unchanged: it never counted every weight.
+        assert_eq!(gpu.need("h3"), 700 * MIB + MARGIN + 2 * GIB + 20 * GIB + MARGIN);
     }
 
     #[test]

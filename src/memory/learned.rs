@@ -55,6 +55,10 @@ pub struct Plan {
     /// Its weights as stages count them at load (decoded copies included) and their floor.
     pub weights: u64,
     pub weights_floor: u64,
+    /// The weight bytes a call kept on the GPU from its start to its end with nothing evicted:
+    /// what its entrypoint's stages use. A construction may register more than a call maps
+    /// (H3's two denoisers: 101.8 GB registered, 79.9 GB mapped). 0: never measured.
+    pub mapped: u64,
     /// Custody's names (without the generation) of the weight sets its executor asked the
     /// machine for or offered it: what a new executor of it attaches when they are held.
     pub holdings: BTreeSet<String>,
@@ -152,6 +156,12 @@ impl Learned {
         }
     }
 
+    /// The weights a call of `plan` kept mapped without evicting any (`Plan::mapped`).
+    pub fn mapped(&mut self, plan: &str, bytes: u64) {
+        let row = self.plans.entry(plan.into()).or_default();
+        row.mapped = row.mapped.max(bytes);
+    }
+
     /// `plan`'s weights at its last load: what the next load plans before it starts.
     pub fn load(&mut self, plan: &str, weights: u64, floor: u64) {
         let row = self.plans.entry(plan.into()).or_default();
@@ -228,6 +238,8 @@ mod tests {
         learned.call("anima", "height=2048,width=2048", 5 << 30, &methods);
         learned.context("GPU-1/580", 220 << 20);
         learned.load("anima", 6 << 30, 2 << 30);
+        learned.mapped("anima", 5 << 30);
+        learned.mapped("anima", 4 << 30); // only ever grows
         // A row that only ever measured host bytes (an import-only parent) is kept too.
         learned.host("parent:abc", 600 << 20);
         learned.save().unwrap();
@@ -235,6 +247,7 @@ mod tests {
         assert_eq!(learned.plans["parent:abc"].host_bytes, 600 << 20);
         let anima = &learned.plans["anima"];
         assert_eq!((anima.weights, anima.weights_floor), (6 << 30, 2 << 30));
+        assert_eq!(anima.mapped, 5 << 30);
         assert_eq!(learned.peak("anima"), Some(5 << 30));
         assert_eq!(
             learned
