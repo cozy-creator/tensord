@@ -171,12 +171,16 @@ class Host:
         self.py = self.sh("command -v python3").strip()
 
     def sh(self, command: str, check: bool = True) -> str:
+        refused = 0
         while True:   # sshd is the machine agent's child: it is briefly absent while an arm restarts
             done = subprocess.run(self.ssh + [command], capture_output=True, text=True)
             if done.returncode != 255 or self.ssh[0] != "ssh":
                 break
             if "Permission denied" in done.stderr or "authentication failures" in done.stderr:
-                raise RuntimeError(f"ssh authentication refused: {done.stderr.strip()}")
+                refused += 1   # another sshd may answer for a moment while arms switch; a standing refusal is final
+                if refused > 15:
+                    raise RuntimeError(f"ssh authentication refused: {done.stderr.strip()}")
+                time.sleep(2)
             time.sleep(0.2)
         if check and done.returncode:
             raise RuntimeError(f"host command failed ({done.returncode}): {command}\n{done.stderr}")
