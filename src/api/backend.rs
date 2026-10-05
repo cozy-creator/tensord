@@ -1,9 +1,10 @@
 //! One adapter into the owned execution engine. This module owns no journal.
 use super::{
     auth::VerifiedActor,
-    pb,
+    pb, v1,
     workspaces::{UploadedPackage, WorkspaceUploads},
 };
+use std::collections::BTreeMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -53,6 +54,15 @@ pub trait MachineBackend: Send + Sync + 'static {
         _: pb::ModelListQuery,
     ) -> Result<pb::ModelList, Status> {
         unsupported()
+    }
+    /// What each of the caller's installations holds now (`Environment.level`), by
+    /// installation id.
+    fn levels(&self, _: VerifiedActor) -> Result<BTreeMap<String, &'static str>, Status> {
+        Ok(BTreeMap::new())
+    }
+    /// The caller's warm set, each member with what it holds now (`StatusFrame.warm`).
+    fn warm_set(&self, _: VerifiedActor) -> Result<Vec<v1::WarmItem>, Status> {
+        Ok(vec![])
     }
     fn retain_bytes(
         &self,

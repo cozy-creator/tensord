@@ -348,6 +348,7 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS submission_closures(actor TEXT NOT NULL,submission_id TEXT NOT NULL,request_id TEXT NOT NULL,workspace_id TEXT NOT NULL,closed_ms INTEGER NOT NULL,PRIMARY KEY(actor,submission_id));
             CREATE TABLE IF NOT EXISTS installations(actor TEXT NOT NULL,alias TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,alias));
             CREATE TABLE IF NOT EXISTS preparations(actor TEXT NOT NULL,id TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,id));
+            CREATE TABLE IF NOT EXISTS warm_sets(actor TEXT NOT NULL,position INTEGER NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,position));
             CREATE TABLE IF NOT EXISTS public_terminals(execution INTEGER PRIMARY KEY REFERENCES executions(id),outcome BLOB NOT NULL,events BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS run_products(execution INTEGER NOT NULL REFERENCES executions(id),sequence INTEGER NOT NULL,at_ms INTEGER NOT NULL,product BLOB NOT NULL,PRIMARY KEY(execution,sequence));
             CREATE TABLE IF NOT EXISTS run_measurements(execution INTEGER PRIMARY KEY REFERENCES executions(id),measurements BLOB NOT NULL);
@@ -827,6 +828,46 @@ impl Journal {
             .map_err(db_error)?
             .map(|record| serde_json::from_str(&record).map_err(db_error))
             .transpose()
+    }
+
+    /// Replace `actor`'s warm set with `members` (each one's record, in its order).
+    pub fn replace_warm_set(&mut self, actor: &str, members: &[String]) -> io::Result<()> {
+        let transaction = self.connection.transaction().map_err(db_error)?;
+        transaction
+            .execute("DELETE FROM warm_sets WHERE actor=?1", [actor])
+            .map_err(db_error)?;
+        for (position, record) in members.iter().enumerate() {
+            transaction
+                .execute(
+                    "INSERT INTO warm_sets(actor,position,record) VALUES(?1,?2,?3)",
+                    params![actor, position as i64, record],
+                )
+                .map_err(db_error)?;
+        }
+        transaction.commit().map_err(db_error)
+    }
+    /// Every warm set member's record as (actor, record), each actor's in its order.
+    pub fn warm_sets(&self) -> io::Result<Vec<(String, String)>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT actor,record FROM warm_sets ORDER BY actor,position")
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(db_error)?;
+        rows.map(|row| row.map_err(db_error)).collect()
+    }
+    /// Every preparation `actor` bound to `installation`.
+    pub fn preparations_of(&self, actor: &str, installation: &str) -> io::Result<Vec<Preparation>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT record FROM preparations WHERE actor=?1 AND json_extract(record,'$.installation')=?2")
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map(params![actor, installation], |row| row.get::<_, String>(0))
+            .map_err(db_error)?;
+        rows.map(|row| serde_json::from_str(&row.map_err(db_error)?).map_err(db_error))
+            .collect()
     }
 
     pub fn bind_preparation(&mut self, record: Preparation) -> io::Result<Preparation> {

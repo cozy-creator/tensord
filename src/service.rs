@@ -2,11 +2,12 @@
 use crate::{
     catalog::Catalog,
     execution::{process_ended, Engine},
+    gpu_service::{GpuPool, KeptMember, Level, Member},
     journal::{Execution, ProcessBirth, State, SubmissionContext},
 };
 use serde_json::Value;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fs::File,
     io,
     path::Path,
@@ -178,7 +179,42 @@ impl Service {
         for held in self.catalog.installed() {
             gpu.kernel_boot(held);
         }
+        self.restore_warm_sets(&gpu)?;
         self.changed_environment()
+    }
+    /// Each caller's warm set as the journal keeps it, brought up again in the background: a
+    /// restarted machine re-warms without its controller. A member whose installation is gone
+    /// leaves the set.
+    fn restore_warm_sets(&self, gpu: &Arc<GpuPool>) -> io::Result<()> {
+        let kept = self.engine.with_journal(|journal| journal.warm_sets())?;
+        let actors: BTreeSet<&String> = kept.iter().map(|(actor, _)| actor).collect();
+        for actor in actors {
+            let all = kept.iter().filter(|(of, _)| of == actor);
+            let (records, members): (Vec<String>, Vec<Arc<Member>>) = all
+                .clone()
+                .filter_map(|(_, record)| Some((record.clone(), self.restore_member(gpu, actor, record)?)))
+                .unzip();
+            if records.len() < all.count() {
+                self.engine.with_journal(|journal| journal.replace_warm_set(actor, &records))?;
+            }
+            gpu.set_members(actor, members);
+            let (gpu, actor) = (gpu.clone(), actor.clone());
+            std::thread::Builder::new().name("warm-set".into()).spawn(move || gpu.keep(&actor))?;
+        }
+        Ok(())
+    }
+
+    /// One kept member, with its plan as it was bound while the store still holds its weights.
+    fn restore_member(&self, gpu: &GpuPool, actor: &str, record: &str) -> Option<Arc<Member>> {
+        let kept: KeptMember = serde_json::from_str(record).ok()?;
+        let installed = self.engine.installation(actor, &kept.installation).ok()??;
+        let held = self.catalog.resolve(&installed.generation).ok()?;
+        let bound = match kept.preparation.as_str() {
+            "" => None,
+            id => self.engine.preparation(actor, id).ok()?,
+        };
+        let plan = bound.and_then(|bound| gpu.plan(&bound).ok()).filter(|plan| gpu.holds(plan));
+        Some(Member::new(held, plan, Level::named(&kept.level)?))
     }
 
     pub fn submit(

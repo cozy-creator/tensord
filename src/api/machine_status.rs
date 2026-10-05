@@ -10,13 +10,16 @@ pub(super) type Frames = Pin<Box<dyn Stream<Item = Result<v1::StatusFrame, Statu
 
 /// What this machine serves on `cozy.machine.v1`, for clients that adapt to it.
 /// `warm/1`: a warm run with no entrypoint installs its code and makes its model choices
-/// present. `upload/1`: a warm run of one provider source puts it in its weights destination.
+/// present. `warm/2`: a warm run's `set` replaces the caller's warm set, and Status reports the
+/// set and each environment's level. `upload/1`: a warm run of one provider source puts it in
+/// its weights destination.
 pub const CAPABILITIES: &[&str] = &[
     "status/1",
     "run/1",
     "control/1",
     "read/1",
     "warm/1",
+    "warm/2",
     "upload/1",
     "local-models/1",
 ];
@@ -128,9 +131,10 @@ async fn frame<B: MachineBackend>(
     actor: VerifiedActor,
 ) -> Result<v1::StatusFrame, Status> {
     let (backend, store) = (backend.clone(), identity.store.clone());
-    let ((runs, environments), models) = tokio::task::spawn_blocking(move || {
+    let ((runs, environments), warm, models) = tokio::task::spawn_blocking(move || {
         let models = store.as_deref().map(crate::held_models::listing);
-        held(&*backend, actor).map(|held| (held, models.unwrap_or_default()))
+        let held = held(&*backend, actor)?;
+        Ok::<_, Status>((held, backend.warm_set(actor)?, models.unwrap_or_default()))
     })
     .await
     .map_err(|_| Status::internal("machine operation stopped"))??;
@@ -177,6 +181,7 @@ async fn frame<B: MachineBackend>(
         runtime: software.runtime,
         tensorfs: software.tensorfs,
         environments,
+        warm,
         disk: identity.store.as_deref().and_then(disk),
         models: models.models,
         models_bytes: models.bytes,
@@ -205,9 +210,11 @@ fn held(
             .list_packages(actor, pb::PackageListQuery::default())
             .map(|l| l.packages),
     )?;
+    let levels = backend.levels(actor)?;
     let environments = packages
         .into_iter()
         .map(|p| v1::Environment {
+            level: levels.get(&p.installation_id).copied().unwrap_or_default().into(),
             installation: p.installation_id,
             package: p.package,
             release: p.release,

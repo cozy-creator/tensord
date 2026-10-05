@@ -138,6 +138,7 @@ fn write_longform(objects: &Objects) -> String {
 fn film(manifest: &str, reference: &(String, u64), segments: &[&str], hold_at: i64) -> Spec {
     Spec {
         warm: false,
+        set: None,
         job: true,
         parent: String::new(),
         source: Source::Local(manifest.into()),

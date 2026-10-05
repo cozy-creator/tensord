@@ -5,6 +5,7 @@
 //! completes ends the run FAILED (`journal::PREPARING`).
 use crate::{
     api::pb,
+    gpu_service::{without_gpus, KeptMember, Level, Member},
     hub,
     journal::{Execution, Failure, InputFile, Installation, Outcome, Preparation, ResultRecord},
     local_source::LocalSources,
@@ -12,6 +13,7 @@ use crate::{
     published::{declares_models, Providers, Publisher, Request},
     service::{Call, Service},
 };
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Value};
 use tensorfs_core::ids::ObjectRef;
 use std::{
@@ -30,9 +32,21 @@ pub enum Source {
     Models,
 }
 
+/// One member of the warm set a warm run carries (`RunSpec.set`).
+pub struct SetItem {
+    pub source: Source,
+    pub entrypoint: String,
+    pub models: Vec<pb::ModelChoice>,
+    pub level: Level,
+    /// The item as the caller sent it, for Status.
+    pub sent: Vec<u8>,
+}
+
 pub struct Spec {
     /// Prepare only (`kind: warm`): install and download, then succeed.
     pub warm: bool,
+    /// A warm run's whole warm set for its caller, replacing the previous one.
+    pub set: Option<Vec<SetItem>>,
     /// `kind: job`: `entrypoint` names an `@app.job`, run in a deviceless executor.
     pub job: bool,
     /// A child run's parent execution (a job's call through its seam).
@@ -172,6 +186,13 @@ fn own_input(choice: &pb::ModelChoice, job: &str) -> bool {
     }
 }
 
+/// Whether `installation` declares the entrypoint `name`.
+fn declares(installation: &Installation, name: &str) -> Result<bool, Refused> {
+    let interface: Value = serde_json::from_slice(&installation.interface)
+        .map_err(|_| refused("package_interface_invalid", "held interface is corrupt"))?;
+    let rows = interface["entrypoints"].as_array();
+    Ok(rows.is_some_and(|rows| rows.iter().any(|row| row["name"] == name)))
+}
 fn refused(code: &'static str, message: impl Into<String>) -> Refused {
     Refused {
         code,
@@ -487,6 +508,9 @@ impl Runs {
                 asset_bindings: vec![],
             }))
         };
+        if let Some(items) = &spec.set {
+            return self.warm_set(actor, &spec, items, &observe);
+        }
         if let Source::Models = spec.source {
             let models = self.warm_models(actor, id, &spec, &*observe)?;
             return warm_result(json!({}), models);
@@ -527,6 +551,7 @@ impl Runs {
             release,
             hub.clone(),
             &spec,
+            &spec.entrypoint,
             choices,
             Box::new({
                 let observe = observe.clone();
@@ -613,6 +638,87 @@ impl Runs {
         Ok(None)
     }
 
+    /// A warm run's set: every member installed and its weights downloaded as a warm run of it
+    /// alone does, the set kept in the journal, and one pass to bring the members up. The
+    /// result lists each member's `level` and why it is lower than asked (`held_back`).
+    fn warm_set(
+        &self,
+        actor: &str,
+        spec: &Spec,
+        items: &[SetItem],
+        observe: &Arc<impl Fn(&str, u64, u64) + Send + Sync + 'static>,
+    ) -> Result<Option<ResultRecord>, Refused> {
+        let hub = spec.hub.clone().or_else(|| self.own_hub.clone());
+        let (mut members, mut kept, mut rows) = (vec![], vec![], vec![]);
+        for item in items {
+            let (held, release) = match &item.source {
+                Source::Installation(alias) => {
+                    let held = self.service.engine.installation(actor, alias)?;
+                    let absent = || refused("installation_absent", "this machine holds no such installation for this signer");
+                    (Some(held.ok_or_else(absent)?), None)
+                }
+                Source::Release { package, release } => (None, Some((package.clone(), release.clone()))),
+                _ => return Err(refused("invalid_request", "a warm set member names a release or an installation")),
+            };
+            // `installed` stops at the code: nothing of the function is resolved or downloaded.
+            let (entrypoint, choices) = match item.level {
+                Level::Installed => ("", &[][..]),
+                _ => (item.entrypoint.as_str(), &item.models[..]),
+            };
+            let report = observe.clone();
+            let (installation, plan) = self.resolve(
+                actor,
+                held,
+                release,
+                hub.clone(),
+                spec,
+                entrypoint,
+                choices,
+                Box::new(move |stage: &str, done: u64, total: u64| report(stage, done, total)),
+            )?;
+            if item.level > Level::Installed && !declares(&installation, &item.entrypoint)? {
+                return Err(refused(
+                    "invalid_entrypoint",
+                    format!("{} declares no entrypoint {:?}", installation.package, item.entrypoint),
+                ));
+            }
+            kept.push(serde_json::to_string(&KeptMember {
+                installation: installation.alias.clone(),
+                level: item.level.name().into(),
+                preparation: plan.as_ref().map(|plan| plan.id.clone()).unwrap_or_default(),
+                item: STANDARD.encode(&item.sent),
+            })
+            .map_err(io::Error::other)?);
+            rows.push(json!({"package": installation.package, "release": installation.release,
+                "entrypoint": item.entrypoint}));
+            let held = self.service.catalog.resolve(&installation.generation)?;
+            members.push(Member::new(held, plan, item.level));
+        }
+        self.service
+            .engine
+            .with_journal(|journal| journal.replace_warm_set(actor, &kept))?;
+        observe("warming", 0, 0);
+        let holds = match self.service.gpu() {
+            Some(gpu) => {
+                gpu.set_members(actor, members);
+                gpu.keep(actor);
+                gpu.members(actor)
+            }
+            None => members.iter().map(|member| without_gpus(member.level)).collect(),
+        };
+        for (row, (level, held_back)) in rows.iter_mut().zip(holds) {
+            row["level"] = level.name().into();
+            if !held_back.is_empty() {
+                row["held_back"] = held_back.into();
+            }
+        }
+        Ok(Some(ResultRecord {
+            value: json!({"set": rows}),
+            artifacts: vec![],
+            asset_bindings: vec![],
+        }))
+    }
+
     /// The run's installation and model plan: through the Hub when it needs one (a release,
     /// or held code declaring models), else held code with the operator's configured grants.
     #[allow(clippy::too_many_arguments)]
@@ -623,12 +729,13 @@ impl Runs {
         release: Option<(String, String)>,
         hub: Option<hub::Source>,
         spec: &Spec,
+        entrypoint: &str,
         choices: &[pb::ModelChoice],
         observe: crate::published::Observer,
     ) -> Result<(Installation, Option<crate::gpu_service::GpuPlan>), Refused> {
         let needs_hub = held
             .as_ref()
-            .is_none_or(|installed| declares_models(installed, &spec.entrypoint));
+            .is_none_or(|installed| declares_models(installed, entrypoint));
         match (hub, &self.publisher) {
             (Some(source), Some(publisher)) if needs_hub => {
                 let (package, release) = release.unwrap_or_default();
@@ -640,7 +747,7 @@ impl Runs {
                     owner: spec.owner.clone(),
                     binding_revision: spec.binding_revision.clone(),
                     providers: spec.providers.clone(),
-                    entrypoint: spec.entrypoint.clone(),
+                    entrypoint: entrypoint.into(),
                     choices: choices.to_vec(),
                 };
                 let prepared = publisher
@@ -655,7 +762,7 @@ impl Runs {
                         "a release runs with the run's Hub access, and this run carries none",
                     )
                 })?;
-                let plan = self.configured(actor, &installed, &spec.entrypoint, choices)?;
+                let plan = self.configured(actor, &installed, entrypoint, choices)?;
                 Ok((installed, plan))
             }
         }
@@ -728,6 +835,7 @@ impl Runs {
         let prefix = format!("{entrypoint}.");
         Ok(Spec {
             warm: false,
+            set: None,
             job,
             parent: parent.into(),
             source: Source::Installation(context.installation),
@@ -766,7 +874,7 @@ impl Runs {
                     let Source::Installation(alias) = &spec.source else { unreachable!() };
                     let held = runs.service.engine.installation(&actor, alias)?;
                     let (hub, models) = (spec.hub.clone(), spec.models.clone());
-                    runs.resolve(&actor, held, None, hub, &spec, &models, Box::new(|_, _, _| ()))
+                    runs.resolve(&actor, held, None, hub, &spec, &spec.entrypoint, &models, Box::new(|_, _, _| ()))
                 });
             match prepared {
                 Ok((installation, Some(plan))) => {
@@ -1001,6 +1109,7 @@ mod tests {
     fn spec(source: Source, warm: bool, digest: &str) -> Spec {
         Spec {
             warm,
+            set: None,
             job: false,
             parent: String::new(),
             source,
@@ -1109,6 +1218,40 @@ mod tests {
         let warm = settled(&service.engine, &warm.id);
         assert_eq!(warm.state, State::Completed, "{:?}", warm.failure);
         assert_eq!(warm.result.unwrap().value["package"], "local/cozy-machine-cpu-lifecycle");
+
+        // A warm run's set is kept in the journal as sent, replacing the caller's last one.
+        // This function binds no model, so its member holds its code and says why no more.
+        let alias = service.engine.installations("alice").unwrap()[0].alias.clone();
+        let set = |digest: &str, items: Vec<SetItem>| Spec {
+            set: Some(items),
+            ..spec(Source::Models, true, digest)
+        };
+        let member = SetItem {
+            source: Source::Installation(alias.clone()),
+            entrypoint: "steps".into(),
+            models: vec![],
+            level: Level::Imported,
+            sent: b"as sent".to_vec(),
+        };
+        let kept = runs.submit("alice", "set-1", set("s1", vec![member])).unwrap();
+        let kept = settled(&service.engine, &kept.id);
+        assert_eq!(kept.state, State::Completed, "{:?}", kept.failure);
+        let row = kept.result.unwrap().value["set"][0].clone();
+        assert_eq!(row["entrypoint"], "steps");
+        assert_eq!(row["level"], "installed");
+        assert!(row["held_back"].as_str().unwrap().contains("binds no model"), "{row}");
+        let stored = || service.engine.with_journal(|journal| journal.warm_sets()).unwrap();
+        let members = stored();
+        let [(actor, record)] = &members[..] else {
+            panic!("one member kept")
+        };
+        let record: KeptMember = serde_json::from_str(record).unwrap();
+        assert_eq!((actor.as_str(), record.installation, record.level.as_str()), ("alice", alias, "imported"));
+        assert_eq!(STANDARD.decode(record.item).unwrap(), b"as sent");
+        // Its empty set clears it.
+        let cleared = runs.submit("alice", "set-2", set("s2", vec![])).unwrap();
+        assert_eq!(settled(&service.engine, &cleared.id).state, State::Completed);
+        assert!(stored().is_empty());
 
         // Another signer cannot run code it did not write: refused, naming what is missing,
         // and nothing is journaled under its id.
