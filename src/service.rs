@@ -199,7 +199,19 @@ impl Service {
             }
             gpu.set_members(actor, members);
         }
-        gpu.keep_all(&self.engine);
+        // A previous run's executors still exiting fence it, as they fence requests.
+        let (fence, started) = (self.startup_gpu_births.lock().unwrap().clone(), self.started_ticks);
+        let (gpu, engine) = (gpu.clone(), self.engine.clone());
+        std::thread::Builder::new().name("warm-set-restore".into()).spawn(move || {
+            let mut seen = engine.activity_epoch();
+            let alive = |birth: &ProcessBirth| {
+                !process_ended(birth).unwrap_or(false) || crate::process::group_outlives(birth, started)
+            };
+            while fence.iter().any(alive) {
+                seen = engine.wait_activity(seen, Some(std::time::Duration::from_millis(100)));
+            }
+            gpu.keep_all(&engine);
+        })?;
         Ok(())
     }
 
