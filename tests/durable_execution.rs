@@ -1273,6 +1273,7 @@ fn caches_expire_but_held_named_and_uncollected_work_stays() {
         bound: &bound,
         kernels: Some(&caches),
         memo: None,
+        uv_cache: None,
         store: None,
         disk: &|| reclaim::measure(&fixture.root),
     })

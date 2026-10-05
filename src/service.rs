@@ -370,12 +370,16 @@ impl Service {
             }
             let kernels = gpu.as_ref().map(|gpu| gpu.kernel_caches());
             let publisher = self.publisher.lock().unwrap().clone();
+            let uv_cache = publisher
+                .as_ref()
+                .and_then(|publisher| publisher.uv_cache());
             let mut swept = crate::reclaim::sweep(&crate::reclaim::Caches {
                 engine: &self.engine,
                 catalog: &self.catalog,
                 bound: &bound,
                 kernels: kernels.as_ref(),
                 memo: gpu.as_ref().map(|gpu| gpu.memo()),
+                uv_cache: uv_cache.as_deref(),
                 store: match publisher.as_ref().map(|publisher| publisher.caches(self)) {
                     Some(Ok(caches)) => Some(caches),
                     Some(Err(error)) => {

@@ -119,17 +119,20 @@ before the run's terminal state is written. `results/<id>` is removed when the c
 retention and the store holds the public products. The caches manage themselves (`reclaim.rs`, at
 start and every 10 minutes; no purge verb): crash-leftover spools of settled runs go at once;
 logs, collected results, generations (last use: `.hold` mtime), compiled kernels (last read or
-write) and cached models go 7 days after their last use. A disk is low when no more than
+write), cached models and the uv cache's unpacked wheels no environment links (last use: the
+last link or unlink, ctime) go 7 days after their last use. A disk is low when no more than
 TensorFS's reserve is free (2% of the filesystem within 1 to 10 GiB; `ensure::Disk`). A low disk
 drops a plan that lifts it back above the reserve, or only the store's garbage when nothing
-covers that: collected results, settled logs, memoized stages, generations idle for a sweep
-period, then the fewest least recently used cached models, compiled kernels last and only if
-they alone cover what is still missing. Only bytes an unlink frees count: single-link files this
+covers that: collected results, settled logs, memoized stages, unpacked wheels no environment
+links, generations idle for a sweep period, then the fewest least recently used cached models,
+compiled kernels last and only if they alone cover what is still missing. Only bytes an unlink frees count: single-link files this
 process does not hold open, on the measured filesystem. Never evicted: uncollected results,
 journal rows, a generation any run or executor holds (its `.hold` lock) or an installation,
 unfinished run or configured package names, a model a live executor, unfinished run or
 preparation names, a kernel namespace a live executor or kernel boot holds (`kernels/.u<uid>.hold`,
-shared; the sweep takes it exclusively). On a low disk an executor's compiled kernels go to its
+shared; the sweep takes it exclusively), anything in the uv cache while an install holds its
+`.lock` (uv per command, the publisher per environment build). An image's seeded uv cache is never
+touched: environments symlink into it. On a low disk an executor's compiled kernels go to its
 run-scoped JIT directory instead of the persistent store, and a download the disk cannot fit
 fails as `machine_disk_full`.
 
