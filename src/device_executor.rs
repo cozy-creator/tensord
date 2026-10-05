@@ -516,6 +516,10 @@ pub struct PlaneFacts {
     /// Components the executor gave back to make torch room since it started, and their bytes.
     pub paged_out: Option<u64>,
     pub paged_out_bytes: Option<u64>,
+    /// Facts this machine does not read, kept as the executor sent them: they reach
+    /// invokes.jsonl and the journal without a machine release (copy paths, plan inputs).
+    #[serde(flatten)]
+    pub other: BTreeMap<String, Value>,
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -2129,6 +2133,18 @@ fn scan(value: &Value) -> io::Result<()> {
 #[cfg(test)]
 mod codec_tests {
     use super::*;
+
+    #[test]
+    fn plane_facts_this_machine_does_not_read_reach_its_records() {
+        let facts: PlaneFacts = serde_json::from_value(serde_json::json!({
+            "h2d_bytes": 7, "bounce_copy_bytes": 5, "plan_inputs": {"budget": 42}
+        }))
+        .unwrap();
+        assert_eq!(facts.h2d_bytes, Some(7));
+        let written = serde_json::to_value(&facts).unwrap();
+        assert_eq!(written["bounce_copy_bytes"], 5);
+        assert_eq!(written["plan_inputs"]["budget"], 42);
+    }
 
     fn pid(codec: &Codec) -> Option<u32> {
         codec.helper.lock().unwrap().as_ref().map(|h| h.child.id())
