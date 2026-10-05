@@ -101,6 +101,8 @@ pub enum Step {
     Shrink(String, u64),
     /// Revoke a Degree 2 holding the planned call does not read.
     Revoke(String),
+    /// Revoke only enough of a holding's regions for these bytes; the rest stays attachable.
+    Trim(String, u64),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -551,7 +553,12 @@ impl Gpu {
                 .max_by_key(|h| h.idle_ms)
             {
                 round.tried.insert(holding.id.clone());
-                return Decision::Step(Step::Revoke(holding.id.clone()));
+                // Only the shortfall goes: a 12 GB card switching SDXL and Anima revoked the
+                // UNet's 5.3 GB for a 1.6 GB one, and loaded it all again at the next switch.
+                return Decision::Step(match want.map(|want| want - room) {
+                    Some(short) if short < holding.bytes => Step::Trim(holding.id.clone(), short),
+                    _ => Step::Revoke(holding.id.clone()),
+                });
             }
         }
         if room >= need {
@@ -866,6 +873,7 @@ mod tests {
         ];
         let s = sample(16 * GIB, 2 * GIB, &[(11, GIB / 2)]);
         let mut round = Round::default();
+        let short = gpu.want("anima").unwrap() - gpu.room("anima", &s);
         assert_eq!(
             gpu.decide(
                 "anima",
@@ -874,7 +882,7 @@ mod tests {
                 &s,
                 &mut round
             ),
-            Decision::Step(Step::Revoke("sdxl#1".into()))
+            Decision::Step(Step::Trim("sdxl#1".into(), short))
         );
     }
 
@@ -902,14 +910,43 @@ mod tests {
         let want = gpu.want("anima").unwrap();
         assert_eq!(want, GIB / 2 + 5 * GIB + GIB + MARGIN, "its held GiB is not asked again");
         let mut round = Round::default();
+        let short = want - gpu.room("anima", &s);
         assert_eq!(
             gpu.decide("anima", Some(want), gpu.need("anima"), &s, &mut round),
-            Decision::Step(Step::Revoke("GPU-1/sha256:unet#5".into()))
+            Decision::Step(Step::Trim("GPU-1/sha256:unet#5".into(), short))
         );
         assert_eq!(
             gpu.decide("anima", Some(want), gpu.need("anima"), &s, &mut round),
             Decision::Go(gpu.room("anima", &s)),
             "nothing else of another plan's to revoke, and its own stays"
+        );
+    }
+
+    #[test]
+    fn a_holding_larger_than_the_shortfall_is_trimmed_by_the_shortfall() {
+        let mut gpu = Gpu::default();
+        loaded(&mut gpu, "anima", 11, 6 * GIB, GIB);
+        let held = |id: &str, bytes| Holding {
+            id: id.into(),
+            bytes,
+            readers: vec![10],
+            idle_ms: 5_000,
+            revoking: false,
+        };
+        gpu.holdings = vec![held("GPU-1/sha256:unet#5", 5 * GIB)];
+        let s = sample(12 * GIB, 5 * GIB, &[(11, GIB / 2)]);
+        let want = gpu.want("anima").unwrap();
+        let short = want - gpu.room("anima", &s);
+        assert!(0 < short && short < 5 * GIB);
+        assert_eq!(
+            gpu.decide("anima", Some(want), gpu.need("anima"), &s, &mut Round::default()),
+            Decision::Step(Step::Trim("GPU-1/sha256:unet#5".into(), short))
+        );
+        // A holding the shortfall exceeds goes whole.
+        gpu.holdings = vec![held("GPU-1/sha256:te#4", GIB)];
+        assert_eq!(
+            gpu.decide("anima", Some(want), gpu.need("anima"), &s, &mut Round::default()),
+            Decision::Step(Step::Revoke("GPU-1/sha256:te#4".into()))
         );
     }
 
@@ -1021,9 +1058,10 @@ mod tests {
         gpu.holdings = vec![held("GPU-1/sha256:other#1")];
         let need = gpu.spawn_need("sdxl");
         assert_eq!(need, gpu.context_estimate() + GIB + 7 * GIB);
+        let short = need - gpu.room("sdxl", &s);
         assert_eq!(
             gpu.decide("sdxl", Some(need), need, &s, &mut round),
-            Decision::Step(Step::Revoke("GPU-1/sha256:other#1".into()))
+            Decision::Step(Step::Trim("GPU-1/sha256:other#1".into(), short))
         );
     }
 

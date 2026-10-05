@@ -291,10 +291,13 @@ pub enum DeviceCommand {
     },
     /// Offer the machine every GPU region filled and not shared yet (`weights.attach/1`).
     Share,
-    /// Release the machine's GPU regions of one layout (`weights.revoke/1`).
+    /// Release the machine's GPU regions of one layout (`weights.revoke/1`), or only
+    /// `regions` of it (`weights.trim/1`).
     Revoke {
         layout: String,
         generation: u64,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        regions: Vec<u32>,
     },
     Unload {
         construction: String,

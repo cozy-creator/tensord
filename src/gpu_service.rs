@@ -1837,6 +1837,67 @@ impl GpuPool {
                 log_released(custody.lock().unwrap().collect());
                 return Ok(true);
             }
+            Step::Trim(id, bytes) => {
+                let Some(custody) = &self.custody else {
+                    return Ok(false);
+                };
+                let found = custody
+                    .lock()
+                    .unwrap()
+                    .holdings()
+                    .into_iter()
+                    .find(|h| holding_id(&h.key, h.generation) == *id);
+                let Some(holding) = found else {
+                    return Ok(false);
+                };
+                let regions = custody.lock().unwrap().trim_regions(
+                    &holding.key,
+                    holding.generation,
+                    *bytes,
+                );
+                // Every reader must be an executor here that trims (`weights.trim/1`); an
+                // older one, or a reader this service does not hold, gets the whole revoke.
+                let trims = |s: &Session| s.executor.hello.offers("weights.trim/1");
+                let readers = sessions
+                    .values()
+                    .filter(|s| holding.readers.contains(&s.executor.birth))
+                    .collect::<Vec<_>>();
+                let Some(regions) = regions.filter(|_| {
+                    readers.len() == holding.readers.len() && readers.iter().all(|s| trims(s))
+                }) else {
+                    return self.carry_out(&Step::Revoke(id.clone()), sessions);
+                };
+                for session in sessions
+                    .values_mut()
+                    .filter(|s| holding.readers.contains(&s.executor.birth))
+                {
+                    let reply = session.executor.command(
+                        &DeviceCommand::Revoke {
+                            layout: holding.key.layout.clone(),
+                            generation: holding.generation,
+                            regions: regions.clone(),
+                        },
+                        &mut device_executor::Baseline,
+                    )?;
+                    if !reply.ok {
+                        // Its mapping stays a reference: the regions stay charged, nothing freed.
+                        eprintln!("trim of {} refused: {} {}", id, reply.code, reply.detail);
+                        return Ok(false);
+                    }
+                }
+                let freed =
+                    custody
+                        .lock()
+                        .unwrap()
+                        .trim(&holding.key, holding.generation, &regions);
+                eprintln!(
+                    "resident GPU weights trimmed: {} on {}, {freed} bytes in {} regions",
+                    holding.key.layout,
+                    holding.key.device,
+                    regions.len()
+                );
+                return Ok(true);
+            }
             Step::Unmap(plan) => {
                 let Some(session) = sessions.get_mut(plan) else {
                     return Ok(false);
@@ -2897,6 +2958,7 @@ fn detach(custody: &Mutex<ResidentCustody>, executor: &mut DeviceExecutor) -> io
             &DeviceCommand::Revoke {
                 layout: key.layout.clone(),
                 generation,
+                regions: vec![],
             },
             &mut device_executor::Baseline,
         )?;
@@ -2935,6 +2997,7 @@ fn release_revoked(
             &DeviceCommand::Revoke {
                 layout: key.layout.clone(),
                 generation,
+                regions: vec![],
             },
             &mut device_executor::Baseline,
         )?;

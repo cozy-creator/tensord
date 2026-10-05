@@ -227,6 +227,52 @@ impl ResidentCustody {
         Ok(held.readers.iter().map(|r| r.birth.clone()).collect())
     }
 
+    /// The regions of a Ready holding that give at least `bytes`, its highest regions first;
+    /// never all of them (that is a revoke). None: not held, not Ready, or not partly.
+    pub fn trim_regions(&self, key: &HoldingKey, generation: u64, bytes: u64) -> Option<Vec<u32>> {
+        let held = self
+            .holdings
+            .get(key)
+            .filter(|h| h.generation == generation && h.phase == Phase::Ready)?;
+        let mut order: Vec<&SharedRegion> = held.regions.iter().collect();
+        order.sort_by_key(|r| std::cmp::Reverse(r.region));
+        let (mut picked, mut sum) = (vec![], 0);
+        for region in order {
+            if sum >= bytes {
+                break;
+            }
+            sum += region.chunks.iter().sum::<u64>();
+            picked.push(region.region);
+        }
+        (sum >= bytes && picked.len() < held.regions.len()).then_some(picked)
+    }
+
+    /// Every reader let `regions` go: their fds close here, the last references to their
+    /// memory. The holding keeps the rest, attachable. Returns the bytes freed.
+    pub fn trim(&mut self, key: &HoldingKey, generation: u64, regions: &[u32]) -> u64 {
+        let Some(held) = self
+            .holdings
+            .get_mut(key)
+            .filter(|h| h.generation == generation)
+        else {
+            return 0;
+        };
+        let mut fds = std::mem::take(&mut held.fds).into_iter();
+        let (mut kept, mut freed) = (vec![], 0);
+        for region in std::mem::take(&mut held.regions) {
+            let own: Vec<OwnedFd> = fds.by_ref().take(region.chunks.len()).collect();
+            if regions.contains(&region.region) {
+                freed += region.chunks.iter().sum::<u64>();
+            } else {
+                held.fds.extend(own);
+                kept.push(region);
+            }
+        }
+        held.regions = kept;
+        held.bytes -= freed;
+        freed
+    }
+
     /// A reader answered `revoke`: it unmapped and released the generation after its queued
     /// work. A reader that could not stays charged until its process ends.
     pub fn released(&mut self, key: &HoldingKey, generation: u64, birth: &ProcessBirth) {
@@ -550,6 +596,30 @@ mod tests {
         };
         let refused = custody.offer(named, "h3/dit", one(), fds(1), mine().0);
         assert!(refused.is_err());
+    }
+
+    #[test]
+    fn a_trim_closes_the_highest_regions_and_keeps_the_rest_attachable() {
+        let mut custody = ResidentCustody::default();
+        let three = vec![
+            region(0, vec![GRANULE]),
+            region(1, vec![GRANULE, GRANULE]),
+            region(2, vec![4 * GRANULE]),
+        ];
+        let Offered::Kept { generation } = custody
+            .offer(key("a"), "sdxl/unet", three, fds(4), mine().0)
+            .unwrap()
+        else {
+            panic!("kept")
+        };
+        assert_eq!(custody.trim_regions(&key("a"), generation, 5 * GRANULE), Some(vec![2, 1]));
+        assert_eq!(custody.trim_regions(&key("a"), generation, 7 * GRANULE), None, "all of it");
+        assert_eq!(custody.trim(&key("a"), generation, &[2, 1]), 6 * GRANULE);
+        let held = &custody.holdings()[0];
+        assert_eq!(held.bytes, GRANULE);
+        let reader = mine().0;
+        let attached = custody.attach(&key("a"), reader).unwrap().unwrap();
+        assert_eq!((attached.regions, attached.fds.len()), (vec![region(0, vec![GRANULE])], 1));
     }
 
     #[test]
