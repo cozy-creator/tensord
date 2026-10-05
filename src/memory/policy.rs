@@ -907,6 +907,41 @@ mod tests {
     }
 
     #[test]
+    fn a_report_from_before_an_export_hides_external_memory() {
+        // 16 GiB card with 1 GiB of foreign memory. SDXL's idle executor holds a 0.5 GiB
+        // context; its 7 GiB of weights are custody's since it exported them.
+        let mut gpu = Gpu::default();
+        loaded(&mut gpu, "sdxl", 10, 7 * GIB, 3 * GIB);
+        gpu.holdings = vec![Holding {
+            id: "GPU-1/sha256:sdxl#1".into(),
+            bytes: 7 * GIB,
+            readers: vec![10],
+            idle_ms: 0,
+            revoking: false,
+        }];
+        let s = Sample {
+            processes: None,
+            ..sample(16 * GIB, 16 * GIB - 7 * GIB - GIB / 2 - GIB, &[])
+        };
+        let room = 16 * GIB - HEADLESS_FLOOR - 7 * GIB - GIB;
+        // Its report from before the export counts the weights again: the foreign GiB vanishes.
+        let stale = Facts {
+            process: Some(7 * GIB + GIB / 2),
+            ..Facts::default()
+        };
+        gpu.observe("sdxl", stale, None);
+        assert_eq!(gpu.external(&s), 0);
+        assert_eq!(gpu.room("sdxl", &s), room + GIB);
+        // The export's own reply says what the process still holds.
+        let fresh = Facts {
+            process: Some(GIB / 2),
+            ..Facts::default()
+        };
+        gpu.observe("sdxl", fresh, None);
+        assert_eq!((gpu.external(&s), gpu.room("sdxl", &s)), (GIB, room));
+    }
+
+    #[test]
     fn a_spawn_reservation_never_hides_foreign_memory() {
         // rtx-3070 with a 6 GiB pool: 2 GiB of ballast, no per-process NVML in the container.
         // Anima (5.4 GiB of weights, 1.4 GiB of activations) was measured in an earlier run.

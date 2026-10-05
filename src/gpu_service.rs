@@ -2335,6 +2335,13 @@ impl GpuPool {
             let shared = session
                 .executor
                 .command(&DeviceCommand::Share, &mut callbacks);
+            if let Ok(reply) = &shared {
+                // What it exported is custody's to count now: its report says what it still
+                // holds. Its last one counted those bytes too, which hid that much external
+                // memory and raised its next cap by it (run 4391: 22.52 GB for 21.84 GB of room).
+                let facts = plane_facts(reply.plane.as_ref());
+                self.observe(&plan.id, plan.degree, facts, &reply.rank_planes, None);
+            }
             let released = shared.and_then(|_| release_revoked(custody, &mut session.executor));
             if let Err(error) = released {
                 eprintln!("device weights share/revoke failed; replacing the executor: {error}");
