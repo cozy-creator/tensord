@@ -16,8 +16,10 @@ This increment changes the tracked gate harness only:
 - Failed priming is terminal even when timed failures are collected for diagnosis.
 - Collected failed cells and incomplete qualification return a nonzero exit status.
 - Qualification requires every planned candidate cell and every low-memory
-  request's successful control and verified file-hash receipts. Exact byte identity
-  is the current same-GPU acceptance bar; PSNR remains separate diagnostic data.
+  request's successful control and verified file-hash receipts. The quality bar is
+  PSNR to the same-GPU full-card control: at least 30 dB, or reviewed as good by a
+  person (owner, 2026-10-04: lossy is fine if the image is good). Byte identity is
+  reported, not required.
 
 The report's overall `pass` includes failures of either engine. R1's per-candidate
 capacity/source verdict is separate; ComfyUI running out of memory supplies no

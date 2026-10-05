@@ -21,7 +21,7 @@ def image(path: Path, seed: int, noise: int = 0) -> str:
 
 
 def run(tmp_path: Path, rust_disk=2 << 30, cold_s=23.0, failed=False, noise=0, missing_control=False,
-        missing_receipt=False, tampered=False, missing_cell=False, changed_input=False) -> dict:
+        missing_receipt=False, tampered=False, missing_cell=False, changed_input=False, reviewed=None) -> dict:
     cells = {"3gib-grouped": {"budget": "3GiB", "requests": [{"model": "sdxl", "input": {"prompt": "p", "seed": seed}} for seed in (1, 2)]},
              "cold-sdxl": {"cold": True, "requests": [{"model": "sdxl", "input": {"prompt": "c", "seed": 9}}]}}
     (tmp_path / "manifest.json").write_text(json.dumps({"cells": cells, "r1": {"baseline": {"cold-sdxl": 22.2}}}))
@@ -51,6 +51,8 @@ def run(tmp_path: Path, rust_disk=2 << 30, cold_s=23.0, failed=False, noise=0, m
         rows.pop()
     if changed_input:
         rows[2]["requests"][0]["input"]["steps"] = 10
+    if reviewed is not None:
+        (tmp_path / "reviewed.json").write_text(json.dumps(reviewed))
     return gate.r1(tmp_path, rows)
 
 
@@ -73,10 +75,19 @@ def test_a_cold_start_over_ten_percent_slower_than_comfyui_on_the_same_pod_fails
     assert not run(tmp_path, cold_s=25.0)["pass"]
 
 
-def test_changed_bytes_fail_and_psnr_remains_diagnostic(tmp_path):
+def test_lossy_output_above_30_db_passes_and_byte_identity_is_reported(tmp_path):
+    v = run(tmp_path, noise=4)   # small rounding-like differences: changed bytes, PSNR well above 30 dB
+    cell = next(c for c in v["cells"] if c["cell"] == "3gib-grouped")
+    assert v["pass"] and not v["review"]
+    assert cell["byte_identical"] == [False, True] and 30 < cell["psnr_db"][0] < float("inf")
+
+
+def test_under_30_db_fails_until_a_person_reviews_it_as_good(tmp_path):
     v = run(tmp_path, noise=60)
     assert not v["pass"] and len(v["review"]) == 1 and v["review"][0]["psnr_db"] < 30
     assert next(c for c in v["cells"] if c["cell"] == "3gib-grouped")["psnr_db"][1] == float("inf")
+    assert not run(tmp_path, noise=60, reviewed=[{"cell": "3gib-grouped", "seed": 1, "good": False, "by": "owner"}])["pass"]
+    assert run(tmp_path, noise=60, reviewed=[{"cell": "3gib-grouped", "seed": 1, "good": True, "by": "owner"}])["pass"]
 
 
 def test_missing_control_cannot_qualify(tmp_path):
