@@ -498,6 +498,13 @@ pub struct PlaneFacts {
     pub lora_bake_ms: Option<f64>,
     /// LoRA'd weights whose baked bytes came from custody: no bake in this executor.
     pub lora_attached: Option<u64>,
+    /// torch's allocator short of room since the executor started: times it dropped its whole
+    /// cache to place one allocation, out-of-memory errors it raised, and the executor's own
+    /// cache releases with their bytes. A call with room adds none of the first two.
+    pub alloc_retries: Option<u64>,
+    pub alloc_ooms: Option<u64>,
+    pub cache_releases: Option<u64>,
+    pub cache_released_bytes: Option<u64>,
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
