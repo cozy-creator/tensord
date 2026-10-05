@@ -18,6 +18,7 @@ pub const CAPABILITIES: &[&str] = &[
     "read/1",
     "warm/1",
     "upload/1",
+    "local-models/1",
 ];
 
 const LIVE: [&str; 4] = ["queued", "starting", "running", "paused"];
