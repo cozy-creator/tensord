@@ -725,7 +725,9 @@ impl Engine {
             && record.pause_actor.is_some()
             && record.cancel_actor.is_none();
         if stopping {
-            if let Some(ActiveRun::Managed(stop)) = self.active.lock().unwrap().get(id).cloned() {
+            // Released before `stop` runs: a job's stop pauses its children through here.
+            let active = self.active.lock().unwrap().get(id).cloned();
+            if let Some(ActiveRun::Managed(stop)) = active {
                 let _ = stop();
             }
         }

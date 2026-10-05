@@ -19,7 +19,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tensorfs_core::{sha256, store::Store};
 
@@ -218,14 +218,27 @@ fn paused_and_unstarted_runs_keep_their_objects(restart: bool) {
         let children = children(&engine, &paused.id);
         children.len() == 2 && children[0].state == State::Completed
     });
+    // Paused once its second segment is claimed: the window where nothing of it has run yet.
+    let segment = children(&engine, &paused.id)[1].id.clone();
+    until(&engine, &segment, "was claimed", |r| r.state != State::Queued);
     jobs.pause(&engine.get(&paused.id).unwrap(), ACTOR).unwrap();
+    let paused_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
     until(&engine, &paused.id, "rested paused", |r| r.state == State::Paused);
-    // Its finished child's result is what the parent adopted; the held one rests paused.
+    // Its finished child's result is what the parent adopted. The second segment is held if
+    // its code had not started when the job paused, and runs to its end if it had: nothing
+    // starts after the pause.
     for child in children(&engine, &paused.id) {
         until(&engine, &child.id, "rested", |r| matches!(r.state, State::Completed | State::Paused));
     }
-    let rested: Vec<_> = children(&engine, &paused.id).iter().map(|c| c.state).collect();
-    assert_eq!(rested, [State::Completed, State::Paused]);
+    let rested = children(&engine, &paused.id);
+    assert_eq!(rested[0].state, State::Completed);
+    let segment = &rested[1];
+    assert!(
+        segment.state == State::Paused || segment.started_at_ms <= paused_at,
+        "the second segment started after its job paused: {:?} at {} (paused by {paused_at})",
+        segment.state,
+        segment.started_at_ms
+    );
     // `unstarted`: accepted and paused before its root ever ran (no segment 9: none holds).
     let unstarted = machine
         .runs
