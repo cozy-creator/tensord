@@ -1936,9 +1936,10 @@ impl Journal {
     }
 
     /// Pause a run: an unstarted attempt rests at once, a preparing one once prepared, a
-    /// started one when it stops (`Outcome::Paused`). `unstarted_only` holds only a queued run
-    /// (a paused job's children: started work runs to its end). Finished, canceled and already
-    /// pausing runs are unchanged.
+    /// started one when it stops (`Outcome::Paused`). `unstarted_only` holds only an attempt
+    /// whose package code has not started: queued, or claimed and not yet authorized (`running`
+    /// then refuses it). A paused job's children: started work runs to its end. Finished,
+    /// canceled and already pausing runs are unchanged.
     pub fn pause(&mut self, id: &str, actor: &str, unstarted_only: bool) -> io::Result<Execution> {
         if actor.is_empty() {
             return Err(io::Error::new(
@@ -1951,7 +1952,7 @@ impl Journal {
                 || record.state == State::Paused
                 || record.cancel_actor.is_some()
                 || record.pause_actor.is_some()
-                || (unstarted_only && record.state != State::Queued)
+                || (unstarted_only && !matches!(record.state, State::Queued | State::Starting))
             {
                 return Ok(false);
             }
@@ -2093,7 +2094,9 @@ impl Journal {
         progress: Option<&ProgressSnapshot>,
     ) -> io::Result<Execution> {
         self.update_observed(id, progress, |record| {
-            if record.state.terminal() {
+            // A paused run's attempt has ended: a late outcome of it (its executor's shutdown
+            // failing) changes nothing.
+            if record.state.terminal() || record.state == State::Paused {
                 return Ok(false);
             }
             if record.state == State::Queued {
@@ -2235,4 +2238,60 @@ fn public_prior(
     )
     .optional()
     .map_err(db_error)
+}
+
+#[cfg(test)]
+mod pause_tests {
+    use super::*;
+
+    /// A paused job's child that is claimed but not yet authorized has run no package code:
+    /// the pause holds it, and its authorization is refused. One already running is not held.
+    #[test]
+    fn a_held_pause_takes_a_claimed_attempt_and_leaves_a_running_one() {
+        let root = std::env::temp_dir().join(format!("cm-pause-{}", uuid::Uuid::new_v4()));
+        let mut journal = Journal::open(&root).unwrap();
+        let birth = |pid| ProcessBirth {
+            pid,
+            boot_id: "boot".into(),
+            start_ticks: 1,
+        };
+        let mut claimed = |key: &str| {
+            let invocation = Invocation {
+                package: "audit/package".into(),
+                input: serde_json::json!({}),
+                ..Default::default()
+            };
+            let id = journal.accept(key, invocation).unwrap().id;
+            assert!(journal.claim(&id).unwrap());
+            journal
+                .register_process(&id, birth(id.parse().unwrap()))
+                .unwrap();
+            id
+        };
+        let (starting, started) = (claimed("starting"), claimed("started"));
+        journal.running(&started, None).unwrap();
+
+        let held = journal.pause(&starting, "alice", true).unwrap();
+        assert_eq!(
+            (held.state, held.pause_actor.as_deref()),
+            (State::Starting, Some("alice"))
+        );
+        let refused = journal.running(&starting, None).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(
+            journal.finish(&starting, Outcome::Paused).unwrap().state,
+            State::Paused
+        );
+
+        // The held attempt has ended: its executor failing to shut down changes nothing.
+        let late = Outcome::Failed("device executor ended".into());
+        assert_eq!(
+            journal.finish(&starting, late).unwrap().state,
+            State::Paused
+        );
+
+        let running = journal.pause(&started, "alice", true).unwrap();
+        assert_eq!((running.state, running.pause_actor), (State::Running, None));
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
