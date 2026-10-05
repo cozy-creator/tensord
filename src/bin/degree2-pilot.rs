@@ -177,9 +177,6 @@ fn exec(
         "pilot",
         &configured("CUDA_VISIBLE_DEVICES").unwrap_or_default(),
     )?;
-    if let Some(alloc_conf) = configured("PYTORCH_CUDA_ALLOC_CONF") {
-        seal.alloc_conf = alloc_conf;
-    }
     if let Some(threads) = configured("OMP_NUM_THREADS") {
         seal.threads = threads.parse().map_err(io::Error::other)?;
     }

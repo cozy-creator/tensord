@@ -21,8 +21,7 @@ PYTHON -I -m cozy_runtime.internal.trampoline --expect-parent <pid> --oom-adj 10
 - Environment (`Seal::environment`, the only place it is composed): the machine's environment
   without credential-like names or Runtime's erased prefixes (`COZY_`, `CUDA_`, `PYTORCH_`,
   `NCCL_`, `HF_`, `TMPDIR`, …), then configured locations, then the seal, which always wins:
-  `CUDA_VISIBLE_DEVICES`, `PYTORCH_CUDA_ALLOC_CONF` (default `expandable_segments:True`),
-  `OMP_NUM_THREADS` (4), NCCL group seal for degree > 1, `COZY_HOME` (per-UID home, so the
+  `CUDA_VISIBLE_DEVICES`, `OMP_NUM_THREADS` (4), NCCL group seal for degree > 1, `COZY_HOME` (per-UID home, so the
   attention qualification is cached), JIT caches and `TMPDIR` (per machine run and generation),
   and the persistent per-UID kernel store.
 - The SDK trampoline applies parent-death, no_new_privs and OOM ordering before imports. Every
