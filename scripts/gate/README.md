@@ -14,8 +14,9 @@ python3 gate.py report OUT                # OUT/summary.json; with an `r1` key i
 `"control": "rust"` in the manifest. A cell passes with:
 - zero failed requests and no NVRM Xid (a failed cell counts; nothing is left out);
 - disk reads at most 1.5× the reference engine's in the same cell on the same pod;
-- a cold cell's submit → CLI exit with the image saved at most 10% over the previous candidate's (`baseline`),
-  reported beside the reference's (server start included).
+- a cold cell's submit → CLI exit with the image saved at most 1.10× the reference's on the same pod (server start
+  included); the previous candidate's figure (`baseline`) and the pod's host load (median load1 and CPU pressure over
+  the cell) are reported beside it, since a shared host slows CPU-bound startup for both engines.
 
 Each low-memory (`budget`) request is run again, untimed, on the full card after every timed cell (`control`); its
 output's PSNR to that control is reported, and anything under 30 dB goes to `review` for a person to look at. A flag,

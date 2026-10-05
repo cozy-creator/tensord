@@ -41,7 +41,7 @@ def test_a_clean_run_passes_and_reports_cold_start_beside_comfyui(tmp_path):
     v = run(tmp_path)
     assert v["pass"] and not v["review"]
     cold = next(c for c in v["cells"] if c["cell"] == "cold-sdxl")
-    assert cold["cold_s"] == 23.0 and cold["reference_cold_s"] == 22.0 and abs(cold["cold_vs_previous"] - 0.036) < 1e-3
+    assert cold["cold_s"] == 23.0 and cold["reference_cold_s"] == 22.0 and cold["cold_ratio"] == 1.045 and cold["previous_cold_s"] == 22.2
 
 
 def test_a_failed_request_fails_the_verdict(tmp_path):
@@ -52,7 +52,7 @@ def test_disk_reads_over_one_and_a_half_times_comfyui_fail(tmp_path):
     assert not run(tmp_path, rust_disk=4 << 30)["pass"]
 
 
-def test_a_cold_start_over_ten_percent_slower_than_the_previous_candidate_fails(tmp_path):
+def test_a_cold_start_over_ten_percent_slower_than_comfyui_on_the_same_pod_fails(tmp_path):
     assert not run(tmp_path, cold_s=25.0)["pass"]
 
 

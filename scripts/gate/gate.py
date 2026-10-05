@@ -641,13 +641,16 @@ def psnr(a: str, b: str) -> float:
 
 def r1(out: Path, rows: list[dict]) -> dict:
     """R1 per cell (CUTOVER.md section 4): zero failures; disk reads at most 1.5x the reference engine's; a cold start,
-    submit to the CLI's exit with the image saved, at most 10% over the previous candidate's and shown beside the
-    reference's (server start included); each low-memory output's PSNR to the unconstrained control on the same pod,
-    under 30 dB flagged for a person to look at (diffusion amplifies rounding: a flag, not a failure); no Xid."""
+    submit to the CLI's exit with the image saved, at most 1.10x the reference engine's on the same pod (server start
+    included), with the previous candidate's figure and the pod's host load beside it; each low-memory output's PSNR to
+    the unconstrained control on the same pod, under 30 dB flagged for a person to look at (diffusion amplifies
+    rounding: a flag, not a failure); no Xid."""
     m = json.loads((out / "manifest.json").read_text())
     plan, cells = m["r1"], {(r["arm"], r["cell"]): r for r in rows if r.get("event") == "cell"}
     cand, ref, baseline = plan.get("candidate", "rust"), plan.get("reference", "comfy"), plan.get("baseline", {})
     control = {(q["prompt"], q["seed"]): q for q in (cells.get((cand, "control")) or {}).get("requests", []) if q.get("images")}
+    samples = [json.loads(line) for line in (out / "samples.jsonl").read_text().splitlines() if line.strip()] \
+        if (out / "samples.jsonl").exists() else []
     verdict: dict = {"pass": True, "cells": [], "review": []}
     for (arm, name), c in cells.items():
         if arm != cand or name == "control":
@@ -659,12 +662,18 @@ def r1(out: Path, rows: list[dict]) -> dict:
         if other and other["ok"]:
             row["disk_ratio"] = round(c["disk_read_bytes"] / max(other["disk_read_bytes"], 1), 2)
             row["disk_gib"] = [round(c["disk_read_bytes"] / 2**30, 2), round(other["disk_read_bytes"] / 2**30, 2)]
+        window = [x["load"] for x in samples if c["t_first"] + c["offset"] <= x["t"] <= c["t_end"] + c["offset"]]
+        if window:   # the pod's host, shared with other tenants: CPU-bound work slows with it
+            row["host_load1"] = round(statistics.median(x["load1"] for x in window), 1)
+            row["host_cpu_pressure"] = round(statistics.median(x.get("cpu_some_avg10") or 0 for x in window), 1)
         if spec.get("cold") and c["requests"] and c["requests"][0].get("ok"):
             q = c["requests"][0]
             row["cold_s"] = round(q["done"] - q["submit"], 2)   # what the user sees
-            row["reference_cold_s"] = round(other["total_s"] + (other.get("startup_s") or 0), 2) if other and other["ok"] else None
-            if name in baseline:
-                row["cold_vs_previous"] = round(row["cold_s"] / baseline[name] - 1, 4)
+            if other and other["ok"]:
+                row["reference_cold_s"] = round(other["total_s"] + (other.get("startup_s") or 0), 2)
+                row["cold_ratio"] = round(row["cold_s"] / row["reference_cold_s"], 3)
+            if name in baseline:   # reported, not judged: another pod's host
+                row["previous_cold_s"] = baseline[name]
         if spec.get("budget"):
             row["psnr_db"] = []
             for q in c["requests"]:
@@ -676,7 +685,7 @@ def r1(out: Path, rows: list[dict]) -> dict:
                         verdict["review"].append({"cell": name, "seed": q["seed"], "psnr_db": db, "image": q["images"][0]["path"],
                                                   "control": twin["images"][0]["path"]})
         row["pass"] = (row["failed"] == 0 and not row["xid"] and row.get("disk_ratio", 0) <= 1.5
-                       and row.get("cold_vs_previous", 0) <= 0.10)
+                       and row.get("cold_ratio", 0) <= 1.10)
         verdict["pass"] &= row["pass"]
         verdict["cells"].append(row)
     return verdict
