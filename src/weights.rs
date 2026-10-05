@@ -51,6 +51,18 @@ pub struct Grant {
     /// Refuses once the attempt is no longer current (canceled, paused, ended).
     pub current: Arc<dyn Fn() -> bool + Send + Sync>,
     opened: Mutex<BTreeMap<String, String>>,
+    /// Publications attempted and not yet in the run's log.
+    uploads: Mutex<Vec<Upload>>,
+}
+
+/// One output's publication into its destination: when it ran, and its refusal if any.
+pub struct Upload {
+    pub output: String,
+    pub transaction: String,
+    pub destination: String,
+    pub called_ms: i64,
+    pub finished_ms: i64,
+    pub error: Option<String>,
 }
 
 impl Grant {
@@ -72,7 +84,13 @@ impl Grant {
             destination,
             current,
             opened: Mutex::new(BTreeMap::new()),
+            uploads: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The publications attempted since the last call, for the run's log.
+    pub fn take_uploads(&self) -> Vec<Upload> {
+        std::mem::take(&mut *self.uploads.lock().unwrap())
     }
 }
 
@@ -232,7 +250,17 @@ impl Weights {
             .apply_repository(current.as_deref(), &mutation, &Fault::default())
             .map_err(tfs)?;
         if let Some(destination) = &grant.destination {
-            self.publish(grant, destination, slot, &receipt.manifest)?;
+            let called_ms = crate::machine::lifecycle::now_ms();
+            let published = self.publish(grant, destination, slot, &receipt.manifest);
+            grant.uploads.lock().unwrap().push(Upload {
+                output: slot.clone(),
+                transaction: frame.transaction.clone(),
+                destination: destination.repository.trim_start_matches("model://").into(),
+                called_ms,
+                finished_ms: crate::machine::lifecycle::now_ms(),
+                error: published.as_ref().err().map(|(_, message)| message.clone()),
+            });
+            published?;
         }
         let mut answer = Answer::ok(frame.seq);
         answer.request_id = grant.run.clone();
@@ -268,7 +296,14 @@ impl Weights {
             streams: 8,
         })
         .map(drop)
-        .map_err(|e| ("weights_publication_failed", e.to_string()))
+        .map_err(|e| {
+            let message = if e.code == tensorfs_core::err::Code::HUB_REFUSED {
+                format!("publication was refused before its commit: {}", e.detail)
+            } else {
+                format!("publication failed before its commit: {e}")
+            };
+            ("weights_publication_failed", message)
+        })
     }
 }
 
