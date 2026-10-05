@@ -173,42 +173,12 @@ impl Service {
         }
         *current = Some(gpu.clone());
         drop(current);
-        // Parents of the most recently used generations first, while the host has room.
-        let plans = self.recent_gpu_plans(&gpu);
-        let recent: Vec<_> = plans.iter().map(|(held, _)| held.clone()).collect();
-        let others = self.catalog.installed().into_iter().filter(|held| {
-            !recent
-                .iter()
-                .any(|r| r.record.identity == held.record.identity)
-        });
-        for held in recent.clone().into_iter().chain(others) {
-            gpu.kernel_boot(held.clone());
-            gpu.prespawn(held);
+        // Kernels compile at boot. An executor starts for a request or an install: nothing
+        // here prepares a package nobody asked for.
+        for held in self.catalog.installed() {
+            gpu.kernel_boot(held);
         }
-        // A previous run's executors still exiting fence it, as they fence requests.
-        let fence = self.startup_gpu_births.lock().unwrap().clone();
-        gpu.prewarm(&self.engine, plans, fence);
         self.changed_environment()
-    }
-    /// Each installed GPU generation's most recently used construction, newest first.
-    fn recent_gpu_plans(
-        &self,
-        gpu: &crate::gpu_service::GpuPool,
-    ) -> Vec<(crate::catalog::HeldGeneration, crate::gpu_service::GpuPlan)> {
-        let mut seen = std::collections::BTreeSet::new();
-        let mut plans = vec![];
-        for preparation in self.engine.recent_preparations(64).unwrap_or_default() {
-            let Ok(plan) = gpu.plan(&preparation) else {
-                continue;
-            };
-            if !seen.insert(plan.generation.clone()) {
-                continue;
-            }
-            if let Ok(held) = self.catalog.resolve(&plan.generation) {
-                plans.push((held, plan));
-            }
-        }
-        plans
     }
 
     pub fn submit(

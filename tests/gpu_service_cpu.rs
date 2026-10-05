@@ -56,23 +56,6 @@ fn restart_ends_a_retained_gpu_birth_before_admitting_gpu_work() {
             .len(),
         2
     );
-    // Prewarm reads the constructions recent runs used, newest first, each once.
-    journal
-        .bind_preparation(Preparation {
-            actor: "actor".into(),
-            id: "gpu-later".into(),
-            installation: "published".into(),
-            document: b"{}".to_vec(),
-        })
-        .unwrap();
-    complete(&mut journal, 300, &generation, birth.clone(), "gpu-later");
-    let recent: Vec<_> = journal
-        .recent_preparations(8)
-        .unwrap()
-        .into_iter()
-        .map(|preparation| preparation.id)
-        .collect();
-    assert_eq!(recent, ["gpu-later", "gpu-plan"]);
     // Same PID with a different birth is already ended, and an ordinary CPU process
     // is not a GPU reservation merely because it is still alive.
     let mut obsolete = birth.clone();
