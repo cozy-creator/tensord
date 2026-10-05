@@ -124,7 +124,9 @@ fn own_cgroup() -> Option<PathBuf> {
 /// giving back cannot touch (page-cache refaults on a slow disk) sheds a rung or two, however
 /// long it lasts, while a hog's stall falls rung by rung and a rising one is answered. Nothing
 /// here is a constant: the window is the trigger's, the noise is measured. An event more than
-/// two windows after the last means a whole window passed without a stall: a new episode.
+/// two windows after the last means a whole window passed without a stall: a new episode, in
+/// which a stall no higher than where giving stopped still gives nothing (background refault
+/// bursts would otherwise shed a rung each).
 #[derive(Debug)]
 pub struct Feedback {
     total: u64,
@@ -152,7 +154,8 @@ impl Feedback {
         let share = total.saturating_sub(self.total) as f64 / elapsed.as_micros().max(1) as f64;
         (self.total, self.at) = (total, at);
         if elapsed > 2 * WINDOW {
-            *self = Self::new(total, at);
+            // a new episode; where giving stopped, and the noise, still hold
+            (self.last, self.rung) = (None, None);
         }
         let previous = self.last.replace(share);
         if let Some(level) = self.stopped {
@@ -255,13 +258,17 @@ mod tests {
     }
 
     #[test]
-    fn a_quiet_window_after_a_rung_starts_a_new_episode() {
+    fn a_quiet_window_starts_a_new_episode_that_remembers_where_giving_stopped() {
         let start = Instant::now();
         let mut feedback = Feedback::new(0, start);
-        assert!(feedback.give(600_000, start + WINDOW));
-        assert!(!feedback.give(1_200_000, start + WINDOW * 2), "no lower: stopped");
-        // No event for three windows (the stall stopped), then a stall again.
-        assert!(feedback.give(1_800_000, start + WINDOW * 5 + WINDOW / 2));
+        assert!(feedback.give(600_000, start + WINDOW), "0.3: a rung");
+        assert!(!feedback.give(1_200_000, start + WINDOW * 2), "0.3 again: stopped");
+        assert!(!feedback.give(1_800_000, start + WINDOW * 3), "0.3: the noise is 0");
+        // No stall for three windows, then the same background burst: nothing.
+        assert!(!feedback.give(2_400_000, start + WINDOW * 6));
+        // A hog's stall well above it is answered, and falls rung by rung.
+        assert!(feedback.give(3_600_000, start + WINDOW * 7), "0.6");
+        assert!(feedback.give(4_400_000, start + WINDOW * 8), "0.4");
     }
 
     #[test]
