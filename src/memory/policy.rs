@@ -968,6 +968,49 @@ mod tests {
     }
 
     #[test]
+    fn a_running_call_asking_for_room_is_charged_what_it_holds_now() {
+        // H3's replacement on a 96 GiB card: custody holds 74 GiB, the call runs with a
+        // 21 GiB cap and holds 20 GiB, but its last report is its load's (1 GiB). It gave
+        // back a 6 GiB holding and asks for room; 1 GiB of the card is foreign.
+        let mut gpu = Gpu::default();
+        loaded(&mut gpu, "h3", 11, 80 * GIB, 20 * GIB);
+        gpu.observe(
+            "h3",
+            Facts {
+                process: Some(GIB),
+                ..Facts::default()
+            },
+            None,
+        );
+        gpu.active("h3", 21 * GIB);
+        gpu.holdings = vec![Holding {
+            id: "GPU-1/sha256:dit#1".into(),
+            bytes: 68 * GIB,
+            readers: vec![11],
+            idle_ms: 0,
+            revoking: false,
+        }];
+        let s = Sample {
+            processes: None,
+            ..sample(96 * GIB, 96 * GIB - 68 * GIB - 20 * GIB - GIB, &[])
+        };
+        // Stale: its 19 GiB since its load read as foreign, and the room is 19 GiB short.
+        assert_eq!(gpu.external(&s), 20 * GIB);
+        let room = 96 * GIB - HEADLESS_FLOOR - 68 * GIB - GIB;
+        assert_eq!(gpu.room("h3", &s), room - 19 * GIB);
+        // Its own count with the ask: the room is the card beside custody and the foreign GiB.
+        gpu.observe(
+            "h3",
+            Facts {
+                process: Some(20 * GIB),
+                ..Facts::default()
+            },
+            None,
+        );
+        assert_eq!((gpu.external(&s), gpu.room("h3", &s)), (GIB, room));
+    }
+
+    #[test]
     fn a_report_from_before_an_export_hides_external_memory() {
         // 16 GiB card with 1 GiB of foreign memory. SDXL's idle executor holds a 0.5 GiB
         // context; its 7 GiB of weights are custody's since it exported them.
