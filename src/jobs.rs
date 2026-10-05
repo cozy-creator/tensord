@@ -93,6 +93,12 @@ struct Calls {
 
 struct ChildCall {
     child: String,
+    /// The callee and the author's label for it, for the parent's `call` event.
+    module: String,
+    function: String,
+    label: String,
+    /// Its `call` event is in the parent's log.
+    recorded: bool,
     /// A memoized call that ran: (operation identity, computation digest), for its `memo` event.
     memo: Option<(String, String)>,
     request: String,
@@ -740,6 +746,10 @@ impl Jobs {
         held.map_err(|e| ("child_call_refused", e.to_string()))?;
         calls.by_index.entry(frame.call_index).or_insert(ChildCall {
             child: record.id.clone(),
+            module: frame.module.clone(),
+            function: frame.export.clone(),
+            label: frame.progress_label.clone(),
+            recorded: false,
             memo,
             request: request.clone(),
             settled: None,
@@ -860,6 +870,9 @@ impl Jobs {
                 answer.detail = "the child run was canceled".into();
             }
             _ => answer.state = "pending".into(),
+        }
+        if record.state.terminal() && !call.recorded {
+            call.recorded = record_call(&service.engine, parent, frame.call_index, call, &record);
         }
         Ok(answer)
     }
@@ -1356,5 +1369,42 @@ mod exact_tests {
         let received = crate::boundary_json::parse(sent.as_bytes()).unwrap();
         assert_eq!(received["seed"].as_u64(), Some(u64::MAX));
         assert!(received["float"].is_f64());
+    }
+}
+
+/// Journals a settled child as a `call` event on its parent: the callee, the author's label,
+/// how it ended and when, and what its executor measured (`run show` lists each call). True
+/// once it is in the parent's log, or the parent has ended and takes no more.
+fn record_call(
+    engine: &Engine,
+    parent: &Parent,
+    index: u64,
+    call: &ChildCall,
+    record: &Execution,
+) -> bool {
+    let (status, error) = match record.state {
+        State::Completed => ("succeeded", String::new()),
+        State::Canceled => ("canceled", "the child run was canceled".to_string()),
+        _ => ("failed", Failure::decode(record.failure.as_deref().unwrap_or_default()).message),
+    };
+    let measurements = engine
+        .with_journal(|journal| journal.measurements(&record.id))
+        .ok()
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .unwrap_or(Value::Null);
+    let body = json!({
+        "request": call.request, "parent": parent.request, "index": index,
+        "attempt": record.attempt.max(1), "module": call.module, "export": call.function,
+        "label": call.label, "status": status, "error": error,
+        "called_unix_ms": record.accepted_at_ms, "finished_unix_ms": record.finished_at_ms,
+        "measurements": measurements,
+    });
+    match engine.append_call(&parent.id, &record.id, &crate::boundary_json::exact(&body)) {
+        Ok(_) => true,
+        Err(error) => {
+            eprintln!("job {}: call {index}: {error}", parent.id);
+            false
+        }
     }
 }

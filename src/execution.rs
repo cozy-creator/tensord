@@ -358,6 +358,23 @@ impl Engine {
     pub fn memos(&self, id: &str) -> io::Result<Vec<crate::journal::StoredProduct>> {
         self.journal.lock().unwrap().memos(id)
     }
+    /// A settled call of the run (`call` names it), recorded in the run's log once.
+    pub fn append_call(&self, id: &str, call: &str, body: &[u8]) -> io::Result<Option<u64>> {
+        let progress = self.progress.lock().unwrap();
+        let sequence = self
+            .journal
+            .lock()
+            .unwrap()
+            .append_call(id, progress.get(id), call, body)?;
+        drop(progress);
+        if sequence.is_some() {
+            self.notify_activity();
+        }
+        Ok(sequence)
+    }
+    pub fn calls(&self, id: &str) -> io::Result<Vec<crate::journal::StoredProduct>> {
+        self.journal.lock().unwrap().calls(id)
+    }
     pub fn commit_public_terminal(
         &self,
         id: &str,

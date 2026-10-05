@@ -127,6 +127,7 @@ message RunEvent {
     LogLine log = 6;
     Outcome outcome = 7;
     MemoRecord memo = 8;
+    Call call = 9;
   }
 }
 message RunState {
@@ -184,6 +185,18 @@ message MemoRecord {
   string operation = 1;
   string computation_digest = 2;
   bytes result = 3;
+}
+// One settled call the run made: a child run, or an effect such as its weights publication.
+message Call {
+  string run = 1;           // the child run's id
+  uint32 index = 2;         // its index among the run's calls
+  string function = 3;
+  string label = 4;         // the author's label for it
+  string status = 5;        // succeeded, failed, canceled
+  int64 called_at_ms = 6;
+  int64 finished_at_ms = 7;
+  bytes measurements = 8;   // its executor's, as canonical JSON (Outcome.measurements)
+  Reason reason = 9;        // why it did not succeed
 }
 
 // ---- Control -----------------------------------------------------------------------------

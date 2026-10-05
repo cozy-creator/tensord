@@ -352,6 +352,7 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS run_products(execution INTEGER NOT NULL REFERENCES executions(id),sequence INTEGER NOT NULL,at_ms INTEGER NOT NULL,product BLOB NOT NULL,PRIMARY KEY(execution,sequence));
             CREATE TABLE IF NOT EXISTS run_measurements(execution INTEGER PRIMARY KEY REFERENCES executions(id),measurements BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS run_memos(execution INTEGER NOT NULL REFERENCES executions(id),sequence INTEGER NOT NULL,at_ms INTEGER NOT NULL,record BLOB NOT NULL,PRIMARY KEY(execution,sequence));
+            CREATE TABLE IF NOT EXISTS run_calls(execution INTEGER NOT NULL REFERENCES executions(id),sequence INTEGER NOT NULL,at_ms INTEGER NOT NULL,call TEXT NOT NULL,record BLOB NOT NULL,PRIMARY KEY(execution,sequence),UNIQUE(execution,call));
             CREATE TABLE IF NOT EXISTS native_outputs(actor TEXT NOT NULL,owner TEXT NOT NULL,source BLOB NOT NULL,PRIMARY KEY(actor,owner));
             CREATE TABLE IF NOT EXISTS input_intakes(actor TEXT NOT NULL,retention TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,retention));
             CREATE TABLE IF NOT EXISTS hub_access(actor TEXT NOT NULL,origin TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,origin));
@@ -1704,6 +1705,50 @@ impl Journal {
             },
         )?;
         Ok(record.revision)
+    }
+    /// One settled call of the run (a `call` event: a child run, or an effect such as its
+    /// weights publication) at the next sequence, once per `call`; None when it is already
+    /// in the log or the run has ended.
+    pub fn append_call(
+        &mut self,
+        id: &str,
+        progress: Option<&ProgressSnapshot>,
+        call: &str,
+        body: &[u8],
+    ) -> io::Result<Option<u64>> {
+        let known: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM run_calls WHERE execution=?1 AND call=?2)",
+                params![id, call],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        if known {
+            return Ok(None);
+        }
+        let mut appended = false;
+        let record = self.update_with(
+            id,
+            progress,
+            |record| Ok(!record.state.terminal()),
+            |tx, record| {
+                appended = true;
+                tx.execute(
+                    "INSERT INTO run_calls(execution,sequence,at_ms,call,record) VALUES(?1,?2,?3,?4,?5)",
+                    params![id, record.revision as i64, timestamp(), call, body],
+                )
+                .map_err(db_error)?;
+                Ok(())
+            },
+        )?;
+        Ok(appended.then_some(record.revision))
+    }
+    pub fn calls(&self, id: &str) -> io::Result<Vec<StoredProduct>> {
+        self.stored(
+            "SELECT sequence,at_ms,record FROM run_calls WHERE execution=?1 ORDER BY sequence",
+            id,
+        )
     }
     pub fn memos(&self, id: &str) -> io::Result<Vec<StoredProduct>> {
         self.stored(
