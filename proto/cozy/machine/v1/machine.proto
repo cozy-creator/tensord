@@ -207,6 +207,7 @@ message Outcome {
   // construction load and warm) and `observations` (attention rows, Sol's dense and sparse
   // calls among them). Empty for a run that ran on no device.
   bytes measurements = 6;
+  uint64 execution_ms = 7;  // its own time running its callable, every attempt summed; 0: unknown
 }
 message Reason {
   string code = 1;

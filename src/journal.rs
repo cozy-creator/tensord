@@ -227,6 +227,9 @@ pub struct Execution {
     /// When the attempt started running (wall clock), and on which executor.
     #[serde(default)]
     pub started_at_ms: u64,
+    /// The run's own time running its callable, every ended attempt summed.
+    #[serde(default)]
+    pub executed_ms: u64,
     #[serde(default)]
     pub executor: Option<ExecutorFacts>,
     pub result: Option<ResultRecord>,
@@ -1342,6 +1345,7 @@ fn insert(
         progress: None,
         running_revision: 0,
         started_at_ms: 0,
+        executed_ms: 0,
         executor: None,
         result: None,
         failure: None,
@@ -1643,7 +1647,12 @@ impl Journal {
             ));
         }
         let was_terminal = record.state.terminal();
+        let running_since = (record.state == State::Running).then_some(record.started_at_ms);
         let changed = change(&mut record)?;
+        if let Some(since) = running_since.filter(|&s| s > 0 && record.state != State::Running) {
+            let now = timestamp().max(0) as u64;
+            record.executed_ms += now.saturating_sub(since);
+        }
         let observed =
             !was_terminal && progress.is_some_and(|progress| progress.overlay(&mut record));
         if changed || observed {

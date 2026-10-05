@@ -119,6 +119,10 @@ pub trait MachineBackend: Send + Sync + 'static {
     ) -> Result<Option<Vec<u8>>, Status> {
         Ok(None)
     }
+    /// A run's own time running its callable, every attempt summed (0: unknown).
+    fn execution_ms(&self, _: VerifiedActor, _: pb::MachineExecutionQuery) -> Result<u64, Status> {
+        Ok(0)
+    }
     fn events_observed(
         &self,
         actor: VerifiedActor,

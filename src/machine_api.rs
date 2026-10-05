@@ -1266,6 +1266,13 @@ impl MachineBackend for NativeBackend {
     ) -> Result<pb::MachineExecutionState, Status> {
         self.state(&self.query(actor, query)?)
     }
+    fn execution_ms(
+        &self,
+        actor: VerifiedActor,
+        query: pb::MachineExecutionQuery,
+    ) -> Result<u64, Status> {
+        Ok(self.query(actor, query)?.executed_ms)
+    }
     fn measurements(
         &self,
         actor: VerifiedActor,
@@ -1332,11 +1339,13 @@ impl MachineBackend for NativeBackend {
         events.retain(|event| event.sequence > request.after);
         let running = record.state == State::Running && record.running_revision > 0;
         if running && record.running_revision > request.after {
-            events.push(event(
+            let mut started = event(
                 record.running_revision,
                 "running",
                 &json!({"generation":attempt}),
-            )?);
+            )?;
+            started.at_ms = record.started_at_ms;
+            events.push(started);
         }
         let floor = request
             .after

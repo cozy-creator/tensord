@@ -736,6 +736,17 @@ mod v1_api {
             panic!("{events:?}")
         };
         assert_eq!(outcome.status, "succeeded", "{outcome:?}");
+        // Its own time running the callable, on the machine's clock.
+        assert!(outcome.execution_ms > 0, "{outcome:?}");
+        let running = events
+            .iter()
+            .find(|e| {
+                matches!(&e.event, Some(v1::run_event::Event::State(s)) if s.state == "running")
+            })
+            .expect("the run is seen running");
+        let finished = events.last().unwrap().at_ms;
+        assert!(running.at_ms > 0 && running.at_ms <= finished, "{events:?}");
+        assert!(outcome.execution_ms <= (finished - running.at_ms) as u64 + 1, "{outcome:?}");
         let result: serde_json::Value = serde_json::from_slice(&outcome.result).unwrap();
         assert_eq!(result["predictions"], serde_json::json!([0, 2]));
         assert_eq!(result["iterations"], 3);
@@ -2443,6 +2454,8 @@ mod v1_api {
         .unwrap();
         let done = outcome(&events);
         assert_eq!(done.status, "succeeded", "{done:?}");
+        // Its running time sums both attempts, never the rest in between.
+        assert!(done.execution_ms > 0, "{done:?}");
         let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
         // Two attempts counted in the run's scratch; the first attempt had declared the first
         // segment's checkpoint (it stopped while the second ran), so that declaration replayed.
