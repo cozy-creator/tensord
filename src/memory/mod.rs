@@ -240,11 +240,13 @@ impl GpuMemory {
         });
     }
 
-    /// Make room for warm set member `plan`'s spawn (`Gpu::admit_member`): its cap, or None
-    /// when only another member or a running call has more. Without NVML: admitted, no cap.
+    /// Make room for warm set member `plan` (`Gpu::admit_member`): its spawn, or with
+    /// `mapped` its weights mapped. Its cap, or None when only another member or a running
+    /// call has more (or its weights were never measured). Without NVML: admitted, no cap.
     pub fn admit_member(
         &self,
         plan: &str,
+        mapped: bool,
         holdings: impl Fn() -> Vec<Holding>,
         mut carry_out: impl FnMut(&Step) -> io::Result<bool>,
     ) -> io::Result<Option<Option<u64>>> {
@@ -256,9 +258,15 @@ impl GpuMemory {
             let held = holdings();
             let decision = self.with(|gpu| {
                 gpu.holdings = held;
-                let decision = gpu.admit_member(plan, &sample, &mut round);
-                note(serde_json::json!({"event": "member", "plan": plan, "free": sample.free,
-                    "room": gpu.room(plan, &sample), "need": gpu.spawn_need(plan),
+                let need = match mapped {
+                    true => gpu.mapped_need(plan),
+                    false => Some(gpu.spawn_need(plan)),
+                };
+                let decision = need.map_or(Decision::Wait, |need| {
+                    gpu.admit_member(plan, need, &sample, &mut round)
+                });
+                note(serde_json::json!({"event": "member", "plan": plan, "mapped": mapped,
+                    "free": sample.free, "room": gpu.room(plan, &sample), "need": need,
                     "decision": format!("{decision:?}")}));
                 decision
             });

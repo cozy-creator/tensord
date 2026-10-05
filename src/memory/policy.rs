@@ -617,12 +617,21 @@ impl Gpu {
             .map(|(other, _)| other.clone())
     }
 
-    /// The next step to admit warm set member `plan`'s executor: the room that is free, else
-    /// what idle tenants outside every warm set give, least recently used first (their
-    /// weights, then their processes). `Wait`: only a member or a running call has more.
-    pub fn admit_member(&self, plan: &str, sample: &Sample, round: &mut Round) -> Decision {
+    /// What `plan`'s process holds with its weights mapped and nothing running: its context
+    /// and the weights its calls map, less what it maps already. None: never measured.
+    pub fn mapped_need(&self, plan: &str) -> Option<u64> {
+        let facts = self.facts(plan);
+        let weights = self.call_weights(plan)?.saturating_sub(self.own_bytes(plan));
+        Some(facts.context.unwrap_or(self.context_estimate()) + weights + MARGIN)
+    }
+
+    /// The next step to give warm set member `plan` `need` bytes (its spawn, or its weights
+    /// mapped): the room that is free, else what idle tenants outside every warm set give,
+    /// least recently used first (their weights, then their processes). `Wait`: only a
+    /// member or a running call has more.
+    pub fn admit_member(&self, plan: &str, need: u64, sample: &Sample, round: &mut Round) -> Decision {
         let room = self.room(plan, sample);
-        if room >= self.spawn_need(plan) {
+        if room >= need {
             return Decision::Go(room);
         }
         let mut idle: Vec<_> = self
@@ -858,8 +867,28 @@ mod tests {
         gpu.learned.holding("member", "GPU-1/sha256:unet-a");
         gpu.holdings = vec![held("GPU-1/sha256:unet-a#1", 9_000), held("GPU-1/sha256:unet-b#1", 1_000)];
         let mut round = Round::default();
-        assert_eq!(gpu.admit_member("c", &s, &mut round), Decision::Step(Step::Revoke("GPU-1/sha256:unet-b#1".into())));
-        assert_eq!(gpu.admit_member("c", &s, &mut round), Decision::Step(Step::End("other".into())));
+        assert_eq!(gpu.admit_member("c", gpu.spawn_need("c"), &s, &mut round), Decision::Step(Step::Revoke("GPU-1/sha256:unet-b#1".into())));
+        assert_eq!(gpu.admit_member("c", gpu.spawn_need("c"), &s, &mut round), Decision::Step(Step::End("other".into())));
+    }
+
+    #[test]
+    fn a_member_mapped_ahead_needs_its_context_and_weights_and_takes_only_from_outside_the_set() {
+        // "c" joins the set at `gpu`: its process with its weights mapped, nothing running.
+        let (mut gpu, s) = two_idle_and_a_third(&["member", "c"]);
+        assert_eq!(gpu.mapped_need("c"), Some(GIB + GIB + MARGIN));
+        let weights = Facts { weights: Some(2 * GIB), ..Facts::default() };
+        gpu.observe("c", weights, None);
+        let need = gpu.mapped_need("c").unwrap();
+        assert_eq!(need, GIB + 2 * GIB + MARGIN);
+        gpu.observe("other", Facts::default(), Some(true));
+        let mut round = Round::default();
+        assert_eq!(gpu.admit_member("c", need, &s, &mut round), Decision::Step(Step::Unmap("other".into())));
+        gpu.unmapped("other");
+        assert_eq!(gpu.admit_member("c", need, &s, &mut round), Decision::Step(Step::End("other".into())));
+        // Then the member's room is never taken for it: mapped as far as room allows, or not.
+        gpu.ended("other");
+        let last = gpu.admit_member("c", need, &s, &mut Round::default());
+        assert!(!matches!(last, Decision::Step(_)), "{last:?}");
     }
 
     #[test]
@@ -868,16 +897,16 @@ mod tests {
         let (mut gpu, s) = two_idle_and_a_third(&["member", "c"]);
         gpu.observe("other", Facts::default(), Some(true));
         let mut round = Round::default();
-        assert_eq!(gpu.admit_member("c", &s, &mut round), Decision::Step(Step::Unmap("other".into())));
+        assert_eq!(gpu.admit_member("c", gpu.spawn_need("c"), &s, &mut round), Decision::Step(Step::Unmap("other".into())));
         gpu.unmapped("other");
-        assert_eq!(gpu.admit_member("c", &s, &mut round), Decision::Step(Step::End("other".into())));
+        assert_eq!(gpu.admit_member("c", gpu.spawn_need("c"), &s, &mut round), Decision::Step(Step::End("other".into())));
         // Another member is never touched for it: it waits at a lower level.
         gpu.ended("other");
-        assert_eq!(gpu.admit_member("c", &s, &mut Round::default()), Decision::Wait);
+        assert_eq!(gpu.admit_member("c", gpu.spawn_need("c"), &s, &mut Round::default()), Decision::Wait);
         // With the room free it is simply admitted.
         gpu.ended("member");
         let free = sample(8 * GIB, 8 * GIB, &[]);
-        assert!(matches!(gpu.admit_member("c", &free, &mut Round::default()), Decision::Go(_)));
+        assert!(matches!(gpu.admit_member("c", gpu.spawn_need("c"), &free, &mut Round::default()), Decision::Go(_)));
     }
 
     #[test]

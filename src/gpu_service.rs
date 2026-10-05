@@ -816,7 +816,7 @@ impl GpuPool {
                 (_, Level::Downloaded) => "",
                 (_, Level::Imported) => self.import(&member.held),
                 (Some(plan), Level::Host | Level::Gpu) => match self.import(&member.held) {
-                    "" => self.load_member(engine, &member.held, plan),
+                    "" => self.load_member(engine, &member.held, plan, member.level),
                     held_back => held_back,
                 },
             };
@@ -844,8 +844,10 @@ impl GpuPool {
         engine: &Arc<Engine>,
         held: &HeldGeneration,
         plan: &GpuPlan,
+        level: Level,
     ) -> &'static str {
-        if self.levels.lock().unwrap().contains_key(&plan.id) {
+        let holds = self.levels.lock().unwrap().get(&plan.id).map(|(_, held)| *held);
+        if holds.is_some_and(|holds| holds >= level) {
             return "";
         }
         let busy = self
@@ -864,7 +866,10 @@ impl GpuPool {
         }
         let asked = Instant::now();
         let mut sessions = self.sessions.lock().unwrap();
-        let result = self.prewarm_locked(engine, held, plan.clone(), &mut sessions, true);
+        let mut result = self.prewarm_locked(engine, held, plan.clone(), &mut sessions, true);
+        if let (Ok("loaded" | "already loaded"), Level::Gpu) = (&result, level) {
+            result = self.map_locked(plan, &mut sessions);
+        }
         for device in &self.devices {
             device.memory.finished(&plan.id);
         }
@@ -873,7 +878,7 @@ impl GpuPool {
         }
         self.note_prewarm(&plan.id, Default::default(), asked.elapsed(), &result);
         match result {
-            Ok("loaded" | "already loaded") => "",
+            Ok("loaded" | "already loaded" | "mapped") => "",
             Ok(held_back) => held_back,
             Err(error) => {
                 eprintln!("warm set: loading {}: {error}", plan.id);
@@ -881,15 +886,59 @@ impl GpuPool {
             }
         }
     }
+    /// A loaded member's weights mapped onto its GPU (`gpu`), inside the room a member may
+    /// take: "mapped", or why they stay in the host tier.
+    fn map_locked(
+        &self,
+        plan: &GpuPlan,
+        sessions: &mut BTreeMap<String, Session>,
+    ) -> io::Result<&'static str> {
+        let level = self.levels.lock().unwrap().get(&plan.id).map(|(_, level)| *level);
+        if level == Some(Level::Gpu) {
+            return Ok("mapped");
+        }
+        if plan.degree != 1 {
+            return Ok("a group of GPUs maps its weights at its first call");
+        }
+        let offers = |s: &Session| s.executor.hello.offers("weights.map/1");
+        if !sessions.get(&plan.id).is_some_and(offers) {
+            return Ok("its Runtime maps no weights ahead of a request");
+        }
+        let device = &self.lane(1)?[0];
+        let step = |step: &Step| self.carry_out(step, sessions);
+        let Some(cap) = device.memory.admit_member(&plan.id, true, || self.holdings(), step)? else {
+            return Ok("no GPU room for its weights beside the warm set and the running call");
+        };
+        let Some(session) = sessions.get_mut(&plan.id) else {
+            return Ok("its executor ended");
+        };
+        let reply = session.executor.command(
+            &DeviceCommand::Map {
+                construction: plan.id.clone(),
+                cap_bytes: cap,
+                floor_bytes: self.first().floor(),
+            },
+            &mut device_executor::Baseline,
+        )?;
+        if !reply.ok {
+            eprintln!("warm set: mapping {}: {} {}", plan.id, reply.code, reply.detail);
+            return Ok("its weights could not be mapped (the machine's log says why)");
+        }
+        let (mapped, weights) = (reply.mapped_bytes.unwrap_or(0), self.first().with(|gpu| gpu.facts(&plan.id).weights));
+        let facts = plane_facts(reply.plane.as_ref());
+        self.observe(&plan.id, 1, facts, &reply.rank_planes, Some(mapped > 0));
+        if weights.is_some_and(|weights| mapped < weights) {
+            self.levels.lock().unwrap().entry(plan.id.clone()).and_modify(|(_, l)| *l = Level::Host);
+            return Ok("part of its weights stay in host memory: the GPU has no room for them all");
+        }
+        Ok("mapped")
+    }
     /// What each of `actor`'s members holds now, and why that is lower than it asked.
     pub fn members(&self, actor: &str) -> Vec<(Level, &'static str)> {
         let holds = |member: &Arc<Member>| {
             let (holds, held_back) = (self.holding(member), *member.held_back.lock().unwrap());
             match (holds < member.level, holds, held_back) {
                 (false, ..) => (holds, ""),
-                (true, Level::Host, "") => {
-                    (holds, "this machine puts no weights on the GPU ahead of a request")
-                }
                 (true, _, "") => (holds, "a request took its room; it returns when room does"),
                 (true, ..) => (holds, held_back),
             }
@@ -1445,7 +1494,7 @@ impl GpuPool {
             let cap = match member {
                 true => {
                     let step = |step: &Step| self.carry_out(step, sessions);
-                    device.memory.admit_member(&plan.id, holdings, step)?
+                    device.memory.admit_member(&plan.id, false, holdings, step)?
                 }
                 false => device.memory.admits(&plan.id, holdings).then_some(None),
             };
