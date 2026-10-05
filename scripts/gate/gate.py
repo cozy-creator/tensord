@@ -462,7 +462,10 @@ class Gate:
         """A rebench cell on a freshly started machine. Requests are model names (a fresh prompt and seed
         each) or {"model", "input"} payloads. Options: "budget" (a ballast leaves that much GPU memory free),
         "cold" (clock from the machine's birth, no ready wait). An arm with "command" runs its own driver
-        on the host (another engine) and returns the same record. Total = first submit to last saved output."""
+        on the host (another engine) and returns the same record. Total = first submit to last saved output.
+        An arm with "keeps_root" is never restarted (a machine that is the container's main process): its
+        "restart" command only ends what it runs (its executors), and a cold cell is clocked from the submit.
+        An arm's "before" command runs before every one of its cells (e.g. free the card for another engine)."""
         spec = self.m["arms"][arm]
         if isinstance(spec_cell, list):
             spec_cell = {"requests": spec_cell}
@@ -474,7 +477,8 @@ class Gate:
             self.pod.sh(f"({spec['cgroup']}) > {self.pod.dir}/cgroup")
         if self.m.get("rental"):
             subprocess.run(["cozy", "rental", "keepalive", self.m["rental"], f"--tensorhub={self.m['hub']}"], capture_output=True)
-        self.record({"arm": arm, "cell": name, "event": "cell_begin", "clock": self.clock(), "cool": self.cool()})
+        freed = self.pod.sh(spec["before"]) if spec.get("before") else None
+        self.record({"arm": arm, "cell": name, "event": "cell_begin", "clock": self.clock(), "cool": self.cool(), "before": freed})
         warm = None
         paths = spec.get("cache_paths", self.m.get("cache_paths"))
         if paths or spec.get("cache_list"):   # this engine's files read into the page cache; the cell's disk reads show what held
@@ -495,7 +499,10 @@ class Gate:
             ballast = json.loads(self.pod.sh(self.m["ballast"]["start"].format(gib=budget)))
         try:
             old = (self.pod.sh(spec["root"]).split() or ["none"])[0]
-            if not (spec.get("command") and old != "none"):   # a command arm only needs its parking machine up
+            if spec.get("keeps_root"):
+                restarted = self.pod.sh(spec["restart"]) if spec.get("restart") and not spec.get("command") else None
+                new = {"pid": int(old), "kept": True, "restart": restarted}
+            elif not (spec.get("command") and old != "none"):   # a command arm only needs its parking machine up
                 self.pod.sh(spec["restart"])
                 if spec.get("start"):
                     while self.pod.helper("now")["executors"]:
@@ -522,7 +529,8 @@ class Gate:
                     row = {"total_s": 0.0, "t_first": time.time(), "t_end": time.time(), "ok": False, "requests": [],
                            "error": str(error)[-3000:]}
             else:
-                row = self.cozy_cell(arm, name, spec, spec_cell["requests"], new.get("started") if cold else None, ready=not cold,
+                row = self.cozy_cell(arm, name, spec, spec_cell["requests"], new.get("started") if cold and not spec.get("keeps_root") else None,
+                                     ready=not cold,
                                      prime=None if cold else spec_cell.get("prime"))
             after = self.pod.helper("now")
             if by_run:   # the machine `cozy run` started: the limits it ran under

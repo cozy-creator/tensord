@@ -90,6 +90,9 @@ a list of requests (model names, or `{"model", "input"}` payloads) or `{"request
 - a warm cell's `prime` requests (`{"model", "input"}`, e.g. one per model) run first, one at a time and outside the clock, so
   each engine's processes exist and its models are loaded when the timed requests start; an engine with its own driver gets
   the same requests through its `command`. Cold cells prime nothing: they measure start-up;
+- an arm with `keeps_root` is never restarted (on a Rust-only image the machine is the container's main process): its
+  `restart` only ends what the machine runs (its executors) and a cold cell is clocked from the submit; an arm's `before`
+  command runs before each of its cells (e.g. the ComfyUI arm frees the card of the machine's executors);
 - a cell's `setup` command runs first (e.g. that cell's host limits, in place before the machine starts);
 - an arm's `cache_list` command prints the files to read into the page cache, where `cache_paths` (whole directories)
   would be too much (a shared store);
