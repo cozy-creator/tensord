@@ -505,6 +505,8 @@ pub struct PlaneFacts {
     pub alloc_ooms: Option<u64>,
     pub cache_releases: Option<u64>,
     pub cache_released_bytes: Option<u64>,
+    /// Those releases by the executor function that asked: (count, bytes).
+    pub cache_released_by: BTreeMap<String, (u64, u64)>,
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
