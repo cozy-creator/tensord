@@ -451,6 +451,7 @@ fn run() -> io::Result<()> {
             &DeviceCommand::Revoke {
                 layout: holding.key.layout.clone(),
                 generation: holding.generation,
+                regions: vec![],
             },
             &mut Baseline,
         )?;
