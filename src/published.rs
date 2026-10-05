@@ -656,6 +656,7 @@ impl Publisher {
         if dir.join("generation.json").is_file() {
             return Ok(());
         }
+        let _cache = self.uv_cache_hold().map_err(io_failure)?;
         if dir.exists() {
             fs::remove_dir_all(&dir).map_err(io_failure)?; // an interrupted, never-published build
         }
@@ -806,6 +807,31 @@ impl Publisher {
         File::open(generations)
             .and_then(|d| d.sync_all())
             .map_err(io_failure)
+    }
+
+    /// This machine's own uv cache, which `reclaim` manages; None when an image's seeded cache
+    /// serves installs (environments symlink into it, so nothing there is ever removed).
+    pub fn uv_cache(&self) -> Option<PathBuf> {
+        self.sdk
+            .seed_cache
+            .is_none()
+            .then(|| self.root.join("uv-cache"))
+    }
+
+    /// Held shared through one environment build, so `reclaim` removes nothing from the cache
+    /// between uv's own per-command holds either.
+    fn uv_cache_hold(&self) -> io::Result<Option<File>> {
+        let Some(cache) = self.uv_cache() else {
+            return Ok(None);
+        };
+        fs::create_dir_all(&cache)?;
+        let lock = File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(cache.join(".lock"))?;
+        lock.lock_shared()?;
+        Ok(Some(lock))
     }
 
     fn uv(&self, args: &[&str]) -> Result<(), Failure> {

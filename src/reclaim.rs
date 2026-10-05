@@ -2,8 +2,9 @@
 //! last use. A disk is low when no more than its reserve is free (TensorFS `ensure::Disk`).
 //! On a low disk a sweep frees what lifts it back above the reserve, but only when what it may
 //! drop together covers that; otherwise it drops only the store's garbage. The plan drops, in
-//! order: collected result copies, settled logs, memoized stages, unused generations, then the
-//! store's least recently used model caches, compiled kernels last. Only bytes an unlink frees
+//! order: collected result copies, settled logs, memoized stages, downloaded wheels no
+//! environment links, unused generations, then the store's least recently used model caches,
+//! compiled kernels last. Only bytes an unlink frees
 //! on the measured filesystem count: single-link files this process does not hold open, on
 //! that filesystem. Optional cache writes are skipped on a low disk. Never evicted:
 //! uncollected results (durable outputs), journal rows, a generation a run holds or an
@@ -12,12 +13,12 @@
 use crate::{catalog::Catalog, execution::Engine};
 use fs2::FileExt;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{self, File},
     io,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    time::{Duration, SystemTime},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tensorfs_core::store::Store;
 
@@ -49,6 +50,8 @@ pub struct Swept {
     pub store_bytes: u64,
     /// Memoized stage results (`memo::Memo`).
     pub memo: usize,
+    /// Unpacked wheels of the machine's uv cache (`uv_entries`).
+    pub uv_cache: usize,
 }
 
 /// The persistent compiled-kernel store (`Seal::prepare`'s `<root>/u<uid>/`). Every executor
@@ -82,6 +85,8 @@ pub struct Caches<'a> {
     pub bound: &'a HashSet<String>,
     pub kernels: Option<&'a KernelCaches>,
     pub memo: Option<&'a crate::memo::Memo>,
+    /// The machine's own uv download cache (`Publisher::uv_cache`).
+    pub uv_cache: Option<&'a Path>,
     pub store: Option<StoreCaches<'a>>,
     /// The filesystem the machine's state is on (`measure`; a test's own).
     pub disk: &'a dyn Fn() -> io::Result<Disk>,
@@ -92,6 +97,7 @@ enum Kind {
     Result,
     Log,
     Memo,
+    UvCache,
     Generation,
     Kernel,
 }
@@ -102,6 +108,7 @@ impl Kind {
             Kind::Result => &mut swept.results,
             Kind::Log => &mut swept.logs,
             Kind::Memo => &mut swept.memo,
+            Kind::UvCache => &mut swept.uv_cache,
             Kind::Generation => &mut swept.generations,
             Kind::Kernel => &mut swept.kernels,
         } += 1;
@@ -115,10 +122,15 @@ struct Entry {
     path: PathBuf,
     used: SystemTime,
     hold: Option<File>,
+    /// Removed first: a uv cache entry's pointers (`uv_pointers`).
+    pointers: Vec<PathBuf>,
 }
 
 impl Entry {
     fn remove(&mut self) -> io::Result<bool> {
+        for pointer in &self.pointers {
+            remove_pointer(pointer);
+        }
         if self.kind != Kind::Generation {
             return Ok(remove(&self.path));
         }
@@ -261,6 +273,96 @@ fn kernel_entries(caches: &KernelCaches) -> (Vec<PathBuf>, Vec<File>) {
     (entries, locks)
 }
 
+/// The uv cache's unpacked wheels (`archive-v0/<id>`) no environment links, each with the
+/// last time one linked or let go of it (its newest ctime) and its pointers. Environments
+/// hard-link these files, so an entry with a file linked twice is a live environment's and
+/// frees nothing: it stays. uv takes the cache's `.lock` shared for each command and the
+/// publisher for a whole environment build; the returned exclusive hold keeps both out until
+/// the sweep ends. An entry removed with its pointers is a cache miss to uv, which unpacks the
+/// wheel again. A layout uv no longer writes lists nothing.
+type UvEntry = (PathBuf, SystemTime, Vec<PathBuf>);
+fn uv_entries(cache: &Path) -> (Vec<UvEntry>, Option<File>) {
+    let lock = File::options().write(true).open(cache.join(".lock"));
+    let Some(lock) = lock.ok().filter(|lock| lock.try_lock_exclusive().is_ok()) else {
+        return (vec![], None);
+    };
+    let mut pointers = HashMap::new();
+    for bucket in fs::read_dir(cache).into_iter().flatten().flatten() {
+        if bucket.file_name() != "archive-v0" {
+            uv_pointers(&bucket.path(), &mut pointers);
+        }
+    }
+    let archives = fs::read_dir(cache.join("archive-v0"))
+        .into_iter()
+        .flatten()
+        .flatten();
+    let entries = archives
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| {
+            let used = unlinked_since(&entry.path())?;
+            let pointers = pointers.remove(&entry.file_name()).unwrap_or_default();
+            Some((entry.path(), used, pointers))
+        })
+        .collect();
+    (entries, Some(lock))
+}
+
+/// The symlinks under `dir` into `archive-v0`, by the archive's name: uv's pointers to an
+/// unpacked wheel. Each has sidecars beside it (`<pointer>.rev`, `.http`, `.msgpack`).
+fn uv_pointers(dir: &Path, found: &mut HashMap<std::ffi::OsString, Vec<PathBuf>>) {
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            uv_pointers(&entry.path(), found);
+        } else if let Ok(target) = kind
+            .is_symlink()
+            .then(|| fs::read_link(entry.path()))
+            .transpose()
+        {
+            let archive = target
+                .as_deref()
+                .filter(|t| t.parent().and_then(Path::file_name) == Some("archive-v0".as_ref()));
+            if let Some(name) = archive.and_then(Path::file_name) {
+                found.entry(name.to_owned()).or_default().push(entry.path());
+            }
+        }
+    }
+}
+
+/// A uv pointer and its sidecars, before the entry it names: never a pointer to nothing.
+fn remove_pointer(pointer: &Path) {
+    let (Some(dir), Some(name)) = (pointer.parent(), pointer.file_name()) else {
+        return;
+    };
+    let sidecar = format!("{}.", name.to_string_lossy());
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        if entry.file_name().to_string_lossy().starts_with(&sidecar) {
+            remove(&entry.path());
+        }
+    }
+    remove(pointer);
+}
+
+/// The newest ctime under `path` (a link or unlink changes it), or None while a file under it
+/// has another link, or cannot be read.
+fn unlinked_since(path: &Path) -> Option<SystemTime> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    let nanos = Duration::new(metadata.ctime().max(0) as u64, metadata.ctime_nsec() as u32);
+    let changed = UNIX_EPOCH + nanos;
+    if metadata.is_dir() {
+        let children = fs::read_dir(path).ok()?.flatten();
+        children
+            .map(|entry| unlinked_since(&entry.path()))
+            .try_fold(changed, |newest, child| Some(newest.max(child?)))
+    } else if metadata.is_file() && metadata.nlink() > 1 {
+        None
+    } else {
+        Some(changed)
+    }
+}
+
 /// Bytes one store GC call freed, or None while a download holds the store: nothing of the
 /// store can be dropped this pass.
 fn collected(
@@ -290,19 +392,20 @@ pub fn sweep(caches: &Caches) -> io::Result<Swept> {
         }
     }
     let mut entries = vec![];
-    let mut add = |kind, path: PathBuf, used| {
+    let mut add = |kind, path: PathBuf, used, pointers| {
         entries.push(Entry {
             kind,
             path,
             used,
             hold: None,
+            pointers,
         })
     };
     // Result copies the client collected; uncollected ones are durable outputs.
     for entry in fs::read_dir(root.join("results"))?.flatten() {
         let id = entry.file_name().to_string_lossy().into_owned();
         if engine.get(&id).is_ok_and(|record| record.collected) {
-            add(Kind::Result, entry.path(), modified(&entry.path()));
+            add(Kind::Result, entry.path(), modified(&entry.path()), vec![]);
         }
     }
     // Runner logs of settled or unknown runs: diagnostics.
@@ -315,7 +418,7 @@ pub fn sweep(caches: &Caches) -> io::Result<Swept> {
                 Err(error) => error.kind() == io::ErrorKind::NotFound,
             };
             if settled {
-                add(Kind::Log, entry.path(), modified(&entry.path()));
+                add(Kind::Log, entry.path(), modified(&entry.path()), vec![]);
             }
         }
     }
@@ -323,7 +426,7 @@ pub fn sweep(caches: &Caches) -> io::Result<Swept> {
         swept.memo += memo.sweep(); // its own TTL and cap
         for home in memo.homes() {
             let used = last_use(&home);
-            add(Kind::Memo, home, used);
+            add(Kind::Memo, home, used, vec![]);
         }
     }
     // Generations unbound by any installation, unfinished run or configured package: a
@@ -336,11 +439,8 @@ pub fn sweep(caches: &Caches) -> io::Result<Swept> {
             && name.bytes().all(|b| b.is_ascii_hexdigit())
             && !caches.bound.contains(&name)
         {
-            add(
-                Kind::Generation,
-                entry.path(),
-                modified(&entry.path().join(".hold")),
-            );
+            let used = modified(&entry.path().join(".hold"));
+            add(Kind::Generation, entry.path(), used, vec![]);
         }
     }
     // The TTL, low disk or not.
@@ -352,10 +452,14 @@ pub fn sweep(caches: &Caches) -> io::Result<Swept> {
     }
     // Kernel namespaces stay locked from here until the sweep ends: an executor that starts
     // meanwhile waits for it.
+    let (wheels, _installs) = caches.uv_cache.map(uv_entries).unwrap_or_default();
+    for (path, used, pointers) in wheels {
+        add(Kind::UvCache, path, used, pointers);
+    }
     let (kernels, _namespaces) = caches.kernels.map(kernel_entries).unwrap_or_default();
     for path in kernels {
         let used = last_use(&path);
-        add(Kind::Kernel, path, used);
+        add(Kind::Kernel, path, used, vec![]);
     }
     let mut kept = vec![];
     for mut entry in entries {

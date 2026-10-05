@@ -140,6 +140,46 @@ impl Fixture {
             Ok(disk((reserve() + 1 + freed).saturating_sub(short)))
         }
     }
+    /// A wheel of `name` installed with real uv (offline, from a local wheel file) into
+    /// `target`: uv unpacks it into the fixture's cache and hard-links the files from there.
+    fn install(&self, name: &str, target: &Path) {
+        let wheel = self.root.join(format!("{name}-0.1-py3-none-any.whl"));
+        if !wheel.exists() {
+            let info = format!("{name}-0.1.dist-info");
+            let mut zip = zip::ZipWriter::new(fs::File::create(&wheel).unwrap());
+            let body = vec![b'#'; 256 << 10];
+            let metadata = format!("Metadata-Version: 2.1\nName: {name}\nVersion: 0.1\n");
+            let tag =
+                "Wheel-Version: 1.0\nGenerator: st\nRoot-Is-Purelib: true\nTag: py3-none-any\n";
+            let files = [
+                (format!("{name}/__init__.py"), body.as_slice()),
+                (format!("{info}/METADATA"), metadata.as_bytes()),
+                (format!("{info}/WHEEL"), tag.as_bytes()),
+                (format!("{info}/RECORD"), b"".as_slice()),
+            ];
+            for (path, bytes) in files {
+                zip.start_file(path, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                std::io::Write::write_all(&mut zip, bytes).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let installed = std::process::Command::new("uv")
+            .args([
+                "pip",
+                "install",
+                "--quiet",
+                "--offline",
+                "--no-config",
+                "--target",
+            ])
+            .arg(target)
+            .arg(&wheel)
+            .env("UV_CACHE_DIR", self.root.join("uv-cache"))
+            .status()
+            .unwrap();
+        assert!(installed.success());
+    }
     fn sweep(&self, keep: Option<&[String]>, disk: &dyn Fn() -> io::Result<Disk>) -> Swept {
         reclaim::sweep(&Caches {
             engine: &self.engine,
@@ -147,6 +187,7 @@ impl Fixture {
             bound: &self.engine.bound_generations().unwrap(),
             kernels: Some(&self.kernels),
             memo: None,
+            uv_cache: Some(&self.root.join("uv-cache")),
             store: keep.map(|keep| StoreCaches {
                 store: &self.store,
                 keep: keep.to_vec(),
@@ -342,4 +383,48 @@ fn paused_and_unknown_runs_keep_the_generations_they_name() {
         .unwrap();
     assert_eq!(fixture.sweep(None, &fixture.low(MIB / 2)), Swept::default());
     assert!(paused.exists() && unknown.exists());
+}
+
+#[test]
+fn the_uv_cache_drops_wheels_no_environment_links_before_generations_and_never_mid_install() {
+    let fixture = Fixture::new();
+    let (live, collected) = (
+        fixture.root.join("env-live"),
+        fixture.root.join("env-collected"),
+    );
+    fixture.install("alpha", &live);
+    fixture.install("beta", &collected);
+    fs::remove_dir_all(&collected).unwrap(); // its generation was collected
+    let generation = fixture.generation('a');
+    let module = live.join("alpha/__init__.py");
+    let unpacked = || {
+        fs::read_dir(fixture.root.join("uv-cache/archive-v0"))
+            .unwrap()
+            .count()
+    };
+    assert_eq!(unpacked(), 2);
+    // Fresh, it outlives the TTL pass.
+    assert_eq!(
+        fixture.sweep(None, &|| Ok(disk(CAPACITY / 40))),
+        Swept::default()
+    );
+    // Low by an eighth of a mebibyte: beta's unpacked wheel covers it, before the generation.
+    // Alpha's is a live environment's (its files are linked twice): it frees nothing, stays.
+    let swept = fixture.sweep(None, &fixture.low(MIB / 8));
+    assert_eq!((swept.uv_cache, swept.generations), (1, 0), "{swept:?}");
+    assert_eq!(unpacked(), 1);
+    assert!(generation.exists() && module.exists());
+    assert_eq!(fs::metadata(&module).unwrap().nlink(), 2);
+    // A removed entry is a cache miss: uv unpacks the wheel again.
+    let again = fixture.root.join("env-again");
+    fixture.install("beta", &again);
+    assert!(again.join("beta/__init__.py").exists());
+    fs::remove_dir_all(&again).unwrap();
+    // An install holds the cache shared, as uv does for each command and the publisher for a
+    // whole environment build: nothing of it goes, so the generation is what covers.
+    let install = fs::File::open(fixture.root.join("uv-cache/.lock")).unwrap();
+    fs2::FileExt::lock_shared(&install).unwrap();
+    let swept = fixture.sweep(None, &fixture.low(MIB / 8));
+    assert_eq!((swept.uv_cache, swept.generations), (0, 1), "{swept:?}");
+    assert_eq!(unpacked(), 2);
 }
