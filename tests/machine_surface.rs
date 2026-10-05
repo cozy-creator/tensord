@@ -637,6 +637,16 @@ mod v1_api {
         );
         request
     }
+    /// One Status frame as `token`'s holder sees it.
+    async fn status_frame(
+        client: &mut v1::machine_client::MachineClient<Channel>,
+        token: &str,
+    ) -> v1::StatusFrame {
+        let request = authorized(v1::StatusRequest { keepalive: false }, token);
+        let mut frames = client.status(request).await.unwrap().into_inner();
+        frames.message().await.unwrap().unwrap()
+    }
+
     async fn client(machine: &Machine) -> v1::machine_client::MachineClient<Channel> {
         let ready: serde_json::Value =
             serde_json::from_slice(&fs::read(machine.root.join("state/api-ready.json")).unwrap())
@@ -1880,6 +1890,49 @@ mod v1_api {
         let result: serde_json::Value = serde_json::from_slice(&installed.result).unwrap();
         assert_eq!(result["package"], "local/cozy-machine-cpu-lifecycle");
         assert_eq!(result["models"], serde_json::json!([]));
+        // A warm run's set is the caller's warm set: Status shows each member as it was sent,
+        // with what it holds now. This function binds no model, so it holds its code.
+        let frame = status_frame(&mut client, &all).await;
+        assert!(frame.capabilities.iter().any(|c| c == "warm/2"), "{frame:?}");
+        let member = |entrypoint: &str| v1::WarmItem {
+            source: Some(v1::warm_item::Source::Installation(
+                frame.environments[0].installation.clone(),
+            )),
+            entrypoint: entrypoint.into(),
+            level: v1::WarmLevel::Host as i32,
+            ..Default::default()
+        };
+        let set = |items: Vec<v1::WarmItem>| v1::RunSpec {
+            kind: v1::RunKind::Warm as i32,
+            set: Some(v1::WarmSet { items }),
+            owner: "alice".into(),
+            ..Default::default()
+        };
+        let kept = client.run(authorized(run("set-1", set(vec![member("steps")])), &all));
+        let kept = collect(kept.await.unwrap().into_inner()).await.unwrap();
+        assert_eq!(outcome(&kept).status, "succeeded", "{kept:?}");
+        let result: serde_json::Value = serde_json::from_slice(&outcome(&kept).result).unwrap();
+        assert_eq!(result["set"][0]["level"], "installed", "{result}");
+        let frame = status_frame(&mut client, &all).await;
+        let [shown] = &frame.warm[..] else {
+            panic!("one member: {frame:?}")
+        };
+        assert_eq!(
+            (shown.entrypoint.as_str(), shown.level, shown.holds.as_str()),
+            ("steps", v1::WarmLevel::Host as i32, "installed")
+        );
+        assert!(shown.held_back.contains("binds no model"), "{shown:?}");
+        assert_eq!(frame.environments[0].level, "installed");
+        // A member naming no entrypoint of its package refuses the whole set: the last one stays.
+        let unknown = client.run(authorized(run("set-2", set(vec![member("absent")])), &all));
+        let unknown = collect(unknown.await.unwrap().into_inner()).await.unwrap();
+        assert_eq!(outcome(&unknown).status, "failed", "{unknown:?}");
+        assert_eq!(status_frame(&mut client, &all).await.warm.len(), 1);
+        // An empty set clears it.
+        let cleared = client.run(authorized(run("set-3", set(vec![])), &all));
+        let cleared = collect(cleared.await.unwrap().into_inner()).await.unwrap();
+        assert_eq!(outcome(&cleared).status, "succeeded", "{cleared:?}");
+        assert!(status_frame(&mut client, &all).await.warm.is_empty());
         let called = collect(
             client
                 .run(authorized(run("call-1", local(v1::RunKind::Call)), &all))

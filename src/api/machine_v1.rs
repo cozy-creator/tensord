@@ -9,6 +9,7 @@ use super::{
     pb, v1, MachineIdentity,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use crate::gpu_service::Level;
 use serde_json::Value;
 use std::{
     collections::HashMap,
@@ -163,6 +164,78 @@ pub(super) fn state(id: &str, state: &pb::MachineExecutionState) -> v1::RunState
     }
 }
 
+/// A run's model choices as the preparation path reads them.
+fn choices(sent: Vec<v1::ModelChoice>) -> Result<Vec<pb::ModelChoice>, Status> {
+    sent.into_iter()
+        .map(|choice| -> Result<pb::ModelChoice, Status> {
+            Ok(pb::ModelChoice {
+                parameter: choice.parameter,
+                repository: choice.repository,
+                release: choice.release,
+                lane: choice.lane,
+                manifest: if choice.manifest.is_empty() {
+                    None
+                } else {
+                    Some(pb::Ref {
+                        digest: digest(&choice.manifest)?,
+                        length: choice.manifest_length,
+                    })
+                },
+                source: choice.source,
+                profiles: choice.profiles,
+                adapters: choice
+                    .adapters
+                    .into_iter()
+                    .map(|a| pb::DownloadAdapterRef {
+                        component: a.component,
+                        model: a.model,
+                        release: a.release,
+                        lane: a.lane,
+                        manifest: a.manifest,
+                        scale: a.scale,
+                        source: a.source,
+                        profiles: a.profiles,
+                        ..Default::default()
+                    })
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
+/// One warm set member. A level this machine does not know is its highest; none is
+/// `downloaded`.
+fn member(mut item: v1::WarmItem) -> Result<crate::runs::SetItem, Status> {
+    (item.holds, item.held_back) = Default::default();
+    let sent = prost::Message::encode_to_vec(&item);
+    let level = match v1::WarmLevel::try_from(item.level) {
+        Ok(v1::WarmLevel::Installed) => Level::Installed,
+        Ok(v1::WarmLevel::Unspecified | v1::WarmLevel::Downloaded) => Level::Downloaded,
+        Ok(v1::WarmLevel::Imported) => Level::Imported,
+        Ok(v1::WarmLevel::Host) => Level::Host,
+        Ok(v1::WarmLevel::Gpu) | Err(_) => Level::Gpu,
+    };
+    let source = match item.source {
+        Some(v1::warm_item::Source::Release(release)) => crate::runs::Source::Release {
+            package: release.package,
+            release: release.release,
+        },
+        Some(v1::warm_item::Source::Installation(alias)) => crate::runs::Source::Installation(alias),
+        None => {
+            return Err(Status::invalid_argument(
+                "a warm set member names a release or an installation",
+            ))
+        }
+    };
+    Ok(crate::runs::SetItem {
+        source,
+        entrypoint: item.entrypoint,
+        models: choices(item.models)?,
+        level,
+        sent,
+    })
+}
+
 /// A Run spec as this machine's run sources (`runs`). Its digest (the token cleared) makes the
 /// id idempotent: the same id with another spec is refused.
 fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
@@ -227,45 +300,15 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
         None if warm => crate::runs::Source::Models,
         None => return Err(Status::invalid_argument("a run spec names its source")),
     };
-    let models = spec
-        .models
-        .into_iter()
-        .map(|choice| -> Result<pb::ModelChoice, Status> {
-            Ok(pb::ModelChoice {
-                parameter: choice.parameter,
-                repository: choice.repository,
-                release: choice.release,
-                lane: choice.lane,
-                manifest: if choice.manifest.is_empty() {
-                    None
-                } else {
-                    Some(pb::Ref {
-                        digest: digest(&choice.manifest)?,
-                        length: choice.manifest_length,
-                    })
-                },
-                source: choice.source,
-                profiles: choice.profiles,
-                adapters: choice
-                    .adapters
-                    .into_iter()
-                    .map(|a| pb::DownloadAdapterRef {
-                        component: a.component,
-                        model: a.model,
-                        release: a.release,
-                        lane: a.lane,
-                        manifest: a.manifest,
-                        scale: a.scale,
-                        source: a.source,
-                        profiles: a.profiles,
-                        ..Default::default()
-                    })
-                    .collect(),
-            })
-        })
-        .collect::<Result<_, _>>()?;
+    // The caller's whole warm set, each member kept as it was sent for Status.
+    let set = match spec.set.take().filter(|_| warm) {
+        None => None,
+        Some(set) => Some(set.items.into_iter().map(member).collect::<Result<_, _>>()?),
+    };
+    let models = choices(spec.models)?;
     Ok(crate::runs::Spec {
         warm,
+        set,
         job,
         parent: String::new(),
         source,

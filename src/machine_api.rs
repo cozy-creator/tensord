@@ -2,10 +2,11 @@
 use crate::{
     api::{
         auth::{Authority, VerifiedActor},
-        pb,
+        pb, v1,
         workspaces::WorkspaceUploads,
         MachineBackend,
     },
+    gpu_service::{without_gpus, KeptMember, Level},
     journal::{Execution, PublicTerminal, State, SubmissionContext},
     service::Service,
 };
@@ -13,6 +14,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use prost::Message;
 use serde_json::{json, Value};
 use std::{
+    collections::BTreeMap,
     io::{self, Read, Seek, SeekFrom},
     sync::{Arc, Mutex},
     time::Duration,
@@ -880,6 +882,55 @@ impl MachineBackend for NativeBackend {
             ))
         });
         Ok(pb::PackageList { packages })
+    }
+    fn levels(&self, actor: VerifiedActor) -> Result<BTreeMap<String, &'static str>, Status> {
+        let (actor, gpu) = (actor_id(actor), self.service.gpu());
+        let held = gpu.as_ref().map(|gpu| gpu.levels()).unwrap_or_default();
+        let mut levels = BTreeMap::new();
+        for installed in self.service.engine.installations(&actor).map_err(problem)? {
+            // `downloaded`: the store still holds every model of a preparation bound to it.
+            let bound = self
+                .service
+                .engine
+                .with_journal(|journal| journal.preparations_of(&actor, &installed.alias))
+                .map_err(problem)?;
+            let downloaded = gpu.as_ref().is_some_and(|gpu| {
+                bound.iter().any(|bound| gpu.plan(bound).is_ok_and(|plan| gpu.holds(&plan)))
+            });
+            let base = match downloaded {
+                true => Level::Downloaded,
+                false => Level::Installed,
+            };
+            let level = held.get(&installed.generation).map_or(base, |held| base.max(*held));
+            levels.insert(installed.alias, level.name());
+        }
+        Ok(levels)
+    }
+    fn warm_set(&self, actor: VerifiedActor) -> Result<Vec<v1::WarmItem>, Status> {
+        let actor = actor_id(actor);
+        let kept = self
+            .service
+            .engine
+            .with_journal(|journal| journal.warm_sets())
+            .map_err(problem)?;
+        let holds = self.service.gpu().map(|gpu| gpu.members(&actor));
+        let mut items = vec![];
+        fn corrupt<E>(_: E) -> Status {
+            Status::data_loss("kept warm set corrupt")
+        }
+        for (position, (_, record)) in kept.iter().filter(|(of, _)| *of == actor).enumerate() {
+            let kept: KeptMember = serde_json::from_str(record).map_err(corrupt)?;
+            let sent = STANDARD.decode(&kept.item).map_err(corrupt)?;
+            let mut item = v1::WarmItem::decode(&sent[..]).map_err(corrupt)?;
+            // Before the pool has taken the set up (a restart in progress) it holds its code.
+            let (level, held_back) = match &holds {
+                Some(holds) => holds.get(position).copied().unwrap_or((Level::Installed, "")),
+                None => without_gpus(Level::named(&kept.level).ok_or_else(|| corrupt(()))?),
+            };
+            (item.holds, item.held_back) = (level.name().into(), held_back.into());
+            items.push(item);
+        }
+        Ok(items)
     }
     fn retain_bytes(
         &self,

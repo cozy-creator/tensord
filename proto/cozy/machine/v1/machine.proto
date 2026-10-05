@@ -30,6 +30,34 @@ enum RunKind {
   RUN_KIND_UPDATE = 3;  // stage, verify and activate a software cohort at idle
 }
 
+// How far a function is kept ready; each level includes the ones before it.
+enum WarmLevel {
+  WARM_LEVEL_UNSPECIFIED = 0;
+  WARM_LEVEL_INSTALLED = 1;   // the package environment
+  WARM_LEVEL_DOWNLOADED = 2;  // the function's bound weights in the store
+  WARM_LEVEL_IMPORTED = 3;    // a process with its imports done: no device, no VRAM
+  WARM_LEVEL_HOST = 4;        // an executor with the model constructed, weights in the host tier
+  WARM_LEVEL_GPU = 5;         // its weights on the GPU
+}
+// One member of a caller's warm set: a function the machine keeps ready up to `level`. It is
+// the last idle thing to give its memory to a request, and comes back when room returns.
+message WarmItem {
+  oneof source {
+    Release release = 1;
+    string installation = 2;
+  }
+  string entrypoint = 3;
+  repeated ModelChoice models = 4;  // none: the owner's bindings, as for a run
+  WarmLevel level = 5;
+  // Status only: the level it holds now (installed, downloaded, imported, host, gpu) and why
+  // that is lower than `level`.
+  string holds = 6;
+  string held_back = 7;
+}
+message WarmSet {
+  repeated WarmItem items = 1;
+}
+
 message RunSpec {
   RunKind kind = 1;
   oneof source {
@@ -52,6 +80,10 @@ message RunSpec {
   // leaf: the run writes its weights destination under it. The machine renews the bearer with
   // its sender proof, the run's Hub token or a rental's own worker capability.
   string publication = 17;
+  // RUN_KIND_WARM (`warm/2`): the caller's whole warm set, replacing its previous one; no items
+  // clears it. The run installs and downloads every member, and its result lists each one's
+  // `level` and `held_back`. Absent: the set is left as it is.
+  WarmSet set = 18;
 }
 
 // The caller's provider tokens, for models a run makes from a provider source.
@@ -267,6 +299,7 @@ message StatusFrame {
   repeated Model models = 17;       // the models the machine's store holds
   uint64 models_bytes = 18;         // their bytes together, shared content counted once
   WebRTC webrtc = 19;               // the direct player endpoint, when the machine listens
+  repeated WarmItem warm = 20;      // the caller's warm set, each with what it holds now
 }
 message WebRTC {
   uint32 port = 1;                  // the listener; a persistent machine keeps it across restarts
@@ -304,6 +337,7 @@ message Environment {
   string release = 3;
   repeated string entrypoints = 4;
   string runtime = 5;       // the cozy-runtime installed in it
+  string level = 6;         // what it holds now (as WarmItem.holds), in a warm set or not
 }
 message Disk {
   uint64 total_bytes = 1;

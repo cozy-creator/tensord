@@ -217,8 +217,85 @@ pub fn group_degree(
         .unwrap_or(1))
 }
 
+/// How far a function is prepared on this machine: a warm set member's `level`, and what
+/// Status says a member or an installation `holds`. Each level includes the ones before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Level {
+    Installed,
+    Downloaded,
+    /// A process with its imports done: no device, no VRAM.
+    Imported,
+    /// An executor with the model constructed, its weights in the host tier.
+    Host,
+    /// Its weights on the GPU.
+    Gpu,
+}
+impl Level {
+    pub const ALL: [Level; 5] = [
+        Level::Installed,
+        Level::Downloaded,
+        Level::Imported,
+        Level::Host,
+        Level::Gpu,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            Level::Installed => "installed",
+            Level::Downloaded => "downloaded",
+            Level::Imported => "imported",
+            Level::Host => "host",
+            Level::Gpu => "gpu",
+        }
+    }
+    pub fn named(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|level| level.name() == name)
+    }
+}
+
+/// A warm set member as the journal keeps it: enough to bring it back after a restart, and
+/// to show it in Status as its caller sent it.
+#[derive(Serialize, Deserialize)]
+pub struct KeptMember {
+    pub installation: String,
+    pub level: String,
+    /// Its function's bound preparation; empty when it binds no model on a GPU.
+    pub preparation: String,
+    /// The `WarmItem` the caller sent, base64.
+    pub item: String,
+}
+
+/// Why a member stays at `installed`: nothing of it loads on a GPU.
+const UNBOUND: &str = "its function binds no model on a GPU, or the store let its weights go";
+/// What a member holds on a machine with no GPU: its code (a function that binds a model is
+/// refused there).
+pub fn without_gpus(asked: Level) -> (Level, &'static str) {
+    (Level::Installed, if asked > Level::Installed { UNBOUND } else { "" })
+}
+
+/// One member of a caller's warm set, as the pool keeps it.
+pub struct Member {
+    pub held: HeldGeneration,
+    /// The models its function binds. None: it binds none on a GPU, or the store let them go.
+    pub plan: Option<GpuPlan>,
+    /// The level the controller asked for.
+    pub level: Level,
+    /// Why it holds less than `level`, from the last pass over the set.
+    held_back: Mutex<&'static str>,
+}
+impl Member {
+    pub fn new(held: HeldGeneration, plan: Option<GpuPlan>, level: Level) -> Arc<Self> {
+        Arc::new(Self {
+            held,
+            plan,
+            level,
+            held_back: Mutex::new(""),
+        })
+    }
+}
+
 struct Session {
     plan: String,
+    generation: String,
     /// GPUs of its group; its followers (rank 1 first) once it started, held by pidfd so a
     /// call that fails can name the GPU whose process ended first.
     degree: u32,
@@ -324,6 +401,9 @@ impl Zygote {
     fn failed(&self) -> bool {
         matches!(*self.state.lock().unwrap(), ZygoteState::Failed(_))
     }
+    fn ready(&self) -> bool {
+        matches!(*self.state.lock().unwrap(), ZygoteState::Ready(_))
+    }
     /// Ready and with no live child: ending it ends nothing else.
     fn childless(&self) -> bool {
         if !matches!(*self.state.lock().unwrap(), ZygoteState::Ready(_)) {
@@ -388,6 +468,11 @@ pub struct GpuPool {
     zygotes: Mutex<BTreeMap<String, Arc<Zygote>>>,
     /// Each generation's kernel boot of this machine run: its process while it runs.
     kernel_boots: Mutex<BTreeMap<String, Option<crate::process::Exact>>>,
+    /// Each caller's warm set, in the order it sent it.
+    members: Mutex<BTreeMap<String, Vec<Arc<Member>>>>,
+    /// Each live executor's (generation, level) by plan: what Status reads while a call holds
+    /// `sessions`.
+    levels: Mutex<BTreeMap<String, (String, Level)>>,
     /// Each envelope GPU with its own memory decisions, in envelope order.
     devices: Vec<Device>,
     host: Arc<HostTier>,
@@ -490,6 +575,8 @@ impl GpuPool {
             sessions: Mutex::new(BTreeMap::new()),
             zygotes: Mutex::new(BTreeMap::new()),
             kernel_boots: Mutex::new(BTreeMap::new()),
+            members: Mutex::new(BTreeMap::new()),
+            levels: Mutex::new(BTreeMap::new()),
             host,
             host_ledger,
             custody,
@@ -548,6 +635,7 @@ impl GpuPool {
     }
     /// `plan`'s executor is gone: no GPU charges it any more.
     fn ended(&self, plan: &str) {
+        self.levels.lock().unwrap().remove(plan);
         for device in &self.devices {
             device.memory.with(|gpu| gpu.ended(plan));
         }
@@ -566,7 +654,126 @@ impl GpuPool {
         for (device, facts) in self.lane(degree).unwrap_or_default().iter().zip(&each) {
             device.memory.observe(plan, *facts, mapped);
         }
+        // Its weights left the GPU or came back: a loaded executor holds `host` or `gpu`.
+        if let (Some(mapped), Some((_, level))) = (mapped, self.levels.lock().unwrap().get_mut(plan))
+        {
+            *level = if mapped { Level::Gpu } else { Level::Host };
+        }
         each[0]
+    }
+
+    /// Replace `actor`'s warm set; `keep` then brings its members up. A member dropped from
+    /// it stays as it is until its memory is needed.
+    pub fn set_members(&self, actor: &str, members: Vec<Arc<Member>>) {
+        let mut sets = self.members.lock().unwrap();
+        match members.is_empty() {
+            true => drop(sets.remove(actor)),
+            false => drop(sets.insert(actor.into(), members)),
+        }
+    }
+    /// One pass over `actor`'s warm set: each member is brought as far toward its level as
+    /// the room that is free now allows, and the reason is kept when that is short of it.
+    pub fn keep(&self, actor: &str) {
+        for member in self.warm_set(actor) {
+            let held_back = match (&member.plan, member.level) {
+                (_, Level::Installed) => "",
+                (None, _) => UNBOUND,
+                (_, Level::Downloaded) => "",
+                (_, Level::Imported) => self.import(&member.held),
+                (_, Level::Host | Level::Gpu) => match self.import(&member.held) {
+                    "" => "this machine builds no model ahead of a request yet",
+                    held_back => held_back,
+                },
+            };
+            *member.held_back.lock().unwrap() = held_back;
+        }
+    }
+    /// What each of `actor`'s members holds now, and why that is lower than it asked.
+    pub fn members(&self, actor: &str) -> Vec<(Level, &'static str)> {
+        let holds = |member: &Arc<Member>| {
+            let holds = self.holding(member);
+            let short = holds < member.level;
+            (holds, if short { *member.held_back.lock().unwrap() } else { "" })
+        };
+        self.warm_set(actor).iter().map(holds).collect()
+    }
+    fn warm_set(&self, actor: &str) -> Vec<Arc<Member>> {
+        let sets = self.members.lock().unwrap();
+        sets.get(actor).cloned().unwrap_or_default()
+    }
+    fn holding(&self, member: &Member) -> Level {
+        let executor = member.plan.as_ref().and_then(|plan| {
+            let levels = self.levels.lock().unwrap();
+            levels.get(&plan.id).map(|(_, level)| *level)
+        });
+        let imported = || {
+            let zygotes = self.zygotes.lock().unwrap();
+            zygotes.get(&member.held.record.identity).cloned()
+        };
+        match (executor, &member.plan) {
+            (Some(level), _) => level,
+            _ if imported().is_some_and(|parent| parent.ready()) => Level::Imported,
+            (None, Some(plan)) if self.holds(plan) => Level::Downloaded,
+            _ => Level::Installed,
+        }
+    }
+    /// Note what a loaded executor that is kept holds now, for Status.
+    fn note_level(&self, session: &Session) {
+        let mapped = |gpu: &mut crate::memory::policy::Gpu| {
+            gpu.tenant(&session.plan).is_some_and(|tenant| tenant.mapped)
+        };
+        let level = match self.first().with(mapped) {
+            true => Level::Gpu,
+            false => Level::Host,
+        };
+        let noted = (session.generation.clone(), level);
+        self.levels.lock().unwrap().insert(session.plan.clone(), noted);
+    }
+    /// Whether the store holds every model `plan` binds.
+    pub fn holds(&self, plan: &GpuPlan) -> bool {
+        plan.selections().iter().all(|selected| {
+            let hex = selected.manifest.trim_start_matches("sha256:");
+            self.store.manifest_path(hex).exists()
+        })
+    }
+    /// The highest level each generation holds now: an import-only parent, or an executor.
+    pub fn levels(&self) -> BTreeMap<String, Level> {
+        let parents: Vec<_> = self.zygotes.lock().unwrap().clone().into_iter().collect();
+        let mut highest: BTreeMap<String, Level> = parents
+            .into_iter()
+            .filter(|(_, parent)| parent.ready())
+            .map(|(generation, _)| (generation, Level::Imported))
+            .collect();
+        for (generation, level) in self.levels.lock().unwrap().values() {
+            let held = highest.entry(generation.clone()).or_insert(*level);
+            *held = (*held).max(*level);
+        }
+        highest
+    }
+    /// `held`'s import-only parent, started here when the host has room for it: empty once
+    /// it is up, else why it is not.
+    fn import(&self, held: &HeldGeneration) -> &'static str {
+        let generation = &held.record.identity;
+        let known = self.zygotes.lock().unwrap().contains_key(generation);
+        if !known && !self.parent_fits(generation) {
+            return "no host memory free for its imports";
+        }
+        let Some((parent, start)) = self.zygote(held) else {
+            return "this machine imports nothing ahead for it (no fork, or it binds no model)";
+        };
+        if start {
+            parent.set(self.import_only(held));
+        }
+        parent.wait_started();
+        match (parent.ready(), parent.failed()) {
+            (true, _) => "",
+            (_, false) => "its Runtime forks no executors: nothing imports ahead of a request",
+            (_, true) => {
+                // The next pass imports again; a request that needs it starts one itself.
+                self.forget_parent(generation, &parent);
+                "its imports failed (the machine's log says why)"
+            }
+        }
     }
     /// Each GPU of the group decides for itself, in device order (so two groups never wait
     /// on each other): one cap per GPU, rank 0's first. None: that GPU could not say.
@@ -1065,6 +1272,7 @@ impl GpuPool {
             true,
         ) {
             Ok(_) => {
+                self.note_level(&session);
                 sessions.insert(session.plan.clone(), session);
                 Ok("loaded")
             }
@@ -1645,6 +1853,7 @@ impl GpuPool {
                 false,
             ) {
                 Ok(true) => {
+                    self.note_level(&session);
                     sessions.insert(session.plan.clone(), session);
                     return Ok(());
                 }
@@ -1778,6 +1987,7 @@ impl GpuPool {
         self.host.prepare(grants.clone(), staged);
         Ok(Session {
             plan: plan.id.clone(),
+            generation: plan.generation.clone(),
             degree: plan.degree,
             followers: vec![],
             loaded: false,
