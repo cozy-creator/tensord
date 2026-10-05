@@ -1579,6 +1579,9 @@ pub fn describe_environment(python: &str, root: &str, hub_origin: &str) -> Resul
 fn split_lock(lock: &str, name: &str, release: &str, own_sdk: bool) -> Result<Lock, Failure> {
     let (mut exact, mut constraints, mut distribution, mut sdk) =
         (String::new(), String::new(), None, String::new());
+    // One requirement per line: `uv export` continues a requirement's `--hash` options on
+    // the lines after it (`\` at a line's end).
+    let lock = lock.replace("\\\r\n", " ").replace("\\\n", " ");
     for line in lock
         .lines()
         .map(str::trim)
@@ -1672,6 +1675,24 @@ mod tests {
         assert_eq!(
             split_lock(lock, "sdxl", "9.9.9", true).err().unwrap().0,
             "package_prepare_project_pin_missing"
+        );
+    }
+
+    /// `uv export` writes each requirement's hashes on continuation lines: they stay with it.
+    #[test]
+    fn a_requirement_continued_over_lines_keeps_its_hashes() {
+        let lock = "cozy-runtime==0.18.102 \\\n    --hash=sha256:aa \\\n    --hash=sha256:bb\n    # via probe\nmsgspec==0.22.0 ; python_full_version >= '3.12' \\\n    --hash=sha256:cc\nprobe @ http://files/probe-1.0.0-py3-none-any.whl --hash=sha256:dd\n";
+        let split = split_lock(lock, "probe", "1.0.0", true).unwrap();
+        assert!(split
+            .exact
+            .lines()
+            .chain(split.sdk.lines())
+            .all(|l| !l.starts_with("--hash")));
+        assert!(split.sdk.contains("cozy-runtime==0.18.102") && split.sdk.contains("sha256:bb"));
+        assert!(split.exact.contains("msgspec==0.22.0") && split.exact.contains("sha256:cc"));
+        assert_eq!(
+            split.constraints,
+            "msgspec==0.22.0 ; python_full_version >= '3.12'\n"
         );
     }
 
