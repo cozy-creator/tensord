@@ -701,7 +701,7 @@ impl Runs {
         let holds = match self.service.gpu() {
             Some(gpu) => {
                 gpu.set_members(actor, members);
-                gpu.keep(actor);
+                gpu.keep(&self.service.engine, actor);
                 gpu.members(actor)
             }
             None => members.iter().map(|member| without_gpus(member.level)).collect(),

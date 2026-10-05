@@ -470,6 +470,8 @@ pub struct GpuPool {
     kernel_boots: Mutex<BTreeMap<String, Option<crate::process::Exact>>>,
     /// Each caller's warm set, in the order it sent it.
     members: Mutex<BTreeMap<String, Vec<Arc<Member>>>>,
+    /// One pass over the warm sets at a time.
+    keeping: Mutex<()>,
     /// Each live executor's (generation, level) by plan: what Status reads while a call holds
     /// `sessions`.
     levels: Mutex<BTreeMap<String, (String, Level)>>,
@@ -509,6 +511,25 @@ impl Drop for WakeOnExit {
             engine.notify_activity();
         }
     }
+}
+
+/// Whether an accepted call waits in the queue for a GPU.
+fn gpu_request_queued(engine: &Engine) -> bool {
+    let mut cursor = 0;
+    while let Ok(page) = engine.ready_after(cursor, 256) {
+        let Some(last) = page.last() else {
+            return false;
+        };
+        let queued = |record: &Execution| {
+            let gpu = record.submission.as_ref().is_some_and(|s| !s.preparation_id.is_empty());
+            gpu && record.state == State::Queued && record.waiting_reason.is_none()
+        };
+        if page.iter().any(queued) {
+            return true;
+        }
+        cursor = last.id.parse().unwrap_or(u64::MAX);
+    }
+    false
 }
 
 impl GpuPool {
@@ -576,6 +597,7 @@ impl GpuPool {
             zygotes: Mutex::new(BTreeMap::new()),
             kernel_boots: Mutex::new(BTreeMap::new()),
             members: Mutex::new(BTreeMap::new()),
+            keeping: Mutex::new(()),
             levels: Mutex::new(BTreeMap::new()),
             host,
             host_ledger,
@@ -663,37 +685,110 @@ impl GpuPool {
     }
 
     /// Replace `actor`'s warm set; `keep` then brings its members up. A member dropped from
-    /// it stays as it is until its memory is needed.
+    /// it becomes an ordinary tenant: it stays as it is until its memory is needed.
     pub fn set_members(&self, actor: &str, members: Vec<Arc<Member>>) {
-        let mut sets = self.members.lock().unwrap();
-        match members.is_empty() {
-            true => drop(sets.remove(actor)),
-            false => drop(sets.insert(actor.into(), members)),
+        let plans: std::collections::BTreeSet<String> = {
+            let mut sets = self.members.lock().unwrap();
+            match members.is_empty() {
+                true => drop(sets.remove(actor)),
+                false => drop(sets.insert(actor.into(), members)),
+            }
+            let plans = sets.values().flatten().filter_map(|member| member.plan.as_ref());
+            plans.map(|plan| plan.id.clone()).collect()
+        };
+        for device in &self.devices {
+            device.memory.with(|gpu| gpu.members = plans.clone());
         }
     }
     /// One pass over `actor`'s warm set: each member is brought as far toward its level as
-    /// the room that is free now allows, and the reason is kept when that is short of it.
-    pub fn keep(&self, actor: &str) {
+    /// free room and the room of idle tenants outside every warm set allow. It never takes
+    /// from another member or a running call, and keeps the reason when it stops short.
+    pub fn keep(self: &Arc<Self>, engine: &Arc<Engine>, actor: &str) {
+        let _pass = self.keeping.lock().unwrap();
         for member in self.warm_set(actor) {
             let held_back = match (&member.plan, member.level) {
                 (_, Level::Installed) => "",
                 (None, _) => UNBOUND,
                 (_, Level::Downloaded) => "",
                 (_, Level::Imported) => self.import(&member.held),
-                (_, Level::Host | Level::Gpu) => match self.import(&member.held) {
-                    "" => "this machine builds no model ahead of a request yet",
+                (Some(plan), Level::Host | Level::Gpu) => match self.import(&member.held) {
+                    "" => self.load_member(engine, &member.held, plan),
                     held_back => held_back,
                 },
             };
             *member.held_back.lock().unwrap() = held_back;
         }
     }
+    /// Every warm set's pass, off the caller's thread: after a call ends, when room may
+    /// have come back for a member a request pushed down.
+    pub fn keep_all(self: &Arc<Self>, engine: &Arc<Engine>) {
+        let actors: Vec<String> = self.members.lock().unwrap().keys().cloned().collect();
+        if actors.is_empty() {
+            return;
+        }
+        let (pool, engine) = (self.clone(), engine.clone());
+        let started = std::thread::Builder::new()
+            .name("warm-set".into())
+            .spawn(move || actors.iter().for_each(|actor| pool.keep(&engine, actor)));
+        if let Err(error) = started {
+            eprintln!("warm set: {error}");
+        }
+    }
+    /// A member's executor loaded when the call slot is free: empty once it is, else why not.
+    fn load_member(
+        self: &Arc<Self>,
+        engine: &Arc<Engine>,
+        held: &HeldGeneration,
+        plan: &GpuPlan,
+    ) -> &'static str {
+        if self.levels.lock().unwrap().contains_key(&plan.id) {
+            return "";
+        }
+        let busy = self
+            .reserved
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire);
+        if busy.is_err() {
+            return "a request holds the GPU; it loads when that ends";
+        }
+        let _permit = Permit {
+            pool: self.clone(),
+            engine: Arc::downgrade(engine),
+        };
+        // A request queued for the GPU goes first; the member comes back after it.
+        if gpu_request_queued(engine) {
+            return "a request is queued; it loads after";
+        }
+        let asked = Instant::now();
+        let mut sessions = self.sessions.lock().unwrap();
+        let result = self.prewarm_locked(engine, held, plan.clone(), &mut sessions, true);
+        for device in &self.devices {
+            device.memory.finished(&plan.id);
+        }
+        if !sessions.contains_key(&plan.id) {
+            self.ended(&plan.id);
+        }
+        self.note_prewarm(&plan.id, Default::default(), asked.elapsed(), &result);
+        match result {
+            Ok("loaded" | "already loaded") => "",
+            Ok(held_back) => held_back,
+            Err(error) => {
+                eprintln!("warm set: loading {}: {error}", plan.id);
+                "its load failed (the machine's log says why)"
+            }
+        }
+    }
     /// What each of `actor`'s members holds now, and why that is lower than it asked.
     pub fn members(&self, actor: &str) -> Vec<(Level, &'static str)> {
         let holds = |member: &Arc<Member>| {
-            let holds = self.holding(member);
-            let short = holds < member.level;
-            (holds, if short { *member.held_back.lock().unwrap() } else { "" })
+            let (holds, held_back) = (self.holding(member), *member.held_back.lock().unwrap());
+            match (holds < member.level, holds, held_back) {
+                (false, ..) => (holds, ""),
+                (true, Level::Host, "") => {
+                    (holds, "this machine puts no weights on the GPU ahead of a request")
+                }
+                (true, _, "") => (holds, "a request took its room; it returns when room does"),
+                (true, ..) => (holds, held_back),
+            }
         };
         self.warm_set(actor).iter().map(holds).collect()
     }
@@ -1090,11 +1185,14 @@ impl GpuPool {
             engine: Arc::downgrade(engine),
         };
         engine.dispatch_managed(&record.id, move |engine, id| {
-            let _permit = permit;
-            let result = _permit.pool.run(&engine, &id, held, plan);
+            let pool = permit.pool.clone();
+            let result = pool.run(&engine, &id, held, plan);
             if let Err(error) = &result {
                 settle(&engine, &id, error)?;
             }
+            // The call slot is free: a warm set member this call pushed down may come back.
+            drop(permit);
+            pool.keep_all(&engine);
             result
         })
     }
@@ -1186,7 +1284,7 @@ impl GpuPool {
                 let key = plan.id.clone();
                 let waited = asked.elapsed();
                 let mut sessions = pool.sessions.lock().unwrap();
-                let result = pool.prewarm_locked(&engine, &held, plan, &mut sessions);
+                let result = pool.prewarm_locked(&engine, &held, plan, &mut sessions, false);
                 for device in &pool.devices {
                     device.memory.finished(&key);
                 }
@@ -1230,28 +1328,35 @@ impl GpuPool {
         held: &HeldGeneration,
         plan: GpuPlan,
         sessions: &mut BTreeMap<String, Session>,
+        member: bool,
     ) -> io::Result<&'static str> {
         if sessions.contains_key(&plan.id) {
             return Ok("already loaded");
         }
         let lane = self.lane(plan.degree)?;
-        let fits = lane.iter().enumerate().all(|(index, device)| {
-            device.memory.admits(
-                &plan.id,
-                || {
-                    if index == 0 {
-                        self.holdings()
-                    } else {
-                        vec![]
-                    }
-                },
-            )
-        });
-        if !fits {
-            return Ok("no room beside the other tenants");
+        let mut load_caps = vec![];
+        for (index, device) in lane.iter().enumerate() {
+            let holdings = || if index == 0 { self.holdings() } else { vec![] };
+            // A warm set member may take the room of idle tenants outside every set; a
+            // prefetch only what is free. Neither touches a member or a running call.
+            let cap = match member {
+                true => {
+                    let step = |step: &Step| self.carry_out(step, sessions);
+                    device.memory.admit_member(&plan.id, holdings, step)?
+                }
+                false => device.memory.admits(&plan.id, holdings).then_some(None),
+            };
+            match cap {
+                Some(cap) => load_caps.push(cap),
+                None => return Ok("no GPU room beside the warm set and the running call"),
+            }
         }
-        self.host_room(&plan.id, sessions);
-        let load_caps = self.decide(&plan.id, plan.degree, true, sessions)?;
+        if !self.host_room(&plan.id, sessions, true) {
+            return Ok("no host memory free beside the warm set");
+        }
+        if !member {
+            load_caps = self.decide(&plan.id, plan.degree, true, sessions)?;
+        }
         for device in lane {
             device
                 .memory
@@ -1497,15 +1602,22 @@ impl GpuPool {
         }
     }
 
-    /// End the least recently used parent with no live child, for host room: the bytes it
-    /// held privately (at least 1 when one ended unmeasured), 0 when there is none to end.
-    fn end_idle_parent(&self) -> u64 {
+    /// End a parent with no live child, for host room: one of a generation outside every
+    /// warm set before a member's (`spare`: never a member's), least recently used first.
+    /// Returns the bytes it held privately (at least 1 when one ended unmeasured), 0 when
+    /// there is none to end.
+    fn end_idle_parent(&self, spare: bool) -> u64 {
+        let kept: std::collections::BTreeSet<String> = {
+            let sets = self.members.lock().unwrap();
+            let members = sets.values().flatten().filter(|member| member.level >= Level::Imported);
+            members.map(|member| member.held.record.identity.clone()).collect()
+        };
         let victim = {
             let mut zygotes = self.zygotes.lock().unwrap();
             let chosen = zygotes
                 .iter()
-                .filter(|(_, zygote)| zygote.childless())
-                .min_by_key(|(_, zygote)| *zygote.used.lock().unwrap())
+                .filter(|(generation, zygote)| zygote.childless() && !(spare && kept.contains(*generation)))
+                .min_by_key(|(generation, zygote)| (kept.contains(*generation), *zygote.used.lock().unwrap()))
                 .map(|(generation, _)| generation.clone());
             chosen.and_then(|generation| zygotes.remove(&generation))
         };
@@ -1790,7 +1902,7 @@ impl GpuPool {
         let cold = !sessions.contains_key(&plan.id);
         let mut load_caps = vec![];
         if cold {
-            self.host_room(&plan.id, sessions);
+            self.host_room(&plan.id, sessions, false);
             // A context and the first working set are reserved on every GPU of the group
             // before the process exists.
             load_caps = self.decide(&plan.id, plan.degree, true, sessions)?;
@@ -2505,7 +2617,10 @@ impl GpuPool {
     /// the page cache or the store again), then import-only parents with no live child, then
     /// idle executors, least recently used first.
     /// A plan never measured asks nothing; nothing is refused for the room that is left.
-    fn host_room(&self, plan: &str, sessions: &mut BTreeMap<String, Session>) {
+    /// Within each kind, what is outside every warm set goes before a member; `spare`
+    /// (a member's own admission, a prefetch) never takes from a member. Returns whether
+    /// the room is there.
+    fn host_room(&self, plan: &str, sessions: &mut BTreeMap<String, Session>, spare: bool) -> bool {
         let need = self.first().with(|gpu| {
             gpu.learned
                 .plans
@@ -2513,22 +2628,22 @@ impl GpuPool {
                 .map_or(0, |learned| learned.host_bytes)
         });
         if need == 0 {
-            return;
+            return true;
         }
         loop {
             let host = crate::host_memory::read();
             let Ok(available) = u64::try_from(host.available) else {
-                return;
+                return true;
             };
             if available >= need {
-                return;
+                return true;
             }
             // Unheld sealed layouts, then a parent with no live child (cheaper to recreate
             // than an executor with its weights), then idle executors.
             let released = self.host.release(need - available);
             let ended = released == 0
-                && (self.end_idle_parent() > 0
-                    || match self.first().with(|gpu| gpu.lru_idle(plan)) {
+                && (self.end_idle_parent(spare) > 0
+                    || match self.first().with(|gpu| gpu.lru_idle(plan, spare)) {
                         Some(victim) => self
                             .carry_out(&Step::End(victim), sessions)
                             .unwrap_or(false),
@@ -2537,7 +2652,7 @@ impl GpuPool {
             crate::memory::note(serde_json::json!({"event": "host_room", "plan": plan,
                 "need": need, "available": available, "released": released, "ended": ended}));
             if released == 0 && !ended {
-                return;
+                return false;
             }
         }
     }

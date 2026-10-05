@@ -198,9 +198,8 @@ impl Service {
                 self.engine.with_journal(|journal| journal.replace_warm_set(actor, &records))?;
             }
             gpu.set_members(actor, members);
-            let (gpu, actor) = (gpu.clone(), actor.clone());
-            std::thread::Builder::new().name("warm-set".into()).spawn(move || gpu.keep(&actor))?;
         }
+        gpu.keep_all(&self.engine);
         Ok(())
     }
 

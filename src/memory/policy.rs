@@ -128,6 +128,8 @@ pub struct Gpu {
     /// Degree 2 holdings custody charges on this GPU, counted once; the caller refreshes them
     /// before each decision.
     pub holdings: Vec<Holding>,
+    /// Plans in a caller's warm set: among idle tenants, the last to give anything up.
+    pub members: BTreeSet<String>,
     /// What executors measured here and in earlier runs (contexts, activations per shape).
     pub learned: Learned,
     /// This GPU and driver, the key its contexts are learned under.
@@ -547,7 +549,7 @@ impl Gpu {
                 .iter()
                 .filter(|(other, _)| other.as_str() != plan && !round.tried.contains(*other))
                 .collect();
-            rows.sort_by_key(|(_, tenant)| tenant.last_used);
+            rows.sort_by_key(|(other, tenant)| (self.members.contains(*other), tenant.last_used));
             rows
         };
         if want.is_none_or(|want| room < want) {
@@ -608,13 +610,43 @@ impl Gpu {
         Decision::Go(room)
     }
 
-    /// The least recently used idle tenant other than `plan`: what the host gives up first.
-    pub fn lru_idle(&self, plan: &str) -> Option<String> {
+    /// The idle tenant other than `plan` the host gives up first: one outside every warm
+    /// set before a member, least recently used first. `spare`: never a member.
+    pub fn lru_idle(&self, plan: &str, spare: bool) -> Option<String> {
         self.tenants
             .iter()
             .filter(|(other, t)| other.as_str() != plan && t.phase == Phase::Idle)
-            .min_by_key(|(_, t)| t.last_used)
+            .filter(|(other, _)| !(spare && self.members.contains(*other)))
+            .min_by_key(|(other, t)| (self.members.contains(*other), t.last_used))
             .map(|(other, _)| other.clone())
+    }
+
+    /// The next step to admit warm set member `plan`'s executor: the room that is free, else
+    /// what idle tenants outside every warm set give, least recently used first (their
+    /// weights, then their processes). `Wait`: only a member or a running call has more.
+    pub fn admit_member(&self, plan: &str, sample: &Sample, round: &mut Round) -> Decision {
+        let room = self.room(plan, sample);
+        if room >= self.spawn_need(plan) {
+            return Decision::Go(room);
+        }
+        let mut idle: Vec<_> = self
+            .tenants
+            .iter()
+            .filter(|(other, t)| other.as_str() != plan && t.phase == Phase::Idle)
+            .filter(|(other, _)| !self.members.contains(*other))
+            .collect();
+        idle.sort_by_key(|(_, tenant)| tenant.last_used);
+        for (other, tenant) in &idle {
+            if tenant.mapped && round.tried.insert(other.to_string()) {
+                return Decision::Step(Step::Unmap(other.to_string()));
+            }
+        }
+        for (other, _) in idle {
+            if round.tried.insert(format!("end:{other}")) {
+                return Decision::Step(Step::End(other.clone()));
+            }
+        }
+        Decision::Wait
     }
 
     /// Every live tenant as `(plan, weights, pinned now)`, `first` ahead and then most
@@ -755,6 +787,65 @@ mod tests {
             gpu.decide("c", gpu.want("c"), gpu.need("c"), &s, &mut round),
             Decision::Step(Step::End("a".into()))
         );
+    }
+
+    /// Two idle tenants on a 4 GiB card, "member" the less recently used, and a third
+    /// model whose lowest rung does not fit beside both contexts.
+    fn two_idle_and_a_third(members: &[&str]) -> (Gpu, Sample) {
+        let mut gpu = Gpu::default();
+        loaded(&mut gpu, "member", 10, 2 * GIB, GIB);
+        loaded(&mut gpu, "other", 11, 2 * GIB, GIB);
+        gpu.members = members.iter().map(|plan| plan.to_string()).collect();
+        gpu.observe(
+            "c",
+            Facts {
+                context: Some(GIB),
+                weights: Some(GIB),
+                weights_floor: Some(GIB),
+                activation: Some(GIB / 2),
+                ..Facts::default()
+            },
+            None,
+        );
+        gpu.starting("c", 0);
+        let s = sample(4 * GIB, 3 * GIB - 512 * MIB, &[(10, GIB / 2), (11, GIB)]);
+        (gpu, s)
+    }
+
+    #[test]
+    fn a_request_takes_from_tenants_outside_the_warm_set_before_a_member() {
+        let (mut gpu, s) = two_idle_and_a_third(&["member"]);
+        let decide = |gpu: &Gpu| {
+            gpu.decide("c", gpu.want("c"), gpu.need("c"), &s, &mut Round::default())
+        };
+        // By the clock alone the member, the older of the two, would go first.
+        assert_eq!(decide(&gpu), Decision::Step(Step::End("other".into())));
+        gpu.observe("member", Facts::default(), Some(true));
+        gpu.observe("other", Facts::default(), Some(true));
+        assert_eq!(decide(&gpu), Decision::Step(Step::Unmap("other".into())));
+        // Work is never refused: with nothing else idle, the member gives its room too.
+        gpu.ended("other");
+        assert_eq!(decide(&gpu), Decision::Step(Step::Unmap("member".into())));
+        assert_eq!(gpu.lru_idle("c", false), Some("member".into()));
+        assert_eq!(gpu.lru_idle("c", true), None);
+    }
+
+    #[test]
+    fn a_member_is_admitted_into_free_room_and_the_room_of_tenants_outside_the_set_only() {
+        // "c" joins the set: the idle tenant outside it gives its weights, then its process.
+        let (mut gpu, s) = two_idle_and_a_third(&["member", "c"]);
+        gpu.observe("other", Facts::default(), Some(true));
+        let mut round = Round::default();
+        assert_eq!(gpu.admit_member("c", &s, &mut round), Decision::Step(Step::Unmap("other".into())));
+        gpu.unmapped("other");
+        assert_eq!(gpu.admit_member("c", &s, &mut round), Decision::Step(Step::End("other".into())));
+        // Another member is never touched for it: it waits at a lower level.
+        gpu.ended("other");
+        assert_eq!(gpu.admit_member("c", &s, &mut Round::default()), Decision::Wait);
+        // With the room free it is simply admitted.
+        gpu.ended("member");
+        let free = sample(8 * GIB, 8 * GIB, &[]);
+        assert!(matches!(gpu.admit_member("c", &free, &mut Round::default()), Decision::Go(_)));
     }
 
     #[test]
