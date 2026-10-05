@@ -378,57 +378,43 @@ impl Gpu {
             .and_then(|shape| self.learned.shape(plan, shape))
     }
 
-    /// Holdings `plan`'s executor maps (Degree 2): weights already on the GPU, counted once
-    /// among the resident allocations, never again in what it asks for.
-    fn attached(&self, plan: &str) -> u64 {
-        let Some(pid) = self.tenant(plan).map(|t| t.pid).filter(|pid| *pid != 0) else {
-            return 0;
-        };
-        self.holdings
-            .iter()
-            .filter(|h| h.readers.contains(&pid))
-            .map(|h| h.bytes)
-            .sum()
+    /// Whether `holding` is `plan`'s own: mapped by its process, or named by an earlier
+    /// executor of it and held now, read by anyone or nobody. Its bytes are on the GPU already:
+    /// counted once among the resident allocations, never again in what `plan` asks for, and
+    /// never revoked for `plan`'s own call (phil, 12 GB: each Anima grant revoked 1.79 GB of
+    /// Anima's own idle holdings, then loaded them again).
+    fn own(&self, plan: &str, holding: &Holding) -> bool {
+        let pid = self.tenant(plan).map_or(0, |t| t.pid);
+        (pid != 0 && holding.readers.contains(&pid))
+            || (!holding.revoking
+                && self
+                    .learned
+                    .plans
+                    .get(plan)
+                    .is_some_and(|learned| learned.holdings.contains(holding_name(&holding.id))))
     }
 
-    /// Holdings `plan`'s next executor attaches although another tenant reads them: named by
-    /// an earlier executor of it (learned), held now, and not mapped by its own process. They
-    /// are resident already, so its load adds none of their bytes.
-    fn shared(&self, plan: &str) -> u64 {
-        let Some(names) = self
-            .learned
-            .plans
-            .get(plan)
-            .map(|learned| &learned.holdings)
-        else {
-            return 0;
-        };
-        let own = self.tenant(plan).map_or(0, |t| t.pid);
+    fn own_bytes(&self, plan: &str) -> u64 {
         self.holdings
             .iter()
-            .filter(|h| {
-                !h.revoking
-                    && !h.readers.is_empty()
-                    && !h.readers.contains(&own)
-                    && names.contains(holding_name(&h.id))
-            })
+            .filter(|h| self.own(plan, h))
             .map(|h| h.bytes)
             .sum()
     }
 
     /// Whether `plan`'s whole construction and its activations fit beside the other tenants
-    /// (Degree 2 keeps every component resident). Holdings nobody reads are reclaimable or its
-    /// own to attach, and those another tenant reads of its own weight sets it attaches too.
-    /// False while its weights or activations were never measured.
+    /// (Degree 2 keeps every component resident). Its own holdings are in `want` already;
+    /// another plan's that nobody reads are reclaimable. False while its weights or
+    /// activations were never measured.
     pub fn fits_resident(&self, plan: &str, sample: &Sample) -> bool {
         let unread: u64 = self
             .holdings
             .iter()
-            .filter(|h| h.readers.is_empty())
+            .filter(|h| h.readers.is_empty() && !self.own(plan, h))
             .map(|h| h.bytes)
             .sum();
         self.want(plan)
-            .is_some_and(|want| self.room(plan, sample) + unread + self.shared(plan) >= want)
+            .is_some_and(|want| self.room(plan, sample) + unread >= want)
     }
 
     /// The weights a call of `plan` puts on the GPU: what one kept mapped with nothing evicted
@@ -444,7 +430,7 @@ impl Gpu {
         let facts = self.facts(plan);
         Some(
             facts.context.unwrap_or(self.context_estimate())
-                + self.call_weights(plan)?.saturating_sub(self.attached(plan))
+                + self.call_weights(plan)?.saturating_sub(self.own_bytes(plan))
                 + self.activation(plan)?
                 + MARGIN,
         )
@@ -466,7 +452,7 @@ impl Gpu {
                 .max()?;
             Some(
                 facts.context.unwrap_or(self.context_estimate())
-                    + self.call_weights(plan)?.saturating_sub(self.attached(plan))
+                    + self.call_weights(plan)?.saturating_sub(self.own_bytes(plan))
                     + largest
                     + MARGIN,
             )
@@ -480,22 +466,9 @@ impl Gpu {
             + facts
                 .weights_floor
                 .unwrap_or(0)
-                .saturating_sub(self.attached(plan))
+                .saturating_sub(self.own_bytes(plan))
             + self.activation(plan).unwrap_or(0)
             + MARGIN
-    }
-
-    /// Holdings `plan`'s next executor attaches at its load: named by an earlier executor of
-    /// it and held now, read or not.
-    fn attachable(&self, plan: &str) -> u64 {
-        let Some(learned) = self.learned.plans.get(plan) else {
-            return 0;
-        };
-        self.holdings
-            .iter()
-            .filter(|h| !h.revoking && learned.holdings.contains(holding_name(&h.id)))
-            .map(|h| h.bytes)
-            .sum()
     }
 
     /// What a spawn of `plan` reserves: a context and its first working set when known. The
@@ -508,7 +481,7 @@ impl Gpu {
             + facts
                 .weights_floor
                 .unwrap_or(0)
-                .saturating_sub(self.attachable(plan))
+                .saturating_sub(self.own_bytes(plan))
             + self.activation(plan).unwrap_or(0)
     }
 
@@ -560,7 +533,6 @@ impl Gpu {
                 round.tried.insert(other.clone());
                 return Decision::Step(Step::Unmap(other.clone()));
             }
-            let reader = self.tenant(plan).map_or(0, |t| t.pid);
             let busy: BTreeSet<u32> = self
                 .tenants
                 .iter()
@@ -573,10 +545,8 @@ impl Gpu {
                 .filter(|h| {
                     !h.revoking
                         && !round.tried.contains(&h.id)
-                        && !h
-                            .readers
-                            .iter()
-                            .any(|pid| *pid == reader || busy.contains(pid))
+                        && !self.own(plan, h)
+                        && !h.readers.iter().any(|pid| busy.contains(pid))
                 })
                 .max_by_key(|h| h.idle_ms)
             {
@@ -905,6 +875,41 @@ mod tests {
                 &mut round
             ),
             Decision::Step(Step::Revoke("sdxl#1".into()))
+        );
+    }
+
+    #[test]
+    fn a_grant_never_revokes_the_planned_plans_own_holdings() {
+        // phil, 12 GB, SDXL and Anima alternating: Anima's executor unmapped its text encoder
+        // at the last switch, so nobody read it; Anima's next grant revoked it as the most idle
+        // holding, then loaded it again. Its own holdings are counted once and stay.
+        let mut gpu = Gpu::default();
+        loaded(&mut gpu, "sdxl", 10, 7 * GIB, GIB);
+        loaded(&mut gpu, "anima", 11, 6 * GIB, GIB);
+        gpu.learned.holding("anima", "GPU-1/sha256:qwen");
+        let held = |id: &str, bytes, readers: &[u32], idle_ms| Holding {
+            id: id.into(),
+            bytes,
+            readers: readers.to_vec(),
+            idle_ms,
+            revoking: false,
+        };
+        gpu.holdings = vec![
+            held("GPU-1/sha256:qwen#6", GIB, &[], 90_000),
+            held("GPU-1/sha256:unet#5", 5 * GIB, &[10], 30_000),
+        ];
+        let s = sample(12 * GIB, 4 * GIB, &[(10, GIB / 2), (11, GIB / 2)]);
+        let want = gpu.want("anima").unwrap();
+        assert_eq!(want, GIB / 2 + 5 * GIB + GIB + MARGIN, "its held GiB is not asked again");
+        let mut round = Round::default();
+        assert_eq!(
+            gpu.decide("anima", Some(want), gpu.need("anima"), &s, &mut round),
+            Decision::Step(Step::Revoke("GPU-1/sha256:unet#5".into()))
+        );
+        assert_eq!(
+            gpu.decide("anima", Some(want), gpu.need("anima"), &s, &mut round),
+            Decision::Go(gpu.room("anima", &s)),
+            "nothing else of another plan's to revoke, and its own stays"
         );
     }
 
