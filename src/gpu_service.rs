@@ -100,11 +100,6 @@ pub struct GpuConfig {
     /// host memory (no device memory); false spawns every executor, which imports again.
     #[serde(default = "yes")]
     pub prespawn: bool,
-    /// At machine start, load each installed GPU generation's most recently used
-    /// construction where it fits beside the tenants already there (it never makes room).
-    /// They stay as idle tenants the memory policy evicts least recently used first.
-    #[serde(default = "yes")]
-    pub prewarm: bool,
 }
 impl GpuConfig {
     pub fn load(path: &Path) -> io::Result<Self> {
@@ -954,77 +949,11 @@ impl GpuPool {
         }
     }
 
-    /// Load the given constructions in the background, each only where it fits beside the
-    /// tenants already there (a prewarm never makes room), most recent first. Each waits for
-    /// the GPU's call slot, so a request already running finishes first.
-    /// `fence`: a previous run's executors; new GPU work waits until each has exited.
-    pub fn prewarm(
-        self: &Arc<Self>,
-        engine: &Arc<Engine>,
-        plans: Vec<(HeldGeneration, GpuPlan)>,
-        fence: Vec<ProcessBirth>,
-    ) {
-        if !self.config.prewarm || plans.is_empty() {
-            return;
-        }
-        let (pool, engine) = (self.clone(), engine.clone());
-        let started = std::thread::Builder::new()
-            .name("executor-prewarm".into())
-            .spawn(move || {
-                while !fence
-                    .iter()
-                    .all(|birth| process_ended(birth).unwrap_or(true))
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-                for (held, plan) in plans {
-                    let asked = Instant::now();
-                    // Its parent imports first, off the call slot; a request in flight or
-                    // queued always goes ahead of a prewarm.
-                    if let Some((zygote, start)) = pool.zygote(&held) {
-                        if start {
-                            zygote.set(pool.import_only(&held));
-                        }
-                        zygote.wait_started();
-                    }
-                    while !engine.nonterminal(1).is_ok_and(|work| work.is_empty())
-                        || pool
-                            .reserved
-                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                            .is_err()
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    }
-                    let _permit = Permit {
-                        pool: pool.clone(),
-                        engine: Arc::downgrade(&engine),
-                    };
-                    let key = plan.id.clone();
-                    let waited = asked.elapsed();
-                    let mut sessions = pool.sessions.lock().unwrap();
-                    let result = pool.prewarm_locked(&engine, &held, plan, &mut sessions);
-                    for device in &pool.devices {
-                        device.memory.finished(&key);
-                    }
-                    if !sessions.contains_key(&key) {
-                        pool.ended(&key);
-                    }
-                    pool.note_prewarm(&key, waited, asked.elapsed() - waited, &result);
-                }
-            });
-        if let Err(error) = started {
-            eprintln!("executor prewarm: {error}");
-        }
-    }
-
     /// A running parent's hint that it will call `plan` next (`model_prefetch`, H3 long-form's
     /// `prefetch(motion_segment)`): load it in the background where it fits beside the tenants
-    /// already there, as a prewarm does, but without waiting for the parent's own run to end.
+    /// already there (it never makes room), without waiting for the parent's own run to end.
     /// It takes the GPU's call slot like any call, so a child call in flight finishes first.
     pub fn prefetch(self: &Arc<Self>, engine: &Arc<Engine>, held: HeldGeneration, plan: GpuPlan) {
-        if !self.config.prewarm {
-            return;
-        }
         let (pool, engine) = (self.clone(), engine.clone());
         let started = std::thread::Builder::new()
             .name("executor-prefetch".into())
@@ -1298,8 +1227,8 @@ impl GpuPool {
         }
     }
 
-    /// Start a generation's import-only executor in the background (machine start, after
-    /// an install), so its imports overlap everything before the first request.
+    /// Start a generation's import-only executor in the background after its install, so its
+    /// imports overlap the model download before the first request.
     pub fn prespawn(self: &Arc<Self>, held: HeldGeneration) {
         if !self.parent_fits(&held.record.identity) {
             eprintln!(
