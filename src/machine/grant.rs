@@ -20,7 +20,6 @@ const NAMES: &[&str] = &[
     "COZY_WORKER_ID",
     "COZY_WORKER_AUTH_TOKEN",
     "COZY_WORKER_INTERNAL_PORT",
-    "COZY_MEDIA_INTERNAL_PORT",
     "COZY_WEBRTC_INTERNAL_PORT",
     "COZY_WEBRTC_PUBLIC_ADDRESS",
     "COZY_RECORD_OWNER_AUTH_JSON",
@@ -62,8 +61,6 @@ pub struct Grant {
     pub listen_host: IpAddr,
     pub worker_id: String,
     pub worker_port: u16,
-    /// A launcher that still grants a media port reads the receipt there.
-    pub media_port: Option<u16>,
     pub webrtc_port: Option<u16>,
     /// Where browsers reach the WebRTC listener ([`super::player::reach`]).
     pub webrtc_reach: super::player::Reach,
@@ -153,11 +150,6 @@ impl Grant {
             "COZY_WORKER_INTERNAL_PORT",
         )?
         .ok_or_else(|| invalid("COZY_WORKER_INTERNAL_PORT is required"))?;
-        // A pre-machine Hub may still grant a media port; this machine serves one endpoint.
-        let media_port = port(get("COZY_MEDIA_INTERNAL_PORT"), "COZY_MEDIA_INTERNAL_PORT")?;
-        if media_port == Some(worker_port) {
-            return Err(invalid("the worker and media ports must differ"));
-        }
         let webrtc_port = port(
             get("COZY_WEBRTC_INTERNAL_PORT"),
             "COZY_WEBRTC_INTERNAL_PORT",
@@ -247,7 +239,6 @@ impl Grant {
             listen_host,
             worker_id,
             worker_port,
-            media_port,
             webrtc_port,
             webrtc_reach: super::player::reach(webrtc_port, env),
             hub,
@@ -407,7 +398,6 @@ mod tests {
         assert!(Grant::read(&env(&base)).is_ok());
         for (name, value) in [
             ("COZY_WORKER_INTERNAL_PORT", "08443"),
-            ("COZY_MEDIA_INTERNAL_PORT", "8443"),
             ("COZY_MACHINE_ROOT", "relative"),
             ("COZY_LISTEN_HOST", "::"),
             ("COZY_AUTHORIZED_KEYS", "short"),

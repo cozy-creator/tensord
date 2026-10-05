@@ -1,6 +1,8 @@
 //! One root, one machine, one store: the real binary as this computer's launcher starts it.
 //! A second machine on the root refuses, a holder of the Go agent's lock excludes it, and the
 //! store the launcher names is the store it fills, with what another writer left there.
+mod common;
+
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use cozy_machine::api::{
     capability::{self, Grant},
@@ -83,14 +85,7 @@ fn boot(root: &Path, port: u16, store: Option<&Path>) -> Machine {
 }
 
 fn served(root: &Path, port: u16) -> bool {
-    let output = Command::new("curl")
-        .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "--cacert"])
-        .arg(root.join("run/cozy/bootstrap/tls.crt"))
-        .args(["--resolve", &format!("cozy-worker:{port}:127.0.0.1")])
-        .arg(format!("https://cozy-worker:{port}/v1/bootstrap/receipt"))
-        .output()
-        .unwrap();
-    output.stdout == b"200"
+    common::receipt(root, port).is_some()
 }
 
 fn ready(machine: &mut Machine, root: &Path, port: u16) {

@@ -1,5 +1,5 @@
 //! Readiness: what this machine measured about itself, sealed once under the attempt's key and
-//! served at `/v1/bootstrap/receipt`. The reader is Tensorhub `internal/podreadiness`.
+//! carried by Status without a capability. The reader is Tensorhub `internal/podreadiness`.
 use base64::{engine::general_purpose::STANDARD, Engine};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;

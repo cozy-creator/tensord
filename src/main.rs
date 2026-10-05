@@ -231,9 +231,6 @@ fn run_machine(
     }
     let control = bind_control(&owner)?;
     let api = std::net::TcpListener::bind((grant.listen_host, grant.worker_port))?;
-    if let Some(port) = grant.media_port {
-        identity.media = Some(std::net::TcpListener::bind((grant.listen_host, port))?);
-    }
     identity.webrtc = cozy_machine::machine::player::listen(&layout.state, grant.webrtc_port, !rental)?;
     identity.player = grant.webrtc_reach.clone();
     // The client this binary embeds, and the installer helper over it (made once per client).

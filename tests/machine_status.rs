@@ -1,6 +1,8 @@
 //! Status on the real binary in machine mode: anyone gets identity and the sealed receipt (the
 //! bytes the Hub verifies); a machine cap gets the whole picture as it changes; an open stream is
 //! not activity and only `keepalive` moves the idle deadline.
+mod common;
+
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use cozy_machine::api::{
     capability::{self, Grant},
@@ -71,7 +73,7 @@ fn webrtc(lifetime: &str) -> Vec<(String, String)> {
         .to_vec()
 }
 
-/// The HTTPS receipt route the Go-era Hub reads, until it answers.
+/// The sealed receipt, once the machine serves it on Status.
 fn receipt(machine: &mut Machine, root: &Path, port: u16) -> Vec<u8> {
     let start = Instant::now();
     loop {
@@ -79,16 +81,8 @@ fn receipt(machine: &mut Machine, root: &Path, port: u16) -> Vec<u8> {
             machine.0.try_wait().unwrap().is_none(),
             "the machine exited"
         );
-        let output = Command::new("curl")
-            .args(["-s", "-w", "\n%{http_code}", "--cacert"])
-            .arg(root.join("run/cozy/bootstrap/tls.crt"))
-            .args(["--resolve", &format!("cozy-worker:{port}:127.0.0.1")])
-            .arg(format!("https://cozy-worker:{port}/v1/bootstrap/receipt"))
-            .output()
-            .unwrap();
-        let text = String::from_utf8(output.stdout).unwrap();
-        if let Some((body, "200")) = text.rsplit_once('\n') {
-            return body.as_bytes().to_vec();
+        if let Some(body) = common::receipt(root, port) {
+            return body;
         }
         assert!(start.elapsed() < Duration::from_secs(300), "no receipt");
         std::thread::sleep(Duration::from_millis(200));
@@ -192,7 +186,7 @@ async fn status_answers_identity_to_anyone_and_the_machine_to_its_owner() {
             (only.worker_id.as_str(), only.boot_id.as_str()),
             (WORKER, boot_id.as_str())
         );
-        assert_eq!(only.receipt, sealed, "the receipt the HTTPS route serves");
+        assert_eq!(only.receipt, sealed, "every caller reads one sealed receipt");
         assert!(only.capabilities.contains(&"update/1".to_string()));
         assert!(only.runs.is_empty() && only.gpus.is_empty() && only.idle_deadline_unix_ms == 0);
         assert!(only.models.is_empty() && only.models_bytes == 0);

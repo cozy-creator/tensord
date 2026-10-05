@@ -48,7 +48,7 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 | Module | Owns | Main types | Owner |
 |---|---|---|---|
 | `main.rs` | `serve`/`version` commands, weight-peer socket and owner-only admin socket, wiring | — | E (admin socket split), D2 (rental config) |
-| `api/server.rs` | TLS listener: `cozy.machine.v1`, health, the readiness receipt, retired worker.v1 answers | `MachineIdentity`, `serve` | D1 |
+| `api/server.rs` | TLS listener: `cozy.machine.v1`, health, retired worker.v1 answers | `MachineIdentity`, `serve` | D1 |
 | `api/auth.rs` | Admitted keys (a rental's Hub lease) and each open stream's authority | `Authority`, `Keys`, `StreamAuthority` | D1 |
 | `api/identity.rs` | Persistent P-256 TLS identity, typed machine config, readiness secret | `MachineConfig`, `AuthorizedKeys`, `ReadinessSecret` | D2 |
 | `api/backend.rs` | The one backend trait the server calls | `MachineBackend`, `InputTreeReceiver`, `Observation` | D1 |
