@@ -189,6 +189,8 @@ fn run_machine(
             "authorized_device_limit_bytes": null,
             "pinned_budget_bytes": 4i64 << 30,
             "environment": {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": home, "COZY_HOME": home},
+            // A rented pod is the machine's alone (its grant says so); anywhere else it is a guest.
+            "host": {"mode": if rental { "dedicated" } else { "shared" }},
         });
         // The operator's GPU settings, when the machine root has them, over these defaults.
         if let Ok(file) = std::fs::File::open(layout.state.join("gpu-config.json")) {
