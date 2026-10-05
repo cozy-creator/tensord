@@ -513,6 +513,9 @@ pub struct PlaneFacts {
     /// Per stage method, the most room torch had at an entry that made it drop its whole
     /// cache more than once (`memory::learned::Shape::squeezed`).
     pub squeezed: BTreeMap<String, u64>,
+    /// Components the executor gave back to make torch room since it started, and their bytes.
+    pub paged_out: Option<u64>,
+    pub paged_out_bytes: Option<u64>,
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
