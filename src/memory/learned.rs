@@ -19,6 +19,11 @@ pub struct Shape {
     pub peak: u64,
     /// Each stage method's.
     pub methods: BTreeMap<String, u64>,
+    /// Per stage method, the most room torch had at an entry that made it drop its whole
+    /// cache more than once: an executor gives that method's entries more (it pages out
+    /// components the stage does not read). Never part of the fit: a peak can fit a room
+    /// torch still squeezes in.
+    pub squeezed: BTreeMap<String, u64>,
     /// An estimate, never a measurement: the measured shape it was scaled from, and the ratio
     /// of their token counts. Never written back (`call` stores measurements only).
     #[serde(skip)]
@@ -34,13 +39,15 @@ impl Shape {
     /// This shape's peaks scaled by `ratio`, as an estimate from `cell`.
     fn scaled(&self, cell: &str, ratio: f64) -> Self {
         let scale = |bytes: u64| (bytes as f64 * ratio).ceil() as u64;
+        let scaled = |rows: &BTreeMap<String, u64>| {
+            rows.iter()
+                .map(|(method, bytes)| (method.clone(), scale(*bytes)))
+                .collect()
+        };
         Self {
             peak: scale(self.peak),
-            methods: self
-                .methods
-                .iter()
-                .map(|(method, bytes)| (method.clone(), scale(*bytes)))
-                .collect(),
+            methods: scaled(&self.methods),
+            squeezed: scaled(&self.squeezed),
             estimated_from: Some((cell.into(), ratio)),
         }
     }
@@ -156,6 +163,17 @@ impl Learned {
         }
     }
 
+    /// Rooms a call of `plan` at `shape` saw squeeze its stage methods (`Shape::squeezed`);
+    /// each only grows.
+    pub fn squeezed(&mut self, plan: &str, shape: &str, rooms: &BTreeMap<String, u64>) {
+        let cell = self.plans.entry(plan.into()).or_default();
+        let cell = cell.shapes.entry(shape.into()).or_default();
+        for (method, bytes) in rooms {
+            let entry = cell.squeezed.entry(method.clone()).or_default();
+            *entry = (*entry).max(*bytes);
+        }
+    }
+
     /// The weights a call of `plan` kept mapped without evicting any (`Plan::mapped`).
     pub fn mapped(&mut self, plan: &str, bytes: u64) {
         let row = self.plans.entry(plan.into()).or_default();
@@ -228,6 +246,27 @@ impl Learned {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_squeezed_room_is_kept_per_shape_and_never_counts_as_a_peak() {
+        let path = std::env::temp_dir().join(format!("learned-{}.json", uuid::Uuid::new_v4()));
+        let mut learned = Learned::open(&path);
+        let methods = BTreeMap::from([("sample".to_string(), 20 << 30)]);
+        learned.call("h3", "frames=362", 20 << 30, &methods);
+        let room = |gib: u64| BTreeMap::from([("sample".to_string(), gib << 30)]);
+        learned.squeezed("h3", "frames=362", &room(21));
+        learned.squeezed("h3", "frames=362", &room(19)); // only ever grows
+        learned.save().unwrap();
+        let learned = Learned::open(&path);
+        let shape = learned.shape("h3", "frames=362").unwrap();
+        assert_eq!(shape.squeezed, room(21));
+        // The fit stays on what was measured.
+        assert_eq!(shape.bytes(), 20 << 30);
+        // A larger shape never measured scales the room with its tokens, as its peaks.
+        let larger = learned.shape("h3", "frames=724").unwrap();
+        assert_eq!((larger.bytes(), larger.squeezed), (40 << 30, room(42)));
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn a_shape_never_seen_takes_the_least_larger_one_and_survives_a_restart() {
