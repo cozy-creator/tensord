@@ -1355,26 +1355,6 @@ fn state_name(state: State) -> &'static str {
     }
 }
 
-#[cfg(test)]
-mod exact_tests {
-    use super::*;
-
-    /// Seeds past 2^53 name distinct child calls and come back from a child exact.
-    #[test]
-    fn large_integers_stay_exact() {
-        let seed = |text: &str| crate::boundary_json::parse(text.as_bytes()).unwrap();
-        let intent = |input: &Value| child_intent("package", "call", input);
-        let first = seed(r#"{"seed":9007199254740992,"nested":{"b":2,"a":1}}"#);
-        assert_eq!(intent(&first), intent(&seed(r#" {"nested":{"a":1,"b":2}, "seed":9007199254740992} "#)));
-        assert_ne!(intent(&first), intent(&seed(r#"{"seed":9007199254740993,"nested":{"b":2,"a":1}}"#)));
-        let result = crate::journal::ResultRecord { value: json!({"seed": u64::MAX, "float": 1.0}), artifacts: vec![], asset_bindings: vec![] };
-        let (sent, _) = grant(Path::new("unused"), &result, Path::new("unused"), None).unwrap();
-        let received = crate::boundary_json::parse(sent.as_bytes()).unwrap();
-        assert_eq!(received["seed"].as_u64(), Some(u64::MAX));
-        assert!(received["float"].is_f64());
-    }
-}
-
 /// Journals a weights output's publication as a `call` event on its run (`run show` lists it
 /// beside the run's child calls), before the run settles. Keyed by output and transaction, so
 /// a replay adds no second row.
@@ -1427,5 +1407,25 @@ fn record_call(
             eprintln!("job {}: call {index}: {error}", parent.id);
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod exact_tests {
+    use super::*;
+
+    /// Seeds past 2^53 name distinct child calls and come back from a child exact.
+    #[test]
+    fn large_integers_stay_exact() {
+        let seed = |text: &str| crate::boundary_json::parse(text.as_bytes()).unwrap();
+        let intent = |input: &Value| child_intent("package", "call", input);
+        let first = seed(r#"{"seed":9007199254740992,"nested":{"b":2,"a":1}}"#);
+        assert_eq!(intent(&first), intent(&seed(r#" {"nested":{"a":1,"b":2}, "seed":9007199254740992} "#)));
+        assert_ne!(intent(&first), intent(&seed(r#"{"seed":9007199254740993,"nested":{"b":2,"a":1}}"#)));
+        let result = crate::journal::ResultRecord { value: json!({"seed": u64::MAX, "float": 1.0}), artifacts: vec![], asset_bindings: vec![] };
+        let (sent, _) = grant(Path::new("unused"), &result, Path::new("unused"), None).unwrap();
+        let received = crate::boundary_json::parse(sent.as_bytes()).unwrap();
+        assert_eq!(received["seed"].as_u64(), Some(u64::MAX));
+        assert!(received["float"].is_f64());
     }
 }
