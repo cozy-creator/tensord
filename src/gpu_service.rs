@@ -67,6 +67,10 @@ pub struct HostOptions {
     pub fill_threads: Option<usize>,
     #[serde(default)]
     pub ttl_seconds: Option<u64>,
+    /// `shared` (the default): a guest that gives memory back whenever anything on the host
+    /// stalls on it; `dedicated` (a rented pod's image or grant): only when this cgroup does.
+    #[serde(default)]
+    pub mode: crate::host_pressure::HostMode,
 }
 
 /// Root-sealed configuration, never peer-controlled paths or environment logic switches.
@@ -478,6 +482,11 @@ pub struct GpuPool {
     /// Each envelope GPU with its own memory decisions, in envelope order.
     devices: Vec<Device>,
     host: Arc<HostTier>,
+    /// Shared mode's room for the host's other programs, and the stalls the watcher saw: the
+    /// count at the last bring-back pass says whether one came since (`host_pressure`).
+    reserve: Mutex<crate::host_pressure::Reserve>,
+    stalls: std::sync::atomic::AtomicU64,
+    stalls_seen: std::sync::atomic::AtomicU64,
     /// The memory policy's host ledger; the tier's limit reads it.
     host_ledger: Arc<crate::memory::host::HostLedger>,
     /// Degree 2: GPU weights kept across executors. None on a GPU that drives a display.
@@ -584,7 +593,7 @@ impl GpuPool {
                 memory: GpuMemory::start(entry, &memory, &learned),
             });
         }
-        Ok(Arc::new(Self {
+        let pool = Arc::new(Self {
             launcher: crate::child_launcher::ChildLauncher::new()?,
             root: root.to_path_buf(),
             serving: Arc::default(),
@@ -600,10 +609,100 @@ impl GpuPool {
             keeping: Mutex::new(()),
             levels: Mutex::new(BTreeMap::new()),
             host,
+            reserve: Mutex::default(),
+            stalls: Default::default(),
+            stalls_seen: Default::default(),
             host_ledger,
             custody,
             memo: Arc::new(crate::memo::Memo::open(root.join("stage-memo"))?),
-        }))
+        });
+        pool.watch_host();
+        Ok(pool)
+    }
+    /// The host-pressure watcher (`host_pressure`): one thread blocked in poll() until the
+    /// kernel reports a stall, then a rung given back when the feedback rule says so.
+    fn watch_host(self: &Arc<Self>) {
+        let mode = self.config.host.mode;
+        let pressure = match crate::host_pressure::Pressure::arm(mode) {
+            Ok(pressure) => pressure,
+            Err(error) => {
+                eprintln!("host pressure: no PSI trigger ({error}); memory goes back only as calls plan");
+                return;
+            }
+        };
+        let pool = Arc::downgrade(self);
+        let started = std::thread::Builder::new()
+            .name("host-pressure".into())
+            .spawn(move || {
+                let mut feedback = crate::host_pressure::Feedback::new(
+                    pressure.stalled_us().unwrap_or(0),
+                    std::time::Instant::now(),
+                );
+                while pressure.wait().is_ok() {
+                    let Some(pool) = pool.upgrade() else { break };
+                    pool.stalls.fetch_add(1, Ordering::AcqRel);
+                    pool.host_room_now();
+                    let Ok(total) = pressure.stalled_us() else { break };
+                    let give = feedback.give(total, std::time::Instant::now());
+                    let gave = give && pool.give_back_one();
+                    if give && !gave {
+                        feedback.exhausted();
+                    }
+                    crate::memory::note(serde_json::json!({"event": "host_pressure",
+                        "mode": format!("{mode:?}"), "stalled_us": total, "gave": gave,
+                        "stopped_at": feedback.stopped_at()}));
+                }
+            });
+        if let Err(error) = started {
+            eprintln!("host pressure: {error}");
+        }
+    }
+    /// One rung back to the host, in the agreed order: sealed layouts no tenant holds, an
+    /// import-only parent with no live child, then an idle executor (outside every warm set
+    /// first). Never anything a running call reads: with a call running, its sessions are
+    /// left alone. Whether anything went back.
+    /// Host bytes discretionary holdings may take now (a warm member, an import ahead): what
+    /// the host has before its tightest limit, less, in shared mode, what its other programs
+    /// used recently beyond their use now (`host_pressure::Reserve`). None: unreadable.
+    fn host_room_now(&self) -> Option<u64> {
+        let host = crate::host_memory::read();
+        let available = u64::try_from(host.available).ok()?;
+        if self.config.host.mode == crate::host_pressure::HostMode::Dedicated {
+            return Some(available);
+        }
+        let ours = crate::host_memory::tree_private(std::process::id())
+            + self.host.facts().charged_bytes;
+        let total = u64::try_from(crate::host_memory::total()).ok()?;
+        let others = crate::host_pressure::others(&host, total, ours)?;
+        Some(available.saturating_sub(self.reserve.lock().unwrap().observe(others)))
+    }
+    /// A bring-back pass: with no stall since the last one, the reserve forgets half.
+    fn quiet_pass(&self) {
+        let stalls = self.stalls.load(Ordering::Acquire);
+        if self.stalls_seen.swap(stalls, Ordering::AcqRel) != stalls {
+            return;
+        }
+        let host = crate::host_memory::read();
+        let ours = crate::host_memory::tree_private(std::process::id())
+            + self.host.facts().charged_bytes;
+        let others = u64::try_from(crate::host_memory::total())
+            .ok()
+            .and_then(|total| crate::host_pressure::others(&host, total, ours));
+        if let Some(others) = others {
+            self.reserve.lock().unwrap().quiet(others);
+        }
+    }
+    pub fn give_back_one(&self) -> bool {
+        if self.host.release(1) > 0 || self.end_idle_parent(false) > 0 {
+            return true;
+        }
+        let Ok(mut sessions) = self.sessions.try_lock() else {
+            return false;
+        };
+        match self.first().with(|gpu| gpu.lru_idle("", false)) {
+            Some(victim) => self.carry_out(&Step::End(victim), &mut sessions).unwrap_or(false),
+            None => false,
+        }
     }
     pub fn memo(&self) -> &crate::memo::Memo {
         &self.memo
@@ -705,6 +804,7 @@ impl GpuPool {
     /// from another member or a running call, and keeps the reason when it stops short.
     pub fn keep(self: &Arc<Self>, engine: &Arc<Engine>, actor: &str) {
         let _pass = self.keeping.lock().unwrap();
+        self.quiet_pass();
         for member in self.warm_set(actor) {
             let held_back = match (&member.plan, member.level) {
                 (_, Level::Installed) => "",
@@ -1352,7 +1452,7 @@ impl GpuPool {
             }
         }
         if !self.host_room(&plan.id, sessions, true) {
-            return Ok("no host memory free beside the warm set");
+            return Ok("host_memory: no host room beside the warm set and what this host's other programs used recently");
         }
         if !member {
             load_caps = self.decide(&plan.id, plan.degree, true, sessions)?;
@@ -1587,8 +1687,7 @@ impl GpuPool {
                 .filter(|bytes| *bytes > 0)
                 .unwrap_or(UNMEASURED_PARENT)
         });
-        let host = crate::host_memory::read();
-        host.available < 0 || host.available as u64 >= need
+        self.host_room_now().is_none_or(|room| room >= need)
     }
 
     /// Drop a dead parent, if it is still the generation's: the next launch starts another.
@@ -2710,8 +2809,13 @@ impl GpuPool {
             return true;
         }
         loop {
-            let host = crate::host_memory::read();
-            let Ok(available) = u64::try_from(host.available) else {
+            // A warm member is discretionary: in shared mode it leaves the host's other
+            // programs their recent peak. A request takes what the host has.
+            let available = match spare {
+                true => self.host_room_now(),
+                false => u64::try_from(crate::host_memory::read().available).ok(),
+            };
+            let Some(available) = available else {
                 return true;
             };
             if available >= need {
