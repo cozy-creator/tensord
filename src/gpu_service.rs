@@ -2249,6 +2249,7 @@ impl GpuPool {
                 "cap": cap, "cap_bytes": plane.cap_bytes, "process": plane.process_bytes,
                 "context": plane.context_bytes, "committed": plane.committed_bytes,
                 "activation": plane.activation_peak_bytes, "oom_retries": plane.oom_retries,
+                "alloc_retries": plane.alloc_retries, "cache_releases": plane.cache_releases,
                 "evictions": plane.evictions, "h2d_bytes": plane.h2d_bytes,
                 "rank_process": reply.rank_planes.iter()
                     .map(|r| r.as_ref().map(|r| r.process_bytes)).collect::<Vec<_>>(),
