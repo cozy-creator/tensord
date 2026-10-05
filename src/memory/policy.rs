@@ -400,6 +400,14 @@ impl Gpu {
                     .is_some_and(|learned| learned.holdings.contains(holding_name(&holding.id))))
     }
 
+    /// Whether `holding` is weights a warm set member's executor named.
+    fn kept(&self, holding: &Holding) -> bool {
+        self.members.iter().any(|member| {
+            let learned = self.learned.plans.get(member);
+            learned.is_some_and(|learned| learned.holdings.contains(holding_name(&holding.id)))
+        })
+    }
+
     /// Whether a grant for `plan` may revoke or trim `holding`: another plan's, read by no
     /// call in progress.
     fn reclaimable(&self, plan: &str, holding: &Holding) -> bool {
@@ -545,11 +553,14 @@ impl Gpu {
             rows.sort_by_key(|(other, tenant)| (self.members.contains(*other), tenant.last_used));
             rows
         };
-        if want.is_none_or(|want| room < want) {
-            if let Some((other, _)) = others()
-                .into_iter()
-                .find(|(_, t)| t.phase == Phase::Idle && t.mapped)
-            {
+        // Idle weights outside every warm set go first, then a member's.
+        for kept in [false, true] {
+            if want.is_some_and(|want| room >= want) {
+                break;
+            }
+            if let Some((other, _)) = others().into_iter().find(|(other, t)| {
+                t.phase == Phase::Idle && t.mapped && self.members.contains(*other) == kept
+            }) {
                 round.tried.insert(other.clone());
                 return Decision::Step(Step::Unmap(other.clone()));
             }
@@ -557,6 +568,7 @@ impl Gpu {
                 .holdings
                 .iter()
                 .filter(|h| !round.tried.contains(&h.id) && self.reclaimable(plan, h))
+                .filter(|h| self.kept(h) == kept)
                 .max_by_key(|h| h.idle_ms)
             {
                 round.tried.insert(holding.id.clone());
@@ -624,6 +636,13 @@ impl Gpu {
             if tenant.mapped && round.tried.insert(other.to_string()) {
                 return Decision::Step(Step::Unmap(other.to_string()));
             }
+        }
+        let unread = self.holdings.iter().filter(|h| {
+            !round.tried.contains(&h.id) && h.readers.is_empty() && !h.revoking && !self.kept(h)
+        });
+        if let Some(holding) = unread.max_by_key(|h| h.idle_ms) {
+            round.tried.insert(holding.id.clone());
+            return Decision::Step(Step::Revoke(holding.id.clone()));
         }
         for (other, _) in idle {
             if round.tried.insert(format!("end:{other}")) {
@@ -812,6 +831,35 @@ mod tests {
         assert_eq!(decide(&gpu), Decision::Step(Step::Unmap("member".into())));
         assert_eq!(gpu.lru_idle("c", false), Some("member".into()));
         assert_eq!(gpu.lru_idle("c", true), None);
+    }
+
+    #[test]
+    fn idle_weights_outside_the_warm_set_are_reclaimed_before_a_members() {
+        // sounosuke, 20 GB: SDXL as a member and another SDXL checkpoint, both idle with
+        // their weights in custody, then Anima. Its grant trimmed the member's holding, the
+        // older one, by 1.2 GB first.
+        let (mut gpu, s) = two_idle_and_a_third(&["member"]);
+        gpu.learned.holding("member", "GPU-1/sha256:unet-a");
+        gpu.learned.holding("other", "GPU-1/sha256:unet-b");
+        let held = |id: &str, idle_ms| Holding {
+            id: id.into(),
+            bytes: 2 * GIB,
+            readers: vec![],
+            idle_ms,
+            revoking: false,
+        };
+        gpu.holdings = vec![held("GPU-1/sha256:unet-a#1", 9_000), held("GPU-1/sha256:unet-b#1", 1_000)];
+        let want = gpu.want("c").unwrap();
+        let mut round = Round::default();
+        let step = gpu.decide("c", Some(want), gpu.need("c"), &s, &mut round);
+        assert!(matches!(&step, Decision::Step(Step::Trim(id, _) | Step::Revoke(id)) if id.contains("unet-b")), "{step:?}");
+        // A member joining takes the unread holding outside the set, never the member's.
+        let (mut gpu, s) = two_idle_and_a_third(&["member", "c"]);
+        gpu.learned.holding("member", "GPU-1/sha256:unet-a");
+        gpu.holdings = vec![held("GPU-1/sha256:unet-a#1", 9_000), held("GPU-1/sha256:unet-b#1", 1_000)];
+        let mut round = Round::default();
+        assert_eq!(gpu.admit_member("c", &s, &mut round), Decision::Step(Step::Revoke("GPU-1/sha256:unet-b#1".into())));
+        assert_eq!(gpu.admit_member("c", &s, &mut round), Decision::Step(Step::End("other".into())));
     }
 
     #[test]
