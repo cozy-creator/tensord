@@ -545,9 +545,16 @@ class Gate:
         place = spec.get("run_args", [f"--rental={self.m.get('rental')}", f"--tensorhub={self.m.get('hub')}"])
         on_gpu = re.compile(r'"type":\s*"(machine\.gpu\.grant|machine\.executor|run\.in_progress|machine\.stage\.turn)"')
         procs, first = [], None
+
+        def reap() -> None:   # each CLI's own exit time, seen within 0.1 s, also while later requests are submitted
+            for p in procs:
+                if "done" not in p and p["proc"].poll() is not None:
+                    p["done"] = time.time()
+
         for k, item in enumerate(requests):
             if procs:
                 while procs[-1]["proc"].poll() is None and not on_gpu.search(procs[-1]["err"].read_text()):
+                    reap()
                     time.sleep(0.1)
             if isinstance(item, str):
                 prompt, seed = self.unique()
@@ -566,9 +573,9 @@ class Gate:
                                     stdout=(root / "stdout.json").open("w"), stderr=err.open("w"))
             procs.append({"proc": proc, "err": err, "root": root, "model": model, "payload": payload, "submit": submit})
             self.index += 1
-        for p in procs:
-            p["proc"].wait()
-            p["done"] = time.time()
+        while any("done" not in p for p in procs):
+            reap()
+            time.sleep(0.1)
         rows = []
         for p in procs:
             images = verify(p["root"] / "out", self.m["shapes"][p["model"]]) if (p["root"] / "out").is_dir() else []
