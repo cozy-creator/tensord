@@ -1779,6 +1779,77 @@ mod v1_api {
         let _ = fs::remove_dir_all(tools);
     }
 
+    /// A job calls another package's invocable that its environment holds as a dependency, as a
+    /// published package's callee is: the call is a child run of that package, counted where it
+    /// truly runs.
+    #[tokio::test]
+    async fn a_job_calls_a_package_its_environment_depends_on() {
+        let (machine, tools) = installing_machine().await;
+        let mut client = client(&machine).await;
+        let all = cap(Grant {
+            action: MACHINE.into(),
+            ..Default::default()
+        });
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let built = tools.join("callee-wheel");
+        let status = std::process::Command::new("uv")
+            .args(["build", "--wheel", "--out-dir"])
+            .arg(&built)
+            .arg(fixtures.join("cpu_memo"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let wheel = fs::read_dir(&built).unwrap().next().unwrap().unwrap().path();
+        let bytes = fs::read(&wheel).unwrap();
+        let wheel_digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&bytes));
+        write(&mut client, &all, &wheel_digest, bytes.len() as u64, 0, &bytes).await.unwrap();
+        let mut archive = tar::Builder::new(Vec::new());
+        for name in ["pyproject.toml", "package.toml", "cpu_caller/__init__.py"] {
+            archive
+                .append_path_with_name(fixtures.join("cpu_caller").join(name), name)
+                .unwrap();
+        }
+        let source = archive.into_inner().unwrap();
+        let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&source));
+        write(&mut client, &all, &digest, source.len() as u64, 0, &source).await.unwrap();
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "package": "local/cozy-machine-cpu-caller", "release": "0.1.0", "python_version": "3.12",
+            "source": {"digest": digest, "length": source.len()},
+            "wheels": [{"name": wheel.file_name().unwrap().to_str().unwrap(), "digest": wheel_digest, "length": bytes.len()}]}))
+        .unwrap();
+        let manifest_digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&manifest));
+        write(&mut client, &all, &manifest_digest, manifest.len() as u64, 0, &manifest).await.unwrap();
+        let counter = machine.root.join("measured");
+        let spec = v1::RunSpec {
+            kind: v1::RunKind::Job as i32,
+            source: Some(v1::run_spec::Source::Local(v1::LocalSource {
+                manifest: manifest_digest,
+            })),
+            entrypoint: "relay".into(),
+            payload: serde_json::to_vec(&serde_json::json!({"values": [3, 4], "counter": counter}))
+                .unwrap(),
+            owner: "alice".into(),
+            ..Default::default()
+        };
+        let request = authorized(
+            v1::RunRequest {
+                id: "relay-1".into(),
+                after: 0,
+                spec: Some(spec),
+            },
+            &all,
+        );
+        let events = collect(client.run(request).await.unwrap().into_inner())
+            .await
+            .unwrap();
+        let done = outcome(&events);
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        assert_eq!(result["squares"], serde_json::json!([9, 16]));
+        assert_eq!(fs::read_to_string(&counter).unwrap(), "2");
+        let _ = fs::remove_dir_all(tools);
+    }
+
     /// Write and run sources on the real serve process: an object resumes from what is held,
     /// and unpublished code written with Write prepares inside its run (warm, then a call).
     #[tokio::test]
