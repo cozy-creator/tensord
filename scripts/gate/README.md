@@ -11,6 +11,9 @@ python3 gate.py report OUT                # OUT/summary.json; with an `r1` key i
 Both commands exit nonzero for failed requests, cells, setup, or preflight. `continue_on_failure`
 collects further timed-cell evidence; it never makes a failed run successful. Setup and priming
 failures are terminal and retain their command/request receipts before any timed requests.
+`summary.pass` includes failures of either engine. The per-candidate R1 verdict is separate:
+Rust completing a pool where ComfyUI runs out of memory is capacity evidence; that failed
+reference has no completed timing and cannot establish a speed win.
 
 ## R1 verdict (CUTOVER.md section 4), per Rust cell
 

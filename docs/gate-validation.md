@@ -19,6 +19,11 @@ This increment changes the tracked gate harness only:
   request's successful control and verified file-hash receipts. Exact byte identity
   is the current same-GPU acceptance bar; PSNR remains separate diagnostic data.
 
+The report's overall `pass` includes failures of either engine. R1's per-candidate
+capacity/source verdict is separate; ComfyUI running out of memory supplies no
+completed timing for a speed comparison. This increment changes validation, not
+the numerical behavior of inference.
+
 CPU checks use real failing setup/CLI commands and real retained image files. This
 is harness evidence, not GPU, inference, or performance qualification. No rental,
 GPU, Runtime, package, allocator, or release change belongs to this increment.
