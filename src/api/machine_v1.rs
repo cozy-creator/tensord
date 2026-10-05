@@ -414,6 +414,35 @@ impl Log {
                     stage_fraction: payload["stage_fraction"].as_f64(),
                 })
             }
+            "call" => v1::run_event::Event::Call(v1::Call {
+                run: body["request"].as_str().unwrap_or_default().into(),
+                index: body["index"].as_u64().unwrap_or_default() as u32,
+                function: body["export"].as_str().unwrap_or_default().into(),
+                label: body["label"].as_str().unwrap_or_default().into(),
+                status: body["status"].as_str().unwrap_or_default().into(),
+                called_at_ms: body["called_unix_ms"].as_i64().unwrap_or_default(),
+                finished_at_ms: body["finished_unix_ms"].as_i64().unwrap_or_default(),
+                measurements: match &body["measurements"] {
+                    Value::Null => vec![],
+                    measured => crate::boundary_json::exact(measured),
+                },
+                reason: match body["error"].as_str().unwrap_or_default() {
+                    "" => None,
+                    message => Some(v1::Reason {
+                        code: message
+                            .split_once(": ")
+                            .map(|(code, _)| code)
+                            .filter(|code| {
+                                code.bytes()
+                                    .all(|b| b.is_ascii_lowercase() || b == b'_' || b == b'.')
+                            })
+                            .unwrap_or(body["status"].as_str().unwrap_or("failed"))
+                            .into(),
+                        message: message.into(),
+                        origin: "runtime".into(),
+                    }),
+                },
+            }),
             "memo" => v1::run_event::Event::Memo(v1::MemoRecord {
                 operation: body["operation"].as_str().unwrap_or_default().into(),
                 computation_digest: body["computation_digest"]

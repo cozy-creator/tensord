@@ -2002,6 +2002,30 @@ mod v1_api {
             context = tensorfs_core::sha256::hex_digest(body.as_bytes());
             film.push_str(&body);
         }
+        // Each child run is a settled call in the job's log, with what its executor measured.
+        let calls: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.event {
+                Some(v1::run_event::Event::Call(call)) => Some(call.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|c| (c.index, c.function.as_str(), c.status.as_str()))
+                .collect::<Vec<_>>(),
+            (0..3)
+                .map(|i| (i, "render_segment", "succeeded"))
+                .collect::<Vec<_>>(),
+            "{events:?}"
+        );
+        for call in &calls {
+            assert!(call.run.ends_with(&format!("/{}", call.index)), "{call:?}");
+            assert!(call.finished_at_ms >= call.called_at_ms && call.called_at_ms > 0, "{call:?}");
+            assert!(call.reason.is_none(), "{call:?}");
+            serde_json::from_slice::<serde_json::Value>(&call.measurements).unwrap();
+        }
         // The film after every segment is a product of the job's `video` output.
         let products: Vec<_> = events
             .iter()
