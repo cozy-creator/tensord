@@ -159,7 +159,8 @@ impl NativeBackend {
             .collect::<Result<Vec<_>, Status>>()?;
         let memos = engine.memos(&record.id).map_err(problem)?.into_iter().map(|m| ("memo", m));
         let calls = engine.calls(&record.id).map_err(problem)?.into_iter().map(|c| ("call", c));
-        for (kind, stored) in memos.chain(calls) {
+        let logs = engine.logs(&record.id).map_err(problem)?.into_iter().map(|l| ("log", l));
+        for (kind, stored) in memos.chain(calls).chain(logs) {
             events.push(pb::MachineExecutionEvent {
                 sequence: stored.sequence,
                 attempt_ordinal: attempt,
@@ -641,7 +642,17 @@ impl MachineBackend for NativeBackend {
                 true => Level::Downloaded,
                 false => Level::Installed,
             };
-            let level = held.get(&installed.generation).map_or(base, |held| base.max(*held));
+            // Only the installation's own App: a callee's executors in its environment are the
+            // callee's.
+            let application = self
+                .service
+                .catalog
+                .resolve(&installed.generation)
+                .map(|g| g.record.application)
+                .unwrap_or_default();
+            let level = held
+                .get(&(installed.generation.clone(), application))
+                .map_or(base, |held| base.max(*held));
             levels.insert(installed.alias, level.name());
         }
         Ok(levels)

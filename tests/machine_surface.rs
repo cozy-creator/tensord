@@ -1929,12 +1929,12 @@ mod v1_api {
         )
         .await
         .unwrap();
+        // A choice naming no slot anywhere is a warning, never a refusal: the run goes on.
+        let warned = stray.iter().any(|e| matches!(&e.event,
+            Some(v1::run_event::Event::Log(l)) if l.level == "warning" && l.text.contains("nope.models.base")));
         let stray = outcome(&stray);
-        assert_eq!(
-            stray.reason.as_ref().map(|r| r.code.as_str()),
-            Some("invalid_request"),
-            "{stray:?}"
-        );
+        assert_eq!(stray.status, "succeeded", "{stray:?}");
+        assert!(warned, "the stray choice is not in the run's log as a warning");
         collect(
             client
                 .run(authorized(
@@ -1956,14 +1956,9 @@ mod v1_api {
         )
         .await
         .unwrap();
-        // render_segment declares no model slot, so the choice it was handed is refused there.
-        let refused = outcome(&child);
-        assert!(
-            refused.reason.as_ref().is_some_and(|r| r
-                .message
-                .contains("model choices name no declared model slot")),
-            "{refused:?}"
-        );
+        // render_segment declares no model slot, so the choice never reaches it: it runs.
+        let child = outcome(&child);
+        assert_eq!(child.status, "succeeded", "{child:?}");
         let _ = fs::remove_dir_all(tools);
     }
 

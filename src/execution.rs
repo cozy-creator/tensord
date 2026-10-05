@@ -351,6 +351,22 @@ impl Engine {
     pub fn memos(&self, id: &str) -> io::Result<Vec<crate::journal::StoredProduct>> {
         self.journal.lock().unwrap().memos(id)
     }
+    /// A line the machine writes to the run's log (`{"level", "text"}`).
+    pub fn append_log(&self, id: &str, level: &str, text: &str) -> io::Result<u64> {
+        let line = serde_json::to_vec(&serde_json::json!({"level": level, "text": text}))?;
+        let progress = self.progress.lock().unwrap();
+        let sequence = self
+            .journal
+            .lock()
+            .unwrap()
+            .append_log(id, progress.get(id), &line)?;
+        drop(progress);
+        self.notify_activity();
+        Ok(sequence)
+    }
+    pub fn logs(&self, id: &str) -> io::Result<Vec<crate::journal::StoredProduct>> {
+        self.journal.lock().unwrap().logs(id)
+    }
     /// A settled call of the run (`call` names it), recorded in the run's log once.
     pub fn append_call(&self, id: &str, call: &str, body: &[u8]) -> io::Result<Option<u64>> {
         let progress = self.progress.lock().unwrap();

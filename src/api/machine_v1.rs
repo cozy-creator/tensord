@@ -486,6 +486,10 @@ impl Log {
                     }),
                 },
             }),
+            "log" => v1::run_event::Event::Log(v1::LogLine {
+                level: body["level"].as_str().unwrap_or("info").into(),
+                text: body["text"].as_str().unwrap_or_default().into(),
+            }),
             "memo" => v1::run_event::Event::Memo(v1::MemoRecord {
                 operation: body["operation"].as_str().unwrap_or_default().into(),
                 computation_digest: body["computation_digest"]

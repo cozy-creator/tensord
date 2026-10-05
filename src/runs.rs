@@ -193,6 +193,24 @@ fn own_input(choice: &pb::ModelChoice, job: &str) -> bool {
     }
 }
 
+/// The slot of `package`'s `interface` a choice's parameter addresses: its full slot path
+/// (`<callable>.models.<parameter>`), or that path behind the package's name, as the CLI names
+/// another package's callable (`<org>/<name>/<callable>.models.<parameter>`).
+fn addressed(parameter: &str, package: &str, interface: &Value) -> Option<String> {
+    let path = parameter
+        .strip_prefix(package)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .unwrap_or(parameter);
+    ["jobs", "entrypoints"]
+        .iter()
+        .any(|section| {
+            interface[section].as_array().into_iter().flatten().any(|entry| {
+                entry["models"].as_array().into_iter().flatten().any(|slot| slot["path"] == path)
+            })
+        })
+        .then(|| path.to_string())
+}
+
 /// Whether `installation` declares the entrypoint `name`.
 fn declares(installation: &Installation, name: &str) -> Result<bool, Refused> {
     let interface: Value = serde_json::from_slice(&installation.interface)
@@ -586,21 +604,22 @@ impl Runs {
         }
         if spec.job {
             // A bare parameter, or `<job>.models.<parameter>`, is the job's own model input.
+            // Another goes to the child it names: one of this package's callables, or a slot a
+            // callee App of its environment declares. One naming neither is only a warning.
+            let callees = self.service.catalog.resolve(&installation.generation).map(|held| held.record.callees)?;
             for choice in spec.models.iter().filter(|c| !own_input(c, &spec.entrypoint)) {
-                let callable = choice.parameter.split_once(".models.").map(|(name, _)| name);
-                let declared = interface["entrypoints"].as_array().is_some_and(|rows| {
-                    rows.iter()
-                        .any(|row| Some(row["name"].as_str().unwrap_or_default()) == callable)
-                });
+                let declared = addressed(&choice.parameter, &installation.package, &interface).is_some()
+                    || callees.iter().any(|callee| {
+                        addressed(&choice.parameter, &callee.package, &callee.interface).is_some()
+                    });
                 if !declared {
-                    return Err(refused(
-                        "invalid_request",
-                        format!(
-                            "model choice {:?} names no callable of this job's package \
-                             (<entrypoint>.models.<parameter>)",
-                            choice.parameter
-                        ),
-                    ));
+                    let warning = format!(
+                        "model choice {:?} names no model slot of this job or the packages it calls; it is ignored",
+                        choice.parameter
+                    );
+                    if let Err(error) = self.service.engine.append_log(id, "warning", &warning) {
+                        eprintln!("run {id}: {warning} ({error})");
+                    }
                 }
             }
         }
@@ -613,7 +632,7 @@ impl Runs {
             return warm_result(installed, models);
         }
         if spec.job {
-            let inputs = self.job_inputs(&spec, &interface, hub.as_ref(), &*observe)?;
+            let inputs = self.job_inputs(&spec, &installation, &interface, hub.as_ref(), &*observe)?;
             let context = JobContext {
                 installation: installation.alias.clone(),
                 application: spec.application.clone(),
@@ -869,10 +888,10 @@ impl Runs {
         };
         let installed = self.service.engine.installation(actor, &context.installation)?
             .ok_or_else(|| refused("child_call_refused", "the job's installation is gone"))?;
-        let parent_package = self.callee_view(installed.clone(), &context.application)?.package;
         let installed = self.callee_view(installed, application)?;
-        let own = installed.package == parent_package;
         let job = captured_child_job(&installed.interface, entrypoint)?;
+        let callee_interface: Value = serde_json::from_slice(&installed.interface)
+            .map_err(|_| refused("package_interface_invalid", "held interface is corrupt"))?;
         let prefix = format!("{entrypoint}.");
         Ok(Spec {
             warm: false,
@@ -883,12 +902,20 @@ impl Runs {
             entrypoint: entrypoint.into(),
             input,
             inputs,
+            // A child takes the caller's choices addressed to a slot its own interface declares
+            // (a callee's included), named by that slot's path; any other was a warning at the
+            // job's preparation.
             models: context
                 .models
                 .into_iter()
-                .filter(|choice| own && choice.parameter.starts_with(&prefix))
+                .filter_map(|choice| {
+                    let path = addressed(&choice.parameter, &installed.package, &callee_interface)
+                        .filter(|path| path.starts_with(&prefix))?;
+                    Some(pb::ModelChoice { parameter: path, ..choice })
+                })
                 .collect(),
-            binding_revision: if own { context.binding_revision } else { String::new() },
+            // The owner's binding revision covers every package: a callee's rebinding is seen too.
+            binding_revision: context.binding_revision,
             attention_kernel: context.attention_kernel,
             hub: context.hub,
             providers: context.providers,
@@ -978,6 +1005,7 @@ impl Runs {
     fn job_inputs(
         &self,
         spec: &Spec,
+        installation: &Installation,
         interface: &Value,
         hub: Option<&hub::Source>,
         observe: &(dyn Fn(&str, u64, u64) + Sync),
@@ -995,30 +1023,34 @@ impl Runs {
             let choice = spec
                 .models
                 .iter()
-                .find(|c| c.parameter == parameter || c.parameter == path)
-                .ok_or_else(|| {
-                    refused("model_input_absent", format!("the job's model input {parameter:?} is not chosen"))
-                })?;
+                .find(|c| c.parameter == parameter || c.parameter == path);
             let publisher = self.publisher.as_ref().ok_or_else(|| {
                 refused("capability_unavailable", "this machine prepares no models")
             })?;
-            let manifest = if !choice.source.is_empty() {
+            let manifest = if let Some(choice) = choice.filter(|c| !c.source.is_empty()) {
                 publisher
                     .make_source(&choice.source, &choice.profiles, &spec.providers, observe)?
                     .manifest
             } else {
-                let digest = choice.manifest.as_ref().ok_or_else(|| {
-                    refused(
-                        "invalid_request",
-                        format!("the job's model input {parameter:?} names no exact checkpoint or provider source"),
-                    )
-                })?;
-                let manifest = format!("sha256:{}", tensorfs_core::sha256::hex(&digest.digest));
+                // An exact checkpoint, a repository selector or nothing chosen: resolved at the
+                // run's Hub the way a direct run's slot is.
                 let hub = hub.ok_or_else(|| {
                     refused("hub_access_absent", "a Hub model downloads with the run's Hub access, and this run carries none")
                 })?;
-                let stage = format!("downloading {}", choice.repository);
-                publisher.download(&self.service, hub, &choice.repository, &manifest, &|done, total| {
+                let catalog = hub::Catalog::new(hub).map_err(|e| refused("catalog_read_failed", e.0))?;
+                observe(&format!("resolving the model for {path}"), 0, 0);
+                let (gpu, width) = crate::published::machine_gpu(&self.service);
+                let (repository, manifest) = crate::published::job_input(
+                    &catalog,
+                    installation,
+                    &row,
+                    choice,
+                    &spec.owner,
+                    (&gpu, width),
+                )
+                .map_err(|(code, message)| refused(code, message))?;
+                let stage = format!("downloading {repository}");
+                publisher.download(&self.service, hub, &repository, &manifest, &|done, total| {
                     observe(&stage, done, total)
                 })?;
                 let sha256 = manifest.trim_start_matches("sha256:").to_string();
@@ -1405,12 +1437,17 @@ mod tests {
         runs.jobs.lock().unwrap().insert("7".into(), JobContext {
             installation:"caller".into(),application:String::new(),hub:Some(source),providers:Default::default(),
             owner:"alice".into(),binding_revision:"caller-binding".into(),attention_kernel:String::new(),
-            models:vec![pb::ModelChoice { parameter:"render.models.network".into(),repository:"first/wrong".into(),..Default::default() }],
+            models:vec![
+                pb::ModelChoice { parameter:"second/callee/render.models.network".into(),repository:"second/chosen".into(),..Default::default() },
+                pb::ModelChoice { parameter:"render.models.absent".into(),repository:"second/nowhere".into(),..Default::default() },
+            ],
             inputs:Default::default(),weights_destination:String::new(),publication:String::new(),known:vec![],
         });
         let child = runs.child_spec("alice","7","callee:app","render",json!({}),vec![],"child").unwrap();
-        assert!(child.models.is_empty(), "caller choices do not override a callee's slots");
-        assert!(child.binding_revision.is_empty());
+        let chosen: Vec<_> = child.models.iter().map(|c| (c.parameter.as_str(), c.repository.as_str())).collect();
+        assert_eq!(chosen, [("render.models.network", "second/chosen")],
+            "a choice addressed to the callee's package reaches its declared slot, by that slot's path");
+        assert_eq!(child.binding_revision, "caller-binding", "a callee sees the owner's rebindings");
         fs::remove_dir_all(root).unwrap();
     }
 

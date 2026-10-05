@@ -300,6 +300,8 @@ impl Member {
 struct Session {
     plan: String,
     generation: String,
+    /// The App it serves: its environment's root, or a callee's App in it.
+    application: String,
     /// GPUs of its group; its followers (rank 1 first) once it started, held by pidfd so a
     /// call that fails can name the GPU whose process ended first.
     degree: u32,
@@ -439,7 +441,10 @@ fn parent_key(held: &HeldGeneration) -> String {
     format!("parent:{}:{}", held.record.identity, held.record.application)
 }
 
-fn parent_app(held: &HeldGeneration) -> (String, String) {
+/// An App of an environment: `(generation, application)`. Executors are keyed by it.
+type App = (String, String);
+
+fn parent_app(held: &HeldGeneration) -> App {
     (held.record.identity.clone(), held.record.application.clone())
 }
 
@@ -482,7 +487,7 @@ pub struct GpuPool {
     keeping: Mutex<()>,
     /// Each live executor's (generation, level) by plan: what Status reads while a call holds
     /// `sessions`.
-    levels: Mutex<BTreeMap<String, (String, Level)>>,
+    levels: Mutex<BTreeMap<String, (App, Level)>>,
     /// Each envelope GPU with its own memory decisions, in envelope order.
     devices: Vec<Device>,
     host: Arc<HostTier>,
@@ -974,7 +979,7 @@ impl GpuPool {
             true => Level::Gpu,
             false => Level::Host,
         };
-        let noted = (session.generation.clone(), level);
+        let noted = ((session.generation.clone(), session.application.clone()), level);
         self.levels.lock().unwrap().insert(session.plan.clone(), noted);
     }
     /// Whether the store holds every model `plan` binds.
@@ -984,16 +989,18 @@ impl GpuPool {
             self.store.manifest_path(hex).exists()
         })
     }
-    /// The highest level each generation holds now: an import-only parent, or an executor.
-    pub fn levels(&self) -> BTreeMap<String, Level> {
+    /// The highest level each App of each generation holds now (keyed `(generation,
+    /// application)`): an import-only parent, or an executor. A callee's executors in a
+    /// caller's environment are its own, never the caller's.
+    pub fn levels(&self) -> BTreeMap<App, Level> {
         let parents: Vec<_> = self.zygotes.lock().unwrap().clone().into_iter().collect();
-        let mut highest: BTreeMap<String, Level> = parents
+        let mut highest: BTreeMap<App, Level> = parents
             .into_iter()
             .filter(|(_, parent)| parent.ready())
-            .map(|((generation, _), _)| (generation, Level::Imported))
+            .map(|(app, _)| (app, Level::Imported))
             .collect();
-        for (generation, level) in self.levels.lock().unwrap().values() {
-            let held = highest.entry(generation.clone()).or_insert(*level);
+        for (app, level) in self.levels.lock().unwrap().values() {
+            let held = highest.entry(app.clone()).or_insert(*level);
             *held = (*held).max(*level);
         }
         highest
@@ -2314,6 +2321,7 @@ impl GpuPool {
         Ok(Session {
             plan: plan.id.clone(),
             generation: plan.generation.clone(),
+            application: held.record.application.clone(),
             degree: plan.degree,
             followers: vec![],
             loaded: false,

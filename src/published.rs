@@ -1141,6 +1141,97 @@ impl Publisher {
     }
 }
 
+/// The GPU this machine's ladders are read for, and how many it groups (none: "", 0).
+pub(crate) fn machine_gpu(service: &Service) -> (String, usize) {
+    service.gpu().map_or((String::new(), 0), |gpu| {
+        (gpu_name(&gpu.config().envelope()[0]), gpu.width())
+    })
+}
+
+/// A job's model input, resolved as a direct run's slot is: an exact checkpoint as chosen;
+/// else the chosen repository (or the package's binding, then its authored ladder) at the
+/// chosen release (else the binding's, else the newest the Hub lists with the lane) and the
+/// chosen lane (else the ladder's rung for this machine). Returns (repository, manifest id).
+pub(crate) fn job_input(
+    catalog: &Catalog,
+    installation: &Installation,
+    slot: &Value,
+    choice: Option<&pb::ModelChoice>,
+    owner: &str,
+    (gpu, width): (&str, usize),
+) -> Result<(String, String), Failure> {
+    let path = slot["path"].as_str().unwrap_or_default();
+    let chosen = choice.cloned().unwrap_or_default();
+    if let Some(digest) = chosen.manifest.as_ref().filter(|m| m.digest.len() == 32) {
+        return Ok((chosen.repository, format!("sha256:{}", sha256::hex(&digest.digest))));
+    }
+    let mut cached = None;
+    let row = match (chosen.repository.is_empty(), chosen.lane.is_empty()) {
+        (false, false) => Value::Null,
+        _ => model_binding(catalog, installation, slot, &mut cached)?,
+    };
+    let mut model = match chosen.repository.is_empty() {
+        true => row["model"].as_str().unwrap_or_default().to_string(),
+        false => chosen.repository.clone(),
+    };
+    if !model.contains('/') && !model.is_empty() {
+        let org = installation.package.split_once('/').map_or("", |(org, _)| org);
+        let account = if org == "local" || org.is_empty() { owner } else { org };
+        if account.is_empty() {
+            return Err(("model_binding_absent", format!("{path} names its owner's model and this run names no owner")));
+        }
+        model = format!("{account}/{model}");
+    }
+    let (org, name) = model.split_once('/').ok_or((
+        "model_binding_absent",
+        format!("{path} names no model repository"),
+    ))?;
+    let lane = match chosen.lane.is_empty() {
+        false => chosen.lane.clone(),
+        true => rung(row.get("ladder"), gpu, width).map(|(lane, _)| lane).ok_or((
+            "model_binding_absent",
+            format!("no rung of {path}'s ladder fits {width}x {gpu:?}"),
+        ))?,
+    };
+    let mut release = match (chosen.release.is_empty(), chosen.repository.is_empty()) {
+        (false, _) => chosen.release.clone(),
+        (true, true) => row["release"].as_str().unwrap_or_default().to_string(),
+        (true, false) => String::new(),
+    };
+    if release.is_empty() {
+        let card = catalog
+            .json(&format!("/v1/models/{}/{}", hub::escape(org), hub::escape(name)))
+            .map_err(|e| ("catalog_read_failed", e.0))?;
+        release = card["releases"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .rev()
+            .find(|r| {
+                r["yanked"].as_bool() != Some(true)
+                    && r["lanes"].as_array().into_iter().flatten().any(|l| l["lane"] == lane.as_str())
+            })
+            .and_then(|r| r["release"].as_str())
+            .ok_or(("model_binding_absent", format!("{model} has no release with lane {lane}")))?
+            .to_string();
+    }
+    let query = format!(
+        "/v1/models/resolve?ref={}&lane={}",
+        hub::escape(&format!("{model}@{release}")),
+        hub::escape(&lane)
+    );
+    let resolved = catalog.json(&query).map_err(|e| ("catalog_read_failed", e.0))?;
+    let manifest = resolved["manifest_id"].as_str().ok_or((
+        "catalog_read_failed",
+        "model resolution named no manifest".to_string(),
+    ))?;
+    let manifest = match manifest.starts_with("sha256:") {
+        true => manifest.to_string(),
+        false => format!("sha256:{manifest}"),
+    };
+    Ok((resolved["model"].as_str().unwrap_or(&model).to_string(), manifest))
+}
+
 /// One package's own slot default: its Hub bindings, then its authored ladder. A dependency
 /// installed in another package's environment still asks under its own package identity.
 pub(crate) fn model_binding(
@@ -1790,5 +1881,66 @@ mod tests {
         assert_eq!(component, "unet");
         assert!(tensors.iter().any(|(key, _)| key.ends_with("attn1.to_q.lora_A.weight")));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A job's model input named by repository alone resolves as a direct run's slot does:
+    /// the newest release with the ladder's lane, then that lane's checkpoint, at the Hub.
+    /// Nothing chosen takes the package's own ladder; an exact checkpoint reads nothing.
+    #[test]
+    fn a_job_model_input_selector_resolves_at_the_hub() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let manifest = "ab".repeat(32);
+        let served = std::thread::spawn(move || {
+            let mut seen = vec![];
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut bytes = Vec::new();
+                while !bytes.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    assert_eq!(stream.read(&mut byte).unwrap(), 1);
+                    bytes.push(byte[0]);
+                }
+                let line = String::from_utf8(bytes).unwrap().lines().next().unwrap().to_string();
+                let body = if line.starts_with("GET /v1/models/proof/probe ") {
+                    json!({"releases":[{"release":"0.9.0","lanes":[{"lane":"bf16"}]},
+                        {"release":"1.0.0","lanes":[{"lane":"bf16"}]},{"release":"2.0.0","lanes":[{"lane":"fp8"}]}]})
+                } else {
+                    json!({"model":"proof/probe","release":"1.0.0","lane":"bf16","manifest_id":format!("sha256:{}", "ab".repeat(32))})
+                }
+                .to_string();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                seen.push(line);
+            }
+            seen
+        });
+        let source = hub::Source { origin, credential: "bearer t".into(), ca_der: None, object_hosts: vec![] };
+        let catalog = Catalog::new(&source).unwrap();
+        let installation = Installation {
+            actor: "alice".into(),
+            alias: "probe".into(),
+            generation: String::new(),
+            package: "local/probe".into(),
+            release: "0.1.0".into(),
+            interface: vec![],
+        };
+        let slot = json!({"path":"touch.models.source","class":"probe.Probe",
+            "default_ladder":[{"gpu":"*","lane":"proof/probe@1.0.0/bf16"}]});
+        let named = pb::ModelChoice { parameter: "source".into(), repository: "proof/probe".into(), ..Default::default() };
+        let resolved = job_input(&catalog, &installation, &slot, Some(&named), "alice", ("", 0)).unwrap();
+        assert_eq!(resolved, ("proof/probe".to_string(), format!("sha256:{manifest}")));
+        let defaulted = job_input(&catalog, &installation, &slot, None, "alice", ("", 0)).unwrap();
+        assert_eq!(defaulted.1, format!("sha256:{manifest}"));
+        let exact = pb::ModelChoice {
+            repository: "proof/probe".into(),
+            manifest: Some(pb::Ref { digest: vec![7; 32], ..Default::default() }),
+            ..Default::default()
+        };
+        assert_eq!(job_input(&catalog, &installation, &slot, Some(&exact), "alice", ("", 0)).unwrap().1, format!("sha256:{}", "07".repeat(32)));
+        let seen = served.join().unwrap();
+        assert!(seen[0].starts_with("GET /v1/models/proof/probe "), "{seen:?}");
+        assert!(seen[1].contains("ref=proof%2Fprobe%401.0.0") && seen[1].contains("lane=bf16"), "{seen:?}");
+        assert!(seen[2].contains("ref=proof%2Fprobe%401.0.0") && seen[2].contains("lane=bf16"), "{seen:?}");
     }
 }

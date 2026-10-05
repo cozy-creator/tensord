@@ -356,6 +356,7 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS run_products(execution INTEGER NOT NULL REFERENCES executions(id),sequence INTEGER NOT NULL,at_ms INTEGER NOT NULL,product BLOB NOT NULL,PRIMARY KEY(execution,sequence));
             CREATE TABLE IF NOT EXISTS run_measurements(execution INTEGER PRIMARY KEY REFERENCES executions(id),measurements BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS run_memos(execution INTEGER NOT NULL REFERENCES executions(id),sequence INTEGER NOT NULL,at_ms INTEGER NOT NULL,record BLOB NOT NULL,PRIMARY KEY(execution,sequence));
+            CREATE TABLE IF NOT EXISTS run_logs(execution INTEGER NOT NULL REFERENCES executions(id),sequence INTEGER NOT NULL,at_ms INTEGER NOT NULL,record BLOB NOT NULL,PRIMARY KEY(execution,sequence));
             CREATE TABLE IF NOT EXISTS run_calls(execution INTEGER NOT NULL REFERENCES executions(id),sequence INTEGER NOT NULL,at_ms INTEGER NOT NULL,call TEXT NOT NULL,record BLOB NOT NULL,PRIMARY KEY(execution,sequence),UNIQUE(execution,call));
             CREATE TABLE IF NOT EXISTS native_outputs(actor TEXT NOT NULL,owner TEXT NOT NULL,source BLOB NOT NULL,PRIMARY KEY(actor,owner));
             CREATE TABLE IF NOT EXISTS input_intakes(actor TEXT NOT NULL,retention TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,retention));
@@ -1724,16 +1725,32 @@ impl Journal {
         progress: Option<&ProgressSnapshot>,
         memo: &[u8],
     ) -> io::Result<u64> {
+        self.append_entry("INSERT INTO run_memos(execution,sequence,at_ms,record) VALUES(?1,?2,?3,?4)", id, progress, memo)
+    }
+    /// One line of the run's log the machine itself writes (a `log` event: a warning about
+    /// its request), at the next sequence.
+    pub fn append_log(
+        &mut self,
+        id: &str,
+        progress: Option<&ProgressSnapshot>,
+        line: &[u8],
+    ) -> io::Result<u64> {
+        self.append_entry("INSERT INTO run_logs(execution,sequence,at_ms,record) VALUES(?1,?2,?3,?4)", id, progress, line)
+    }
+    fn append_entry(
+        &mut self,
+        insert: &str,
+        id: &str,
+        progress: Option<&ProgressSnapshot>,
+        entry: &[u8],
+    ) -> io::Result<u64> {
         let record = self.update_with(
             id,
             progress,
             |record| Ok(!record.state.terminal()),
             |tx, record| {
-                tx.execute(
-                    "INSERT INTO run_memos(execution,sequence,at_ms,record) VALUES(?1,?2,?3,?4)",
-                    params![id, record.revision as i64, timestamp(), memo],
-                )
-                .map_err(db_error)?;
+                tx.execute(insert, params![id, record.revision as i64, timestamp(), entry])
+                    .map_err(db_error)?;
                 Ok(())
             },
         )?;
@@ -1780,6 +1797,12 @@ impl Journal {
     pub fn calls(&self, id: &str) -> io::Result<Vec<StoredProduct>> {
         self.stored(
             "SELECT sequence,at_ms,record FROM run_calls WHERE execution=?1 ORDER BY sequence",
+            id,
+        )
+    }
+    pub fn logs(&self, id: &str) -> io::Result<Vec<StoredProduct>> {
+        self.stored(
+            "SELECT sequence,at_ms,record FROM run_logs WHERE execution=?1 ORDER BY sequence",
             id,
         )
     }

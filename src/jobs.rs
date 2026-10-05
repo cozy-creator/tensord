@@ -66,6 +66,11 @@ struct Parent {
     callables: Callables,
     /// The memoized ones' operation identity.
     memoized: HashMap<(String, String), String>,
+    /// The job itself is memoized: each call it makes must be too, or replaying its result
+    /// would skip that call's effects.
+    pure: bool,
+    /// The callables declared `memoize=True` (with or without an operation identity).
+    pure_callables: std::collections::HashSet<(String, String)>,
     /// The parent's own file inputs: a child may be handed any of them.
     inputs: Vec<InputFile>,
     calls: Mutex<Calls>,
@@ -339,6 +344,12 @@ impl Jobs {
             spool: spool.clone(),
             callables,
             memoized: memoized(&held.record),
+            pure: declarations(&document).any(|(declared, entry, kind)| {
+                kind == "job"
+                    && entry["name"].as_str() == Some(record.invocation.entrypoint.as_str())
+                    && declared["memoize"].as_bool() == Some(true)
+            }),
+            pure_callables: pure_callables(&held.record),
             inputs: record.invocation.inputs.clone(),
             calls: Mutex::new(Calls::default()),
         });
@@ -704,6 +715,16 @@ impl Jobs {
             .as_ref().ok_or(("child_ambiguous", format!(
                 "{}.{} is registered by more than one App in this environment", frame.module, frame.export,
             )))?;
+        let callable = (frame.module.clone(), frame.export.clone());
+        if parent.pure && !parent.pure_callables.contains(&callable) {
+            return Err((
+                "child_impure",
+                format!(
+                    "a memoized job cannot call {}.{}, which is not memoized",
+                    frame.module, frame.export
+                ),
+            ));
+        }
         let input: Value = crate::boundary_json::parse(frame.payload.as_bytes()).map_err(|e| {
             (
                 "child_call_refused",
@@ -1154,6 +1175,18 @@ fn memoized(generation: &crate::catalog::Generation) -> HashMap<(String, String)
     memoized
 }
 
+/// `(module, export)` of every invocable of the environment declared `memoize=True`.
+fn pure_callables(generation: &crate::catalog::Generation) -> std::collections::HashSet<(String, String)> {
+    std::iter::once(&generation.interface)
+        .chain(generation.callees.iter().map(|c| &c.interface))
+        .flat_map(declarations)
+        .filter(|(declared, _, _)| declared["memoize"].as_bool() == Some(true))
+        .filter_map(|(declared, _, _)| {
+            Some((declared["module"].as_str()?.into(), declared["export"].as_str()?.into()))
+        })
+        .collect()
+}
+
 /// Each declared invocable of an interface: its declaration, its entry and its kind.
 fn declarations(interface: &Value) -> impl Iterator<Item = (&Value, &Value, &'static str)> {
     [("jobs", "job"), ("entrypoints", "entrypoint")]
@@ -1483,9 +1516,17 @@ mod exact_tests {
         let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
         let jobs = Jobs::configure(&service,store,None).unwrap();
         let parent = Parent { id:"parent".into(),request:"parent".into(),actor:"alice".into(),spool:root.clone(),
-            callables:calls,memoized:Default::default(),inputs:vec![],calls:Default::default() };
+            callables:calls,memoized:Default::default(),pure:false,pure_callables:Default::default(),
+            inputs:vec![],calls:Default::default() };
         let frame = Frame { module:"shared".into(),export:"apply".into(),..Default::default() };
         assert_eq!(jobs.child_call(&parent,&frame).unwrap_err().0,"child_ambiguous");
+        assert!(service.engine.nonterminal(usize::MAX).unwrap().is_empty());
+        // A memoized job calls only memoized callables: replaying its result skips its calls.
+        let unrelated = Frame { module:"root".into(),export:"unrelated".into(),payload:"{}".into(),..Default::default() };
+        let pure = Parent { pure:true, ..parent };
+        assert_eq!(jobs.child_call(&pure,&unrelated).unwrap_err().0,"child_impure");
+        let pure = Parent { pure_callables:[("root".into(),"unrelated".into())].into(), ..pure };
+        assert_ne!(jobs.child_call(&pure,&unrelated).unwrap_err().0,"child_impure");
         assert!(service.engine.nonterminal(usize::MAX).unwrap().is_empty());
         fs::remove_dir_all(root).unwrap();
     }
