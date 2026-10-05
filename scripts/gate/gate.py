@@ -46,12 +46,15 @@ def cg():   # cgroup v2, else v1 (v1 rss = anon without shmem; shmem sits inside
         m = {l.split()[0]: int(l.split()[1]) for l in open(f"{CG}/memory.stat")}
         r = sum(int(f.split("=")[1]) for l in open(f"{CG}/io.stat") for f in l.split() if f.startswith("rbytes=")) \
             if os.path.exists(f"{CG}/io.stat") else unit_reads(CG)
-        anon, shmem, mapped, file = m["anon"], m["shmem"], m["file_mapped"], m["file"]
-    else:
+        anon, shmem, mapped, file = (m.get(k, 0) for k in ("anon", "shmem", "file_mapped", "file"))
+    elif os.path.exists(f"{CG}/memory/memory.stat"):
         m = {l.split()[0]: int(l.split()[1]) for l in open(f"{CG}/memory/memory.stat")}
         r = sum(int(l.split()[2]) for l in open(f"{CG}/blkio/blkio.throttle.io_service_bytes_recursive")
                 if len(l.split()) == 3 and l.split()[1] == "Read")
         anon, shmem, mapped, file = m["total_rss"], m["total_shmem"], m["total_mapped_file"], m["total_cache"]
+    else:   # a sandboxed runtime (gVisor) shows no cgroup accounting: memory from /proc/meminfo, no disk reads
+        m = {l.split(":")[0]: int(l.split()[1]) * 1024 for l in open("/proc/meminfo") if l.split()[1].isdigit()}
+        anon, shmem, mapped, file, r = m.get("AnonPages", 0), m.get("Shmem", 0), m.get("Mapped", 0), m.get("Cached", 0), 0
     cpu = None
     for path, scale in ((f"{CG}/cpuacct/cpuacct.usage", 1), (f"{CG}/cpu,cpuacct/cpuacct.usage", 1)):
         if os.path.exists(path): cpu = int(open(path).read()) * scale; break
