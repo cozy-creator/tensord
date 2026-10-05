@@ -555,7 +555,8 @@ impl Log {
                     result,
                     outputs: self.products.clone(),
                     triage: body.get("triage_bundle").is_some(),
-                    measurements: vec![], // `stream_run` adds them
+                    measurements: vec![], // `stream_run` adds them, and the execution time
+                    execution_ms: 0,
                 })
             }
             _ => return None,
@@ -937,12 +938,15 @@ pub(super) async fn stream_run<B: MachineBackend>(
             }
             if let (Some(v1::run_event::Event::Outcome(outcome)), None) = (&mut converted.event, &limit) {
                 let (kept_backend, kept_id) = (backend.clone(), id.clone());
-                outcome.measurements = tokio::task::spawn_blocking(move || {
-                    kept_backend.measurements(actor, query(&*kept_backend, actor, &kept_id)?)
+                let (measurements, execution_ms) = tokio::task::spawn_blocking(move || {
+                    let run = query(&*kept_backend, actor, &kept_id)?;
+                    let measured = kept_backend.measurements(actor, run.clone())?;
+                    Ok::<_, Status>((measured, kept_backend.execution_ms(actor, run)?))
                 })
                 .await
-                .map_err(|_| Status::internal("machine operation stopped"))??
-                .unwrap_or_default();
+                .map_err(|_| Status::internal("machine operation stopped"))??;
+                outcome.measurements = measurements.unwrap_or_default();
+                outcome.execution_ms = execution_ms;
             }
             if sender.send(Ok(converted)).await.is_err() {
                 return Ok(());
