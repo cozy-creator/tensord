@@ -256,6 +256,15 @@ class Gate:
             sink.write(json.dumps(row) + "\n")
         self.index += 1
 
+    def prepare(self, event: str, command: str, **context: object) -> None:
+        """Setup/contract checks are prerequisites, never measured cell failures to continue past."""
+        try:
+            out = self.pod.sh(command)
+        except RuntimeError as error:
+            self.record({"event": event, **context, "ok": False, "error": str(error), "t": time.time()})
+            raise
+        self.record({"event": event, **context, "ok": True, "out": out, "t": time.time()})
+
     def unique(self) -> tuple[str, int]:
         """A prompt and a seed never used before in OUT: no engine or memo cache can answer."""
         while True:
@@ -439,6 +448,8 @@ class Gate:
             if spec.get("after_start"):
                 self.pod.sh(spec["after_start"])
             self.record({"arm": arm, "cycle": -1, "event": "prime", "root": root})
+        if spec.get("preflight"):
+            self.prepare("preflight", spec["preflight"], arm=arm)
         self.request(arm, -1, "prime", "sdxl")
         self.request(arm, -1, "prime", "anima")
 
@@ -472,7 +483,7 @@ class Gate:
         budget, cold = spec_cell.get("budget"), spec_cell.get("cold", False)
         by_run = cold and spec.get("cold_by_run", False)   # this computer: the first `cozy run` starts the stopped machine
         if spec_cell.get("setup"):   # e.g. this cell's host limits, in place before the machine starts
-            self.pod.sh(spec_cell["setup"])
+            self.prepare("setup", spec_cell["setup"], arm=arm, cell=name)
         if spec.get("cgroup"):
             self.pod.sh(f"({spec['cgroup']}) > {self.pod.dir}/cgroup")
         if self.m.get("rental"):
@@ -517,6 +528,8 @@ class Gate:
             if spec.get("cgroup"):
                 self.pod.sh(f"({spec['cgroup']}) > {self.pod.dir}/cgroup")
             limits = self.pod.sh(spec["limits"]) if spec.get("limits") and not by_run else None
+            if spec.get("preflight"):
+                self.prepare("preflight", spec["preflight"], arm=arm, cell=name)
             before = self.pod.helper("now")
             if spec.get("command"):
                 try:
@@ -577,8 +590,12 @@ class Gate:
             (root / "events.jsonl").write_text(done.stderr)
             images = verify(root / "out", self.m["shapes"][item["model"]]) if (root / "out").is_dir() else []
             primed.append({"model": item["model"], "s": round(time.time() - began, 2), "dir": str(root),
+                           "exit": done.returncode, "images": images,
                            "ok": done.returncode == 0 and len(images) == 1 and images[0]["ok"]})
-            self.index += 1
+            self.record({"event": "prime_request", "arm": arm, "cell": name, **primed[-1],
+                         "error": None if primed[-1]["ok"] else done.stdout[-3000:] or done.stderr[-3000:]})
+            if not primed[-1]["ok"]:
+                raise RuntimeError(f"priming {item['model']} failed before timed cell {name}; evidence in {root}")
 
         def reap() -> None:   # each CLI's own exit time, seen within 0.1 s, also while later requests are submitted
             for p in procs:
@@ -614,7 +631,7 @@ class Gate:
         for p in procs:
             images = verify(p["root"] / "out", self.m["shapes"][p["model"]]) if (p["root"] / "out").is_dir() else []
             seen = marks(p["err"].read_text())
-            rows.append({"model": p["model"], "prompt": p["payload"]["prompt"], "seed": p["payload"]["seed"],
+            rows.append({"model": p["model"], "prompt": p["payload"]["prompt"], "seed": p["payload"]["seed"], "input": p["payload"],
                          "exit": p["proc"].returncode, "dir": str(p["root"]), "submit": p["submit"], "done": p["done"],
                          "accepted_pod": seen.get("request.machine_accepted"), "outcome_pod": seen.get("machine.outcome"),
                          "events": seen,   # first time of each event type the CLI printed (client events on this clock)
@@ -639,10 +656,11 @@ class Gate:
                 "ok": all(r["ok"] for r in rows) and all(p["ok"] for p in primed), "requests": rows, "primed": primed}
 
     def run(self) -> None:
+        for event in ("setup", "on_start", "preflight"):
+            if self.m.get(event):
+                self.prepare(event, self.m[event])
         samples = f"{self.pod.dir}/samples-{self.m['salt']}.jsonl"
         sampler = self.pod.sh(f"nohup {self.pod.py} {self.pod.dir}/pod.py sample {samples} >/dev/null 2>&1 & echo $!").strip()
-        if self.m.get("on_start"):   # e.g. host-side watchers that stamp the machine's log
-            self.record({"event": "on_start", "out": self.pod.sh(self.m["on_start"]), "t": time.time()})
         try:
             for arm in self.m.get("prime", []):
                 self.prime(arm)
@@ -664,6 +682,9 @@ class Gate:
                     subprocess.run(self.pod.ssh + [self.m["collect"]], stdout=sink, check=False)
             with (self.out / "samples.jsonl").open("w") as sink:
                 subprocess.run(self.pod.ssh + [f"cat {samples}"], stdout=sink, check=False)
+        rows = [json.loads(line) for line in self.results.read_text().splitlines()] if self.results.exists() else []
+        if failed_rows(rows) or (self.m.get("r1") and not r1(self.out, rows)["pass"]):
+            raise RuntimeError(f"benchmark failed; report the retained evidence in {self.out}")
 
 
 def spread(values: list[float]) -> dict | None:
@@ -680,26 +701,79 @@ def psnr(a: str, b: str) -> float:
     return math.inf if mse == 0 else 10 * math.log10(255 ** 2 / mse)
 
 
+def failed_rows(rows: list[dict]) -> bool:
+    return any(r.get("ok") is False or r.get("event") in ("failed", "xid") for r in rows)
+
+
+def artifact(out: Path, path: str) -> Path:
+    """Older runs stored paths relative to the controller's working directory."""
+    candidates = (Path(path), out.parent / path, out / path)
+    return next((p for p in candidates if p.is_file()), candidates[0])
+
+
+def identity_receipt(out: Path, request: dict) -> tuple[str, dict, Path]:
+    if not request.get("ok") or len(request.get("images", [])) != 1:
+        raise ValueError("request has no single successful image")
+    receipt = request["images"][0]
+    path = artifact(out, receipt["path"])
+    data = path.read_bytes()
+    digest = hashlib.sha256(data).hexdigest()
+    if receipt.get("sha256") != digest or receipt.get("bytes") != len(data) or not receipt.get("ok"):
+        raise ValueError("image file does not match its successful hash/size receipt")
+    payload = request.get("input")
+    if payload is None and request.get("dir"):
+        payload = json.loads(artifact(out, str(Path(request["dir"]) / "input.json")).read_text())
+    if not isinstance(payload, dict) or (payload.get("prompt"), payload.get("seed")) != (request.get("prompt"), request.get("seed")):
+        raise ValueError("input receipt is absent or does not match the request")
+    return digest, payload, path
+
+
 def r1(out: Path, rows: list[dict]) -> dict:
     """R1 per cell (CUTOVER.md section 4): zero failures; disk reads at most 1.5x the reference engine's; a cold start,
     submit to the CLI's exit with the image saved, at most 1.10x the reference engine's on the same pod (server start
-    included), with the previous candidate's figure and the pod's host load beside it; each low-memory output's PSNR to
-    the unconstrained control on the same pod, under 30 dB flagged for a person to look at (diffusion amplifies
-    rounding: a flag, not a failure); no Xid."""
+    included), with the previous candidate's figure and host load beside it; complete same-input control/hash
+    receipts and exact encoded-byte identity on the same GPU; PSNR is diagnostic; no Xid."""
     m = json.loads((out / "manifest.json").read_text())
     plan, cells = m["r1"], {(r["arm"], r["cell"]): r for r in rows if r.get("event") == "cell"}
     cand, ref, baseline = plan.get("candidate", "rust"), plan.get("reference", "comfy"), plan.get("baseline", {})
-    control = {(q["prompt"], q["seed"]): q for q in (cells.get((cand, "control")) or {}).get("requests", []) if q.get("images")}
+    key = lambda q: (q.get("model"), q.get("prompt"), q.get("seed"))
+    control: dict = {}
+    control_cell = cells.get((cand, "control"))
+    for q in (control_cell or {}).get("requests", []):
+        control.setdefault(key(q), []).append(q)
     samples = [json.loads(line) for line in (out / "samples.jsonl").read_text().splitlines() if line.strip()] \
         if (out / "samples.jsonl").exists() else []
-    verdict: dict = {"pass": True, "cells": [], "review": []}
-    for (arm, name), c in cells.items():
-        if arm != cand or name == "control":
+    verdict: dict = {"pass": True, "cells": [], "review": [], "identity": "exact_bytes_same_gpu"}
+    planned = [name for arm, name in m.get("cell_order", []) if arm == cand]
+    names = dict.fromkeys(planned or m["cells"])
+    names.update(dict.fromkeys(name for arm, name in cells if arm == cand and name != "control"))
+    for name in names:
+        if name == "control":
+            continue
+        c = cells.get((cand, name))
+        if c is None:
+            verdict["pass"] = False
+            verdict["cells"].append({"cell": name, "pass": False, "errors": ["planned candidate cell is absent"]})
             continue
         spec, other = m["cells"][name], cells.get((ref, name))
+        if isinstance(spec, list):
+            spec = {"requests": spec}
         row = {"cell": name, "budget": spec.get("budget"),
                "failed": max(len(spec["requests"]) - sum(bool(q.get("ok")) for q in c["requests"]), 0 if c["ok"] else 1),
-               "xid": int((re.search(r"xid-events=(\d+)", c.get("facts") or "") or ["", "0"])[1]) or "NVRM: Xid" in (c.get("facts") or "")}
+               "xid": int((re.search(r"xid-events=(\d+)", c.get("facts") or "") or ["", "0"])[1]) or "NVRM: Xid" in (c.get("facts") or ""),
+               "errors": []}
+        if other is None:
+            row["errors"].append("planned reference cell is absent")
+        if len(c["requests"]) != len(spec["requests"]):
+            row["errors"].append("candidate request count does not match the plan")
+        for i, q in enumerate(c["requests"]):
+            try:
+                _, payload, _ = identity_receipt(out, q)
+                expected = spec["requests"][i]
+                if isinstance(expected, dict) and (q.get("model") != expected["model"] or payload != expected["input"]):
+                    raise ValueError("request input does not match the planned model and input")
+            except (OSError, ValueError, KeyError, TypeError, IndexError) as error:
+                row["errors"].append(f"request {i}: {error}")
         if other and other["ok"]:
             row["disk_ratio"] = round(c["disk_read_bytes"] / max(other["disk_read_bytes"], 1), 2)
             row["disk_gib"] = [round(c["disk_read_bytes"] / 2**30, 2), round(other["disk_read_bytes"] / 2**30, 2)]
@@ -716,16 +790,32 @@ def r1(out: Path, rows: list[dict]) -> dict:
             if name in baseline:   # reported, not judged: another pod's host
                 row["previous_cold_s"] = baseline[name]
         if spec.get("budget"):
+            if control_cell is None or not control_cell.get("ok"):
+                row["errors"].append("successful full-card control cell is absent")
             row["psnr_db"] = []
+            row["byte_identical"] = []
             for q in c["requests"]:
-                twin = control.get((q["prompt"], q["seed"]))
-                if q.get("images") and twin:
-                    db = round(psnr(q["images"][0]["path"], twin["images"][0]["path"]), 2)
+                twins = control.get(key(q), [])
+                try:
+                    if len(twins) != 1:
+                        raise ValueError("exactly one control is required for the model, prompt and seed")
+                    digest, payload, path = identity_receipt(out, q)
+                    control_digest, control_payload, control_path = identity_receipt(out, twins[0])
+                    if payload != control_payload:
+                        raise ValueError("candidate and control input receipts differ")
+                    identical = digest == control_digest
+                    if not identical:
+                        row["errors"].append(f"seed {q.get('seed')}: encoded bytes differ from control")
+                    db = round(psnr(str(path), str(control_path)), 2)
+                    row["byte_identical"].append(identical)
                     row["psnr_db"].append(db)
                     if db < 30:
                         verdict["review"].append({"cell": name, "seed": q["seed"], "psnr_db": db, "image": q["images"][0]["path"],
-                                                  "control": twin["images"][0]["path"]})
-        row["pass"] = (row["failed"] == 0 and not row["xid"] and row.get("disk_ratio", 0) <= 1.5
+                                                  "control": twins[0]["images"][0]["path"]})
+                except (OSError, ValueError, KeyError, TypeError) as error:
+                    row["byte_identical"].append(False)
+                    row["errors"].append(f"seed {q.get('seed')}: {error}")
+        row["pass"] = (not row["errors"] and row["failed"] == 0 and not row["xid"] and row.get("disk_ratio", 0) <= 1.5
                        and row.get("cold_ratio", 0) <= 1.10)
         verdict["pass"] &= row["pass"]
         verdict["cells"].append(row)
@@ -796,6 +886,7 @@ def report(out: Path) -> dict:
             "disk_read_gib": round(r["disk_read_bytes"] / 2**30, 2), "controller_load": r.get("controller_load")})
     if json.loads((out / "manifest.json").read_text()).get("r1"):
         summary["r1"] = r1(out, rows)
+    summary["pass"] = not failed_rows(rows) and summary.get("r1", {"pass": True})["pass"]
     (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     return summary
 
@@ -804,7 +895,10 @@ def main() -> None:
     if len(sys.argv) == 4 and sys.argv[1] == "run":
         Gate(Path(sys.argv[2]), Path(sys.argv[3])).run()
     elif len(sys.argv) == 3 and sys.argv[1] == "report":
-        print(json.dumps(report(Path(sys.argv[2])), indent=2))
+        summary = report(Path(sys.argv[2]))
+        print(json.dumps(summary, indent=2))
+        if not summary["pass"]:
+            sys.exit(1)
     else:
         sys.exit(__doc__)
 

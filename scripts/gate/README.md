@@ -8,6 +8,10 @@ python3 gate.py run manifest.json OUT     # cells (and cycles) per the manifest;
 python3 gate.py report OUT                # OUT/summary.json; with an `r1` key in the manifest, the R1 verdict
 ```
 
+Both commands exit nonzero for failed requests, cells, setup, or preflight. `continue_on_failure`
+collects further timed-cell evidence; it never makes a failed run successful. Setup and priming
+failures are terminal and retain their command/request receipts before any timed requests.
+
 ## R1 verdict (CUTOVER.md section 4), per Rust cell
 
 `"r1": {"candidate": "rust", "reference": "comfy", "baseline": {"cold-sdxl": 22.2, "cold-anima": 60.8}}` and
@@ -16,11 +20,15 @@ python3 gate.py report OUT                # OUT/summary.json; with an `r1` key i
 - disk reads at most 1.5× the reference engine's in the same cell on the same pod;
 - a cold cell's submit → CLI exit with the image saved at most 1.10× the reference's on the same pod (server start
   included); the previous candidate's figure (`baseline`) and the pod's host load (median load1 and CPU pressure over
-  the cell) are reported beside it, since a shared host slows CPU-bound startup for both engines.
+  the cell) are reported beside it, since a shared host slows CPU-bound startup for both engines;
+- every planned candidate/reference cell is present, every candidate request has its successful
+  file-hash/size and input receipt, and every low-memory request has one successful same-input
+  full-card control whose encoded image bytes match exactly.
 
 Each low-memory (`budget`) request is run again, untimed, on the full card after every timed cell (`control`); its
-output's PSNR to that control is reported, and anything under 30 dB goes to `review` for a person to look at. A flag,
-not a failure: diffusion amplifies rounding differences, and lossy is fine when the image is good (owner).
+output's PSNR to that control is reported, and anything under 30 dB goes to `review`. PSNR is separate
+diagnostic data: missing controls/receipts, changed files or inputs, and changed encoded bytes fail
+qualification. This is a same-GPU strategy comparison; it does not claim cross-device determinism.
 
 ## One cycle (per arm, order from the manifest, e.g. old, rust, old, rust, ...)
 
@@ -74,7 +82,12 @@ leaves out the executor kill (fault injection stays on rentals). Disk reads fall
 processes' `/proc/<pid>/io` when its cgroup has no io controller. `xid_watch: true` follows `journalctl -kf`; any `NVRM: Xid` runs `on_xid` (stop both
 machines) and stops the harness at once.
 
-A manifest `on_start` command runs once on the host before the first request (e.g. watchers). An arm's optional `facts` command is recorded at every restart; a manifest `collect` command's stdout
+A manifest `setup`, `on_start`, then `preflight` command runs once on the host, in that order,
+before sampling or requests. Use `setup` for model export/download verification rather than a
+separate driver command that merely logs an error and continues. An arm's `preflight` command
+runs after its restart/setup and before each cell's priming/timer; it must check the installed
+package/Runtime pair after any overlays. These commands use the host shell and must return
+nonzero on failure. Their outputs and failures are recorded. An arm's optional `facts` command is recorded at every restart; a manifest `collect` command's stdout
 (a tarball) is saved as `OUT/collect.tgz` at the end.
 
 `cells` with `cell_order` ([arm, cell] pairs) run the 2026-10-01 rebench's cells before the cycles. A cell is
@@ -86,10 +99,11 @@ a list of requests (model names, or `{"model", "input"}` payloads) or `{"request
 - `cold` clocks from the machine's birth with no ready wait;
 - an arm with `command` runs another engine's own driver on the host (ComfyUI) and returns the same record;
 - `target_args` adds per-model arguments (e.g. `model.model=...`), `cell_facts` records a host command per cell,
-  `continue_on_failure` records a failed cell and goes on.
+  `continue_on_failure` records a failed timed cell and goes on, then returns nonzero.
 - a warm cell's `prime` requests (`{"model", "input"}`, e.g. one per model) run first, one at a time and outside the clock, so
   each engine's processes exist and its models are loaded when the timed requests start; an engine with its own driver gets
-  the same requests through its `command`. Cold cells prime nothing: they measure start-up;
+  the same requests through its `command`. A failed prime stops immediately, before submitting
+  any timed request, even with `continue_on_failure`. Cold cells prime nothing: they measure start-up;
 - an arm with `keeps_root` is never restarted (on a Rust-only image the machine is the container's main process): its
   `restart` only ends what the machine runs (its executors) and a cold cell is clocked from the submit; an arm's `before`
   command runs before each of its cells (e.g. the ComfyUI arm frees the card of the machine's executors);
@@ -101,6 +115,13 @@ a list of requests (model names, or `{"model", "input"}` payloads) or `{"request
 
 Local mode counts only the executors in the arm's own cgroup, and the 1 Hz samples are fsynced, so a computer that
 freezes keeps its last second.
+
+For Anima, the ordinary untimed prime exercises the actual package construction and Runtime plan
+after overlays. An incompatible processor contract such as `anima_optimization_block_shape`
+therefore stops the warm cell before timing. Run the cohort's untimed install/construction
+checks before the cold-cell sequence too, then restart normally for the cold measurement.
+Do not reset attention processors or alter the request to bypass a failed check. The separate
+product decision is in [benchmark validation](../../docs/gate-validation.md).
 
 ## Manifest
 
