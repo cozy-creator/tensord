@@ -199,7 +199,6 @@ pub fn inherited() -> BTreeMap<String, String> {
 pub struct Seal {
     /// `CUDA_VISIBLE_DEVICES`; empty means no GPU.
     pub devices: String,
-    pub alloc_conf: String,
     pub threads: u32,
     /// Degree above one: NVLS off and GPU peer memory only over NVLink (Runtime cr-068).
     pub group: bool,
@@ -235,7 +234,6 @@ pub fn inherit(command: &mut Command, holds: &[Option<&Arc<File>>]) {
     }
 }
 
-pub const DEFAULT_ALLOC_CONF: &str = "expandable_segments:True";
 pub const DEFAULT_THREADS: u32 = 4;
 
 impl Seal {
@@ -288,7 +286,6 @@ impl Seal {
         owned(kernels.join(format!("torch-kernels.{generation}")))?;
         Ok(Self {
             devices: devices.into(),
-            alloc_conf: DEFAULT_ALLOC_CONF.into(),
             threads: DEFAULT_THREADS,
             group: false,
             home: owned(root.join("home").join(&namespace))?,
@@ -303,7 +300,6 @@ impl Seal {
         let path = |path: PathBuf| path.to_string_lossy().into_owned();
         let mut imposed = BTreeMap::from([
             ("CUDA_VISIBLE_DEVICES".to_string(), self.devices.clone()),
-            ("PYTORCH_CUDA_ALLOC_CONF".into(), self.alloc_conf.clone()),
             ("OMP_NUM_THREADS".into(), self.threads.to_string()),
             ("COZY_HOME".into(), path(self.home.clone())),
             ("TMPDIR".into(), path(self.jit.clone())),

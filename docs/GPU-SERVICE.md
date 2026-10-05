@@ -120,6 +120,6 @@ thread.
 - One Python post helper per request.
 - Each executor gets its own scope: a cgroup-v2 where the host delegates one (laptop systemd
   scopes, rootful hosts), else a token (containers with a read-only or v1 hierarchy, RunPod).
-- Seal: `alloc_conf`/`threads` config fields; `<root>/home`, `<root>/kernels` (per UID) and
+- Seal: `threads` config field (torch's allocator is set in Runtime code); `<root>/home`, `<root>/kernels` (per UID) and
   `<root>/jit/<run>/<generation>`. Earlier runs' JIT scopes, and executor roots (logs) older than a day, are removed at pool start.
 - `PDEATHSIG` retention after a UID drop is unverified.

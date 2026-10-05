@@ -34,9 +34,6 @@ use std::{
 };
 use tensorfs_core::store::Store;
 
-fn alloc_conf() -> String {
-    crate::launch_identity::DEFAULT_ALLOC_CONF.into()
-}
 fn threads() -> u32 {
     crate::launch_identity::DEFAULT_THREADS
 }
@@ -86,9 +83,7 @@ pub struct GpuConfig {
     /// Explicitly configured locations; the executor seal is imposed on top of them.
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
-    /// `PYTORCH_CUDA_ALLOC_CONF` and `OMP_NUM_THREADS` the seal imposes (worker defaults).
-    #[serde(default = "alloc_conf")]
-    pub alloc_conf: String,
+    /// `OMP_NUM_THREADS` the seal imposes. torch's allocator is the Runtime's, set in code.
     #[serde(default = "threads")]
     pub threads: u32,
     /// Explicit authority for already verified cached catalog bytes, for runs without a
@@ -1498,7 +1493,6 @@ impl GpuPool {
         )?;
         // A group's NCCL seal (NVLS off, peer memory only over NVLink).
         seal.group = degree > 1;
-        seal.alloc_conf = self.config.alloc_conf.clone();
         seal.threads = self.config.threads;
         Ok(ExecutorConfig {
             python: held.record.python.clone(),
