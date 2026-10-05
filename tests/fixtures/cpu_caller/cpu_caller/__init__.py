@@ -5,7 +5,7 @@ from __future__ import annotations
 import msgspec
 
 from cozy_runtime.author import App, Context
-from cpu_memo import Probe, measure
+from cpu_memo import Probe, measure, nested, restricted
 
 app = App()
 
@@ -27,3 +27,21 @@ async def relay(ctx: Context, payload: Relay) -> Relayed:
 
 
 app.job(relay)
+
+
+async def relay_nested(ctx: Context, payload: Relay) -> Relayed:
+    squares = []
+    for value in payload.values:
+        squares.append((await nested(payload=Probe(value, payload.counter))).square)
+    return Relayed(squares=squares)
+
+
+app.job(relay_nested)
+
+
+async def relay_restricted(ctx: Context, payload: Relay) -> Relayed:
+    result = await restricted(payload=Probe(payload.values[0], payload.counter))
+    return Relayed(squares=[result.square])
+
+
+app.job(relay_restricted)

@@ -16,8 +16,8 @@ from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
 from packaging.version import Version
 
-from .package_records import Dependency, DescribeFailed, DescribeInstalled, DESCRIPTION_DECODER, PackageMetadata
-from .packages import PackageError, publish_generation, read_metadata
+from .package_records import Dependency, DescribeInstalled, DESCRIPTION_DECODER, PackageMetadata
+from .packages import PackageError, in_environment, publish_generation, read_metadata
 
 
 def wheel_metadata(path: Path) -> PackageMetadata:
@@ -38,18 +38,7 @@ def wheel_metadata(path: Path) -> PackageMetadata:
 
 
 def installed_description(distribution: str, interpreter: Path) -> msgspec.Raw:
-    request = DescribeInstalled(distribution, str(interpreter))
-    # -S prevents authored .pth startup code; only the owned venv's regular
-    # site-packages paths are inserted before loading the installed SDK reader.
-    bootstrap = ("import pathlib,runpy,sys;"
-                 "root=pathlib.Path(sys.executable).absolute().parent.parent;"
-                 "sys.path[:0]=[str(p) for p in (root/'lib').glob('python*/site-packages')];"
-                 "runpy.run_module('cozy_machine_client.runtime_describe',run_name='__main__')")
-    raw = subprocess.check_output([str(interpreter), "-I", "-S", "-c", bootstrap], input=msgspec.json.encode(request))
-    reply = DESCRIPTION_DECODER.decode(raw)
-    if isinstance(reply, DescribeFailed):
-        raise PackageError(reply.code, reply.detail)
-    return reply.interface
+    return in_environment(interpreter, DescribeInstalled(distribution, str(interpreter)), DESCRIPTION_DECODER).interface
 
 
 def inventory(interpreter: Path) -> list[Dependency]:
@@ -58,7 +47,8 @@ def inventory(interpreter: Path) -> list[Dependency]:
 
 def install_captured(*, project: Path | None, wheels: list[Path], requirements: Path | None,
                      distribution: str, release: str, python_requires: str, python_version: str,
-                     generations: Path, client_wheel: Path, python: str, sdk: list[Path] = ()):
+                     generations: Path, client_wheel: Path, python: str, sdk: list[Path] = (),
+                     callees: dict[str, str] | None = None):
     python = subprocess.check_output(["uv", "python", "find", "--no-project", "--no-python-downloads", python]).decode().strip()
     version = Version(subprocess.check_output([python, "-I", "-S", "-c", "import platform;print(platform.python_version())"]).decode().strip())
     if python_requires and version not in SpecifierSet(python_requires):
@@ -133,7 +123,7 @@ def install_captured(*, project: Path | None, wheels: list[Path], requirements: 
             raise PackageError("package_lock_changed", "runner installation changed the captured dependency closure")
         subprocess.run(["uv", "pip", "check", "--python", str(interpreter)], check=True)
         interface = installed_description(metadata.name, interpreter)
-        return publish_generation(root, metadata, interface)
+        return publish_generation(root, metadata, interface, callees)
     except BaseException:
         shutil.rmtree(root)  # uniquely owned unpublished generation, never dispatched
         raise

@@ -448,7 +448,9 @@ impl Publisher {
             })
             .collect();
         let origin = hub::origin_key(&request.source.origin).unwrap_or_default();
-        let key = json!({"installation":alias,"hub":origin,"owner":request.owner,"bindings":request.binding_revision,"entrypoint":request.entrypoint,"choices":choices,"gpu":gpu});
+        let package = request.installed.as_ref().map(|i| i.package.as_str()).unwrap_or(&request.package);
+        let release = request.installed.as_ref().map(|i| i.release.as_str()).unwrap_or(&request.release);
+        let key = json!({"installation":alias,"package":package,"release":release,"hub":origin,"owner":request.owner,"bindings":request.binding_revision,"entrypoint":request.entrypoint,"choices":choices,"gpu":gpu});
         format!("hub-{}", sha256::hex_digest(key.to_string().as_bytes()))
     }
 
@@ -790,7 +792,11 @@ impl Publisher {
                 "the package interface names no application".to_string(),
             ))?;
         File::create(dir.join(".hold")).map_err(io_failure)?;
-        let record = json!({"identity":identity,"package":split.distribution,"version":release,"application":application,"python":interpreter,"dependencies":[],"interface":interface,"sdk":sdk_choice});
+        let (source_digest, callees) = match &self.sdk.client_wheel {
+            Some(_) => describe_environment(&py, &split.distribution)?,
+            None => (String::new(), vec![]),
+        };
+        let record = json!({"identity":identity,"package":split.distribution,"version":release,"application":application,"python":interpreter,"dependencies":[],"interface":interface,"sdk":sdk_choice,"source_digest":source_digest,"callees":callees});
         let staged = dir.join(".generation.json.new");
         let mut file = OpenOptions::new()
             .create_new(true)
@@ -940,7 +946,7 @@ impl Publisher {
             ))?;
         let gpu_model = gpu_name(&gpu.config().envelope()[0]);
         let width = gpu.width();
-        let (org, name) = installation.package.split_once('/').unwrap_or_default();
+        let (org, _) = installation.package.split_once('/').unwrap_or_default();
         // Unpublished code (local/) has no owner bindings; its org-relative names are its owner's.
         let local = org == "local";
         let account = if local { request.owner.as_str() } else { org };
@@ -984,25 +990,7 @@ impl Publisher {
                     false,
                 )
             } else {
-                if bindings.is_none() && !local {
-                    bindings = Some(
-                        catalog
-                            .json(&format!(
-                                "/v1/packages/{}/{}/bindings",
-                                hub::escape(org),
-                                hub::escape(name)
-                            ))
-                            .map_err(|e| ("catalog_read_failed", e.0))?,
-                    );
-                }
-                let row = bindings
-                    .as_ref()
-                    .and_then(|b| b.get("bindings"))
-                    .and_then(Value::as_array)
-                    .and_then(|rows| rows.iter().find(|row| row.get("slot").and_then(Value::as_str) == Some(path.as_str())))
-                    .cloned()
-                    .or_else(|| authored(slot))
-                    .ok_or(("model_binding_absent", format!("{} binds no model to {path}; bind one with `cozy package bind`", installation.package)))?;
+                let row = model_binding(catalog, installation, slot, &mut bindings)?;
                 let mut model = row
                     .get("model")
                     .and_then(Value::as_str)
@@ -1147,6 +1135,33 @@ impl Publisher {
             .map_err(io_failure)?;
         Ok(plan)
     }
+}
+
+/// One package's own slot default: its Hub bindings, then its authored ladder. A dependency
+/// installed in another package's environment still asks under its own package identity.
+pub(crate) fn model_binding(
+    catalog: &Catalog,
+    installation: &Installation,
+    slot: &Value,
+    cached: &mut Option<Value>,
+) -> Result<Value, Failure> {
+    let (org, name) = installation.package.split_once('/').ok_or((
+        "model_binding_absent", "the model's package identity must be org/name".into(),
+    ))?;
+    let path = slot["path"].as_str().unwrap_or_default();
+    if cached.is_none() && org != "local" {
+        *cached = Some(catalog.json(&format!(
+            "/v1/packages/{}/{}/bindings", hub::escape(org), hub::escape(name),
+        )).map_err(|e| ("catalog_read_failed", e.0))?);
+    }
+    cached.as_ref()
+        .and_then(|b| b["bindings"].as_array())
+        .and_then(|rows| rows.iter().find(|row| row["slot"].as_str() == Some(path)))
+        .cloned()
+        .or_else(|| authored(slot))
+        .ok_or(("model_binding_absent", format!(
+            "{} binds no model to {path}; bind one with `cozy package bind`", installation.package,
+        )))
 }
 
 /// A provider source made into a local model by TensorFS `source_model`, kept as the local
@@ -1527,6 +1542,43 @@ fn normalized(name: &str) -> String {
         }
     }
     out
+}
+
+/// The environment's root digest and the other Apps it holds, described inside it by the
+/// machine's client without importing them (`runtime_describe`). A failed description fails
+/// this preparation; it never publishes an environment with silently missing callees.
+pub fn describe_environment(python: &str, root: &str) -> Result<(String, Vec<crate::catalog::Callee>), Failure> {
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum Reply {
+        DescribedEnvironment { source_digest: String, callees: Vec<crate::catalog::Callee> },
+        DescribeFailed { code: String, detail: String },
+    }
+    // -S keeps authored .pth startup code out; only the venv's own site-packages are added.
+    const BOOTSTRAP: &str = "import pathlib,runpy,sys;\
+        root=pathlib.Path(sys.executable).absolute().parent.parent;\
+        sys.path[:0]=[str(p) for p in (root/'lib').glob('python*/site-packages')];\
+        runpy.run_module('cozy_machine_client.runtime_describe',run_name='__main__')";
+    let described = Command::new(python)
+        .args(["-I", "-S", "-c", BOOTSTRAP])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .and_then(|mut child| {
+            let request = json!({"kind": "describe_environment", "root": root}).to_string();
+            child.stdin.take().expect("piped").write_all(request.as_bytes())?;
+            child.wait_with_output()
+        });
+    let output = described.map_err(io_failure)?;
+    let reply = serde_json::from_slice::<Reply>(&output.stdout).map_err(|error| {
+        ("package_prepare_description_failed", format!("environment description failed: {error}"))
+    })?;
+    match reply {
+        Reply::DescribedEnvironment { source_digest, callees } if output.status.success() => Ok((source_digest, callees)),
+        Reply::DescribeFailed { code, detail } => Err(("package_prepare_description_failed", format!("{code}: {detail}"))),
+        _ => Err(("package_prepare_description_failed", "environment description did not complete".into())),
+    }
 }
 
 /// The release's lock as uv input: index lines and every row, minus the SDK rows when the

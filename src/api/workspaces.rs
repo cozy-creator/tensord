@@ -104,6 +104,8 @@ pub struct RootSet {
     pub source_archive: String,
     #[serde(default)]
     pub dependency_requirements: Vec<u8>,
+    #[serde(default)]
+    pub callees: std::collections::BTreeMap<String, String>,
     pub(crate) files: Vec<Carrier>,
 }
 pub struct UploadedPackage {
@@ -500,6 +502,7 @@ fn root_set(selected: &pb::DesiredLocalPackageSet) -> Result<RootSet, Status> {
         ));
     }
     Ok(RootSet {
+        callees: Default::default(),
         operation_id: selected.operation_id.clone(),
         package: package.package.clone(),
         release: package.release.clone(),

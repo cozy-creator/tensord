@@ -269,7 +269,6 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
         identity.binding_revision.clear();
         identity.known_results.clear();
         identity.publication.clear();
-        identity.known_results.clear(); // what the caller knows never changes the run
         format!(
             "sha256:{}",
             tensorfs_core::sha256::hex_digest(&prost::Message::encode_to_vec(&identity))
@@ -347,6 +346,7 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
             .filter(|(_, result)| serde_json::from_str::<serde_json::Value>(result).is_ok())
             .take(256)
             .collect(),
+        application: String::new(),
         digest: identity_digest,
     })
 }

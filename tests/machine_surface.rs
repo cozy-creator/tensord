@@ -1815,7 +1815,8 @@ mod v1_api {
         let manifest = serde_json::to_vec(&serde_json::json!({
             "package": "local/cozy-machine-cpu-caller", "release": "0.1.0", "python_version": "3.12",
             "source": {"digest": digest, "length": source.len()},
-            "wheels": [{"name": wheel.file_name().unwrap().to_str().unwrap(), "digest": wheel_digest, "length": bytes.len()}]}))
+            "wheels": [{"name": wheel.file_name().unwrap().to_str().unwrap(), "digest": wheel_digest, "length": bytes.len()}],
+            "callees": {"cozy-machine-cpu-memo": "local/cozy-machine-cpu-memo"}}))
         .unwrap();
         let manifest_digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&manifest));
         write(&mut client, &all, &manifest_digest, manifest.len() as u64, 0, &manifest).await.unwrap();
@@ -1835,7 +1836,7 @@ mod v1_api {
             v1::RunRequest {
                 id: "relay-1".into(),
                 after: 0,
-                spec: Some(spec),
+                spec: Some(spec.clone()),
             },
             &all,
         );
@@ -1847,6 +1848,78 @@ mod v1_api {
         let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
         assert_eq!(result["squares"], serde_json::json!([9, 16]));
         assert_eq!(fs::read_to_string(&counter).unwrap(), "2");
+        // Each call is a child run of the callee's own function, and memoized as its own.
+        let calls: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.event {
+                Some(v1::run_event::Event::Call(call)) => Some(call.function.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls, ["measure", "measure"], "{events:?}");
+        assert!(events
+            .iter()
+            .any(|e| matches!(&e.event, Some(v1::run_event::Event::Memo(m)) if m.result == br#"{"square":9}"#)));
+        let mut nested = spec.clone();
+        nested.entrypoint = "relay_nested".into();
+        let events = collect(client.run(authorized(v1::RunRequest {
+            id: "relay-nested".into(), after: 0, spec: Some(nested),
+        }, &all)).await.unwrap().into_inner()).await.unwrap();
+        let done = outcome(&events);
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        assert_eq!(result["squares"], serde_json::json!([9, 16]));
+        assert_eq!(fs::read_to_string(&counter).unwrap(), "4");
+        let mut restricted = spec;
+        restricted.entrypoint = "relay_restricted".into();
+        let events = collect(client.run(authorized(v1::RunRequest {
+            id: "relay-restricted".into(), after: 0, spec: Some(restricted),
+        }, &all)).await.unwrap().into_inner()).await.unwrap();
+        assert_eq!(outcome(&events).status, "failed", "{events:?}");
+        assert_eq!(fs::read_to_string(&counter).unwrap(), "4", "a foreign internal export must run no effects");
+        // A published release's environment is described the same way, inside it.
+        let python = fs::read_dir(machine.root.join("state/generations"))
+            .unwrap()
+            .flatten()
+            .map(|g| g.path().join("env/bin/python"))
+            .find(|p| p.exists())
+            .unwrap();
+        let (digest, callees) = cozy_machine::published::describe_environment(
+            python.to_str().unwrap(),
+            "cozy-machine-cpu-caller",
+        ).unwrap();
+        assert!(digest.starts_with("sha256:"), "{digest}");
+        assert_eq!(callees[0].application, "cpu_memo:app", "{callees:?}");
+        assert_eq!(callees[0].package, "local/cozy-machine-cpu-memo");
+        // The root and callee can both be immutable wheels; no source archive is needed.
+        assert!(std::process::Command::new("uv").args(["build", "--wheel", "--out-dir"])
+            .arg(&built).arg(fixtures.join("cpu_caller")).status().unwrap().success());
+        let root_wheel = fs::read_dir(&built).unwrap().flatten()
+            .map(|entry| entry.path()).find(|path| path.file_name().unwrap().to_str().unwrap().starts_with("cozy_machine_cpu_caller-")).unwrap();
+        let root_bytes = fs::read(&root_wheel).unwrap();
+        let root_digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&root_bytes));
+        write(&mut client, &all, &root_digest, root_bytes.len() as u64, 0, &root_bytes).await.unwrap();
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "package":"local/cozy-machine-cpu-caller","release":"0.1.0","python_version":"3.12",
+            "wheels":[
+                {"name":root_wheel.file_name().unwrap().to_str().unwrap(),"digest":root_digest,"length":root_bytes.len()},
+                {"name":wheel.file_name().unwrap().to_str().unwrap(),"digest":wheel_digest,"length":bytes.len()}],
+            "callees":{"cozy-machine-cpu-memo":"local/cozy-machine-cpu-memo"}
+        })).unwrap();
+        let manifest_digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&manifest));
+        write(&mut client, &all, &manifest_digest, manifest.len() as u64, 0, &manifest).await.unwrap();
+        let wheel_counter = machine.root.join("wheel-measured");
+        let events = collect(client.run(authorized(v1::RunRequest {
+            id:"relay-wheels".into(),after:0,spec:Some(v1::RunSpec {
+                kind:v1::RunKind::Job as i32,entrypoint:"relay".into(),owner:"alice".into(),
+                source:Some(v1::run_spec::Source::Local(v1::LocalSource { manifest:manifest_digest })),
+                payload:serde_json::to_vec(&serde_json::json!({"values":[3,4],"counter":wheel_counter})).unwrap(),
+                ..Default::default()
+            }),
+        }, &all)).await.unwrap().into_inner()).await.unwrap();
+        let done = outcome(&events);
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        assert_eq!(fs::read_to_string(&wheel_counter).unwrap(), "2");
         let _ = fs::remove_dir_all(tools);
     }
 

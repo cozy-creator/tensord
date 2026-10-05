@@ -8,10 +8,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
-import hashlib
-import importlib.metadata
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -23,8 +20,8 @@ from pathlib import Path
 import msgspec
 
 from .package_records import (
-    DESCRIPTION_DECODER, GENERATION_DECODER, Dependency, Describe, DescribeFailed, Generation,
-    InstallFailed, PackageMetadata, Pyproject,
+    DESCRIPTION_DECODER, ENVIRONMENT_DECODER, GENERATION_DECODER, Dependency, Describe,
+    DescribeEnvironment, DescribeFailed, Generation, InstallFailed, PackageMetadata, Pyproject,
 )
 
 
@@ -64,30 +61,31 @@ def probe_cpu_bridge(interpreter: Path) -> str:
     return (lines[-1] if lines else f"bridge import exited {probe.returncode}")[:1024]
 
 
-def source_digest(interpreter: Path, distribution: str) -> str:
-    """The installed package's own files by their RECORD hashes: the same wherever this code
-    is installed, so a memoized call's result is reusable there. Empty when unrecorded or
-    editable (a path file's hash says nothing of the code)."""
-    def name(value: str) -> str:
-        return re.sub(r"[-_.]+", "-", value).lower()
-    site = [str(path) for path in (interpreter.parent.parent / "lib").glob("python*/site-packages")]
-    rows = sorted((str(file), file.hash.value)
-                  for found in importlib.metadata.distributions(path=site)
-                  if name(found.metadata["Name"]) == name(distribution)
-                  for file in found.files or []
-                  if file.hash and file.parts[0] != ".." and not file.parts[0].endswith(".dist-info"))
-    if not rows or any(path.endswith(".pth") for path, _ in rows):
-        return ""
-    return "sha256:" + hashlib.sha256(msgspec.json.encode(rows)).hexdigest()
+# -S prevents authored .pth startup code; only the owned venv's regular site-packages paths
+# are inserted before loading the installed SDK reader.
+BOOTSTRAP = ("import pathlib,runpy,sys;"
+             "root=pathlib.Path(sys.executable).absolute().parent.parent;"
+             "sys.path[:0]=[str(p) for p in (root/'lib').glob('python*/site-packages')];"
+             "runpy.run_module('cozy_machine_client.runtime_describe',run_name='__main__')")
 
 
-def publish_generation(root: Path, metadata: PackageMetadata, interface: msgspec.Raw) -> Generation:
+def in_environment(interpreter: Path, request: msgspec.Struct, decoder: msgspec.json.Decoder):
+    reply = decoder.decode(subprocess.check_output([str(interpreter), "-I", "-S", "-c", BOOTSTRAP],
+                                                   input=msgspec.json.encode(request)))
+    if isinstance(reply, DescribeFailed):
+        raise PackageError(reply.code, reply.detail)
+    return reply
+
+
+def publish_generation(root: Path, metadata: PackageMetadata, interface: msgspec.Raw,
+                       callees: dict[str, str] | None = None) -> Generation:
     interpreter = root / "env" / "bin" / "python"
     inventory = subprocess.check_output(["uv", "pip", "list", "--python", str(interpreter), "--format", "json"])
     dependencies = msgspec.json.decode(inventory, type=list[Dependency])
+    environment = in_environment(interpreter, DescribeEnvironment(metadata.name, callees or {}), ENVIRONMENT_DECODER)
     generation = Generation(root.name, metadata.name, metadata.version, metadata.application,
                             str(interpreter), dependencies, interface, probe_cpu_bridge(interpreter),
-                            source_digest(interpreter, metadata.name))
+                            environment.source_digest, environment.callees)
     with (root / ".generation.json.new").open("wb") as output:
         output.write(msgspec.json.encode(generation))
         output.flush()
@@ -196,6 +194,7 @@ def main():
     captured.add_argument("--client-wheel", type=Path, required=True)
     captured.add_argument("--sdk-wheel", action="append", type=Path, default=[])
     captured.add_argument("--python", default=sys.executable)
+    captured.add_argument("--callees", default="{}")
     args = parser.parse_args()
     if args.command == "install-captured":
         from .captured_packages import install_captured
@@ -203,7 +202,7 @@ def main():
             result = install_captured(project=args.project, wheels=args.wheel, requirements=args.requirements,
                 distribution=args.distribution, release=args.release, python_requires=args.python_requires,
                 python_version=args.python_version, generations=args.generations, client_wheel=args.client_wheel, python=args.python,
-                sdk=args.sdk_wheel)
+                sdk=args.sdk_wheel, callees=msgspec.json.decode(args.callees, type=dict[str, str]))
         except PackageError as exc:
             print(msgspec.json.encode(InstallFailed(exc.code, str(exc))).decode())
             raise SystemExit(1)

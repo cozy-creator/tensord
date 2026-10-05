@@ -43,5 +43,21 @@ async def survey(ctx: Context, payload: Survey) -> Surveyed:
     return Surveyed(squares=squares)
 
 
-app.entrypoint(internal=True)(measure)
+app.entrypoint(measure)
 app.job(survey)
+
+
+@invocable()
+async def nested(ctx: Context, *, payload: Probe) -> Measured:
+    return await restricted(payload=payload)
+
+
+@invocable(memoize=True)
+async def restricted(ctx: Context, *, payload: Probe) -> Measured:
+    counter = Path(payload.counter)
+    counter.write_text(str(int(counter.read_text()) + 1 if counter.exists() else 1))
+    return Measured(square=payload.value * payload.value)
+
+
+app.job(nested)
+app.entrypoint(restricted, internal=True)

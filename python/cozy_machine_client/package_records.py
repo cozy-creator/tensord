@@ -7,6 +7,17 @@ class Dependency(msgspec.Struct, frozen=True):
     version: str
 
 
+class Callee(msgspec.Struct, frozen=True):
+    """Another package's App this environment holds as a dependency: a job of the root calls
+    its invocables as child runs here."""
+    distribution: str
+    version: str
+    application: str
+    interface: msgspec.Raw
+    source_digest: str = ""
+    package: str = ""
+
+
 class Generation(msgspec.Struct, frozen=True):
     identity: str
     package: str
@@ -19,6 +30,7 @@ class Generation(msgspec.Struct, frozen=True):
     cpu_bridge: str = ""
     # The package's own installed files, hashed: what keys its memoized calls across machines.
     source_digest: str = ""
+    callees: list[Callee] = []
 
 
 class ApplicationEntry(msgspec.Struct, frozen=True):
@@ -55,6 +67,16 @@ class DescribeInstalled(msgspec.Struct, tag="describe_installed", tag_field="kin
     environment_python: str
 
 
+class DescribeEnvironment(msgspec.Struct, tag="describe_environment", tag_field="kind"):
+    root: str
+    packages: dict[str, str] = {}
+
+
+class DescribedEnvironment(msgspec.Struct, tag="described_environment", tag_field="kind"):
+    source_digest: str
+    callees: list[Callee]
+
+
 class Described(msgspec.Struct, tag="described", tag_field="kind"):
     interface: msgspec.Raw
 
@@ -71,3 +93,4 @@ class InstallFailed(msgspec.Struct, tag="install_failed", tag_field="kind"):
 
 GENERATION_DECODER = msgspec.json.Decoder(Generation)
 DESCRIPTION_DECODER = msgspec.json.Decoder(Described | DescribeFailed)
+ENVIRONMENT_DECODER = msgspec.json.Decoder(DescribedEnvironment | DescribeFailed)

@@ -435,8 +435,12 @@ const ENDED: &str = "import-only executor ended";
 const UNMEASURED_PARENT: u64 = 1 << 30;
 
 /// The learned-host key of a generation's import-only executor.
-fn parent_key(generation: &str) -> String {
-    format!("parent:{generation}")
+fn parent_key(held: &HeldGeneration) -> String {
+    format!("parent:{}:{}", held.record.identity, held.record.application)
+}
+
+fn parent_app(held: &HeldGeneration) -> (String, String) {
+    (held.record.identity.clone(), held.record.application.clone())
 }
 
 /// The manifests live executors read. A download's GC must not evict them: an evicted file a
@@ -469,7 +473,7 @@ pub struct GpuPool {
     sessions: Mutex<BTreeMap<String, Session>>,
     /// Per generation, the import-only executor sessions fork from. Declared after
     /// `sessions`: executors end before the parent they were forked from.
-    zygotes: Mutex<BTreeMap<String, Arc<Zygote>>>,
+    zygotes: Mutex<BTreeMap<(String, String), Arc<Zygote>>>,
     /// Each generation's kernel boot of this machine run: its process while it runs.
     kernel_boots: Mutex<BTreeMap<String, Option<crate::process::Exact>>>,
     /// Each caller's warm set, in the order it sent it.
@@ -903,7 +907,7 @@ impl GpuPool {
         });
         let imported = || {
             let zygotes = self.zygotes.lock().unwrap();
-            zygotes.get(&member.held.record.identity).cloned()
+            zygotes.get(&parent_app(&member.held)).cloned()
         };
         match (executor, &member.plan) {
             (Some(level), _) => level,
@@ -937,7 +941,7 @@ impl GpuPool {
         let mut highest: BTreeMap<String, Level> = parents
             .into_iter()
             .filter(|(_, parent)| parent.ready())
-            .map(|(generation, _)| (generation, Level::Imported))
+            .map(|((generation, _), _)| (generation, Level::Imported))
             .collect();
         for (generation, level) in self.levels.lock().unwrap().values() {
             let held = highest.entry(generation.clone()).or_insert(*level);
@@ -948,9 +952,8 @@ impl GpuPool {
     /// `held`'s import-only parent, started here when the host has room for it: empty once
     /// it is up, else why it is not.
     fn import(&self, held: &HeldGeneration) -> &'static str {
-        let generation = &held.record.identity;
-        let known = self.zygotes.lock().unwrap().contains_key(generation);
-        if !known && !self.parent_fits(generation) {
+        let known = self.zygotes.lock().unwrap().contains_key(&parent_app(held));
+        if !known && !self.parent_fits(held) {
             return "no host memory free for its imports";
         }
         let Some((parent, start)) = self.zygote(held) else {
@@ -965,7 +968,7 @@ impl GpuPool {
             (_, false) => "its Runtime forks no executors: nothing imports ahead of a request",
             (_, true) => {
                 // The next pass imports again; a request that needs it starts one itself.
-                self.forget_parent(generation, &parent);
+                self.forget_parent(held, &parent);
                 "its imports failed (the machine's log says why)"
             }
         }
@@ -1643,7 +1646,7 @@ impl GpuPool {
     /// Start a generation's import-only executor in the background after its install, so its
     /// imports overlap the model download before the first request.
     pub fn prespawn(self: &Arc<Self>, held: HeldGeneration) {
-        if !self.parent_fits(&held.record.identity) {
+        if !self.parent_fits(&held) {
             eprintln!(
                 "executor prespawn skipped for {}: no host room",
                 held.record.identity
@@ -1672,10 +1675,10 @@ impl GpuPool {
     /// Whether the host has room for `generation`'s parent beside what it holds now: its
     /// measured private bytes (else the largest any parent measured). A prespawn never
     /// makes room; a request that needs a parent always gets one.
-    fn parent_fits(&self, generation: &str) -> bool {
+    fn parent_fits(&self, held: &HeldGeneration) -> bool {
         let need = self.first().with(|gpu| {
             let learned = |key: &str| gpu.learned.plans.get(key).map(|plan| plan.host_bytes);
-            learned(&parent_key(generation))
+            learned(&parent_key(held))
                 .or_else(|| {
                     gpu.learned
                         .plans
@@ -1691,13 +1694,14 @@ impl GpuPool {
     }
 
     /// Drop a dead parent, if it is still the generation's: the next launch starts another.
-    fn forget_parent(&self, generation: &str, dead: &Arc<Zygote>) {
+    fn forget_parent(&self, held: &HeldGeneration, dead: &Arc<Zygote>) {
         let mut zygotes = self.zygotes.lock().unwrap();
+        let key = parent_app(held);
         if zygotes
-            .get(generation)
+            .get(&key)
             .is_some_and(|current| Arc::ptr_eq(current, dead))
         {
-            zygotes.remove(generation);
+            zygotes.remove(&key);
         }
     }
 
@@ -1706,10 +1710,10 @@ impl GpuPool {
     /// Returns the bytes it held privately (at least 1 when one ended unmeasured), 0 when
     /// there is none to end.
     fn end_idle_parent(&self, spare: bool) -> u64 {
-        let kept: std::collections::BTreeSet<String> = {
+        let kept: std::collections::BTreeSet<(String, String)> = {
             let sets = self.members.lock().unwrap();
             let members = sets.values().flatten().filter(|member| member.level >= Level::Imported);
-            members.map(|member| member.held.record.identity.clone()).collect()
+            members.map(|member| parent_app(&member.held)).collect()
         };
         let victim = {
             let mut zygotes = self.zygotes.lock().unwrap();
@@ -1739,11 +1743,12 @@ impl GpuPool {
             return None;
         }
         let mut zygotes = self.zygotes.lock().unwrap();
-        if let Some(zygote) = zygotes.get(&held.record.identity) {
+        let key = parent_app(held);
+        if let Some(zygote) = zygotes.get(&key) {
             return Some((zygote.clone(), false));
         }
         let zygote = Arc::new(Zygote::default());
-        zygotes.insert(held.record.identity.clone(), zygote.clone());
+        zygotes.insert(key, zygote.clone());
         Some((zygote, true))
     }
 
@@ -1787,7 +1792,7 @@ impl GpuPool {
             }
             if let Ok(memory) = crate::host_memory::process(executor.birth.pid) {
                 self.first().learn_host(
-                    &parent_key(&held.record.identity),
+                    &parent_key(held),
                     memory.pss.saturating_sub(memory.pss_shmem),
                 );
             }
@@ -2186,14 +2191,14 @@ impl GpuPool {
                     eprintln!("executor fork refused, spawning: {reason}");
                     config = Some(*returned);
                     if zygote.failed() {
-                        self.forget_parent(&held.record.identity, &zygote);
+                        self.forget_parent(held, &zygote);
                     }
                     break;
                 }
                 Forked::Lost(returned, reason) => {
                     eprintln!("import-only executor lost ({reason}); starting another");
                     config = Some(*returned);
-                    self.forget_parent(&held.record.identity, &zygote);
+                    self.forget_parent(held, &zygote);
                 }
             }
         }

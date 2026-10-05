@@ -24,6 +24,8 @@ pub struct Call {
     pub job: bool,
     /// A child run's parent execution id.
     pub parent: String,
+    /// The callee App a child run calls in its parent's environment; empty for the root's.
+    pub application: String,
 }
 
 pub struct Service {
@@ -275,7 +277,7 @@ impl Service {
         preparation: &str,
     ) -> io::Result<Execution> {
         let held = self.catalog.resolve(generation)?;
-        let mut invocation = held.invocation(&call.entrypoint, call.input)?;
+        let mut invocation = held.invocation_of(&call.application, &call.entrypoint, call.input)?;
         invocation.attention_kernel = call.attention_kernel;
         invocation.inputs = call.inputs;
         invocation.job = call.job;
@@ -456,8 +458,8 @@ impl Service {
                         continue;
                     }
                 };
-                if record.invocation.package != held.record.package
-                    || record.invocation.module != held.record.application
+                if held.record.app(&record.invocation.module).map(|(package, ..)| package)
+                    != Some(record.invocation.package.as_str())
                 {
                     self.engine.wait_for_environment(
                         &record.id,
@@ -503,7 +505,7 @@ impl Service {
                             )
                         })?;
                     gpu_active =
-                        gpu.dispatch(&self.engine, &record, held, gpu.plan(&preparation)?)?;
+                        gpu.dispatch(&self.engine, &record, held.application(&record.invocation.module)?, gpu.plan(&preparation)?)?;
                 }
                 if room == 0 && gpu_active && jobs.is_none() {
                     return Ok(());

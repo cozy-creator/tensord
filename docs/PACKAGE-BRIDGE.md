@@ -27,6 +27,25 @@ atomically last. A generation is never updated. `catalog.rs` resolves one only u
   - Failure prints `{kind: "install_failed", code, detail}`.
 - `collect`: takes an exclusive non-blocking `.hold`, renames the generation, then deletes it.
 
+## Calls between packages
+
+A generation also records `callees`: the other installed distributions with a statically
+described `cozy.application`, their application, interface, package identity and source digest.
+Their child runs use the caller's immutable environment and the callee's own App. A callee job
+can call its own internal exports; another package can call only its public exports. Memoized
+calls use the callee's source digest.
+
+A local-source manifest may carry an optional `callees` map from normalized distribution names
+to package identities. It may carry a source archive, or an immutable root wheel together with
+dependency wheels. Without an explicit mapping, an installed wheel's standard `direct_url.json`
+names its Hub package through `/v1/index/<org>/files/…`; other wheels are local code. Description
+reads metadata and AST inside the environment without importing package code.
+
+Model slots, owner bindings and resolution-cache entries belong to the callee package. The
+caller’s model choices and binding revision do not override another package's slots. GPU
+execution uses the callee's interface; import-only parents are keyed by generation and App.
+These are additive generation and manifest fields; `cozy.machine.v1` is unchanged.
+
 ## Runner (`runner.py`, `runtime_bridge.py`)
 
 `<generation python> -I -m cozy_runtime.internal.trampoline … -- <generation python> -m

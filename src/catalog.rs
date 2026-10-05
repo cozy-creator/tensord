@@ -32,6 +32,35 @@ pub struct Generation {
     /// The package's own installed files, hashed; empty when its installer recorded none.
     #[serde(default)]
     pub source_digest: String,
+    /// Other packages' Apps this environment holds as dependencies: a job calls them here.
+    #[serde(default)]
+    pub callees: Vec<Callee>,
+}
+/// Another package's App installed in an environment: its calls run as child runs of its own
+/// package, from the caller's environment.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Callee {
+    pub distribution: String,
+    pub version: String,
+    pub application: String,
+    pub interface: serde_json::Value,
+    #[serde(default)]
+    pub source_digest: String,
+    #[serde(default)]
+    pub package: String,
+}
+impl Generation {
+    /// The package an application of this environment belongs to (the root's or a callee's),
+    /// its release and its interface.
+    pub fn app(&self, application: &str) -> Option<(&str, &str, &serde_json::Value)> {
+        if application.is_empty() || application == self.application {
+            return Some((&self.package, &self.version, &self.interface));
+        }
+        self.callees
+            .iter()
+            .find(|c| c.application == application)
+            .map(|c| (if c.package.is_empty() { c.distribution.as_str() } else { c.package.as_str() }, c.version.as_str(), &c.interface))
+    }
 }
 #[derive(Clone)]
 pub struct HeldGeneration {
@@ -124,19 +153,53 @@ impl Catalog {
     }
 }
 impl HeldGeneration {
+    /// One App's executor view, with the environment and lifetime hold unchanged.
+    pub fn application(&self, application: &str) -> io::Result<Self> {
+        if application.is_empty() || application == self.record.application {
+            return Ok(self.clone());
+        }
+        let callee = self.record.callees.iter().find(|c| c.application == application)
+            .ok_or_else(|| invalid("this environment holds no such application"))?;
+        let mut held = self.clone();
+        held.record.package = match callee.package.as_str() {
+            "" => callee.distribution.clone(),
+            _ => callee.package.clone(),
+        };
+        held.record.version = callee.version.clone();
+        held.record.application = callee.application.clone();
+        held.record.interface = callee.interface.clone();
+        held.record.source_digest = callee.source_digest.clone();
+        Ok(held)
+    }
     pub fn retention(&self) -> Arc<File> {
         self.hold.clone()
     }
     pub fn invocation(&self, entrypoint: &str, input: serde_json::Value) -> io::Result<Invocation> {
+        self.invocation_of("", entrypoint, input)
+    }
+    /// A call of `application` (empty: the root's; else a callee's) in this environment.
+    pub fn invocation_of(
+        &self,
+        application: &str,
+        entrypoint: &str,
+        input: serde_json::Value,
+    ) -> io::Result<Invocation> {
         if entrypoint.is_empty() || entrypoint.starts_with('_') || entrypoint.contains('/') {
             return Err(invalid(
                 "entrypoint must name a public package registration",
             ));
         }
+        let (package, _, _) = self
+            .record
+            .app(application)
+            .ok_or_else(|| invalid("this environment holds no such application"))?;
         Ok(Invocation {
-            package: self.record.package.clone(),
+            package: package.into(),
             generation: self.record.identity.clone(),
-            module: self.record.application.clone(),
+            module: match application {
+                "" => self.record.application.clone(),
+                callee => callee.into(),
+            },
             entrypoint: entrypoint.into(),
             input,
             attention_kernel: String::new(),

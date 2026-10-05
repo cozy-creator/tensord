@@ -61,8 +61,9 @@ struct Parent {
     request: String,
     actor: String,
     spool: PathBuf,
-    /// `(module, export)` of each own invocable, and the entrypoint it is registered as.
-    callables: HashMap<(String, String), String>,
+    /// `(module, export)` of each invocable it may call: the App it belongs to (empty: its own
+    /// package's; else a callee's in its environment) and the entrypoint registered for it.
+    callables: HashMap<(String, String), (String, String)>,
     /// The memoized ones' operation identity.
     memoized: HashMap<(String, String), String>,
     /// The parent's own file inputs: a child may be handed any of them.
@@ -278,13 +279,24 @@ impl Jobs {
         Ok(Some(executor))
     }
 
-    fn interface(&self, executor: &DeviceExecutor, held: &HeldGeneration) -> io::Result<PathBuf> {
+    /// The interface of the App a run calls (`module`: the root's or a callee's) beside its
+    /// executor, and that App.
+    fn interface(
+        &self,
+        executor: &DeviceExecutor,
+        held: &HeldGeneration,
+        module: &str,
+    ) -> io::Result<(PathBuf, String, Value)> {
+        let (_, _, interface) = held
+            .record
+            .app(module)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "this environment holds no such App"))?;
         let path = executor.root_path().join("package-interface.json");
-        fs::write(&path, serde_json::to_vec(&held.record.interface)?)?;
+        fs::write(&path, serde_json::to_vec(interface)?)?;
         if let Some(identity) = self.identity {
             identity.readable(&path)?;
         }
-        Ok(path)
+        Ok((path, module.to_string(), interface.clone()))
     }
 
     fn spool(&self, executor: &DeviceExecutor, id: &str) -> io::Result<PathBuf> {
@@ -306,11 +318,13 @@ impl Jobs {
         let Some(mut executor) = self.launch(engine, id, &held)? else {
             return Ok(());
         };
-        let interface = self.interface(&executor, &held)?;
+        let (interface, application, document) =
+            self.interface(&executor, &held, &record.invocation.module)?;
         let spool = self.spool(&executor, id)?;
         let scratch = self.scratch(id)?;
         let inputs = stage_inputs(&self.store, self.identity, &spool, &record.invocation.inputs)?;
-        let (call_interfaces, callables) = own_invocables(&held.record.interface, &interface);
+        let (call_interfaces, callables) =
+            invocables(&held.record, &application, &document, &interface);
         let parent = Arc::new(Parent {
             id: id.into(),
             request: record
@@ -334,7 +348,7 @@ impl Jobs {
             .insert(id.into(), parent.clone());
         let (waiting, journal) = (parent.clone(), engine.clone());
         executor.waits = Some(Arc::new(move || waiting.unfinished(&journal)));
-        let (grant, models) = self.weights_grant(engine, &record, &held.record.interface, &spool)?;
+        let (grant, models) = self.weights_grant(engine, &record, &document, &spool)?;
         let mut services = Seam {
             engine,
             id,
@@ -351,7 +365,7 @@ impl Jobs {
                 request_id: id.into(),
                 job: record.invocation.entrypoint.clone(),
                 payload: record.invocation.input.clone(),
-                application: held.record.application.clone(),
+                application,
                 package_interface: interface,
                 spool: spool.clone(),
                 scratch,
@@ -420,7 +434,8 @@ impl Jobs {
         let Some(mut executor) = self.launch(engine, id, &held)? else {
             return Ok(());
         };
-        let interface = self.interface(&executor, &held)?;
+        let (interface, application, _) =
+            self.interface(&executor, &held, &record.invocation.module)?;
         let spool = self.spool(&executor, id)?;
         let mut services = Seam {
             engine,
@@ -434,7 +449,6 @@ impl Jobs {
             appended: HashMap::new(),
             weights: None,
         };
-        let application = held.record.application.clone();
         command_ok(executor.command(
             &DeviceCommand::Start {
                 devices: String::new(),
@@ -677,13 +691,13 @@ impl Jobs {
             .service
             .upgrade()
             .ok_or(("child_call_refused", "machine is stopping".into()))?;
-        let entrypoint = parent
+        let (application, entrypoint) = parent
             .callables
             .get(&(frame.module.clone(), frame.export.clone()))
             .ok_or((
                 "child_undeclared",
                 format!(
-                    "{}.{} is not an invocable of this package",
+                    "{}.{} is not an invocable of this package or its environment's",
                     frame.module, frame.export
                 ),
             ))?;
@@ -726,7 +740,7 @@ impl Jobs {
             .get(&parent.id)
             .map_err(|e| ("child_call_refused", e.to_string()))?;
         let record = runs
-            .child(&job, &request, &intent, entrypoint, input, inputs, answer)
+            .child(&job, &request, &intent, application, entrypoint, input, inputs, answer)
             .map_err(|refusal| match refusal.code {
                 "run_id_conflict" => (
                     "child_call_refused",
@@ -956,13 +970,13 @@ impl Jobs {
             // The job will call it next: its models prepare and load now.
             Kind::ModelPrefetch => {
                 let callable = (frame.module.clone(), frame.export.clone());
-                if let (Some(entrypoint), Some(runs), Some(service)) = (
+                if let (Some((application, entrypoint)), Some(runs), Some(service)) = (
                     parent.callables.get(&callable),
                     self.runs.upgrade(),
                     self.service.upgrade(),
                 ) {
                     if let Ok(job) = service.engine.get(&parent.id) {
-                        runs.prefetch(&job, entrypoint);
+                        runs.prefetch(&job, application, entrypoint);
                     }
                 }
                 Ok(Answer::ok(frame.seq))
@@ -1109,25 +1123,21 @@ fn conclude(
 /// The largest memoized result kept in a run's log or answered from a caller's known results.
 pub const MEMO_RESULT_BYTES: usize = 48 << 10;
 
-/// `(module, export)` of each memoized own invocable and its operation identity: the
-/// package's installed files, the module and the export, the same on every machine. An
-/// installation that recorded no source digest memoizes nothing.
+/// `(module, export)` of each memoized invocable of the environment (the root's and its
+/// callees') and its operation identity: its package's installed files, the module and the
+/// export, the same on every machine. A package with no recorded source digest memoizes nothing.
 fn memoized(generation: &crate::catalog::Generation) -> HashMap<(String, String), String> {
     let mut memoized = HashMap::new();
-    for section in ["jobs", "entrypoints"] {
-        for entry in generation.interface[section]
-            .as_array()
-            .into_iter()
-            .flatten()
-        {
-            let declared = &entry["invocable"];
-            if let (Some(module), Some(export), Some(true), false) = (
+    let apps = std::iter::once((&generation.interface, &generation.source_digest))
+        .chain(generation.callees.iter().map(|c| (&c.interface, &c.source_digest)));
+    for (interface, digest) in apps.filter(|(_, digest)| !digest.is_empty()) {
+        for (declared, _, _) in declarations(interface) {
+            if let (Some(module), Some(export), Some(true)) = (
                 declared["module"].as_str(),
                 declared["export"].as_str(),
                 declared["memoize"].as_bool(),
-                generation.source_digest.is_empty(),
             ) {
-                let identity = format!("{}\0{module}\0{export}", generation.source_digest);
+                let identity = format!("{digest}\0{module}\0{export}");
                 memoized.insert(
                     (module.into(), export.into()),
                     format!(
@@ -1141,16 +1151,36 @@ fn memoized(generation: &crate::catalog::Generation) -> HashMap<(String, String)
     memoized
 }
 
-/// The package's own invocables as the job's call interfaces, and the entrypoint each is.
-fn own_invocables(
-    interface: &Value,
+/// Each declared invocable of an interface: its declaration, its entry and its kind.
+fn declarations(interface: &Value) -> impl Iterator<Item = (&Value, &Value, &'static str)> {
+    [("jobs", "job"), ("entrypoints", "entrypoint")]
+        .into_iter()
+        .flat_map(move |(section, kind)| {
+            interface[section]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(move |entry| (&entry["invocable"], entry, kind))
+        })
+}
+
+/// Every App this environment holds: its own exports, including internal ones, and the
+/// other Apps' public exports. A callee job can call its own App or another dependency too.
+type Callables = HashMap<(String, String), (String, String)>;
+fn invocables(
+    generation: &crate::catalog::Generation,
+    application: &str,
+    own: &Value,
     path: &Path,
-) -> (Vec<CallInterface>, HashMap<(String, String), String>) {
+) -> (Vec<CallInterface>, Callables) {
     let mut rows = vec![];
     let mut callables = HashMap::new();
-    for (section, kind) in [("jobs", "job"), ("entrypoints", "entrypoint")] {
-        for entry in interface[section].as_array().into_iter().flatten() {
-            let declared = &entry["invocable"];
+    let apps = std::iter::once((application, own))
+        .chain(std::iter::once((generation.application.as_str(), &generation.interface)))
+        .chain(generation.callees.iter().map(|c| (c.application.as_str(), &c.interface)));
+    for (owner, interface) in apps {
+        let own = owner == application;
+        for (declared, entry, kind) in declarations(interface) {
             let (Some(module), Some(export), Some(name)) = (
                 declared["module"].as_str(),
                 declared["export"].as_str(),
@@ -1158,18 +1188,22 @@ fn own_invocables(
             ) else {
                 continue;
             };
-            if callables
-                .insert((module.to_string(), export.to_string()), name.to_string())
-                .is_none()
-            {
-                rows.push(CallInterface {
-                    module: module.into(),
-                    export: export.into(),
-                    interface_path: path.into(),
-                    self_call: true,
-                    kind: kind.into(),
-                });
+            // Another package's internal callable is its own business.
+            if !own && entry["internal"].as_bool() == Some(true) {
+                continue;
             }
+            let key = (module.to_string(), export.to_string());
+            if callables.contains_key(&key) {
+                continue;
+            }
+            callables.insert(key, (owner.to_string(), name.to_string()));
+            rows.push(CallInterface {
+                module: module.into(),
+                export: export.into(),
+                interface_path: if own { path.into() } else { PathBuf::new() },
+                self_call: own,
+                kind: kind.into(),
+            });
         }
     }
     (rows, callables)

@@ -70,6 +70,8 @@ pub struct Spec {
     /// Memoized calls' results the caller already holds: (computation digest, result JSON).
     /// A job's calls are answered from them; a child's one entry is its answer.
     pub known: Vec<(String, String)>,
+    /// A child run of a callee: the other package's App its parent's environment holds.
+    pub application: String,
     /// The spec's identity (its token excluded): a resubmitted id must carry the same.
     pub digest: String,
 }
@@ -91,6 +93,7 @@ pub struct Runs {
 #[derive(Clone)]
 pub struct JobContext {
     installation: String,
+    application: String,
     hub: Option<hub::Source>,
     providers: Providers,
     owner: String,
@@ -115,6 +118,8 @@ pub struct JobWeights {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Durable {
     installation: String,
+    #[serde(default)]
+    application: String,
     owner: String,
     binding_revision: String,
     attention_kernel: String,
@@ -130,6 +135,7 @@ impl Durable {
     fn of(context: &JobContext) -> Self {
         Self {
             installation: context.installation.clone(),
+            application: context.application.clone(),
             owner: context.owner.clone(),
             binding_revision: context.binding_revision.clone(),
             attention_kernel: context.attention_kernel.clone(),
@@ -147,6 +153,7 @@ impl Durable {
     fn context(self) -> io::Result<JobContext> {
         Ok(JobContext {
             installation: self.installation,
+            application: self.application,
             hub: None,
             providers: Providers::default(),
             owner: self.owner,
@@ -538,6 +545,10 @@ impl Runs {
                 Some(local.install(&self.service, actor, digest)?)
             }
         };
+        let held = match held {
+            Some(installed) => Some(self.callee_view(installed, &spec.application)?),
+            None => None,
+        };
         let release = match &spec.source {
             Source::Release { package, release } => Some((package.clone(), release.clone())),
             _ => None,
@@ -605,6 +616,7 @@ impl Runs {
             let inputs = self.job_inputs(&spec, &interface, hub.as_ref(), &*observe)?;
             let context = JobContext {
                 installation: installation.alias.clone(),
+                application: spec.application.clone(),
                 hub,
                 providers: spec.providers.clone(),
                 owner: spec.owner.clone(),
@@ -632,6 +644,7 @@ impl Runs {
                 inputs: spec.inputs,
                 job: spec.job,
                 parent: spec.parent,
+                application: spec.application,
             },
             plan.as_ref().map(|plan| plan.id.as_str()).unwrap_or_default(),
         )?;
@@ -777,6 +790,7 @@ impl Runs {
         parent: &Execution,
         request: &str,
         intent: &str,
+        application: &str,
         entrypoint: &str,
         input: Value,
         inputs: Vec<InputFile>,
@@ -787,7 +801,8 @@ impl Runs {
         if let Some(existing) = self.existing(&actor, request, intent)? {
             return Ok(existing);
         }
-        let mut spec = self.child_spec(&actor, &parent.id, entrypoint, input, inputs, intent)?;
+        let mut spec =
+            self.child_spec(&actor, &parent.id, application, entrypoint, input, inputs, intent)?;
         spec.known = answer
             .map(|result| vec![(String::new(), result)])
             .unwrap_or_default();
@@ -804,10 +819,33 @@ impl Runs {
             .map(|(_, r)| r.clone())
     }
 
+    /// The installation as a callee's child runs see it: the callee's package, release and
+    /// interface (its weights and bindings are its own), in the caller's environment.
+    fn callee_view(&self, installed: Installation, application: &str) -> Result<Installation, Refused> {
+        if application.is_empty() {
+            return Ok(installed);
+        }
+        let held = self.service.catalog.resolve(&installed.generation)?;
+        if application == held.record.application {
+            return Ok(installed);
+        }
+        let (package, release, interface) = held.record.app(application).ok_or_else(|| {
+            refused("child_undeclared", format!("this environment holds no App {application}"))
+        })?;
+        Ok(Installation {
+            package: package.into(),
+            release: release.into(),
+            interface: serde_json::to_vec(interface).map_err(io::Error::other)?,
+            ..installed
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn child_spec(
         &self,
         actor: &str,
         parent: &str,
+        application: &str,
         entrypoint: &str,
         input: Value,
         inputs: Vec<InputFile>,
@@ -831,6 +869,9 @@ impl Runs {
         };
         let installed = self.service.engine.installation(actor, &context.installation)?
             .ok_or_else(|| refused("child_call_refused", "the job's installation is gone"))?;
+        let parent_package = self.callee_view(installed.clone(), &context.application)?.package;
+        let installed = self.callee_view(installed, application)?;
+        let own = installed.package == parent_package;
         let job = captured_child_job(&installed.interface, entrypoint)?;
         let prefix = format!("{entrypoint}.");
         Ok(Spec {
@@ -845,9 +886,9 @@ impl Runs {
             models: context
                 .models
                 .into_iter()
-                .filter(|choice| choice.parameter.starts_with(&prefix))
+                .filter(|choice| own && choice.parameter.starts_with(&prefix))
                 .collect(),
-            binding_revision: context.binding_revision,
+            binding_revision: if own { context.binding_revision } else { String::new() },
             attention_kernel: context.attention_kernel,
             hub: context.hub,
             providers: context.providers,
@@ -855,30 +896,36 @@ impl Runs {
             publication: String::new(),
             owner: context.owner,
             known: vec![],
+            application: application.into(),
             digest: digest.into(),
         })
     }
 
     /// `model_prefetch`: the job will call `entrypoint` next, so its models prepare and load
     /// now, beside whatever the GPU already holds.
-    pub fn prefetch(self: &Arc<Self>, parent: &Execution, entrypoint: &str) {
+    pub fn prefetch(self: &Arc<Self>, parent: &Execution, application: &str, entrypoint: &str) {
         let Some(gpu) = self.service.gpu() else {
             return;
         };
         let actor = parent.submission.as_ref().map(|s| s.actor.clone()).unwrap_or_default();
         let (runs, parent, entrypoint) = (self.clone(), parent.id.clone(), entrypoint.to_string());
+        let application = application.to_string();
         let started = std::thread::Builder::new().name("child-prefetch".into()).spawn(move || {
             let prepared = runs
-                .child_spec(&actor, &parent, &entrypoint, json!({}), vec![], "")
+                .child_spec(&actor, &parent, &application, &entrypoint, json!({}), vec![], "")
                 .and_then(|spec| {
                     let Source::Installation(alias) = &spec.source else { unreachable!() };
-                    let held = runs.service.engine.installation(&actor, alias)?;
+                    let held = match runs.service.engine.installation(&actor, alias)? {
+                        Some(installed) => Some(runs.callee_view(installed, &spec.application)?),
+                        None => None,
+                    };
                     let (hub, models) = (spec.hub.clone(), spec.models.clone());
                     runs.resolve(&actor, held, None, hub, &spec, &spec.entrypoint, &models, Box::new(|_, _, _| ()))
                 });
             match prepared {
                 Ok((installation, Some(plan))) => {
-                    match runs.service.catalog.resolve(&installation.generation) {
+                    match runs.service.catalog.resolve(&installation.generation)
+                        .and_then(|held| held.application(&application)) {
                         Ok(held) => gpu.prefetch(&runs.service.engine, held, plan),
                         Err(error) => eprintln!("prefetch of {entrypoint}: {error}"),
                     }
@@ -1046,6 +1093,7 @@ mod tests {
         service.configure_publisher(publisher.clone());
         let context = |model: &str| Durable {
             installation: String::new(),
+            application: String::new(),
             owner: "alice".into(),
             binding_revision: String::new(),
             attention_kernel: String::new(),
@@ -1125,6 +1173,7 @@ mod tests {
             publication: String::new(),
             owner: "alice".into(),
             known: vec![],
+            application: String::new(),
             digest: digest.into(),
         }
     }
@@ -1271,6 +1320,83 @@ mod tests {
 
     /// A job's child that is itself a job runs as one, as its held package declares it.
     #[test]
+    fn a_callee_uses_its_own_model_slots_and_hub_bindings_in_the_callers_environment() {
+        use std::io::{Read, Write};
+        let root = std::env::temp_dir().join(format!("cm-callee-model-{}", uuid::Uuid::new_v4()));
+        let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
+        let generation = "a".repeat(32);
+        let directory = service.catalog.root().join(&generation);
+        fs::create_dir_all(directory.join("env/bin")).unwrap();
+        std::os::unix::fs::symlink("/usr/bin/python3", directory.join("env/bin/python")).unwrap();
+        fs::write(directory.join(".hold"), "").unwrap();
+        let callee = json!({"application":"callee:app","entrypoints":[{
+            "name":"render","models":[{"path":"render.models.network","class":"callee.Model"}]
+        }]});
+        let caller = json!({"application":"caller:app","entrypoints":[{
+            "name":"render","models":[{"path":"render.models.network","class":"caller.Model"}]
+        }]});
+        fs::write(directory.join("generation.json"), json!({
+            "identity":generation,"package":"caller","version":"1.0.0","application":"caller:app",
+            "python":directory.join("env/bin/python"),"interface":caller,
+            "callees":[{"distribution":"callee","package":"second/callee","version":"2.0.0",
+                "application":"callee:app","interface":callee}]
+        }).to_string()).unwrap();
+        let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
+        let objects = Arc::new(Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap());
+        let runs = Runs { service: service.clone(), objects, publisher: None, local: None,
+            own_hub: None, jobs: Default::default() };
+        let installed = service.engine.bind_installation(Installation {
+            actor:"alice".into(),alias:"caller".into(),generation:generation.clone(),
+            package:"first/caller".into(),release:"1.0.0".into(),interface:serde_json::to_vec(&caller).unwrap(),
+        }).unwrap();
+        let selected = runs.callee_view(installed, "callee:app").unwrap();
+        assert_eq!((&selected.alias, &selected.generation), (&"caller".to_string(), &generation));
+        assert_eq!((&selected.package, &selected.release), (&"second/callee".to_string(), &"2.0.0".to_string()));
+        let interface: Value = serde_json::from_slice(&selected.interface).unwrap();
+        let slot = &interface["entrypoints"][0]["models"][0];
+        assert_eq!(slot["class"], "callee.Model");
+        let projected = service.catalog.resolve(&generation).unwrap().application("callee:app").unwrap();
+        assert_eq!(projected.record.application, "callee:app");
+        assert_eq!(projected.record.interface, callee);
+        assert_eq!(service.catalog.resolve(&generation).unwrap().record.interface, caller);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let source = hub::Source { origin:format!("http://{}", listener.local_addr().unwrap()),
+            credential:"bearer callee-test".into(),ca_der:None,object_hosts:vec![] };
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut bytes = Vec::new();
+            while !bytes.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                assert_eq!(stream.read(&mut byte).unwrap(), 1);
+                bytes.push(byte[0]);
+            }
+            let request = String::from_utf8(bytes).unwrap();
+            assert!(request.starts_with("GET /v1/packages/second/callee/bindings "), "{request}");
+            assert!(request.to_ascii_lowercase().contains("authorization: bearer callee-test"));
+            let body = json!({"bindings":[{"slot":"render.models.network","model":"second/weights",
+                "release":"3.0.0","ladder":[{"gpu":"*","lane":"bf16","gpus":1}]}]}).to_string();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let catalog = hub::Catalog::new(&source).unwrap();
+        let mut cached = None;
+        let bound = crate::published::model_binding(&catalog, &selected, slot, &mut cached).unwrap();
+        assert_eq!(bound["model"], "second/weights");
+        assert_eq!(crate::published::model_binding(&catalog, &selected, slot, &mut cached).unwrap(), bound);
+        server.join().unwrap();
+        runs.jobs.lock().unwrap().insert("7".into(), JobContext {
+            installation:"caller".into(),application:String::new(),hub:Some(source),providers:Default::default(),
+            owner:"alice".into(),binding_revision:"caller-binding".into(),attention_kernel:String::new(),
+            models:vec![pb::ModelChoice { parameter:"render.models.network".into(),repository:"first/wrong".into(),..Default::default() }],
+            inputs:Default::default(),weights_destination:String::new(),publication:String::new(),known:vec![],
+        });
+        let child = runs.child_spec("alice","7","callee:app","render",json!({}),vec![],"child").unwrap();
+        assert!(child.models.is_empty(), "caller choices do not override a callee's slots");
+        assert!(child.binding_revision.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn a_child_takes_its_kind_from_the_held_package() {
         let root = std::env::temp_dir().join(format!("cm-child-kind-{}", uuid::Uuid::new_v4()));
         let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
@@ -1287,11 +1413,12 @@ mod tests {
         }).unwrap();
         runs.jobs.lock().unwrap().insert("7".into(), JobContext {
             installation: "pkg".into(), hub: None, providers: Default::default(), owner: "alice".into(),
+            application: String::new(),
             binding_revision: String::new(), attention_kernel: String::new(), models: vec![],
             inputs: Default::default(), weights_destination: String::new(), publication: String::new(),
             known: vec![],
         });
-        let child = |name: &str| runs.child_spec("alice", "7", name, json!({}), vec![], "d");
+        let child = |name: &str| runs.child_spec("alice", "7", "", name, json!({}), vec![], "d");
         assert!(child("leaf-job").unwrap().job);
         assert!(!child("leaf-call").unwrap().job);
         assert_eq!(child("missing").err().unwrap().code, "invalid_entrypoint");

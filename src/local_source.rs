@@ -33,6 +33,9 @@ pub struct Manifest {
     /// The locked dependency requirements (`uv export` text).
     #[serde(default)]
     pub requirements: Option<Member>,
+    /// Installed dependency distribution -> the package whose invocables it owns.
+    #[serde(default)]
+    pub callees: std::collections::BTreeMap<String, String>,
 }
 #[derive(Deserialize)]
 pub struct Member {
@@ -147,10 +150,10 @@ impl LocalSources {
         }
         let member = |m: &Member| written_member(&self.objects, actor, m);
         let (manifest, _) = open_manifest(&self.objects, actor, digest)?;
-        if !manifest.package.starts_with("local/") || manifest.source.is_none() {
+        if !manifest.package.starts_with("local/") || (manifest.source.is_none() && manifest.wheels.is_empty()) {
             return Err(refused(
                 "local_source_invalid",
-                "a local package manifest names local/<name> and its source archive",
+                "a local package manifest names local/<name> and its source archive or root wheel",
             ));
         }
         let requirements = match &manifest.requirements {
@@ -160,13 +163,12 @@ impl LocalSources {
             }
             None => Vec::new(),
         };
-        let source = manifest.source.as_ref().expect("checked above");
-        let source_name = "source.tar".to_string();
-        let mut files = vec![UploadedFile::held(
-            source_name.clone(),
-            &member(source)?,
-            self.store.clone(),
-        )];
+        let (source_name, mut files) = match &manifest.source {
+            Some(source) => ("source.tar".to_string(), vec![UploadedFile::held(
+                "source.tar".into(), &member(source)?, self.store.clone(),
+            )]),
+            None => (String::new(), vec![]),
+        };
         for wheel in &manifest.wheels {
             if !wheel.name.ends_with(".whl") || wheel.name.contains('/') {
                 return Err(refused(
@@ -190,6 +192,7 @@ impl LocalSources {
                 python_version: manifest.python_version,
                 source_archive: source_name,
                 dependency_requirements: requirements,
+                callees: manifest.callees,
                 files: Vec::new(),
             },
             files,

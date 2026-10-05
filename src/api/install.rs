@@ -211,6 +211,9 @@ pub fn prepare_uploaded(
         )
         .arg("--release")
         .arg(&materialized.root_set.release)
+        .arg("--callees")
+        .arg(serde_json::to_string(&materialized.root_set.callees)
+            .map_err(|error| Status::internal(error.to_string()))?)
         .arg(format!(
             "--python-requires={}",
             materialized.root_set.python_requires
