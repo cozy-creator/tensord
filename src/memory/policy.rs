@@ -380,20 +380,36 @@ impl Gpu {
             .and_then(|shape| self.learned.shape(plan, shape))
     }
 
-    /// Whether `holding` is `plan`'s own: mapped by its process, or named by an earlier
-    /// executor of it and held now, read by anyone or nobody. Its bytes are on the GPU already:
-    /// counted once among the resident allocations, never again in what `plan` asks for, and
-    /// never revoked for `plan`'s own call (phil, 12 GB: each Anima grant revoked 1.79 GB of
-    /// Anima's own idle holdings, then loaded them again).
+    /// Whether `holding` is `plan`'s own: mapped by its process, or, while its executor has
+    /// not loaded yet, named by an earlier executor of it and held now (it attaches them at
+    /// its load). Its bytes are on the GPU already: counted once among the resident
+    /// allocations, never again in what `plan` asks for, and never revoked for `plan`'s own
+    /// call (phil, 12 GB: each Anima grant revoked 1.79 GB of Anima's own idle holdings, then
+    /// loaded them again). A loaded executor that let a holding go never maps it again: then
+    /// it is not its own (huaisang: counted as its own, it priced Anima's want at 1.1 GB).
     fn own(&self, plan: &str, holding: &Holding) -> bool {
-        let pid = self.tenant(plan).map_or(0, |t| t.pid);
+        let tenant = self.tenant(plan);
+        let pid = tenant.map_or(0, |t| t.pid);
         (pid != 0 && holding.readers.contains(&pid))
             || (!holding.revoking
+                && tenant.is_none_or(|t| t.phase == Phase::Starting)
                 && self
                     .learned
                     .plans
                     .get(plan)
                     .is_some_and(|learned| learned.holdings.contains(holding_name(&holding.id))))
+    }
+
+    /// Whether a grant for `plan` may revoke or trim `holding`: another plan's, read by no
+    /// call in progress.
+    fn reclaimable(&self, plan: &str, holding: &Holding) -> bool {
+        !holding.revoking
+            && !self.own(plan, holding)
+            && !holding.readers.iter().any(|pid| {
+                self.tenants
+                    .iter()
+                    .any(|(other, t)| other != plan && t.pid == *pid && t.phase != Phase::Idle)
+            })
     }
 
     fn own_bytes(&self, plan: &str) -> u64 {
@@ -406,17 +422,19 @@ impl Gpu {
 
     /// Whether `plan`'s whole construction and its activations fit beside the other tenants
     /// (Degree 2 keeps every component resident). Its own holdings are in `want` already;
-    /// another plan's that nobody reads are reclaimable. False while its weights or
-    /// activations were never measured.
+    /// what its grant may revoke or trim (`reclaimable`: idle tenants' too) is room. Counting
+    /// only holdings nobody read, two models that do not both fit on a 12 GB card each
+    /// detached in turn and reloaded whole at every switch (huaisang). False while its
+    /// weights or activations were never measured.
     pub fn fits_resident(&self, plan: &str, sample: &Sample) -> bool {
-        let unread: u64 = self
+        let reclaimable: u64 = self
             .holdings
             .iter()
-            .filter(|h| h.readers.is_empty() && !self.own(plan, h))
+            .filter(|h| self.reclaimable(plan, h))
             .map(|h| h.bytes)
             .sum();
         self.want(plan)
-            .is_some_and(|want| self.room(plan, sample) + unread >= want)
+            .is_some_and(|want| self.room(plan, sample) + reclaimable >= want)
     }
 
     /// The weights a call of `plan` puts on the GPU: what one kept mapped with nothing evicted
@@ -535,21 +553,10 @@ impl Gpu {
                 round.tried.insert(other.clone());
                 return Decision::Step(Step::Unmap(other.clone()));
             }
-            let busy: BTreeSet<u32> = self
-                .tenants
-                .iter()
-                .filter(|(other, t)| other.as_str() != plan && t.phase != Phase::Idle)
-                .map(|(_, t)| t.pid)
-                .collect();
             if let Some(holding) = self
                 .holdings
                 .iter()
-                .filter(|h| {
-                    !h.revoking
-                        && !round.tried.contains(&h.id)
-                        && !self.own(plan, h)
-                        && !h.readers.iter().any(|pid| busy.contains(pid))
-                })
+                .filter(|h| !round.tried.contains(&h.id) && self.reclaimable(plan, h))
                 .max_by_key(|h| h.idle_ms)
             {
                 round.tried.insert(holding.id.clone());
@@ -887,14 +894,16 @@ mod tests {
     }
 
     #[test]
-    fn a_grant_never_revokes_the_planned_plans_own_holdings() {
-        // phil, 12 GB, SDXL and Anima alternating: Anima's executor unmapped its text encoder
-        // at the last switch, so nobody read it; Anima's next grant revoked it as the most idle
-        // holding, then loaded it again. Its own holdings are counted once and stay.
+    fn a_grant_never_revokes_what_the_planned_plans_executor_maps() {
+        // phil, 12 GB, SDXL and Anima alternating: a grant revoked the planned plan's own
+        // holdings and it loaded them again. What its executor maps is counted once and stays;
+        // one it let go (huaisang: detached when Degree 2 did not fit) it never maps again,
+        // so it is no part of its want and may go like any other.
         let mut gpu = Gpu::default();
         loaded(&mut gpu, "sdxl", 10, 7 * GIB, GIB);
         loaded(&mut gpu, "anima", 11, 6 * GIB, GIB);
         gpu.learned.holding("anima", "GPU-1/sha256:qwen");
+        gpu.learned.holding("anima", "GPU-1/sha256:dit");
         let held = |id: &str, bytes, readers: &[u32], idle_ms| Holding {
             id: id.into(),
             bytes,
@@ -903,23 +912,51 @@ mod tests {
             revoking: false,
         };
         gpu.holdings = vec![
+            held("GPU-1/sha256:dit#7", 4 * GIB, &[11], 95_000),
             held("GPU-1/sha256:qwen#6", GIB, &[], 90_000),
             held("GPU-1/sha256:unet#5", 5 * GIB, &[10], 30_000),
         ];
-        let s = sample(12 * GIB, 4 * GIB, &[(10, GIB / 2), (11, GIB / 2)]);
+        let s = sample(12 * GIB, GIB, &[(10, GIB / 2), (11, GIB / 2)]);
         let want = gpu.want("anima").unwrap();
-        assert_eq!(want, GIB / 2 + 5 * GIB + GIB + MARGIN, "its held GiB is not asked again");
+        assert_eq!(want, GIB / 2 + 2 * GIB + GIB + MARGIN, "only what it maps is not asked again");
         let mut round = Round::default();
+        assert_eq!(
+            gpu.decide("anima", Some(want), gpu.need("anima"), &s, &mut round),
+            Decision::Step(Step::Revoke("GPU-1/sha256:qwen#6".into())),
+            "the holding it let go goes first, as the most idle"
+        );
+        gpu.holdings.remove(1);
+        let s = sample(12 * GIB, 2 * GIB, &[(10, GIB / 2), (11, GIB / 2)]);
         let short = want - gpu.room("anima", &s);
         assert_eq!(
             gpu.decide("anima", Some(want), gpu.need("anima"), &s, &mut round),
-            Decision::Step(Step::Trim("GPU-1/sha256:unet#5".into(), short))
+            Decision::Step(Step::Trim("GPU-1/sha256:unet#5".into(), short)),
+            "its own transformer, though more idle, stays"
         );
-        assert_eq!(
-            gpu.decide("anima", Some(want), gpu.need("anima"), &s, &mut round),
-            Decision::Go(gpu.room("anima", &s)),
-            "nothing else of another plan's to revoke, and its own stays"
-        );
+    }
+
+    #[test]
+    fn a_model_that_fits_once_an_idle_tenants_holdings_are_trimmed_shares() {
+        // huaisang, 12 GB: SDXL (7 GiB) and Anima (5.5 GiB) do not both fit. Counting only
+        // holdings nobody read, each found it did not fit beside the other's idle holdings,
+        // detached and reloaded whole at every switch. The grant trims an idle tenant's
+        // holdings, so they count as room at the fit.
+        let mut gpu = Gpu::default();
+        loaded(&mut gpu, "sdxl", 10, 7 * GIB, GIB);
+        loaded(&mut gpu, "anima", 11, 11 * GIB / 2, GIB / 2);
+        gpu.holdings = vec![Holding {
+            id: "GPU-1/sha256:dit#3".into(),
+            bytes: 11 * GIB / 2,
+            readers: vec![11],
+            idle_ms: 1_000,
+            revoking: false,
+        }];
+        let s = sample(12 * GIB, 6 * GIB - GIB / 2, &[(10, GIB / 2), (11, GIB / 2)]);
+        assert!(gpu.room("sdxl", &s) < gpu.want("sdxl").unwrap());
+        assert!(gpu.fits_resident("sdxl", &s));
+        // Not while Anima's call reads them.
+        gpu.active("anima", GIB / 2);
+        assert!(!gpu.fits_resident("sdxl", &s));
     }
 
     #[test]
@@ -991,10 +1028,11 @@ mod tests {
 
     #[test]
     fn a_weight_set_another_tenant_reads_is_not_counted_again_at_the_fit() {
-        // 16 GiB card: an SDXL checkpoint (7 GiB) held and read by one package's idle executor.
+        // 16 GiB card: an SDXL checkpoint (7 GiB) held and read by one package's running call.
         // A second package binds the same checkpoint; its earlier executor named that set.
         let mut gpu = Gpu::default();
         loaded(&mut gpu, "txt2img", 10, 7 * GIB, 3 * GIB);
+        gpu.active("txt2img", GIB / 2); // its call reads the set: no grant may take it
         gpu.holdings = vec![Holding {
             id: "GPU-1/sha256:sdxl#4".into(),
             bytes: 7 * GIB,
