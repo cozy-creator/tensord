@@ -90,7 +90,7 @@ async fn get(url: &str, max: usize) -> io::Result<Bytes> {
     .map_err(io::Error::other)?
     .with_root_certificates(roots)
     .with_no_client_auth();
-    let tcp = tokio::net::TcpStream::connect((host, 443)).await?;
+    let tcp = super::net::connect(host, 443).await?;
     let name = ServerName::try_from(host.to_owned()).map_err(io::Error::other)?;
     let stream = tokio_rustls::TlsConnector::from(Arc::new(tls))
         .connect(name, tcp)
