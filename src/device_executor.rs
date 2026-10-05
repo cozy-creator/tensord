@@ -289,6 +289,15 @@ pub enum DeviceCommand {
     Prefetch {
         construction: String,
     },
+    /// Map a loaded construction's weights onto the GPU inside `cap_bytes`, nothing run
+    /// (`weights.map/1`): a warm set member at `gpu`.
+    Map {
+        construction: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cap_bytes: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        floor_bytes: Option<u64>,
+    },
     /// Offer the machine every GPU region filled and not shared yet (`weights.attach/1`).
     Share,
     /// Release the machine's GPU regions of one layout (`weights.revoke/1`), or only
@@ -370,6 +379,7 @@ impl DeviceCommand {
             Self::Invoke { .. } => "invoke",
             Self::Budget { .. } => "budget",
             Self::Prefetch { .. } => "prefetch",
+            Self::Map { .. } => "map",
             Self::Share => "share",
             Self::Revoke { .. } => "revoke",
             Self::Unload { .. } => "unload",
@@ -639,6 +649,8 @@ pub struct Frame {
     pub holding_bytes: Option<i64>,
     pub facts: Option<LoadFacts>,
     pub plane: Option<PlaneFacts>,
+    /// `map`: the device bytes the construction's weights hold after it.
+    pub mapped_bytes: Option<u64>,
     /// A group's followers' own plane facts, rank 1 first (None: not stated yet).
     pub rank_planes: Vec<Option<PlaneFacts>>,
     pub metrics: Option<Metrics>,
