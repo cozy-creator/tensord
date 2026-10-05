@@ -140,6 +140,11 @@ impl GpuMemory {
         self.sampler.as_ref().and_then(nvml::Sampler::now)
     }
 
+    /// Device bytes in use on this GPU now, by anyone. None: no NVML.
+    pub fn used(&self) -> Option<u64> {
+        self.sample().map(|s| s.total.saturating_sub(s.free))
+    }
+
     pub fn with<T>(&self, f: impl FnOnce(&mut Gpu) -> T) -> T {
         f(&mut self.ledger.lock().unwrap())
     }

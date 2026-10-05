@@ -2222,6 +2222,7 @@ impl GpuPool {
         };
         if !session.loaded {
             let interface_path = self.interface_file(&session.executor, held)?;
+            let used: Vec<_> = self.lane(plan.degree)?.iter().map(|d| d.memory.used()).collect();
             let starting = Instant::now();
             // Rank 0 spawns and forms every follower inside this command; its watch meters
             // the whole group's work, so formation ends only on measured lack of progress.
@@ -2244,6 +2245,23 @@ impl GpuPool {
                     code: "group_unformed".into(),
                     detail: "a follower's budget cell did not reach the machine".into(),
                 }));
+            }
+            // An executor reads its context from its own NVML row, which a container whose
+            // pids are not NVML's lacks (vast: every want then priced it at 1 GiB, against
+            // ~0.25 real). Until it reports one, its context is what each GPU's use grew by
+            // across its start: no call runs beside it and no weight is loaded yet.
+            for (device, before) in self.lane(plan.degree)?.iter().zip(used) {
+                if let Some(grew) = before
+                    .zip(device.memory.used())
+                    .map(|(before, after)| after.saturating_sub(before))
+                    .filter(|grew| *grew > 0)
+                {
+                    let context = Facts {
+                        context: Some(grew),
+                        ..Facts::default()
+                    };
+                    device.memory.observe(&plan.id, context, None);
+                }
             }
             session.launch.start_ms = starting.elapsed().as_secs_f64() * 1e3;
             session.launch.start =
