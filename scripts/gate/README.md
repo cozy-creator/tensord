@@ -87,6 +87,9 @@ a list of requests (model names, or `{"model", "input"}` payloads) or `{"request
 - an arm with `command` runs another engine's own driver on the host (ComfyUI) and returns the same record;
 - `target_args` adds per-model arguments (e.g. `model.model=...`), `cell_facts` records a host command per cell,
   `continue_on_failure` records a failed cell and goes on.
+- a warm cell's `prime` requests (`{"model", "input"}`, e.g. one per model) run first, one at a time and outside the clock, so
+  each engine's processes exist and its models are loaded when the timed requests start; an engine with its own driver gets
+  the same requests through its `command`. Cold cells prime nothing: they measure start-up;
 - a cell's `setup` command runs first (e.g. that cell's host limits, in place before the machine starts);
 - an arm's `cache_list` command prints the files to read into the page cache, where `cache_paths` (whole directories)
   would be too much (a shared store);

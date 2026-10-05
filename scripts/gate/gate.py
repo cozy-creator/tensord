@@ -509,12 +509,14 @@ class Gate:
                     done = json.loads(self.pod.sh(spec["command"].format(cell=name, budget=budget or "uncapped")))
                     row = {"total_s": done["total_s"], "t_first": done["t_first"] - self.offset, "t_end": done["t_end"] - self.offset,
                            "ok": done["ok"], "requests": done["requests"], "startup_s": done.get("startup_s"),
-                           "engine": done.get("engine"), "engine_rss_peak": done.get("engine_rss_peak")}
+                           "engine": done.get("engine"), "engine_rss_peak": done.get("engine_rss_peak"),
+                           "primed": done.get("primed"), "driver_total_s": done.get("driver_total_s")}
                 except (RuntimeError, ValueError, KeyError) as error:   # the engine's driver failed: a failed cell
                     row = {"total_s": 0.0, "t_first": time.time(), "t_end": time.time(), "ok": False, "requests": [],
                            "error": str(error)[-3000:]}
             else:
-                row = self.cozy_cell(arm, name, spec, spec_cell["requests"], new.get("started") if cold else None, ready=not cold)
+                row = self.cozy_cell(arm, name, spec, spec_cell["requests"], new.get("started") if cold else None, ready=not cold,
+                                     prime=None if cold else spec_cell.get("prime"))
             after = self.pod.helper("now")
             if by_run:   # the machine `cozy run` started: the limits it ran under
                 new = self.pod.helper("newroot", "none", spec["root"])
@@ -533,8 +535,11 @@ class Gate:
         if not row["ok"] and not self.m.get("continue_on_failure"):   # between engines a failed cell is a result
             raise RuntimeError(f"cell {name} on {arm} failed")
 
-    def cozy_cell(self, arm: str, name: str, spec: dict, requests: list, born: float | None, ready: bool = True) -> dict:
-        """Ordinary `cozy run --await` per request; the next is submitted once the previous one holds the GPU."""
+    def cozy_cell(self, arm: str, name: str, spec: dict, requests: list, born: float | None, ready: bool = True,
+                  prime: list | None = None) -> dict:
+        """Ordinary `cozy run --await` per request; the next is submitted once the previous one holds the GPU.
+        `prime`: requests run first, one at a time and outside the clock, so the engine's processes exist and its
+        models are loaded when the timed requests start (a warm cell; a cold cell primes nothing)."""
         if ready:
             if spec.get("ready"):
                 self.pod.sh(spec["ready"])
@@ -544,7 +549,21 @@ class Gate:
         cli = spec.get("cli", "cozy")
         place = spec.get("run_args", [f"--rental={self.m.get('rental')}", f"--tensorhub={self.m.get('hub')}"])
         on_gpu = re.compile(r'"type":\s*"(machine\.gpu\.grant|machine\.executor|run\.in_progress|machine\.stage\.turn)"')
-        procs, first = [], None
+        procs, first, primed = [], None, []
+        for k, item in enumerate(prime or []):
+            root = self.out / "runs" / f"{self.index:03}-{arm}-{name}-prime{k}-{item['model']}"
+            root.mkdir(parents=True)
+            (root / "input.json").write_text(json.dumps(item["input"]))
+            began = time.time()
+            done = subprocess.run([cli, "run", self.m["targets"][item["model"]], *self.m.get("target_args", {}).get(item["model"], []),
+                                   f"--input={root / 'input.json'}", *place, "--await", "--json", f"--out={root / 'out'}",
+                                   f"--idempotency-key=gate-{self.m['salt']}-{self.index}"], capture_output=True, text=True)
+            (root / "stdout.json").write_text(done.stdout)
+            (root / "events.jsonl").write_text(done.stderr)
+            images = verify(root / "out", self.m["shapes"][item["model"]]) if (root / "out").is_dir() else []
+            primed.append({"model": item["model"], "s": round(time.time() - began, 2), "dir": str(root),
+                           "ok": done.returncode == 0 and len(images) == 1 and images[0]["ok"]})
+            self.index += 1
 
         def reap() -> None:   # each CLI's own exit time, seen within 0.1 s, also while later requests are submitted
             for p in procs:
@@ -602,7 +621,7 @@ class Gate:
         accepted = [r["accepted_pod"] for r in rows if r["accepted_pod"]]
         machine = (max(outcomes) - (born if born is not None else min(accepted))) if outcomes and accepted else None
         return {"total_s": end - start, "machine_total_s": machine, "t_first": start, "t_end": end,
-                "ok": all(r["ok"] for r in rows), "requests": rows}
+                "ok": all(r["ok"] for r in rows) and all(p["ok"] for p in primed), "requests": rows, "primed": primed}
 
     def run(self) -> None:
         samples = f"{self.pod.dir}/samples-{self.m['salt']}.jsonl"
