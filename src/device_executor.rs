@@ -630,6 +630,10 @@ pub struct Frame {
     pub passes: Option<u64>,
     pub yielded: bool,
     pub free_bytes: u64,
+    /// `device_room`: what the asking process holds on its GPU now (context, torch's segments
+    /// and plane maps), by its own count; -1 when it cannot say. Its last report may be from
+    /// its load.
+    pub holding_bytes: Option<i64>,
     pub facts: Option<LoadFacts>,
     pub plane: Option<PlaneFacts>,
     /// A group's followers' own plane facts, rank 1 first (None: not stated yet).

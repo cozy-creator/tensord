@@ -3416,6 +3416,15 @@ impl Services for Callbacks<'_> {
             }
             Kind::DeviceRoom => {
                 drop(descriptor);
+                if let Some(held) = known(frame.holding_bytes).filter(|_| self.degree == 1) {
+                    // Without it the ledger keeps its load-time report, and the bytes it holds
+                    // since read as external: a holding dropped for it raised no cap (run 4557).
+                    let facts = crate::memory::policy::Facts {
+                        process: Some(held),
+                        ..Default::default()
+                    };
+                    self.pool.first().observe(self.plan, facts, None);
+                }
                 let cap =
                     self.pool
                         .room_for(self.plan, self.degree, frame.free_bytes, self.others)?;
