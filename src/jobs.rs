@@ -1041,6 +1041,9 @@ impl Services for Seam<'_> {
                     return Ok((Answer::unavailable(frame.seq), None));
                 };
                 let (mut answer, channel, adopted) = weights.answer(grant, frame);
+                for upload in grant.take_uploads() {
+                    record_upload(self.engine, self.id, &upload);
+                }
                 if let Some(adopted) = adopted {
                     if let Err(error) = crate::products::record_manifest(self.engine, self.id, &adopted.output, &adopted.manifest) {
                         answer = Answer::refused(frame.seq, "publish_refused", error.to_string());
@@ -1369,6 +1372,24 @@ mod exact_tests {
         let received = crate::boundary_json::parse(sent.as_bytes()).unwrap();
         assert_eq!(received["seed"].as_u64(), Some(u64::MAX));
         assert!(received["float"].is_f64());
+    }
+}
+
+/// Journals a weights output's publication as a `call` event on its run (`run show` lists it
+/// beside the run's child calls), before the run settles. Keyed by output and transaction, so
+/// a replay adds no second row.
+fn record_upload(engine: &Engine, id: &str, upload: &crate::weights::Upload) {
+    let body = json!({
+        "request": format!("{id}/upload/{}", upload.output), "parent": id, "index": 0, "attempt": 1,
+        "module": "cozy_runtime.author.publication", "export": "upload_checkpoint",
+        "label": format!("Upload checkpoint to {}", upload.destination),
+        "status": if upload.error.is_some() { "failed" } else { "succeeded" },
+        "error": upload.error.clone().unwrap_or_default(),
+        "called_unix_ms": upload.called_ms, "finished_unix_ms": upload.finished_ms, "measurements": Value::Null,
+    });
+    let key = format!("weights:{}/{}", upload.output, upload.transaction);
+    if let Err(error) = engine.append_call(id, &key, &crate::boundary_json::exact(&body)) {
+        eprintln!("run {id}: upload call: {error}");
     }
 }
 
