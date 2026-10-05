@@ -105,6 +105,8 @@ struct ChildCall {
     label: String,
     /// Its `call` event is in the parent's log.
     recorded: bool,
+    /// A memoized call's computation digest, whether it ran or a known result answered it.
+    computation: Option<String>,
     /// A memoized call that ran: (operation identity, computation digest), for its `memo` event.
     memo: Option<(String, String)>,
     request: String,
@@ -758,6 +760,7 @@ impl Jobs {
         let answer = memo
             .as_ref()
             .and_then(|(_, digest)| runs.known(&parent.id, digest));
+        let computation = memo.as_ref().map(|(_, digest)| digest.clone());
         let memo = memo.filter(|_| answer.is_none());
         let job = service
             .engine
@@ -788,6 +791,7 @@ impl Jobs {
             function: frame.export.clone(),
             label: frame.progress_label.clone(),
             recorded: false,
+            computation,
             memo,
             request: request.clone(),
             settled: None,
@@ -1473,7 +1477,7 @@ fn record_call(
         "attempt": record.attempt.max(1), "module": call.module, "export": call.function,
         "label": call.label, "status": status, "error": error,
         "called_unix_ms": record.accepted_at_ms, "finished_unix_ms": record.finished_at_ms,
-        "measurements": measurements,
+        "measurements": measurements, "computation_digest": call.computation,
     });
     match engine.append_call(&parent.id, &record.id, &crate::boundary_json::exact(&body)) {
         Ok(_) => true,
