@@ -2271,6 +2271,7 @@ print(json.dumps({"identity": generation.identity}))
                     trees: granted.trees,
                     floor_bytes: None,
                     activation_bytes: Default::default(),
+                    squeezed_bytes: Default::default(),
                     device_weights: None,
                 },
                 &mut Baseline,
@@ -2482,6 +2483,7 @@ print(json.dumps({"identity": generation.identity}))
                             trees: Default::default(),
                             floor_bytes: None,
                             activation_bytes: Default::default(),
+                            squeezed_bytes: Default::default(),
                             device_weights: None,
                         },
                         &mut Publisher {

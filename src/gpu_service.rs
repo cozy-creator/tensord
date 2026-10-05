@@ -2205,6 +2205,7 @@ impl GpuPool {
                 trees: inputs.trees,
                 floor_bytes: self.first().floor(),
                 activation_bytes: self.first().with(|gpu| gpu.seeds(&plan.id)),
+                squeezed_bytes: self.first().with(|gpu| gpu.squeezed(&plan.id)),
                 device_weights: attaches.then_some(share),
             },
             &group,
@@ -2436,6 +2437,8 @@ impl GpuPool {
                 .memory
                 .learn_call(plan, shape, peak, &methods, rank_context(reply, rank), mapped);
         }
+        // The squeezed rooms are those of GPU 0's process, whose facts these are.
+        self.first().learn_squeezed(plan, shape, &plane.squeezed);
         if let Ok(host) = crate::host_memory::process(pid) {
             self.first()
                 .learn_host(plan, host.pss.saturating_sub(host.pss_shmem));

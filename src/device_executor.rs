@@ -273,6 +273,9 @@ pub enum DeviceCommand {
         /// Activation growth per stage method learned for this request's shape.
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         activation_bytes: BTreeMap<String, u64>,
+        /// Rooms known to squeeze its stage methods at this shape (`Shape::squeezed`).
+        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+        squeezed_bytes: BTreeMap<String, u64>,
         /// Degree 2 for this call (`weights.attach/1`); None leaves the executor's setting.
         #[serde(skip_serializing_if = "Option::is_none")]
         device_weights: Option<bool>,
@@ -507,6 +510,9 @@ pub struct PlaneFacts {
     pub cache_released_bytes: Option<u64>,
     /// Those releases by the executor function that asked: (count, bytes).
     pub cache_released_by: BTreeMap<String, (u64, u64)>,
+    /// Per stage method, the most room torch had at an entry that made it drop its whole
+    /// cache more than once (`memory::learned::Shape::squeezed`).
+    pub squeezed: BTreeMap<String, u64>,
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]

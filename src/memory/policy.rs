@@ -362,6 +362,13 @@ impl Gpu {
         self.shape(plan).map(|shape| shape.methods).unwrap_or_default()
     }
 
+    /// Rooms known to squeeze `plan`'s stage methods at its next shape: the executor's seeds.
+    pub fn squeezed(&self, plan: &str) -> BTreeMap<String, u64> {
+        self.shape(plan)
+            .map(|shape| shape.squeezed)
+            .unwrap_or_default()
+    }
+
     /// What was learned for `plan`'s next shape, measured or estimated (`estimated_from`).
     pub fn shape(&self, plan: &str) -> Option<super::learned::Shape> {
         self.shapes
@@ -501,6 +508,24 @@ impl Gpu {
                 .unwrap_or(0)
                 .saturating_sub(self.attachable(plan))
             + self.activation(plan).unwrap_or(0)
+    }
+
+    /// A holding `plan`'s executor named that nobody maps now, least recently used first:
+    /// what it let go to make room comes back before any other tenant gives anything.
+    pub fn own_unread(&self, plan: &str, round: &mut Round) -> Option<Step> {
+        let names = &self.learned.plans.get(plan)?.holdings;
+        let holding = self
+            .holdings
+            .iter()
+            .filter(|h| {
+                !h.revoking
+                    && h.readers.is_empty()
+                    && !round.tried.contains(&h.id)
+                    && names.contains(holding_name(&h.id))
+            })
+            .max_by_key(|h| h.idle_ms)?;
+        round.tried.insert(holding.id.clone());
+        Some(Step::Revoke(holding.id.clone()))
     }
 
     /// The next step toward `want` (None: everything) and `need` bytes for `plan`, or its cap.
@@ -904,6 +929,42 @@ mod tests {
             gpu.decide("sdxl", Some(need), need, &s, &mut round),
             Decision::Step(Step::Revoke("GPU-1/sha256:other#1".into()))
         );
+    }
+
+    #[test]
+    fn what_an_executor_let_go_comes_back_before_another_tenant_gives_anything() {
+        // H3 runs; SDXL's idle executor has its weights mapped. H3's executor unmapped its
+        // VAE to make room and asks for it: custody holds the VAE and H3's text encoder.
+        let mut gpu = Gpu::default();
+        loaded(&mut gpu, "sdxl", 10, 7 * GIB, GIB);
+        gpu.active("sdxl", 8 * GIB);
+        gpu.idle("sdxl");
+        loaded(&mut gpu, "h3", 11, 60 * GIB, 20 * GIB);
+        for name in ["GPU-1/sha256:vae", "GPU-1/sha256:text"] {
+            gpu.learned.holding("h3", name);
+        }
+        let held = |id: &str, readers: &[u32], idle_ms| Holding {
+            id: id.into(),
+            bytes: 6 * GIB,
+            readers: readers.to_vec(),
+            idle_ms,
+            revoking: false,
+        };
+        gpu.holdings = vec![
+            held("GPU-1/sha256:vae#3", &[], 10),
+            held("GPU-1/sha256:text#2", &[11], 5_000),
+            held("GPU-1/sha256:other#1", &[], 9_000),
+        ];
+        // The ladder alone would unmap SDXL first.
+        let s = sample(96 * GIB, 2 * GIB, &[]);
+        let ladder = gpu.decide("h3", None, u64::MAX, &s, &mut Round::default());
+        assert_eq!(ladder, Decision::Step(Step::Unmap("sdxl".into())));
+        // Its own unread holding goes first; one it still maps and another plan's never do.
+        let mut round = Round::default();
+        let own = gpu.own_unread("h3", &mut round);
+        assert_eq!(own, Some(Step::Revoke("GPU-1/sha256:vae#3".into())));
+        assert_eq!(gpu.own_unread("h3", &mut round), None);
+        assert_eq!(gpu.own_unread("sdxl", &mut Round::default()), None);
     }
 
     #[test]

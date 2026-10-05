@@ -249,8 +249,9 @@ impl GpuMemory {
         })
     }
 
-    /// Idle tenants give room until `free_bytes` are free beside the floor (weights first, then
-    /// processes); then `plan`'s cap rises into what is there. None: no NVML.
+    /// Until `free_bytes` are free beside the floor: holdings `plan`'s own executor let go
+    /// are dropped, then idle tenants give room (weights first, then processes); then `plan`'s
+    /// cap rises into what is there. None: no NVML.
     pub fn make_room(
         &self,
         plan: &str,
@@ -269,12 +270,14 @@ impl GpuMemory {
                 if sample.free >= free_bytes + gpu.floor(&sample) {
                     return None;
                 }
-                match gpu.decide(plan, None, u64::MAX, &sample, &mut round) {
-                    Decision::Step(step @ (Step::Unmap(_) | Step::Revoke(_) | Step::End(_))) => {
-                        Some(step)
+                gpu.own_unread(plan, &mut round).or_else(|| {
+                    match gpu.decide(plan, None, u64::MAX, &sample, &mut round) {
+                        Decision::Step(
+                            step @ (Step::Unmap(_) | Step::Revoke(_) | Step::End(_)),
+                        ) => Some(step),
+                        _ => None,
                     }
-                    _ => None,
-                }
+                })
             });
             note(
                 serde_json::json!({"event":"room","plan":plan,"free_bytes":free_bytes,
@@ -332,6 +335,26 @@ impl GpuMemory {
                 let device = gpu.device.clone();
                 gpu.learned.context(&device, context);
             }
+            if let Err(error) = gpu.learned.save() {
+                note(serde_json::json!({"event": "learned_unsaved", "error": error.to_string()}));
+            }
+        });
+    }
+
+    /// Rooms a call saw squeeze its stage methods, kept for later executors of its shape.
+    pub fn learn_squeezed(
+        &self,
+        plan: &str,
+        shape: &str,
+        rooms: &std::collections::BTreeMap<String, u64>,
+    ) {
+        if rooms.is_empty() {
+            return;
+        }
+        self.with(|gpu| {
+            gpu.learned.squeezed(plan, shape, rooms);
+            let shape = serde_json::json!({"plan": plan, "shape": shape, "rooms": rooms});
+            note(serde_json::json!({"event": "squeezed", "learned": shape}));
             if let Err(error) = gpu.learned.save() {
                 note(serde_json::json!({"event": "learned_unsaved", "error": error.to_string()}));
             }

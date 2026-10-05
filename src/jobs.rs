@@ -511,6 +511,7 @@ impl Jobs {
                 trees: inputs.trees,
                 floor_bytes: None,
                 activation_bytes: BTreeMap::new(),
+                squeezed_bytes: BTreeMap::new(),
                 device_weights: None,
             },
             &mut services,
