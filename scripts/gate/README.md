@@ -26,12 +26,14 @@ reference has no completed timing and cannot establish a speed win.
   the cell) are reported beside it, since a shared host slows CPU-bound startup for both engines;
 - every planned candidate/reference cell is present, every candidate request has its successful
   file-hash/size and input receipt, and every low-memory request has one successful same-input
-  full-card control whose encoded image bytes match exactly.
+  full-card control, and the output's PSNR to it is at least 30 dB or a person has reviewed it as good.
 
 Each low-memory (`budget`) request is run again, untimed, on the full card after every timed cell (`control`); its
-output's PSNR to that control is reported, and anything under 30 dB goes to `review`. PSNR is separate
-diagnostic data: missing controls/receipts, changed files or inputs, and changed encoded bytes fail
-qualification. This is a same-GPU strategy comparison; it does not claim cross-device determinism.
+output's PSNR to that control is reported, and anything under 30 dB goes to `review` and fails until a person records
+it as good in `OUT/reviewed.json` (`[{"cell", "seed", "good", "by", "note"}]`). Lossy is fine if the image is good
+(owner, 2026-10-04): whether the encoded bytes equal the control's is reported (`byte_identical`), not judged. Missing
+controls or receipts and changed files or inputs fail qualification. This is a same-GPU comparison; it does not claim
+cross-device determinism.
 
 ## One cycle (per arm, order from the manifest, e.g. old, rust, old, rust, ...)
 

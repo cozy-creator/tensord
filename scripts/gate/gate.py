@@ -732,7 +732,9 @@ def r1(out: Path, rows: list[dict]) -> dict:
     """R1 per cell (CUTOVER.md section 4): zero failures; disk reads at most 1.5x the reference engine's; a cold start,
     submit to the CLI's exit with the image saved, at most 1.10x the reference engine's on the same pod (server start
     included), with the previous candidate's figure and host load beside it; complete same-input control/hash
-    receipts and exact encoded-byte identity on the same GPU; PSNR is diagnostic; no Xid."""
+    receipts; each low-memory output's PSNR to its full-card control at least 30 dB, or a person's review of it in
+    OUT/reviewed.json saying it is good (owner, 2026-10-04: lossy is fine if the image is good); no Xid. Whether the
+    encoded bytes are identical to the control is reported, not judged."""
     m = json.loads((out / "manifest.json").read_text())
     plan, cells = m["r1"], {(r["arm"], r["cell"]): r for r in rows if r.get("event") == "cell"}
     cand, ref, baseline = plan.get("candidate", "rust"), plan.get("reference", "comfy"), plan.get("baseline", {})
@@ -743,7 +745,9 @@ def r1(out: Path, rows: list[dict]) -> dict:
         control.setdefault(key(q), []).append(q)
     samples = [json.loads(line) for line in (out / "samples.jsonl").read_text().splitlines() if line.strip()] \
         if (out / "samples.jsonl").exists() else []
-    verdict: dict = {"pass": True, "cells": [], "review": [], "identity": "exact_bytes_same_gpu"}
+    reviewed = {(r["cell"], r["seed"]): r for r in json.loads((out / "reviewed.json").read_text())} \
+        if (out / "reviewed.json").exists() else {}   # [{"cell", "seed", "good": true|false, "by", "note"}]
+    verdict: dict = {"pass": True, "cells": [], "review": [], "quality": "psnr_30db_or_reviewed"}
     planned = [name for arm, name in m.get("cell_order", []) if arm == cand]
     names = dict.fromkeys(planned or m["cells"])
     names.update(dict.fromkeys(name for arm, name in cells if arm == cand and name != "control"))
@@ -803,15 +807,15 @@ def r1(out: Path, rows: list[dict]) -> dict:
                     control_digest, control_payload, control_path = identity_receipt(out, twins[0])
                     if payload != control_payload:
                         raise ValueError("candidate and control input receipts differ")
-                    identical = digest == control_digest
-                    if not identical:
-                        row["errors"].append(f"seed {q.get('seed')}: encoded bytes differ from control")
                     db = round(psnr(str(path), str(control_path)), 2)
-                    row["byte_identical"].append(identical)
+                    row["byte_identical"].append(digest == control_digest)   # reported, not judged
                     row["psnr_db"].append(db)
-                    if db < 30:
+                    if db < 30:   # below the bar: a person looks at it; it fails until reviewed as good
+                        seen = reviewed.get((name, q["seed"]))
                         verdict["review"].append({"cell": name, "seed": q["seed"], "psnr_db": db, "image": q["images"][0]["path"],
-                                                  "control": twins[0]["images"][0]["path"]})
+                                                  "control": twins[0]["images"][0]["path"], "reviewed": seen})
+                        if not (seen and seen.get("good") is True):
+                            row["errors"].append(f"seed {q.get('seed')}: {db} dB to the control, under 30 dB and not reviewed as good")
                 except (OSError, ValueError, KeyError, TypeError) as error:
                     row["byte_identical"].append(False)
                     row["errors"].append(f"seed {q.get('seed')}: {error}")
