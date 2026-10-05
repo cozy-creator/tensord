@@ -63,7 +63,7 @@ struct Parent {
     spool: PathBuf,
     /// `(module, export)` of each invocable it may call: the App it belongs to (empty: its own
     /// package's; else a callee's in its environment) and the entrypoint registered for it.
-    callables: HashMap<(String, String), (String, String)>,
+    callables: Callables,
     /// The memoized ones' operation identity.
     memoized: HashMap<(String, String), String>,
     /// The parent's own file inputs: a child may be handed any of them.
@@ -700,7 +700,10 @@ impl Jobs {
                     "{}.{} is not an invocable of this package or its environment's",
                     frame.module, frame.export
                 ),
-            ))?;
+            ))?
+            .as_ref().ok_or(("child_ambiguous", format!(
+                "{}.{} is registered by more than one App in this environment", frame.module, frame.export,
+            )))?;
         let input: Value = crate::boundary_json::parse(frame.payload.as_bytes()).map_err(|e| {
             (
                 "child_call_refused",
@@ -970,7 +973,7 @@ impl Jobs {
             // The job will call it next: its models prepare and load now.
             Kind::ModelPrefetch => {
                 let callable = (frame.module.clone(), frame.export.clone());
-                if let (Some((application, entrypoint)), Some(runs), Some(service)) = (
+                if let (Some(Some((application, entrypoint))), Some(runs), Some(service)) = (
                     parent.callables.get(&callable),
                     self.runs.upgrade(),
                     self.service.upgrade(),
@@ -1166,7 +1169,8 @@ fn declarations(interface: &Value) -> impl Iterator<Item = (&Value, &Value, &'st
 
 /// Every App this environment holds: its own exports, including internal ones, and the
 /// other Apps' public exports. A callee job can call its own App or another dependency too.
-type Callables = HashMap<(String, String), (String, String)>;
+/// None names an export owned by different Apps: only that call is refused.
+type Callables = HashMap<(String, String), Option<(String, String)>>;
 fn invocables(
     generation: &crate::catalog::Generation,
     application: &str,
@@ -1174,7 +1178,7 @@ fn invocables(
     path: &Path,
 ) -> (Vec<CallInterface>, Callables) {
     let mut rows = vec![];
-    let mut callables = HashMap::new();
+    let mut callables: Callables = HashMap::new();
     let apps = std::iter::once((application, own))
         .chain(std::iter::once((generation.application.as_str(), &generation.interface)))
         .chain(generation.callees.iter().map(|c| (c.application.as_str(), &c.interface)));
@@ -1193,10 +1197,13 @@ fn invocables(
                 continue;
             }
             let key = (module.to_string(), export.to_string());
-            if callables.contains_key(&key) {
+            if let Some(existing) = callables.get_mut(&key) {
+                if existing.as_ref().is_some_and(|(app, _)| app != owner) {
+                    *existing = None;
+                }
                 continue;
             }
-            callables.insert(key, (owner.to_string(), name.to_string()));
+            callables.insert(key, Some((owner.to_string(), name.to_string())));
             rows.push(CallInterface {
                 module: module.into(),
                 export: export.into(),
@@ -1447,6 +1454,41 @@ fn record_call(
 #[cfg(test)]
 mod exact_tests {
     use super::*;
+
+    #[test]
+    fn a_shared_export_is_refused_only_when_different_apps_own_it() {
+        let own = json!({"entrypoints":[
+            {"name":"apply","invocable":{"module":"shared","export":"apply"}},
+            {"name":"alias","invocable":{"module":"shared","export":"apply"}},
+            {"name":"unrelated","invocable":{"module":"root","export":"unrelated"}}
+        ]});
+        let mut generation: crate::catalog::Generation = serde_json::from_value(json!({
+            "identity":"a".repeat(32),"package":"root","version":"1","application":"root:app",
+            "python":"/usr/bin/python3","interface":own,
+        })).unwrap();
+        let (_, calls) = invocables(&generation,"root:app",&own,Path::new("interface.json"));
+        let shared = ("shared".into(),"apply".into());
+        assert_eq!(calls[&shared], Some(("root:app".into(),"apply".into())));
+        generation.callees.push(crate::catalog::Callee {
+            distribution:"dep".into(),package:"second/dep".into(),version:"1".into(),application:"dep:app".into(),
+            source_digest:String::new(),interface:json!({"entrypoints":[
+                {"name":"apply","invocable":{"module":"shared","export":"apply"}}
+            ]}),
+        });
+        let (_, calls) = invocables(&generation,"root:app",&own,Path::new("interface.json"));
+        assert_eq!(calls[&shared], None);
+        assert_eq!(calls[&("root".into(),"unrelated".into())], Some(("root:app".into(),"unrelated".into())));
+        let root = std::env::temp_dir().join(format!("cm-ambiguous-{}", uuid::Uuid::new_v4()));
+        let service = Service::open(&root.join("state"),&root.join("generations"),1).unwrap();
+        let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
+        let jobs = Jobs::configure(&service,store,None).unwrap();
+        let parent = Parent { id:"parent".into(),request:"parent".into(),actor:"alice".into(),spool:root.clone(),
+            callables:calls,memoized:Default::default(),inputs:vec![],calls:Default::default() };
+        let frame = Frame { module:"shared".into(),export:"apply".into(),..Default::default() };
+        assert_eq!(jobs.child_call(&parent,&frame).unwrap_err().0,"child_ambiguous");
+        assert!(service.engine.nonterminal(usize::MAX).unwrap().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     /// Seeds past 2^53 name distinct child calls and come back from a child exact.
     #[test]

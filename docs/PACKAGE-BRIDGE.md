@@ -38,13 +38,17 @@ calls use the callee's source digest.
 A local-source manifest may carry an optional `callees` map from normalized distribution names
 to package identities. It may carry a source archive, or an immutable root wheel together with
 dependency wheels. Without an explicit mapping, an installed wheel's standard `direct_url.json`
-names its Hub package through `/v1/index/<org>/files/…`; other wheels are local code. Description
+names its Hub package through `/v1/index/<org>/files/…` on the preparation's known Hub origin;
+unknown and foreign origins stay local. Older records without a package identity also read as
+`local/<normalized-distribution>`. Description
 reads metadata and AST inside the environment without importing package code.
 
 Model slots, owner bindings and resolution-cache entries belong to the callee package. The
 caller’s model choices and binding revision do not override another package's slots. GPU
 execution uses the callee's interface; import-only parents are keyed by generation and App.
 These are additive generation and manifest fields; `cozy.machine.v1` is unchanged.
+An export registered by distinct Apps is refused only when that ambiguous call is made;
+other calls and same-App aliases continue to work.
 
 ## Runner (`runner.py`, `runtime_bridge.py`)
 

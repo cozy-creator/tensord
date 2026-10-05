@@ -70,6 +70,7 @@ class DescribeInstalled(msgspec.Struct, tag="describe_installed", tag_field="kin
 class DescribeEnvironment(msgspec.Struct, tag="describe_environment", tag_field="kind"):
     root: str
     packages: dict[str, str] = {}
+    hub_origin: str = ""
 
 
 class DescribedEnvironment(msgspec.Struct, tag="described_environment", tag_field="kind"):

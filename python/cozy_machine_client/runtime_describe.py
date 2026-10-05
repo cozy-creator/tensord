@@ -11,7 +11,7 @@ from .package_records import (Callee, Describe, DescribeEnvironment, DescribeIns
                               DescribedEnvironment, DescribeFailed)
 
 
-def environment(root: str, packages: dict[str, str]) -> DescribedEnvironment:
+def environment(root: str, packages: dict[str, str], hub_origin: str) -> DescribedEnvironment:
     """This environment's root digest and every other installed App, described statically."""
     found = {normalized(d.metadata["Name"]): d for d in importlib.metadata.distributions()}
     callees = []
@@ -26,7 +26,7 @@ def environment(root: str, packages: dict[str, str]) -> DescribedEnvironment:
             continue
         callees.append(Callee(name, distribution.version, applications[0].value,
                               msgspec.Raw(msgspec.json.encode(document)), record_digest(distribution),
-                              package_name(distribution, packages)))
+                              package_name(distribution, packages, hub_origin)))
     return DescribedEnvironment(record_digest(found.get(normalized(root))), callees)
 
 
@@ -34,7 +34,7 @@ def main():
     request = msgspec.json.decode(sys.stdin.buffer.read(), type=Describe | DescribeInstalled | DescribeEnvironment)
     try:
         if isinstance(request, DescribeEnvironment):
-            reply = environment(request.root, request.packages)
+            reply = environment(request.root, request.packages, request.hub_origin)
         else:
             document = (static_interface.build_installed(request.distribution, environment_python=Path(request.environment_python))
                         if isinstance(request, DescribeInstalled) else

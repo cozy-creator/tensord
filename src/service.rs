@@ -458,9 +458,7 @@ impl Service {
                         continue;
                     }
                 };
-                if held.record.app(&record.invocation.module).map(|(package, ..)| package)
-                    != Some(record.invocation.package.as_str())
-                {
+                if !held.record.owns(&record.invocation.module, &record.invocation.package) {
                     self.engine.wait_for_environment(
                         &record.id,
                         Some("held package identity differs from accepted invocation".into()),

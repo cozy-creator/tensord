@@ -1359,6 +1359,24 @@ mod tests {
         assert_eq!(projected.record.application, "callee:app");
         assert_eq!(projected.record.interface, callee);
         assert_eq!(service.catalog.resolve(&generation).unwrap().record.interface, caller);
+        let legacy_id = "b".repeat(32);
+        let legacy = service.catalog.root().join(&legacy_id);
+        fs::create_dir_all(legacy.join("env/bin")).unwrap();
+        std::os::unix::fs::symlink("/usr/bin/python3",legacy.join("env/bin/python")).unwrap();
+        fs::write(legacy.join(".hold"),"").unwrap();
+        fs::write(legacy.join("generation.json"),json!({
+            "identity":legacy_id,"package":"caller","version":"1.0.0","application":"caller:app",
+            "python":legacy.join("env/bin/python"),"interface":caller,"callees":[{
+                "distribution":"CALLEE__Lib.Name","version":"2.0.0","application":"callee:app","interface":callee
+            }]
+        }).to_string()).unwrap();
+        let legacy = service.catalog.resolve(&legacy_id).unwrap();
+        assert_eq!(legacy.record.app("caller:app").unwrap().0,"caller");
+        assert_eq!(legacy.record.app("callee:app").unwrap().0,"local/callee-lib-name");
+        assert_eq!(legacy.application("callee:app").unwrap().record.package,"local/callee-lib-name");
+        assert!(legacy.record.owns("callee:app","CALLEE__Lib.Name"));
+        assert!(!legacy.record.owns("callee:app","unrelated"));
+        assert!(!legacy.record.owns("callee:app","other/callee-lib-name"));
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let source = hub::Source { origin:format!("http://{}", listener.local_addr().unwrap()),

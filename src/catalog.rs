@@ -50,6 +50,14 @@ pub struct Callee {
     pub package: String,
 }
 impl Generation {
+    /// A legacy bare distribution names the same local App, without changing an accepted
+    /// invocation or pretending it is a published package.
+    pub(crate) fn owns(&self, application: &str, package: &str) -> bool {
+        self.app(application).is_some_and(|(expected, ..)| {
+            expected == package || (!package.contains('/') && expected == format!("local/{}", normalized(package)))
+        })
+    }
+
     /// The package an application of this environment belongs to (the root's or a callee's),
     /// its release and its interface.
     pub fn app(&self, application: &str) -> Option<(&str, &str, &serde_json::Value)> {
@@ -59,7 +67,7 @@ impl Generation {
         self.callees
             .iter()
             .find(|c| c.application == application)
-            .map(|c| (if c.package.is_empty() { c.distribution.as_str() } else { c.package.as_str() }, c.version.as_str(), &c.interface))
+            .map(|c| (c.package.as_str(), c.version.as_str(), &c.interface))
     }
 }
 #[derive(Clone)]
@@ -73,6 +81,17 @@ pub struct Catalog {
 }
 fn invalid(detail: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, detail)
+}
+
+pub(crate) fn normalized(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.chars().map(|c| c.to_ascii_lowercase()) {
+        let c = if matches!(c, '_' | '.') { '-' } else { c };
+        if !(c == '-' && out.ends_with('-')) {
+            out.push(c);
+        }
+    }
+    out
 }
 impl Catalog {
     pub fn new(root: &Path) -> io::Result<Self> {
@@ -111,7 +130,14 @@ impl Catalog {
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(directory.join("generation.json"))?;
-        let record: Generation = serde_json::from_reader(manifest).map_err(io::Error::other)?;
+        let mut record: Generation = serde_json::from_reader(manifest).map_err(io::Error::other)?;
+        // Older generations recorded only the distribution. That is local code, never a
+        // bare identity to send to the Hub's package-binding route.
+        for callee in &mut record.callees {
+            if callee.package.is_empty() {
+                callee.package = format!("local/{}", normalized(&callee.distribution));
+            }
+        }
         if record.identity != identity {
             return Err(invalid("generation identity differs from its installation"));
         }
@@ -161,10 +187,7 @@ impl HeldGeneration {
         let callee = self.record.callees.iter().find(|c| c.application == application)
             .ok_or_else(|| invalid("this environment holds no such application"))?;
         let mut held = self.clone();
-        held.record.package = match callee.package.as_str() {
-            "" => callee.distribution.clone(),
-            _ => callee.package.clone(),
-        };
+        held.record.package = callee.package.clone();
         held.record.version = callee.version.clone();
         held.record.application = callee.application.clone();
         held.record.interface = callee.interface.clone();

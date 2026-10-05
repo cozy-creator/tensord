@@ -22,11 +22,23 @@ def record_digest(found: importlib.metadata.Distribution | None) -> str:
     return "sha256:" + hashlib.sha256(msgspec.json.encode(rows)).hexdigest()
 
 
-def package_name(found: importlib.metadata.Distribution, packages: dict[str, str]) -> str:
+def origin(url):
+    try:
+        if (url.scheme not in ("http", "https") or not url.hostname
+                or url.username is not None or url.password is not None):
+            return None
+        port = url.port
+        return url.scheme, url.hostname.lower(), port if port is not None else (443 if url.scheme == "https" else 80)
+    except ValueError:
+        return None
+
+
+def package_name(found: importlib.metadata.Distribution, packages: dict[str, str], hub_origin: str = "") -> str:
     """The explicit capture identity, else the Hub index of its locked direct wheel URL.
 
     Reading installed PEP 610 metadata needs neither imports nor another catalog read.
-    A wheel without Hub provenance is local code, never guessed to belong to the root's org.
+    A wheel without provenance from this preparation's Hub is local code, never guessed
+    to belong to either the root's org or an unrelated host's similarly named index.
     """
     name = normalized(found.metadata["Name"])
     if name in packages:
@@ -39,7 +51,8 @@ def package_name(found: importlib.metadata.Distribution, packages: dict[str, str
     if record:
         url = urlsplit(msgspec.json.decode(record).get("url", ""))
         path = [unquote(part) for part in url.path.split("/")]
-        if (url.scheme in ("http", "https") and url.hostname and not url.username
+        expected = origin(urlsplit(hub_origin)) if hub_origin else None
+        if (expected is not None and origin(url) == expected
                 and len(path) == 7 and path[1:3] == ["v1", "index"]
                 and path[4] == "files" and path[3] and "/" not in path[3]):
             return f"{path[3]}/{name}"

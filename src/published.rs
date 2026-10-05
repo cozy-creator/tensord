@@ -23,6 +23,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tensorfs_core::{sha256, store::Store};
+use crate::catalog::normalized;
 
 /// How each published environment gets its Runtime SDK. Empty `requirements` keeps the
 /// release's own locked SDK rows.
@@ -138,6 +139,7 @@ struct Environment<'a> {
     python: &'a str,
     interface: &'a Value,
     release: &'a str,
+    hub_origin: &'a str,
 }
 
 pub struct Publisher {
@@ -606,12 +608,13 @@ impl Publisher {
             &request.release,
             !self.sdk.requirements.is_empty(),
         )?;
-        let identity = sha256::hex_digest(json!({"lock":lock,"python":python,"sdk":self.sdk.requirements,"links":self.sdk.find_links,"client":self.sdk.client_wheel}).to_string().as_bytes())[..32].to_string();
+        let identity = sha256::hex_digest(json!({"lock":lock,"python":python,"hub":hub::origin_key(&request.source.origin),"sdk":self.sdk.requirements,"links":self.sdk.find_links,"client":self.sdk.client_wheel}).to_string().as_bytes())[..32].to_string();
         let wanted = Environment {
             split: &split,
             python: &python,
             interface: &interface,
             release: &request.release,
+            hub_origin: &request.source.origin,
         };
         self.generation(service.catalog.root(), &identity, &wanted, job)?;
         let held = service.catalog.resolve(&identity).map_err(io_failure)?;
@@ -649,6 +652,7 @@ impl Publisher {
             python,
             interface,
             release,
+            hub_origin,
         } = *wanted;
         let locks = generations.join(".locks");
         fs::create_dir_all(&locks).map_err(io_failure)?;
@@ -793,7 +797,7 @@ impl Publisher {
             ))?;
         File::create(dir.join(".hold")).map_err(io_failure)?;
         let (source_digest, callees) = match &self.sdk.client_wheel {
-            Some(_) => describe_environment(&py, &split.distribution)?,
+            Some(_) => describe_environment(&py, &split.distribution, hub_origin)?,
             None => (String::new(), vec![]),
         };
         let record = json!({"identity":identity,"package":split.distribution,"version":release,"application":application,"python":interpreter,"dependencies":[],"interface":interface,"sdk":sdk_choice,"source_digest":source_digest,"callees":callees});
@@ -1533,21 +1537,10 @@ struct Lock {
     sdk: String,
 }
 
-fn normalized(name: &str) -> String {
-    let mut out = String::new();
-    for c in name.chars().map(|c| c.to_ascii_lowercase()) {
-        let c = if matches!(c, '_' | '.') { '-' } else { c };
-        if !(c == '-' && out.ends_with('-')) {
-            out.push(c);
-        }
-    }
-    out
-}
-
 /// The environment's root digest and the other Apps it holds, described inside it by the
 /// machine's client without importing them (`runtime_describe`). A failed description fails
 /// this preparation; it never publishes an environment with silently missing callees.
-pub fn describe_environment(python: &str, root: &str) -> Result<(String, Vec<crate::catalog::Callee>), Failure> {
+pub fn describe_environment(python: &str, root: &str, hub_origin: &str) -> Result<(String, Vec<crate::catalog::Callee>), Failure> {
     #[derive(serde::Deserialize)]
     #[serde(tag = "kind", rename_all = "snake_case")]
     enum Reply {
@@ -1566,7 +1559,7 @@ pub fn describe_environment(python: &str, root: &str) -> Result<(String, Vec<cra
         .stderr(Stdio::inherit())
         .spawn()
         .and_then(|mut child| {
-            let request = json!({"kind": "describe_environment", "root": root}).to_string();
+            let request = json!({"kind": "describe_environment", "root": root, "hub_origin":hub_origin}).to_string();
             child.stdin.take().expect("piped").write_all(request.as_bytes())?;
             child.wait_with_output()
         });
