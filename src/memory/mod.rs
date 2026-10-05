@@ -235,6 +235,36 @@ impl GpuMemory {
         });
     }
 
+    /// Make room for warm set member `plan`'s spawn (`Gpu::admit_member`): its cap, or None
+    /// when only another member or a running call has more. Without NVML: admitted, no cap.
+    pub fn admit_member(
+        &self,
+        plan: &str,
+        holdings: impl Fn() -> Vec<Holding>,
+        mut carry_out: impl FnMut(&Step) -> io::Result<bool>,
+    ) -> io::Result<Option<Option<u64>>> {
+        let mut round = Round::default();
+        loop {
+            let Some(sample) = self.sample() else {
+                return Ok(Some(None));
+            };
+            let held = holdings();
+            let decision = self.with(|gpu| {
+                gpu.holdings = held;
+                let decision = gpu.admit_member(plan, &sample, &mut round);
+                note(serde_json::json!({"event": "member", "plan": plan, "free": sample.free,
+                    "room": gpu.room(plan, &sample), "need": gpu.spawn_need(plan),
+                    "decision": format!("{decision:?}")}));
+                decision
+            });
+            match decision {
+                Decision::Go(cap) => return Ok(Some(Some(cap))),
+                Decision::Wait => return Ok(None),
+                Decision::Step(step) => drop(carry_out(&step)?),
+            }
+        }
+    }
+
     /// Whether `plan`'s executor and first working set fit in the room there is now, with no
     /// step on another tenant (a prewarm never makes room). True without NVML: nothing is
     /// decided here then.
