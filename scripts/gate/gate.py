@@ -494,16 +494,6 @@ class Gate:
             spec_cell = {"requests": spec_cell}
         budget, cold = spec_cell.get("budget"), spec_cell.get("cold", False)
         by_run = cold and spec.get("cold_by_run", False)   # this computer: the first `cozy run` starts the stopped machine
-        for model in dict.fromkeys(spec_cell.get("unwarm", []) + spec.get("unwarm", [])):   # the cell's, or every cell of the arm
-            # a cold cell, or another engine's: take each model out of the machine's warm set first, so the machine keeps
-            # nothing ready for it (and starts nothing on the card while the other engine runs)
-            place = spec.get("run_args", [f"--rental={self.m.get('rental')}", f"--tensorhub={self.m.get('hub')}"])
-            done = subprocess.run([spec.get("cli", "cozy"), "run", self.m["targets"][model], *self.m.get("target_args", {}).get(model, []),
-                                   "--warm=off", *place, "--await", "--json"], capture_output=True, text=True)
-            self.record({"event": "unwarm", "arm": arm, "cell": name, "model": model, "exit": done.returncode,
-                         "out": (done.stdout or done.stderr)[-500:]})
-            if done.returncode:
-                raise RuntimeError(f"--warm=off for {model} failed before cold cell {name}: {(done.stdout or done.stderr)[-500:]}")
         if spec_cell.get("setup"):   # e.g. this cell's host limits, in place before the machine starts
             self.prepare("setup", spec_cell["setup"], arm=arm, cell=name)
         if spec.get("cgroup"):
@@ -603,21 +593,17 @@ class Gate:
         for k, item in enumerate(prime or []):
             root = self.out / "runs" / f"{self.index:03}-{arm}-{name}-prime{k}-{item['model']}"
             root.mkdir(parents=True)
+            (root / "input.json").write_text(json.dumps(item["input"]))
             began = time.time()
-            if item.get("warm"):   # `cozy run <target> --warm=<level>`: the machine readies the function, runs nothing
-                done = subprocess.run([cli, "run", self.m["targets"][item["model"]], *self.m.get("target_args", {}).get(item["model"], []),
-                                       f"--warm={item['warm']}", *place, "--await", "--json"], capture_output=True, text=True)
-            else:
-                (root / "input.json").write_text(json.dumps(item["input"]))
-                done = subprocess.run([cli, "run", self.m["targets"][item["model"]], *self.m.get("target_args", {}).get(item["model"], []),
-                                       f"--input={root / 'input.json'}", *place, "--await", "--json", f"--out={root / 'out'}",
-                                       f"--idempotency-key=gate-{self.m['salt']}-{self.index}"], capture_output=True, text=True)
+            done = subprocess.run([cli, "run", self.m["targets"][item["model"]], *self.m.get("target_args", {}).get(item["model"], []),
+                                   f"--input={root / 'input.json'}", *place, "--await", "--json", f"--out={root / 'out'}",
+                                   f"--idempotency-key=gate-{self.m['salt']}-{self.index}"], capture_output=True, text=True)
             (root / "stdout.json").write_text(done.stdout)
             (root / "events.jsonl").write_text(done.stderr)
             images = verify(root / "out", self.m["shapes"][item["model"]]) if (root / "out").is_dir() else []
-            primed.append({"model": item["model"], "warm": item.get("warm"), "s": round(time.time() - began, 2), "dir": str(root),
+            primed.append({"model": item["model"], "s": round(time.time() - began, 2), "dir": str(root),
                            "exit": done.returncode, "images": images,
-                           "ok": done.returncode == 0 and (bool(item.get("warm")) or len(images) == 1 and images[0]["ok"])})
+                           "ok": done.returncode == 0 and len(images) == 1 and images[0]["ok"]})
             self.record({"event": "prime_request", "arm": arm, "cell": name, **primed[-1],
                          "error": None if primed[-1]["ok"] else done.stdout[-3000:] or done.stderr[-3000:]})
             if not primed[-1]["ok"]:
