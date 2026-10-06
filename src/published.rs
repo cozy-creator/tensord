@@ -335,6 +335,29 @@ impl Publisher {
         })
     }
 
+    /// A slot's model this machine's store holds, by its exact manifest.
+    fn held_grant(&self, installation: &Installation, path: &str, reference: &domain::Ref) -> Result<ModelGrant, Failure> {
+        let sha = sha256::hex(&reference.digest);
+        let manifest = self.store.read_manifest(&tensorfs_core::ids::ObjectRef { sha256: sha.clone(), length: reference.length })
+            .map_err(|_| ("checkpoint_absent", format!("{path} names checkpoint sha256:{sha}, which this machine does not hold")))?;
+        let header = manifest
+            .header()
+            .map(|reference| tensorfs_core::checkpoint::load_header(&self.store, reference))
+            .transpose()
+            .map_err(|e| ("checkpoint_absent", e.to_string()))?;
+        Ok(ModelGrant {
+            package: installation.package.clone(),
+            slot: path.to_string(),
+            repository: String::new(),
+            release: String::new(),
+            lane: String::new(),
+            manifest: format!("sha256:{sha}"),
+            components: header
+                .map(|h| h.components.into_iter().map(|(name, _)| name).collect())
+                .unwrap_or_default(),
+        })
+    }
+
     /// The store models are made and held in.
     pub fn store(&self) -> &Store {
         &self.store
@@ -1006,6 +1029,14 @@ impl Publisher {
                 grants.push(self.source_grant(installation, &path, &choice, &request.providers, job)?);
                 continue;
             }
+            if let (Some(reference), true) = (
+                choice.manifest.as_ref().filter(|m| m.digest.len() == 32),
+                choice.repository.is_empty(),
+            ) {
+                // A model passed by value (a ModelArtifact a run here produced): held here.
+                grants.push(self.held_grant(installation, &path, reference)?);
+                continue;
+            }
             let (model, release, lane, manifest) = if let Some(reference) =
                 choice.manifest.as_ref().filter(|m| m.digest.len() == 32)
             {
@@ -1114,7 +1145,7 @@ impl Publisher {
         let keep = self.protected(service).map_err(io_failure)?;
         let mut fetched = std::collections::BTreeSet::new();
         for grant in &grants {
-            if !fetched.insert(grant.manifest.clone()) || grant.repository.starts_with("local/") {
+            if !fetched.insert(grant.manifest.clone()) || grant.repository.is_empty() || grant.repository.starts_with("local/") {
                 continue; // one download per checkpoint; a source model is already here
             }
             job.stage(format!(

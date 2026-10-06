@@ -1469,6 +1469,7 @@ mod v1_api {
         assert_eq!(done.status, "succeeded", "{done:?}");
         let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
         assert_eq!(result["squares"], serde_json::json!([9, 16]));
+        assert_eq!(result["greeting"], "squared squared", "{result}");
         assert_eq!(fs::read_to_string(&counter).unwrap(), "2");
         // Each call is a child run of the callee's own function, and memoized as its own.
         let calls: Vec<_> = events
@@ -1478,7 +1479,7 @@ mod v1_api {
                 _ => None,
             })
             .collect();
-        assert_eq!(calls, ["measure", "measure"], "{events:?}");
+        assert_eq!(calls, ["measure", "measure", "greet"], "{events:?}");
         assert!(events
             .iter()
             .any(|e| matches!(&e.event, Some(v1::run_event::Event::Memo(m)) if m.result == br#"{"square":9}"#)));

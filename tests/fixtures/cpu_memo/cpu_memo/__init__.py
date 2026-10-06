@@ -61,3 +61,19 @@ async def restricted(ctx: Context, *, payload: Probe) -> Measured:
 
 app.job(nested)
 app.entrypoint(restricted, internal=True)
+
+
+class Greeting(msgspec.Struct):
+    text: str
+    times: int = 1
+
+
+class Greeted(msgspec.Struct):
+    text: str
+
+
+@app.entrypoint
+def greet(ctx: Context, payload: Greeting) -> Greeted:
+    """A serving entrypoint another package calls with its request's fields, as H3 calls
+    qwen-image-2's generate_image."""
+    return Greeted(" ".join([payload.text] * payload.times))
