@@ -1094,6 +1094,7 @@ impl Codec {
             .as_ref()
             .map(|hold| hold.as_raw_fd());
         let mut command = Command::new(&self.config.python);
+        crate::process::inherit_nothing(&mut command);
         command
             .args([
                 "-I",

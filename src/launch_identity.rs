@@ -118,6 +118,7 @@ pub fn trampoline(
     scope: Option<&crate::scope::Scope>,
 ) -> io::Result<Command> {
     let mut command = Command::new(python);
+    crate::process::inherit_nothing(&mut command);
     command
         .args([
             "-I",

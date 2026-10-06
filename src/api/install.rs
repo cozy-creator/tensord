@@ -179,6 +179,7 @@ pub fn prepare_uploaded(
         &config.python
     };
     let mut command = Command::new(&config.helper_python);
+    crate::process::inherit_nothing(&mut command);
     // The uploaded build backend runs here: it gets the machine's environment without
     // credentials or Runtime-owned names, never the whole service environment.
     command

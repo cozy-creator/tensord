@@ -24,6 +24,9 @@ fn main() {
     }
 }
 fn run() -> io::Result<()> {
+    // Whatever this process inherited (a parent's readiness, key or credential pipe) reaches
+    // nothing it starts; descriptors it hands on are handed explicitly.
+    cozy_machine::process::cloexec_from(3);
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         // The image entrypoint and the CLI's machine launcher: no arguments, a grant in the
@@ -32,7 +35,9 @@ fn run() -> io::Result<()> {
         Some("service") if args.len() == 0 => match (provider_self(), cozy_machine::machine::grant::from_process()?) {
             (provider, Some(mut grant)) => {
                 grant.provider = provider;
-                grant.receipt_key = grant.receipt_key.take().or_else(cozy_machine::machine::supervise::inherited_key);
+                // The parent's key pipe is read and closed whether or not the grant has a key.
+                let inherited = cozy_machine::machine::supervise::inherited_key();
+                grant.receipt_key = grant.receipt_key.take().or(inherited);
                 run_machine(grant, cozy_machine::machine::supervise::inherited())
             }
             (_, None) => Err(io::Error::other("this process has no machine grant")),
@@ -55,7 +60,7 @@ fn run() -> io::Result<()> {
             struct Version { name: &'static str, implementation: &'static str, version: &'static str, #[serde(skip_serializing_if = "Option::is_none")] commit: Option<&'static str>,
                 api: [&'static str; 1], capabilities: Vec<&'static str> }
             // Machine contracts beside the private socket's: clients choose by capability.
-            let capabilities = cozy_machine::api::CAPABILITIES.iter().chain(CAPS).copied().collect();
+            let capabilities = cozy_machine::api::CAPABILITIES.iter().chain(CAPS).chain(&[cozy_machine::machine::provider::CREDENTIAL_CAPABILITY]).copied().collect();
             // `api` names the client API it serves (G/API.md): a controller chooses its machine by it.
             // `commit` is the source a release build was made from (`task release`). The installed
             // Runtime/TensorFS pair is Status's to report; the linked crate's label named neither.

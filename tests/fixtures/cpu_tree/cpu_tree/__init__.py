@@ -1,5 +1,6 @@
 """A job reads one input tree the machine materialized and reports its files; another makes a
-tree in a child, hands it to a second child as its input and returns it as its own."""
+tree in a child, hands it to a second child as its input and returns it as its own; another
+reports the descriptors its executor holds."""
 from __future__ import annotations
 
 import hashlib
@@ -63,7 +64,29 @@ async def survey(ctx: Context, payload: Survey) -> Surveyed:
     return Surveyed(sorted(counted.files), made.tree)
 
 
+class Nothing(msgspec.Struct):
+    pass
+
+
+class Descriptors(msgspec.Struct):
+    targets: list[str]
+
+
+async def descriptors(ctx: Context, payload: Nothing) -> Descriptors:
+    """What every descriptor this executor holds points at."""
+    import os
+
+    targets = []
+    for fd in os.listdir("/proc/self/fd"):
+        try:
+            targets.append(os.readlink(f"/proc/self/fd/{fd}"))
+        except OSError:
+            pass
+    return Descriptors(sorted(targets))
+
+
 app.job(count, accelerator=False)
+app.job(descriptors, accelerator=False)
 app.job(bundle)
 app.job(inspect)
 app.job(survey)
