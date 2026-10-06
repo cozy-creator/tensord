@@ -322,6 +322,8 @@ struct Session {
     invoked: bool,
     /// Regions its plane had evicted when its last call ended (a running total).
     evictions: u64,
+    /// Why its weights come from the store, not the sealed host tier (an older SDK).
+    unsealed: Option<String>,
 }
 
 /// How a session's executor came to exist, for the load record.
@@ -2278,18 +2280,22 @@ impl GpuPool {
         executor.retain_until_exit(directory);
         executor.retain_until_exit(WakeOnExit(Arc::downgrade(engine)));
         executor.keep_memo(self.memo.clone());
-        // Weights come only from the machine's sealed host tier: handed out while it fills, and
-        // streamed when it does not fit. Header and configs come from the store. (An executor
-        // whose TensorFS predates #313/#314 refuses such a layout and reads the store itself.)
-        for needed in ["weight_plane/1", "host_tiers.sealed/1"] {
-            if !executor.hello.offers(needed) {
-                executor.shutdown()?;
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!("executor lacks {needed}: its weights would come from the store"),
-                ));
-            }
-        }
+        // Weights come from the machine's sealed host tier: handed out while it fills, and
+        // streamed when it does not fit. An executor whose SDK cannot adopt a sealed layout
+        // (an older TensorFS or Runtime: version skew) still serves: it reads its weights from
+        // the store and the page cache itself, and every call it serves says so in its log.
+        let sealed = ["weight_plane/1", "host_tiers.sealed/1"]
+            .into_iter()
+            .find(|needed| !executor.hello.offers(needed));
+        let unsealed = sealed.map(|missing| {
+            let text = format!(
+                "its executor (Runtime {}, TensorFS {}) lacks {missing}: its weights are read \
+                 from the store and the page cache, without the machine's sealed host tier",
+                executor.hello.runtime_version, executor.hello.tensorfs_version
+            );
+            eprintln!("{}: {text}", plan.id);
+            text
+        });
         let selections = plan.selections();
         let id = self.serving.next.fetch_add(1, Ordering::Relaxed);
         self.serving.held.lock().unwrap().insert(
@@ -2317,7 +2323,9 @@ impl GpuPool {
             })
             .collect::<io::Result<Vec<_>>>()?;
         // Start on this model's layouts while the executor imports and constructs.
-        self.host.prepare(grants.clone(), staged);
+        if unsealed.is_none() {
+            self.host.prepare(grants.clone(), staged);
+        }
         Ok(Session {
             plan: plan.id.clone(),
             generation: plan.generation.clone(),
@@ -2334,6 +2342,7 @@ impl GpuPool {
             launch,
             invoked: false,
             evictions: 0,
+            unsealed,
         })
     }
 
@@ -2506,9 +2515,9 @@ impl GpuPool {
                         device_total.or(self.config.authorized_device_limit_bytes),
                     attention_pin: String::new(),
                     stages: false,
-                    sealed_tiers: true,
+                    sealed_tiers: session.unsealed.is_none(),
                     model_sources: true,
-                    staged_tiers: true,
+                    staged_tiers: session.unsealed.is_none(),
                     pinned_bytes: at_load.then_some(pinned),
                     device_weights: sharing,
                     cap_bytes: load_cap,
@@ -2555,6 +2564,11 @@ impl GpuPool {
         }
         if load_only {
             return Ok(true);
+        }
+        if let Some(text) = &session.unsealed {
+            if let Err(error) = engine.append_log(id, "warning", text) {
+                eprintln!("run {id}: {text} ({error})");
+            }
         }
         let record = engine.get(id)?;
         let prepared = session.executor.command(
