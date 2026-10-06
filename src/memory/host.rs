@@ -9,8 +9,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-/// Pinned host bytes executors hold outside the machine's tier (their own memfds when they
-/// read the store); an executor adopting sealed layouts page-locks the tier's pages instead.
+/// Pinned host bytes executors hold outside the machine's tier: page-locked copies of the
+/// sealed regions they stream where their GPU will not lock the tier's pages (consumer GPUs).
+/// Invisible in their PSS, so only what they report counts.
 #[derive(Default)]
 pub struct HostLedger {
     private: Mutex<BTreeMap<String, u64>>,
@@ -25,7 +26,7 @@ impl HostLedger {
         };
     }
 
-    fn private_total(&self) -> u64 {
+    pub fn private_total(&self) -> u64 {
         self.private.lock().unwrap().values().sum()
     }
 }

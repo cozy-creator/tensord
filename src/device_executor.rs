@@ -506,6 +506,9 @@ pub struct PlaneFacts {
     pub disk_read_bytes: Option<u64>,
     /// RAM of the machine's sealed layouts the executor maps (the machine's, not its own).
     pub sealed_bytes: Option<u64>,
+    /// Page-locked copies of the sealed regions it streams that its GPU would not lock
+    /// (consumer GPUs): the executor's own RAM, outside the tier and invisible in its PSS.
+    pub copied_bytes: Option<u64>,
     pub late: Option<u64>,
     pub stall_ns: Option<u64>,
     pub misses: Option<u64>,

@@ -681,8 +681,7 @@ impl GpuPool {
         if self.config.host.mode == crate::host_pressure::HostMode::Dedicated {
             return Some(available);
         }
-        let ours = crate::host_memory::tree_private(std::process::id())
-            + self.host.facts().charged_bytes;
+        let ours = self.ours();
         let total = u64::try_from(crate::host_memory::total()).ok()?;
         let others = crate::host_pressure::others(&host, total, ours)?;
         Some(available.saturating_sub(self.reserve.lock().unwrap().observe(others)))
@@ -694,14 +693,20 @@ impl GpuPool {
             return;
         }
         let host = crate::host_memory::read();
-        let ours = crate::host_memory::tree_private(std::process::id())
-            + self.host.facts().charged_bytes;
+        let ours = self.ours();
         let others = u64::try_from(crate::host_memory::total())
             .ok()
             .and_then(|total| crate::host_pressure::others(&host, total, ours));
         if let Some(others) = others {
             self.reserve.lock().unwrap().quiet(others);
         }
+    }
+    /// Host bytes that are this machine's: its process tree's private memory, its tier, and its
+    /// executors' page-locked copies (outside their PSS).
+    fn ours(&self) -> u64 {
+        crate::host_memory::tree_private(std::process::id())
+            + self.host.facts().charged_bytes
+            + self.host_ledger.private_total()
     }
     pub fn give_back_one(&self) -> bool {
         if self.host.release(1) > 0 || self.end_idle_parent(false) > 0 {
@@ -2746,8 +2751,12 @@ impl GpuPool {
                 .and_then(|v| u64::try_from(v).ok())
         });
         self.observe(&plan.id, plan.degree, facts, &reply.rank_planes, Some(true));
-        // Every executor's weights are the tier's: none pins memory of its own.
-        self.host_ledger.private(&plan.id, None);
+        // Every executor's weights are the tier's; one whose GPU will not lock the tier holds
+        // page-locked copies of what it streams beside it, on each GPU of its group.
+        let copied: u64 = (reply.plane.iter().chain(reply.rank_planes.iter().flatten()))
+            .filter_map(|p| p.copied_bytes)
+            .sum();
+        self.host_ledger.private(&plan.id, (copied > 0).then_some(copied));
         if let Some(plane) = &reply.plane {
             crate::memory::note(
                 serde_json::json!({"event": "call", "plan": plan.id, "id": id, "degree": plan.degree,
@@ -2756,7 +2765,7 @@ impl GpuPool {
                 "activation": plane.activation_peak_bytes, "oom_retries": plane.oom_retries,
                 "alloc_retries": plane.alloc_retries, "cache_releases": plane.cache_releases,
                 "paged_out": plane.paged_out,
-                "evictions": plane.evictions, "h2d_bytes": plane.h2d_bytes,
+                "evictions": plane.evictions, "h2d_bytes": plane.h2d_bytes, "copied": copied,
                 "rank_process": reply.rank_planes.iter()
                     .map(|r| r.as_ref().map(|r| r.process_bytes)).collect::<Vec<_>>(),
                 "rank_cap": reply.rank_planes.iter()
