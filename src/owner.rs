@@ -41,7 +41,6 @@ struct Lease {
 pub struct Owner {
     store: Arc<Store>,
     _lock: File,
-    _store_lock: File,
     cache: HashMap<String, Cached>,
     peers: HashMap<u64, Peer>,
     leases: HashMap<u64, Lease>,
@@ -63,27 +62,6 @@ fn validate(object: &Object) -> io::Result<()> {
     ids::hex64("object", &object.sha256).map_err(io::Error::other)?;
     Ok(())
 }
-/// The store's own owner lock, taken exclusively; None when it has none yet and `create`
-/// is false.
-fn lock_store(store: &Path, create: bool) -> io::Result<Option<File>> {
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(create)
-        .open(store.join("owner.lock"));
-    let lock = match lock {
-        Ok(lock) => lock,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    lock.try_lock_exclusive().map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "this TensorFS store already has a machine owner",
-        )
-    })?;
-    Ok(Some(lock))
-}
 impl Owner {
     /// `store` is the TensorFS store this owner serves, which may live outside `root`.
     pub fn new(root: &Path, store: &Path, budget: u64, ttl: Duration) -> io::Result<Shared> {
@@ -101,18 +79,9 @@ impl Owner {
             )
         })?;
         std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
-        // One machine per store, whichever state directory or path names it. A store another
-        // machine owns is refused before its catalog is opened; a new one is locked once
-        // TensorFS has made it (it refuses a directory that already holds a foreign file).
-        let owned = lock_store(store, false)?;
-        let store = Arc::new(Store::ensure(store).map_err(io::Error::other)?);
-        let store_lock = match owned {
-            Some(lock) => lock,
-            None => lock_store(store.root(), true)?.expect("created"),
-        };
-        // The machine is the store's owner: its read leases pin in memory, so its GC can make
-        // room while layouts are served.
-        tensorfs_core::meta::own(&store);
+        // TensorFS retains the exclusive store claim with every borrowed Store and read
+        // lease, and lets this owner's GC run while those leases pin individual objects.
+        let store = Arc::new(Store::ensure_owned(store).map_err(io::Error::other)?);
         let incarnation = format!(
             "{}-{}",
             std::process::id(),
@@ -124,7 +93,6 @@ impl Owner {
         Ok(Arc::new(Mutex::new(Self {
             store,
             _lock: lock,
-            _store_lock: store_lock,
             cache: HashMap::new(),
             peers: HashMap::new(),
             leases: HashMap::new(),
@@ -400,6 +368,42 @@ fn control_socket(root: &Path, name: &str) -> io::Result<PathBuf> {
 mod tests {
     use super::*;
     use tensorfs_core::{meta::Meta, read, store::Fault};
+
+    #[test]
+    fn a_borrowed_store_keeps_its_owner_claim() {
+        let root = std::env::temp_dir().join(format!("cm-owner-lifetime-{}", uuid::Uuid::new_v4()));
+        let path = root.join("tensorfs");
+        let owner = Owner::new(&root.join("first"), &path, 1 << 20, Duration::from_secs(60)).unwrap();
+        let store = owner.lock().unwrap().store();
+        drop(owner);
+        assert!(
+            Owner::new(&root.join("second"), &path, 1 << 20, Duration::from_secs(60)).is_err(),
+            "a borrowed Store still serves this owner's bytes"
+        );
+        drop(store);
+        drop(Owner::new(&root.join("second"), &path, 1 << 20, Duration::from_secs(60)).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_read_lease_keeps_its_owner_claim_without_a_store_handle() {
+        let root = std::env::temp_dir().join(format!("cm-owner-lease-{}", uuid::Uuid::new_v4()));
+        let path = root.join("tensorfs");
+        let owner = Owner::new(&root.join("first"), &path, 1 << 20, Duration::from_secs(60)).unwrap();
+        let store = owner.lock().unwrap().store();
+        let meta = Meta::open(&store).unwrap();
+        let object = store.put_stream(&mut &b"served bytes"[..], None, &Fault::default()).unwrap().obj;
+        let (lease, _) = read::acquire(&store, &meta, "layout", vec![object]).unwrap();
+        drop(store);
+        drop(owner);
+        assert!(
+            Owner::new(&root.join("second"), &path, 1 << 20, Duration::from_secs(60)).is_err(),
+            "an owner read lease still serves bytes without a Store handle"
+        );
+        lease.release(&meta).unwrap();
+        drop(Owner::new(&root.join("second"), &path, 1 << 20, Duration::from_secs(60)).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     /// The machine owns its store: a layout's live read lease no longer stops TensorFS GC,
     /// which keeps the leased bytes and takes what nothing holds.

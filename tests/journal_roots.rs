@@ -21,7 +21,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tensorfs_core::{sha256, store::Store};
+use tensorfs_core::{err::Code, sha256, store::Store};
 
 const ACTOR: &str = "alice";
 
@@ -67,8 +67,7 @@ fn tools(root: &Path) -> Tools {
 fn open(root: &Path, tools: &Tools) -> Machine {
     let state = root.join("state");
     let service = Service::open(&state, &root.join("generations"), 1).unwrap();
-    let store = Arc::new(Store::ensure(&state.join("tensorfs")).unwrap());
-    tensorfs_core::meta::own(&store);
+    let store = Arc::new(Store::ensure_owned(&state.join("tensorfs")).unwrap());
     let objects =
         Arc::new(Objects::new(&root.join("writes"), store.clone(), service.engine.clone()).unwrap());
     let local = LocalSources::new(
@@ -251,8 +250,27 @@ fn paused_and_unstarted_runs_keep_their_objects(restart: bool) {
 
     if restart {
         assert!(machine.service.stop().unwrap(), "the machine was not idle");
+        let store_root = machine.store.root().to_path_buf();
         drop(jobs);
         drop(machine);
+        // stop() requests dispatch shutdown. Its thread may still retain Jobs and the
+        // Store until it observes that request; an in-process restart must wait for that
+        // custody to end just as a process restart waits for the old process to exit. A
+        // successful claim observes the lock's release, including completion of destructors.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match Store::ensure_owned(&store_root) {
+                Ok(store) => {
+                    drop(store);
+                    break;
+                }
+                Err(error) if error.code == Code::STORE_BUSY => {
+                    assert!(Instant::now() < deadline, "the stopped dispatcher retains its Store: {error}");
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("reopen the stopped Store: {error}"),
+            }
+        }
         machine = open(&root, &tools);
     }
     collect(&machine.store);

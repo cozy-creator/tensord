@@ -160,7 +160,7 @@ fn one_store_runs_one_machine() {
 
     // Another root, and another path to the store, change nothing: the store is taken.
     let said = refused(&second_root, Some(&scratch.join("alias/store")));
-    assert!(said.contains("already has a machine owner"), "{said}");
+    assert!(said.contains("STORE_BUSY") && said.contains("already has an owner"), "{said}");
     assert!(served(&first_root, port));
 
     // A stopped machine frees its store at once.
