@@ -604,7 +604,13 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
         if request.id.is_empty() || request.id.len() > 256 {
             return Err(Status::invalid_argument("a run id is 1-256 bytes"));
         }
-        if super::machine_update::owns(&self.identity, &*self.backend, caller.actor, &request)? {
+        let update = if let Some(spec) = &request.spec {
+            spec.kind == v1::RunKind::Update as i32
+        } else {
+            let (identity, actor, observed) = (self.identity.clone(), caller.actor, request.clone());
+            Self::call(&self.backend, move |backend| super::machine_update::owns(&identity, backend, actor, &observed)).await?
+        };
+        if update {
             caller.machine()?;
             let (identity, backend) = (self.identity.clone(), self.backend.clone());
             return super::machine_update::run(identity, backend, caller.actor, request)
@@ -704,9 +710,10 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
         if request.id.is_empty() || request.id.len() > 256 {
             return Err(Status::invalid_argument("a run id is 1-256 bytes"));
         }
-        if super::machine_update::owns(&self.identity, &*self.backend, caller.actor,
-            &v1::RunRequest { id: request.id.clone(), ..Default::default() })? {
-            return Err(Status::unimplemented("software update runs do not support Control"));
+        let (identity, actor, id) = (self.identity.clone(), caller.actor, request.id.clone());
+        if Self::call(&self.backend, move |backend| super::machine_update::owns(&identity, backend, actor,
+            &v1::RunRequest { id, ..Default::default() })).await? {
+            return Err(refused("update_control_unsupported", "software update runs do not support Control"));
         }
         let action = match v1::Action::try_from(request.action) {
             Ok(v1::Action::Cancel) => pb::MachineExecutionAction::Cancel,

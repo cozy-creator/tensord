@@ -4,7 +4,7 @@ use cozy_machine::{
         self,
         auth::VerifiedActor,
         capability::{self, Grant},
-        v1, MachineIdentity,
+        pb, v1, MachineBackend, MachineIdentity,
     },
     execution::Engine,
     journal::{Invocation, Journal, Outcome, ResultRecord, State},
@@ -85,6 +85,7 @@ fn spec() -> v1::RunSpec {
 struct Server {
     client: v1::machine_client::MachineClient<Channel>,
     service: Arc<Service>,
+    backend: Arc<NativeBackend>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Server {
@@ -119,11 +120,10 @@ impl Server {
         }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let task = tokio::spawn(async move {
-            api::serve(listener, identity, Arc::new(backend))
-                .await
-                .unwrap()
-        });
+        let backend = Arc::new(backend);
+        let served = backend.clone();
+        let task =
+            tokio::spawn(async move { api::serve(listener, identity, served).await.unwrap() });
         let tls = ClientTlsConfig::new()
             .ca_certificate(Certificate::from_pem(pem))
             .domain_name("localhost");
@@ -137,6 +137,7 @@ impl Server {
         Self {
             client: v1::machine_client::MachineClient::new(channel),
             service,
+            backend,
             task,
         }
     }
@@ -221,6 +222,30 @@ async fn canceled_ids_refuse_updates_and_another_actors_update_never_shadows_the
         .engine
         .with_journal(|journal| journal.reserve_update_run(&actor(BOB), "shared"))
         .unwrap();
+    // If update admission wins after the API's ownership read, the transactional backend
+    // still refuses this operation without presenting it as a missing/older API method.
+    let error = server
+        .backend
+        .control(
+            VerifiedActor {
+                public_key: SigningKey::from_bytes(&BOB).verifying_key().to_bytes(),
+            },
+            pb::MachineExecutionControl {
+                execution: Some(pb::MachineExecutionQuery {
+                    request_id: "shared".into(),
+                    expected_execution_workspace_id: server.service.engine.workspace_id(),
+                    ..Default::default()
+                }),
+                action: pb::MachineExecutionAction::Cancel as i32,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert_eq!(
+        error.metadata().get("cozy-error-code").unwrap(),
+        "update_control_unsupported"
+    );
     let error = server
         .client
         .control(request(
@@ -233,7 +258,11 @@ async fn canceled_ids_refuse_updates_and_another_actors_update_never_shadows_the
         ))
         .await
         .unwrap_err();
-    assert_eq!(error.code(), Code::Unimplemented);
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert_eq!(
+        error.metadata().get("cozy-error-code").unwrap(),
+        "update_control_unsupported"
+    );
     assert_eq!(server.cancel("shared", ALICE).await, canceled);
     server.canceled("shared", None).await;
     server.stop().await;
@@ -266,7 +295,11 @@ async fn canceled_ids_refuse_updates_and_another_actors_update_never_shadows_the
         ))
         .await
         .unwrap_err();
-    assert_eq!(error.code(), Code::Unimplemented);
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert_eq!(
+        error.metadata().get("cozy-error-code").unwrap(),
+        "update_control_unsupported"
+    );
     assert_eq!(
         restarted.cancel("shared", ALICE).await.number,
         canceled.number
@@ -309,6 +342,66 @@ async fn canceled_ids_refuse_updates_and_another_actors_update_never_shadows_the
     }
     assert!(observed);
     restarted.stop().await;
+}
+
+#[tokio::test]
+async fn a_busy_ownership_lookup_does_not_block_the_api_executor() {
+    let root = Root::new();
+    let mut server = Server::open(&root.0).await;
+    let engine = server.service.engine.clone();
+    let (held, locked) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        engine
+            .with_journal(|_| {
+                held.send(()).unwrap();
+                // The watchdog releases only this fixture's lock if an old blocking handler stalls
+                // the single API executor, so the failure cannot hang the test process.
+                let _ = released.recv_timeout(Duration::from_secs(3));
+                Ok(())
+            })
+            .unwrap()
+    });
+    locked.recv().unwrap();
+    let mut blocked_client = server.client.clone();
+    let lookup = tokio::spawn(async move {
+        blocked_client
+            .run(request(
+                v1::RunRequest {
+                    id: "absent".into(),
+                    spec: None,
+                    after: 0,
+                },
+                ALICE,
+                None,
+            ))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let responsive = tokio::time::timeout(
+        Duration::from_millis(500),
+        server.client.control(request(
+            v1::ControlRequest {
+                id: String::new(),
+                action: v1::Action::Cancel as i32,
+            },
+            ALICE,
+            None,
+        )),
+    )
+    .await;
+    let _ = release.send(());
+    writer.join().unwrap();
+    assert_eq!(
+        responsive
+            .expect("journal ownership I/O stalled the API executor")
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    let mut observed = lookup.await.unwrap().unwrap().into_inner();
+    assert_eq!(observed.message().await.unwrap_err().code(), Code::NotFound);
+    server.stop().await;
 }
 
 #[test]

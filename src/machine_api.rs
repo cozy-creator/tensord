@@ -893,7 +893,11 @@ impl MachineBackend for NativeBackend {
             if query.expected_execution_workspace_id != self.workspace_id() {
                 return Err(refusal("execution_workspace_changed", "the requested execution journal is not this workspace"));
             }
-            let canceled = self.service.engine.cancel_run(&actor_id(actor), &query.request_id).map_err(problem)?;
+            let canceled = self.service.engine.cancel_run(&actor_id(actor), &query.request_id)
+                .map_err(|error| match error.kind() {
+                    std::io::ErrorKind::Unsupported => refusal("update_control_unsupported", &error.to_string()),
+                    _ => problem(error),
+                })?;
             if let Some(jobs) = self.service.jobs() {
                 jobs.canceled(&canceled);
             }
