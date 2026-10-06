@@ -23,10 +23,7 @@ the owner (`service.rs`) admits work and resolves an immutable environment befor
   and optional `preparation_id`. (actor, request) and (actor, submission) are unique. Changed
   bindings fail and never replace accepted work. A `preparation_id` must name a preparation
   whose installation generation equals `invocation.generation`.
-- `close_submission` writes a tombstone in the same immediate transaction boundary as acceptance.
-  If acceptance won, it returns the receipt and does not cancel. If closure won, later acceptance
-  fails.
-- `AdmissionError` (inside `io::Error`): `WorkspaceMismatch`, `BindingConflict`, `SubmissionClosed`.
+- `AdmissionError` (inside `io::Error`): `WorkspaceMismatch`, `BindingConflict`.
 - Credentials and grant secrets never enter the context, journal or input. A capture's
   `record_owner` label never selects authority.
 

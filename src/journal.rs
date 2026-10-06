@@ -85,7 +85,6 @@ pub struct PublicTerminal {
 pub enum AdmissionError {
     WorkspaceMismatch,
     BindingConflict,
-    SubmissionClosed,
 }
 impl std::fmt::Display for AdmissionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -96,7 +95,6 @@ impl std::fmt::Display for AdmissionError {
             Self::BindingConflict => {
                 "request or submission is already bound to different authored semantics"
             }
-            Self::SubmissionClosed => "submission was durably closed before acceptance",
         })
     }
 }
@@ -106,7 +104,6 @@ fn admission(error: AdmissionError) -> io::Error {
     let kind = match error {
         AdmissionError::WorkspaceMismatch => io::ErrorKind::InvalidInput,
         AdmissionError::BindingConflict => io::ErrorKind::AlreadyExists,
-        AdmissionError::SubmissionClosed => io::ErrorKind::PermissionDenied,
     };
     io::Error::new(kind, error)
 }
@@ -352,7 +349,6 @@ impl Journal {
         }
         connection.execute_batch("BEGIN; CREATE TABLE IF NOT EXISTS machine_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS update_run_ids(actor TEXT NOT NULL,id TEXT NOT NULL,PRIMARY KEY(actor,id));
-            CREATE TABLE IF NOT EXISTS submission_closures(actor TEXT NOT NULL,submission_id TEXT NOT NULL,request_id TEXT NOT NULL,workspace_id TEXT NOT NULL,closed_ms INTEGER NOT NULL,PRIMARY KEY(actor,submission_id));
             CREATE TABLE IF NOT EXISTS installations(actor TEXT NOT NULL,alias TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,alias));
             CREATE TABLE IF NOT EXISTS preparations(actor TEXT NOT NULL,id TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,id));
             CREATE TABLE IF NOT EXISTS warm_sets(actor TEXT NOT NULL,position INTEGER NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,position));
@@ -1111,12 +1107,6 @@ impl Journal {
             }
             return Ok(execution);
         }
-        if let Some(context) = &context {
-            let closed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM submission_closures WHERE actor=?1 AND submission_id=?2)", params![context.actor,context.submission_id], |row| row.get(0)).map_err(db_error)?;
-            if closed {
-                return Err(admission(AdmissionError::SubmissionClosed));
-            }
-        }
         let execution = insert(&tx, key, invocation, context, boot, None)?;
         tx.commit().map_err(db_error)?;
         Ok(execution)
@@ -1514,48 +1504,6 @@ impl Journal {
             )
             .map_err(db_error)
     }
-    pub fn close_submission(
-        &mut self,
-        actor: &str,
-        submission_id: &str,
-        request_id: &str,
-        expected_workspace_id: &str,
-    ) -> io::Result<Option<Execution>> {
-        self.validate_workspace(expected_workspace_id)?;
-        validate_scope(actor, request_id, submission_id)?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(db_error)?;
-        let existing = public_prior(&tx, actor, request_id, submission_id)?;
-        let existing: Option<Execution> = existing
-            .map(|record| serde_json::from_str(&record).map_err(db_error))
-            .transpose()?;
-        if let Some(record) = &existing {
-            let context = record
-                .submission
-                .as_ref()
-                .ok_or_else(|| admission(AdmissionError::BindingConflict))?;
-            if context.request_id != request_id || context.submission_id != submission_id {
-                return Err(admission(AdmissionError::BindingConflict));
-            }
-        }
-        let prior: Option<String> = tx
-            .query_row(
-                "SELECT request_id FROM submission_closures WHERE actor=?1 AND submission_id=?2",
-                params![actor, submission_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(db_error)?;
-        if prior.is_some_and(|prior| prior != request_id) {
-            return Err(admission(AdmissionError::BindingConflict));
-        }
-        tx.execute("INSERT OR IGNORE INTO submission_closures(actor,submission_id,request_id,workspace_id,closed_ms) VALUES(?1,?2,?3,?4,?5)", params![actor,submission_id,request_id,expected_workspace_id,timestamp()]).map_err(db_error)?;
-        tx.commit().map_err(db_error)?;
-        Ok(existing)
-    }
-
     fn validate_workspace(&self, expected: &str) -> io::Result<()> {
         if expected != self.workspace_id {
             return Err(admission(AdmissionError::WorkspaceMismatch));

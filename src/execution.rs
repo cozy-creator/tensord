@@ -522,30 +522,6 @@ impl Engine {
     pub fn actor_head(&self, actor: &str) -> io::Result<u64> {
         self.journal.lock().unwrap().actor_head(actor)
     }
-    pub fn close_submission(
-        &self,
-        actor: &str,
-        submission_id: &str,
-        request_id: &str,
-        expected_workspace_id: &str,
-    ) -> io::Result<Option<Execution>> {
-        let owned = self.owned.lock().unwrap();
-        let progress = self.progress.lock().unwrap();
-        let mut record = self.journal.lock().unwrap().close_submission(
-            actor,
-            submission_id,
-            request_id,
-            expected_workspace_id,
-        )?;
-        if let Some(record) = &mut record {
-            overlay_observation(record, &owned, &progress);
-        }
-        drop(progress);
-        drop(owned);
-        self.notify_activity();
-        Ok(record)
-    }
-
     pub fn list(&self) -> io::Result<Vec<Execution>> {
         let owned = self.owned.lock().unwrap();
         let progress = self.progress.lock().unwrap();
