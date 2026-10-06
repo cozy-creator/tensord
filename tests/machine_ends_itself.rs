@@ -236,3 +236,55 @@ fn environments_holding(pid: u32, needle: &str) -> Vec<u32> {
     }
     held
 }
+
+/// A Runtime update back to a machine that predates the credential hand-off (it does not declare
+/// `provider-credential/1`) is never handed the key: it would leave the pipe open for every
+/// executor it starts. It still gets this boot's readiness pipe and key.
+#[test]
+fn an_older_service_is_never_handed_the_provider_key() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target/machine-older-service")
+        .join(std::process::id().to_string());
+    let _ = std::fs::remove_dir_all(&root);
+    let agent = root.join("var/lib/cozy/rust-machine/agent");
+    std::fs::create_dir_all(&agent).unwrap();
+    let older = agent.join("older");
+    std::fs::write(
+        &older,
+        "#!/bin/sh\n[ \"$1\" = version ] && echo '{\"name\":\"cozy-machine\",\"implementation\":\"rust\",\"capabilities\":[]}' && exit 0\nls /proc/$$/fd > \"$COZY_MACHINE_ROOT/service-fds.part\" && mv \"$COZY_MACHINE_ROOT/service-fds.part\" \"$COZY_MACHINE_ROOT/service-fds\"\nexec sleep 60\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&older, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink(&older, agent.join("current")).unwrap();
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let (provider_port, _received) = provider();
+    let machine = launch(&root, port, provider_port);
+    let listing = root.join("service-fds");
+    let start = Instant::now();
+    while !listing.exists() {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the older service never started"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let fds: Vec<String> = std::fs::read_to_string(&listing)
+        .unwrap()
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
+    assert!(
+        fds.contains(&"3".to_string()) && fds.contains(&"4".to_string()),
+        "{fds:?}"
+    );
+    assert!(
+        !fds.contains(&"5".to_string()),
+        "the older service holds fd 5: {fds:?}"
+    );
+    drop(machine);
+    std::fs::remove_dir_all(&root).unwrap();
+}

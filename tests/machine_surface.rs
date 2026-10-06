@@ -1238,6 +1238,57 @@ mod v1_api {
         let _ = fs::remove_dir_all(tools);
     }
 
+    /// An executor holds no descriptor the machine did not hand it: not one the machine itself
+    /// inherited (as a service inherits its parent's readiness, key and credential pipes).
+    #[tokio::test]
+    async fn an_executor_inherits_no_descriptor_the_machine_did_not_hand_it() {
+        use std::os::fd::AsRawFd;
+        // Not close-on-exec: the machine started below inherits it, as from a parent.
+        let (planted, _write) = nix::unistd::pipe().unwrap();
+        let target = fs::read_link(format!("/proc/self/fd/{}", planted.as_raw_fd()))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let (machine, tools) = installing_machine().await;
+        let held = fs::read_dir(format!("/proc/{}/fd", machine.child.id()))
+            .unwrap()
+            .filter_map(|e| fs::read_link(e.unwrap().path()).ok())
+            .any(|t| t.to_string_lossy() == target);
+        assert!(held, "the machine did not inherit the planted pipe {target}");
+        let mut client = client(&machine).await;
+        let all = cap(Grant {
+            action: MACHINE.into(),
+            ..Default::default()
+        });
+        let manifest = write_package(&mut client, &all, "cpu_tree", "local/cozy-machine-cpu-tree").await;
+        let spec = v1::RunSpec {
+            kind: v1::RunKind::Job as i32,
+            source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
+            entrypoint: "descriptors".into(),
+            payload: b"{}".to_vec(),
+            owner: "alice".into(),
+            ..Default::default()
+        };
+        let request = v1::RunRequest {
+            id: "descriptors".into(),
+            after: 0,
+            spec: Some(spec),
+        };
+        let events = collect(client.run(authorized(request, &all)).await.unwrap().into_inner())
+            .await
+            .unwrap();
+        let done = outcome(&events);
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        let targets = result["targets"].as_array().unwrap();
+        assert!(!targets.is_empty(), "{result}");
+        assert!(
+            !targets.iter().any(|t| t == &serde_json::json!(target)),
+            "the executor inherited the machine's pipe {target}: {result}"
+        );
+        let _ = fs::remove_dir_all(tools);
+    }
+
     /// A tree a child made (`out.save_tree`) reaches its parent as a directory, goes to a
     /// sibling as that one's input tree, and is the job's own output: its manifest and each
     /// member file are read back over Read.

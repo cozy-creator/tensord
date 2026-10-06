@@ -49,6 +49,12 @@ pub fn supervise(
     loop {
         super::update::recover_activation(paths)?;
         let activated = super::update::activated_binary(paths)?;
+        // An activated binary that does not read the credential is never handed it.
+        let credential = provider.filter(|_| {
+            activated
+                .as_deref()
+                .is_some_and(super::provider::reads_credential)
+        });
         let (read, write) = pipe2(OFlag::O_CLOEXEC).map_err(io::Error::from)?;
         // SAFETY: no thread exists yet in this process; the child continues single-threaded.
         let child = match unsafe { fork() }.map_err(io::Error::from)? {
@@ -63,7 +69,7 @@ pub fn supervise(
                 let Some(binary) = activated else {
                     return Ok(Ready(Some(File::from(write))));
                 };
-                exec_service(&binary, write, key, provider);
+                exec_service(&binary, write, key, credential);
             }
             ForkResult::Parent { child } => child,
         };

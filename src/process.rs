@@ -14,6 +14,41 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Marks every descriptor from `first` up close-on-exec in this process. In a child about to exec
+/// it leaves the new program only what its spawner hands on afterwards; at a machine's start it
+/// keeps whatever this process inherited (a parent's key or credential pipe) from anything it
+/// starts. Async-signal-safe: `close_range` (Linux 5.11), else each descriptor to the soft limit.
+pub fn cloexec_from(first: u32) {
+    // SAFETY: plain syscalls on this process's own descriptor table.
+    unsafe {
+        if libc::syscall(libc::SYS_close_range, first, u32::MAX, libc::CLOSE_RANGE_CLOEXEC) == 0 {
+            return;
+        }
+        let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        let last = if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
+            limit.rlim_cur.min(1 << 20) as u32
+        } else {
+            1 << 16
+        };
+        for fd in first..last {
+            libc::fcntl(fd as i32, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+    }
+}
+
+/// A package process inherits no descriptor its spawner does not hand on explicitly: run before
+/// every other `pre_exec` of `command`, which then clear close-on-exec on what they hand on.
+pub fn inherit_nothing(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: cloexec_from is async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            cloexec_from(3);
+            Ok(())
+        });
+    }
+}
+
 pub fn process_birth(pid: u32) -> io::Result<ProcessBirth> {
     let stat = process_stat(pid)?;
     Ok(ProcessBirth {
