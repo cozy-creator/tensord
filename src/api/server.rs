@@ -186,9 +186,9 @@ async fn prove_readiness(port: u16, readiness: Arc<Readiness>, id: MeasuredIdent
         )
     });
     match result {
-        Ok(true) => eprintln!("cozy-machine: readiness sealed (listener {listener_bound}, foreign capability refused {foreign_credential_refused})"),
-        Ok(false) => eprintln!("cozy-machine: this boot's retained readiness still holds"),
-        Err(error) => eprintln!("cozy-machine: readiness not proved: {error}"),
+        Ok(true) => eprintln!("tensord: readiness sealed (listener {listener_bound}, foreign capability refused {foreign_credential_refused})"),
+        Ok(false) => eprintln!("tensord: this boot's retained readiness still holds"),
+        Err(error) => eprintln!("tensord: readiness not proved: {error}"),
     }
 }
 

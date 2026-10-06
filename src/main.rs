@@ -1,4 +1,4 @@
-use cozy_machine::{
+use tensord::{
     owner::{Owner, Shared},
     protocol::{self, Body, Command, Reply, CAPS},
 };
@@ -19,7 +19,7 @@ use std::{
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("cozy-machine: {error}");
+        eprintln!("tensord: {error}");
         std::process::exit(1);
     }
 }
@@ -29,18 +29,18 @@ fn run() -> io::Result<()> {
         // The image entrypoint and the CLI's machine launcher: no arguments, a grant in the
         // environment (read before any thread starts; the one-shot key leaves the environment).
         // An activated Runtime update's service, started by the machine's stable parent.
-        Some("service") if args.len() == 0 => match cozy_machine::machine::grant::from_process()? {
-            Some(grant) => run_machine(grant, cozy_machine::machine::supervise::inherited()),
+        Some("service") if args.len() == 0 => match tensord::machine::grant::from_process()? {
+            Some(grant) => run_machine(grant, tensord::machine::supervise::inherited()),
             None => Err(io::Error::other("this process has no machine grant")),
         },
-        None | Some("run") if args.len() == 0 => match cozy_machine::machine::grant::from_process()? {
+        None | Some("run") if args.len() == 0 => match tensord::machine::grant::from_process()? {
             Some(grant) => {
-                cozy_machine::machine::identity::hold(&grant.layout)?;
+                tensord::machine::identity::hold(&grant.layout)?;
                 if let Some(key) = grant.developer_key.as_deref().filter(|_| nix::unistd::geteuid().is_root()) {
-                    cozy_machine::machine::ssh::start(key)?;
+                    tensord::machine::ssh::start(key)?;
                 }
-                let paths = cozy_machine::machine::update::Paths::new(&grant.layout.engine(), &grant.layout.root);
-                let ready = cozy_machine::machine::supervise::supervise(&paths)?;
+                let paths = tensord::machine::update::Paths::new(&grant.layout.engine(), &grant.layout.root);
+                let ready = tensord::machine::supervise::supervise(&paths)?;
                 run_machine(grant, ready)
             }
             None => Err(io::Error::other("this process has no machine grant (COZY_WORKER_ID and the rest of a pod's environment)")),
@@ -50,15 +50,15 @@ fn run() -> io::Result<()> {
             struct Version { name: &'static str, implementation: &'static str, version: &'static str, #[serde(skip_serializing_if = "Option::is_none")] commit: Option<&'static str>,
                 tensorfs: &'static str, api: [&'static str; 1], capabilities: Vec<&'static str> }
             // Machine contracts beside the private socket's: clients choose by capability.
-            let capabilities = cozy_machine::api::CAPABILITIES.iter().chain(CAPS).copied().collect();
+            let capabilities = tensord::api::CAPABILITIES.iter().chain(CAPS).copied().collect();
             // `api` names the client API it serves (G/API.md): a controller chooses its machine by it.
             // `commit` is the source a release build was made from (`task release`).
-            let record = Version { name: "cozy-machine", implementation: "rust", version: env!("CARGO_PKG_VERSION"), commit: option_env!("COZY_MACHINE_COMMIT"), tensorfs: tensorfs_core::VERSION, api: ["cozy.machine.v1"],
+            let record = Version { name: "tensord", implementation: "rust", version: env!("CARGO_PKG_VERSION"), commit: option_env!("TENSORD_COMMIT"), tensorfs: tensorfs_core::VERSION, api: ["cozy.machine.v1"],
                 capabilities };
             println!("{}", serde_json::to_string(&record)?); Ok(())
         }
         Some("host-memory") => {
-            println!("{}", serde_json::to_string(&cozy_machine::host_memory::read())?);
+            println!("{}", serde_json::to_string(&tensord::host_memory::read())?);
             Ok(())
         }
         Some("serve") => {
@@ -66,7 +66,7 @@ fn run() -> io::Result<()> {
             let mut machine_config=None; let mut listen=None; let mut gpu_config=None;
             let mut installer_python=None; let mut client_wheel=None; let mut package_python="3.12".to_string();
             let mut budget=16*1024*1024; let mut ttl=300;
-            let mut sdk=cozy_machine::published::PackageSdk{uv:"uv".into(),..Default::default()};
+            let mut sdk=tensord::published::PackageSdk{uv:"uv".into(),..Default::default()};
             while let Some(arg)=args.next() {
                 match arg.as_str() {
                     "--state"=>root=args.next().map(PathBuf::from),
@@ -89,35 +89,35 @@ fn run() -> io::Result<()> {
             let root=root.ok_or_else(||io::Error::other("--state is required"))?;
             let generations=generations.unwrap_or_else(||root.join("generations"));
             let owner=Owner::new(&root,&root.join("tensorfs"),budget,Duration::from_secs(ttl))?;
-            let service=cozy_machine::service::Service::open(&root,&generations,parallelism)?;
+            let service=tensord::service::Service::open(&root,&generations,parallelism)?;
             if let Some(config)=gpu_config {
-                let gpu=cozy_machine::gpu_service::GpuPool::new(&root.join("gpu"),cozy_machine::gpu_service::GpuConfig::load(&config)?,owner.lock().unwrap().store())?;
+                let gpu=tensord::gpu_service::GpuPool::new(&root.join("gpu"),tensord::gpu_service::GpuConfig::load(&config)?,owner.lock().unwrap().store())?;
                 service.configure_gpu(gpu)?;
             }
             let listener=bind_control(&owner)?;
             match (machine_config,listen) {
                 (Some(config),Some(listen))=>{
-                    let identity=cozy_machine::api::MachineIdentity::retained(&cozy_machine::api::identity::MachineConfig::load(&config)?)?;
+                    let identity=tensord::api::MachineIdentity::retained(&tensord::api::identity::MachineConfig::load(&config)?)?;
                     sdk.python=package_python.clone();
                     start_api(&root,&generations,identity,std::net::TcpListener::bind(listen)?,&owner,&service,installer_python,client_wheel,package_python,sdk,None)?
                 }
-                (None,None)=>{ cozy_machine::jobs::Jobs::configure(&service,owner.lock().unwrap().store(),None)?; }
+                (None,None)=>{ tensord::jobs::Jobs::configure(&service,owner.lock().unwrap().store(),None)?; }
                 _=>return Err(io::Error::other("--machine-config and --listen are required together")),
             }
             serve(owner,service,listener)
         }
-        _=>Err(io::Error::other("usage: cozy-machine version --json | host-memory | serve --state PATH [--generations PATH] [--cpu-parallelism N] [--host-bytes N]")),
+        _=>Err(io::Error::other("usage: tensord version --json | host-memory | serve --state PATH [--generations PATH] [--cpu-parallelism N] [--host-bytes N]")),
     }
 }
 /// Runs the machine from its grant: identity and readiness under the machine root, the engine
 /// under `var/lib/cozy/rust-machine`, the API on the granted port.
 fn run_machine(
-    mut grant: cozy_machine::machine::grant::Grant,
-    mut ready: cozy_machine::machine::supervise::Ready,
+    mut grant: tensord::machine::grant::Grant,
+    mut ready: tensord::machine::supervise::Ready,
 ) -> io::Result<()> {
-    use cozy_machine::machine::{grant::Lifetime, identity, receipt};
+    use tensord::machine::{grant::Lifetime, identity, receipt};
     for name in &grant.ignored {
-        eprintln!("cozy-machine: ignoring {name}, which this machine does not read");
+        eprintln!("tensord: ignoring {name}, which this machine does not read");
     }
     let layout = grant.layout.clone();
     let lifetime = identity::open(&layout)?;
@@ -135,14 +135,14 @@ fn run_machine(
         }
     }
     let fresh = readiness.attested().is_none();
-    let keys = cozy_machine::api::auth::Keys::fixed(grant.authorized.clone());
-    let mut identity = cozy_machine::api::MachineIdentity::machine(
+    let keys = tensord::api::auth::Keys::fixed(grant.authorized.clone());
+    let mut identity = tensord::api::MachineIdentity::machine(
         grant.worker_id.clone(),
         keys.clone(),
         lifetime,
         readiness,
     )?;
-    let lifecycle = cozy_machine::machine::lifecycle::Lifecycle::open(
+    let lifecycle = tensord::machine::lifecycle::Lifecycle::open(
         layout.state.join("idle.json"),
         rental,
         fresh,
@@ -152,12 +152,12 @@ fn run_machine(
     identity.store = Some(layout.store.clone());
     let generations = engine.join("generations");
     let owner = Owner::new(&engine, &layout.store, 16 * 1024 * 1024, Duration::from_secs(300))?;
-    let service = cozy_machine::service::Service::open(&engine, &generations, 1)?;
-    let paths = cozy_machine::machine::update::Paths::new(&engine, &layout.root);
+    let service = tensord::service::Service::open(&engine, &generations, 1)?;
+    let paths = tensord::machine::update::Paths::new(&engine, &layout.root);
     let updates = {
         let (service, admitted) = (service.clone(), lifecycle.clone());
         let idle = move || service.idle().unwrap_or(false) && admitted.admitted() == 0;
-        cozy_machine::machine::update::Updates::open(
+        tensord::machine::update::Updates::open(
             paths.clone(),
             Box::new(idle),
             Some(lifecycle.clone()),
@@ -171,7 +171,7 @@ fn run_machine(
             readiness.wait_proved();
             // A Runtime update this process started on is now committed.
             if let Err(error) = updates.commit() {
-                eprintln!("cozy-machine: Runtime update commit: {error}");
+                eprintln!("tensord: Runtime update commit: {error}");
             }
             ready.report();
         })?;
@@ -197,10 +197,10 @@ fn run_machine(
                 serde_json::from_reader(file).map_err(io::Error::other)?;
             config.as_object_mut().expect("an object").extend(settings);
         }
-        let config: cozy_machine::gpu_service::GpuConfig =
+        let config: tensord::gpu_service::GpuConfig =
             serde_json::from_value(config).map_err(io::Error::other)?;
         let store = owner.lock().unwrap().store();
-        service.configure_gpu(cozy_machine::gpu_service::GpuPool::new(
+        service.configure_gpu(tensord::gpu_service::GpuPool::new(
             &engine.join("gpu"),
             config,
             store,
@@ -208,7 +208,7 @@ fn run_machine(
     }
     if let Some(hub) = grant.hub.clone().filter(|_| rental) {
         identity.hubs = vec![(hub.origin.clone(), hub.worker_id.clone())];
-        let hub = Arc::new(cozy_machine::machine::hub::Hub::new(hub)?);
+        let hub = Arc::new(tensord::machine::hub::Hub::new(hub)?);
         let service = service.clone();
         std::thread::Builder::new()
             .name("rental-lifecycle".into())
@@ -218,12 +218,12 @@ fn run_machine(
                     .build()
                     .expect("a lifecycle runtime");
                 runtime.block_on(async {
-                    tokio::spawn(cozy_machine::machine::lifecycle::keep_authority(
+                    tokio::spawn(tensord::machine::lifecycle::keep_authority(
                         hub.clone(),
                         keys,
                     ));
                     let busy = move || !service.idle().unwrap_or(false);
-                    cozy_machine::machine::lifecycle::release_when_idle(lifecycle, hub, busy).await;
+                    tensord::machine::lifecycle::release_when_idle(lifecycle, hub, busy).await;
                 });
                 // The Hub accepted the release: this rental ends, and this process with it.
                 std::process::exit(0);
@@ -231,16 +231,16 @@ fn run_machine(
     }
     let control = bind_control(&owner)?;
     let api = std::net::TcpListener::bind((grant.listen_host, grant.worker_port))?;
-    identity.webrtc = cozy_machine::machine::player::listen(&layout.state, grant.webrtc_port, !rental)?;
+    identity.webrtc = tensord::machine::player::listen(&layout.state, grant.webrtc_port, !rental)?;
     identity.player = grant.webrtc_reach.clone();
     // The client this binary embeds, and the installer helper over it (made once per client).
-    let uv = cozy_machine::machine::client::uv(&layout.root);
-    let wheel = cozy_machine::machine::client::wheel(&engine)?;
-    let helper = match cozy_machine::machine::client::helper(&engine, &uv, &wheel) {
+    let uv = tensord::machine::client::uv(&layout.root);
+    let wheel = tensord::machine::client::wheel(&engine)?;
+    let helper = match tensord::machine::client::helper(&engine, &uv, &wheel) {
         Ok(python) => Some(python),
         Err(error) => {
             eprintln!(
-                "cozy-machine: no installer helper, so local packages cannot install: {error}"
+                "tensord: no installer helper, so local packages cannot install: {error}"
             );
             None
         }
@@ -258,7 +258,7 @@ fn run_machine(
         image_sdk(&paths.sdk(), &layout.root, uv),
         // A run naming no Hub reads this rental's own Hub as the pod (Go agent parity).
         grant.hub.clone().filter(|_| rental).map(|hub| {
-            cozy_machine::hub::Source::pod(
+            tensord::hub::Source::pod(
                 &hub.origin,
                 &hub.worker_id,
                 &hub.worker_token,
@@ -276,7 +276,7 @@ fn image_sdk(
     wheels: &std::path::Path,
     root: &std::path::Path,
     uv: PathBuf,
-) -> cozy_machine::published::PackageSdk {
+) -> tensord::published::PackageSdk {
     let mut pair: Vec<String> = std::fs::read_dir(wheels)
         .into_iter()
         .flatten()
@@ -289,7 +289,7 @@ fn image_sdk(
     let complete = pair.iter().any(|w| w.contains("/cozy_runtime-"))
         && pair.iter().any(|w| w.contains("/tensorfs-"));
     let seed = root.join("opt/cozy/dependency-seed/uv-cache");
-    cozy_machine::published::PackageSdk {
+    tensord::published::PackageSdk {
         uv,
         python: "3.12".into(),
         find_links: complete.then(|| wheels.to_path_buf()),
@@ -303,17 +303,17 @@ fn image_sdk(
 fn start_api(
     root: &std::path::Path,
     generations: &std::path::Path,
-    identity: cozy_machine::api::MachineIdentity,
+    identity: tensord::api::MachineIdentity,
     listener: std::net::TcpListener,
     owner: &Shared,
-    service: &Arc<cozy_machine::service::Service>,
+    service: &Arc<tensord::service::Service>,
     helper: Option<PathBuf>,
     wheel: Option<PathBuf>,
     python: String,
-    mut sdk: cozy_machine::published::PackageSdk,
-    own_hub: Option<cozy_machine::hub::Source>,
+    mut sdk: tensord::published::PackageSdk,
+    own_hub: Option<tensord::hub::Source>,
 ) -> io::Result<()> {
-    use cozy_machine::{api, machine_api::NativeBackend};
+    use tensord::{api, machine_api::NativeBackend};
     sdk.client_wheel = wheel.clone();
     let (pair, uv): (Vec<PathBuf>, _) = (
         sdk.requirements.iter().map(PathBuf::from).collect(),
@@ -323,7 +323,7 @@ fn start_api(
     let mut backend = NativeBackend::new(service.clone(), identity.authority.clone(), store.clone());
     backend.own_hub = own_hub;
     let publisher =
-        cozy_machine::published::Publisher::new(&root.join("published"), sdk, store.clone())?;
+        tensord::published::Publisher::new(&root.join("published"), sdk, store.clone())?;
     service.configure_publisher(publisher.clone());
     backend.publisher = Some(publisher);
     // Local packages install only with the helper; package environments get the client either way.
@@ -344,17 +344,17 @@ fn start_api(
         }
         _ => None,
     };
-    let objects = Arc::new(cozy_machine::objects::Objects::new(
+    let objects = Arc::new(tensord::objects::Objects::new(
         &root.join("writes"),
         store.clone(),
         service.engine.clone(),
     )?);
-    backend.runs = Some(Arc::new(cozy_machine::runs::Runs {
+    backend.runs = Some(Arc::new(tensord::runs::Runs {
         service: service.clone(),
         objects: objects.clone(),
         publisher: backend.publisher.clone(),
         local: backend.installer.clone().map(|installer| {
-            Arc::new(cozy_machine::local_source::LocalSources::new(
+            Arc::new(tensord::local_source::LocalSources::new(
                 objects,
                 installer,
                 store.clone(),
@@ -363,7 +363,7 @@ fn start_api(
         own_hub: backend.own_hub.clone(),
         jobs: Default::default(),
     }));
-    cozy_machine::jobs::Jobs::configure(service, store.clone(), backend.runs.as_ref())?;
+    tensord::jobs::Jobs::configure(service, store.clone(), backend.runs.as_ref())?;
     listener.set_nonblocking(true)?;
     #[derive(serde::Serialize)]
     struct Ready<'a> {
@@ -378,7 +378,7 @@ fn start_api(
         boot_id: &identity.authority.boot_id,
         cert_pem: &identity.cert_pem,
     })?;
-    cozy_machine::machine::identity::write_atomic(&root.join("api-ready.json"), &ready, 0o600)?;
+    tensord::machine::identity::write_atomic(&root.join("api-ready.json"), &ready, 0o600)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -420,7 +420,7 @@ fn bind_private(path: &std::path::Path) -> io::Result<UnixListener> {
 }
 fn serve(
     owner: Shared,
-    service: Arc<cozy_machine::service::Service>,
+    service: Arc<tensord::service::Service>,
     (listener, admin): (UnixListener, UnixListener),
 ) -> io::Result<()> {
     let paths = {
@@ -518,7 +518,7 @@ fn serve(
     Ok(())
 }
 fn os_peer_outside(stream: &UnixStream) -> io::Result<bool> {
-    cozy_machine::os::peer_descends_from_machine(stream).map(|inside| !inside)
+    tensord::os::peer_descends_from_machine(stream).map(|inside| !inside)
 }
 /// `peer` is a registered weight peer; `None` is the owner's admin connection.
 fn client(
@@ -527,7 +527,7 @@ fn client(
     owner: &Shared,
     stopped: &AtomicBool,
     paths: &[PathBuf; 2],
-    service: &Arc<cozy_machine::service::Service>,
+    service: &Arc<tensord::service::Service>,
 ) -> io::Result<()> {
     let mut capabilities = HashSet::new();
     loop {

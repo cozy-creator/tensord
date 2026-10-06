@@ -1,5 +1,5 @@
 //! Compile the standalone native intake module without adding a second service owner.
-use cozy_machine::native_inputs;
+use tensord::native_inputs;
 
 #[test]
 fn journal_boundary_records_are_typed_and_tolerate_added_members() {

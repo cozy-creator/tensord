@@ -3,7 +3,7 @@
 //! the Go guardian restarts its request plane. A clean exit (a stop or an accepted release)
 //! ends it, and so does a second consecutive exit before readiness: measured progress, no timer.
 //! The parent is never replaced: an activated Runtime update runs as the service child
-//! (`cozy-machine service`, readiness pipe on fd 3), and a candidate that never proves
+//! (`tensord service`, readiness pipe on fd 3), and a candidate that never proves
 //! readiness is rolled back by this same parent.
 use nix::{
     errno::Errno,
@@ -68,7 +68,7 @@ pub fn supervise(paths: &super::update::Paths) -> io::Result<Ready> {
             std::process::exit(code);
         }
         if code == super::update::REPLACE_EXIT {
-            eprintln!("cozy-machine: starting the service on its updated software");
+            eprintln!("tensord: starting the service on its updated software");
             failures_before_ready = 0;
             continue;
         }
@@ -76,14 +76,14 @@ pub fn supervise(paths: &super::update::Paths) -> io::Result<Ready> {
         if failures_before_ready >= 2 {
             let cause = format!("the service exited twice before readiness ({code})");
             if super::update::rollback_pending(paths, &cause)? {
-                eprintln!("cozy-machine: {cause}; Runtime update rolled back");
+                eprintln!("tensord: {cause}; Runtime update rolled back");
                 failures_before_ready = 0;
                 continue;
             }
-            eprintln!("cozy-machine: {cause}; stopping");
+            eprintln!("tensord: {cause}; stopping");
             std::process::exit(code);
         }
-        eprintln!("cozy-machine: the service exited ({code}); starting it again");
+        eprintln!("tensord: the service exited ({code}); starting it again");
     }
 }
 
@@ -103,7 +103,7 @@ fn exec_service(binary: &std::path::Path, ready: std::os::fd::OwnedFd) -> ! {
     }
     std::mem::forget(ready);
     let error = std::process::Command::new(binary).arg("service").exec();
-    eprintln!("cozy-machine: cannot run {}: {error}", binary.display());
+    eprintln!("tensord: cannot run {}: {error}", binary.display());
     std::process::exit(1)
 }
 

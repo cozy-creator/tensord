@@ -1,7 +1,7 @@
 //! Executor lifecycle on real Runtime executors (the shipped SDK's generations of
 //! `tests/fixtures/cpu_lifecycle`), no doubles. CUDA is hidden by the seal; no torch.
 //! `COZY_MACHINE_LIFECYCLE_GENERATIONS` names the installed generations directory.
-use cozy_machine::{
+use tensord::{
     device_executor::{
         Baseline, Binding, Budgets, DeviceCommand, DeviceExecutor, EndedBeforeStart,
         ExecutorConfig, Frame,
@@ -335,7 +335,7 @@ fn retained_executors_killed_while_idle_lose_their_channel_before_any_handler() 
             Exact::open(&executor.birth).unwrap().unwrap().kill().unwrap();
             std::thread::sleep(Duration::from_secs(1));
             let error = invoke(&mut executor, &root, "next", "steps", steps.clone()).unwrap_err();
-            assert!(cozy_machine::device_executor::channel_lost(&error), "cycle {cycle}: {error}");
+            assert!(tensord::device_executor::channel_lost(&error), "cycle {cycle}: {error}");
             eprintln!("cycle {cycle}: {:?}: {error}", error.kind());
             assert_eq!(executor.terminate().unwrap().status.signal(), Some(libc::SIGKILL));
             fs::remove_dir_all(root).unwrap();
@@ -359,10 +359,10 @@ fn a_setsid_descendant_is_killed_with_its_executor_scope() {
         let reply = invoke(&mut executor, &root, "daemon", "daemon", json!({})).unwrap();
         assert_eq!(terminal(&reply), "succeeded", "{reply:?}");
         let spool = root.join("daemon");
-        let pid = cozy_machine::device_executor::read_result(&spool, &reply).unwrap()["pid"]
+        let pid = tensord::device_executor::read_result(&spool, &reply).unwrap()["pid"]
             .as_u64()
             .unwrap() as u32;
-        let daemon = cozy_machine::process::process_birth(pid).unwrap();
+        let daemon = tensord::process::process_birth(pid).unwrap();
         // Its own session: a process-group kill would miss it.
         let session = |pid: u32| {
             fs::read_to_string(format!("/proc/{pid}/stat")).unwrap().rsplit_once(") ").unwrap().1
@@ -410,7 +410,7 @@ fn pre_start_exit_is_a_typed_failure_with_its_stderr() {
 #[test]
 #[ignore = "root only: the SDK slot identity (uid 64000, gid 65533) in a rootful CPU container"]
 fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
-    use cozy_machine::launch_identity::LaunchIdentity;
+    use tensord::launch_identity::LaunchIdentity;
     use std::os::unix::fs::{chown, PermissionsExt};
     assert_eq!(unsafe { libc::geteuid() }, 0, "run as root");
     let identity = LaunchIdentity {
@@ -557,7 +557,7 @@ fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
         )
         .unwrap();
     assert_eq!(terminal(&reply), "succeeded", "{reply:?}");
-    let reach = cozy_machine::device_executor::read_result(&spool, &reply).unwrap();
+    let reach = tensord::device_executor::read_result(&spool, &reply).unwrap();
     println!("{}", serde_json::to_string(&reach).unwrap());
     assert_eq!(
         (reach["uid"].as_u64(), reach["gid"].as_u64()),

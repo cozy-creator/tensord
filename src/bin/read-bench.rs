@@ -3,7 +3,7 @@
 //! `cozy.machine.v1` Read and prints MB/s. Not proof of
 //! anything but the transport.
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use cozy_machine::{
+use tensord::{
     api::{
         capability::{mint, Grant, MACHINE},
         domain, v1,
@@ -91,7 +91,7 @@ fn seed(state: PathBuf, gib: u64, key_seed: &str) -> io::Result<()> {
     )?;
     journal.claim(&record.id)?;
     let mut holder = Command::new("sleep").arg("60").spawn()?;
-    let birth = cozy_machine::execution::process_birth(holder.id())?;
+    let birth = tensord::execution::process_birth(holder.id())?;
     journal.register_process(&record.id, ProcessBirth { ..birth })?;
     journal.running(&record.id, None)?;
     let product = domain::RunProduct {
@@ -104,7 +104,7 @@ fn seed(state: PathBuf, gib: u64, key_seed: &str) -> io::Result<()> {
         media_type: "application/octet-stream".into(),
         ..Default::default()
     };
-    journal.append_product(&record.id, None, &cozy_machine::products::encode(&product))?;
+    journal.append_product(&record.id, None, &tensord::products::encode(&product))?;
     journal.finish(&record.id, Outcome::Failed("bench output seeded".into()))?;
     let _ = holder.kill();
     let _ = holder.wait();

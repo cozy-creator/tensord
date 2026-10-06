@@ -15,7 +15,7 @@ fn fd_result(fd: i32) -> io::Result<File> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 pub fn memfd() -> io::Result<File> {
-    let name = CString::new("cozy-machine-weights").unwrap();
+    let name = CString::new("tensord-weights").unwrap();
     // SAFETY: valid NUL-terminated name, no borrowed output pointers.
     fd_result(unsafe {
         libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)

@@ -1,5 +1,5 @@
 //! CPU birth/journal proof only: this does not qualify a GPU or ordinary CLI inference.
-use cozy_machine::{
+use tensord::{
     execution::process_birth,
     journal::{
         Installation, Invocation, Journal, Outcome, Preparation, ProcessBirth, ResultRecord,
@@ -115,7 +115,7 @@ fn complete(journal: &mut Journal, n: usize, generation: &str, birth: ProcessBir
 
 #[test]
 fn restart_ends_processes_left_in_earlier_executor_scopes() {
-    use cozy_machine::scope::{namespace, Scope};
+    use tensord::scope::{namespace, Scope};
     use std::io::{Read, Write};
     let root = std::env::temp_dir().join(format!("machine-scope-sweep-{}", uuid::Uuid::new_v4()));
     let state = root.join("state");
@@ -136,13 +136,13 @@ fn restart_ends_processes_left_in_earlier_executor_scopes() {
     let mut daemon = String::new();
     leader.stdout.take().unwrap().read_to_string(&mut daemon).unwrap();
     assert!(leader.wait().unwrap().success());
-    let daemon = cozy_machine::process::process_birth(daemon.trim().parse().unwrap()).unwrap();
+    let daemon = tensord::process::process_birth(daemon.trim().parse().unwrap()).unwrap();
     assert_eq!(scope.processes().unwrap(), 1);
     // That machine is gone: nothing in this process claims the scope any more.
     let cgroup = scope.cgroup_relative().map(|relative| format!("/sys/fs/cgroup{relative}"));
     drop(scope);
     let service = Service::open(&state, &root.join("generations"), 1).unwrap();
-    assert!(cozy_machine::process::process_ended(&daemon).unwrap());
+    assert!(tensord::process::process_ended(&daemon).unwrap());
     if let Some(path) = cgroup {
         assert!(!std::path::Path::new(&path).exists());
     }

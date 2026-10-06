@@ -1,4 +1,4 @@
-use cozy_machine::api::{auth::VerifiedActor, domain, workspaces::WorkspaceUploads};
+use tensord::api::{auth::VerifiedActor, domain, workspaces::WorkspaceUploads};
 use std::{fs, io::Read, path::PathBuf, sync::Arc};
 use tensorfs_core::store::Store;
 

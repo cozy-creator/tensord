@@ -2,18 +2,18 @@ version: "3"
 silent: true
 
 tasks:
-  # A Runtime release runs this at the tag it pins (cozy-runtime `cozy-machine.tag`) and bundles the result into its
+  # A Runtime release runs this at the tag it pins (cozy-runtime `tensord.pin`) and bundles the result into its
   # Linux wheel. The container's glibc 2.28 is the floor that wheel's manylinux_2_28 tag promises.
   release:
-    desc: Release build of cozy-machine for linux x86_64 into OUT (default dist), stamped with HEAD
+    desc: Release build of tensord for linux x86_64 into OUT (default dist), stamped with HEAD
     vars:
       OUT: '{{.OUT | default "dist"}}'
     cmds:
       - |
         set -eu; test -z "$(git status --porcelain)" || { echo "commit first: the build is stamped with HEAD" >&2; exit 1; }
-        home=${CARGO_HOME:-$HOME/.cargo}; target=${CARGO_TARGET_DIR:-$PWD/target}/manylinux; mkdir -p "{{.OUT}}" "$target"
+        cargo_home=${CARGO_HOME:-$HOME/.cargo}; target=${CARGO_TARGET_DIR:-$PWD/target}/manylinux; mkdir -p "{{.OUT}}" "$target"
         cargo fetch --locked  # the host reads the private TensorFS; the container builds offline
-        docker run --rm --runtime=runc --user "$(id -u):$(id -g)" -e HOME=/tmp -e RUSTUP_HOME=/target/rustup -e COZY_MACHINE_COMMIT="$(git rev-parse HEAD)" \
-          -v "$home/registry:/cargo/registry" -v "$home/git:/cargo/git" -v "$PWD:/src:ro" -v "$target:/target" -w /src quay.io/pypa/manylinux_2_28_x86_64:2026.10.03-1 \
-          sh -c 'curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal --default-toolchain 1.91.1 >&2 && PATH=/tmp/.cargo/bin:$PATH CARGO_HOME=/cargo cargo build --release --locked --offline --target-dir /target --bin cozy-machine'
-        install -m 0755 "$target/release/cozy-machine" "{{.OUT}}/cozy-machine-linux-x86_64" && "{{.OUT}}/cozy-machine-linux-x86_64" version --json
+        docker run --rm --runtime=runc --user "$(id -u):$(id -g)" -e HOME=/tmp -e RUSTUP_HOME=/target/rustup -e TENSORD_COMMIT="$(git rev-parse HEAD)" \
+          -v "$cargo_home/registry:/cargo/registry" -v "$cargo_home/git:/cargo/git" -v "$PWD:/src:ro" -v "$target:/target" -w /src quay.io/pypa/manylinux_2_28_x86_64:2026.10.03-1 \
+          sh -c 'curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal --default-toolchain 1.91.1 >&2 && PATH=/tmp/.cargo/bin:$PATH CARGO_HOME=/cargo nice -n 19 cargo build --release --locked --offline --target-dir /target --bin tensord -j 2'
+        install -m 0755 "$target/release/tensord" "{{.OUT}}/tensord-linux-x86_64" && "{{.OUT}}/tensord-linux-x86_64" version --json

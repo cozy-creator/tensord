@@ -101,7 +101,7 @@ async fn get(url: &str, max: usize) -> io::Result<Bytes> {
     tokio::spawn(connection);
     let request = Request::get(path)
         .header("host", host)
-        .header("user-agent", "cozy-machine")
+        .header("user-agent", "tensord")
         .body(Empty::<Bytes>::new())
         .map_err(io::Error::other)?;
     let response = sender

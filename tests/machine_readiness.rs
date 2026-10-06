@@ -25,7 +25,7 @@ impl Drop for Machine {
 }
 
 fn boot(root: &Path, port: u16, key: Option<&[u8]>) -> Machine {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_cozy-machine"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tensord"));
     command
         .env_clear()
         .env("PATH", "/usr/bin:/bin")

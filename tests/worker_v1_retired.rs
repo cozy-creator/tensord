@@ -1,6 +1,6 @@
 //! The machine's real listener serves cozy.machine.v1 only. A worker.v1 client is told to
 //! upgrade in words released CLI 0.1.26 prints (it reads UNIMPLEMENTED as a machine too old).
-use cozy_machine::api::{self, domain, retired, v1, MachineIdentity};
+use tensord::api::{self, domain, retired, v1, MachineIdentity};
 use ed25519_dalek::SigningKey;
 use std::sync::Arc;
 use tonic::{

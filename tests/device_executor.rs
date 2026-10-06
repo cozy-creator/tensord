@@ -1,5 +1,5 @@
 //! Actual released Runtime executors and installed classifier package, no handler doubles.
-use cozy_machine::{device_executor, launch_identity::Seal};
+use tensord::{device_executor, launch_identity::Seal};
 
 use device_executor::{
     postprocess, read_result, Baseline, Binding, Budgets, DeviceCommand, DeviceExecutor,
@@ -331,7 +331,7 @@ fn stock_executor_deferred_webp_reuses_sdk_encoder_and_exact_asset_binding() {
 #[test]
 #[ignore = "actual SDK receiver custody gate needs installed current generation"]
 fn retained_source_is_released_only_after_actual_receiver_exit() {
-    use cozy_machine::execution::process_ended;
+    use tensord::execution::process_ended;
     use fs2::FileExt;
     use std::time::{Duration, Instant};
     let (mut executor, root) = prepared(

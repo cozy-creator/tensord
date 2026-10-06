@@ -114,7 +114,7 @@ fn mint_leaf() -> io::Result<(String, String)> {
     let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).map_err(io::Error::other)?;
     let mut params = CertificateParams::new(vec![SERVER_NAME.into()]).map_err(io::Error::other)?;
     let mut name = DistinguishedName::new();
-    name.push(DnType::CommonName, "cozy-machine");
+    name.push(DnType::CommonName, "tensord");
     params.distinguished_name = name;
     params.not_before = time::OffsetDateTime::now_utc() - time::Duration::minutes(5);
     params.not_after = rcgen::date_time_ymd(9999, 12, 31);

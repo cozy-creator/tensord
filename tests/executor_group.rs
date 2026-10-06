@@ -3,7 +3,7 @@
 //! (no torch is installed, so no device is touched) in the executor's own words, and teardown
 //! leaves no member of the group. `COZY_MACHINE_GROUP_GENERATIONS` names the installed
 //! generations directory.
-use cozy_machine::{
+use tensord::{
     device_executor::{Baseline, DeviceCommand, DeviceExecutor, ExecutorConfig},
     journal::ProcessBirth,
     launch_identity::Seal,
@@ -192,7 +192,7 @@ fn a_degree_the_seal_does_not_name_is_refused_before_any_follower() {
 #[test]
 #[ignore = "needs a fork/1 cpu_group generation with CPU torch"]
 fn a_forked_rank_zero_takes_the_group_seal_and_spawns_its_follower() {
-    use cozy_machine::device_executor::{Forked, FORK};
+    use tensord::device_executor::{Forked, FORK};
     let root_dir = PathBuf::from(
         std::env::var("COZY_MACHINE_GROUP_FORK_GENERATIONS").expect("fork/1 generation"),
     );

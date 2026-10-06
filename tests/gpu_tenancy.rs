@@ -6,7 +6,7 @@
 //! `entrypoint`, `input`, `output` (JSON lines) and `packages`: two published packages
 //! (`{package, release}`) of different publishers that bind the same checkpoint. On a card
 //! with room for both executors.
-use cozy_machine::{
+use tensord::{
     gpu_service::{GpuConfig, GpuPool},
     journal::{Execution, Preparation, State, SubmissionContext},
     process::process_ended,
@@ -267,7 +267,7 @@ fn submitters_share_a_packages_executor_and_packages_share_a_checkpoints_weights
     // nothing.
     let birth = second.process.clone().unwrap();
     assert_eq!(
-        cozy_machine::execution::process_birth(birth.pid).unwrap(),
+        tensord::execution::process_birth(birth.pid).unwrap(),
         birth
     );
     // SAFETY: the exact process this test's pool started, by its recorded birth.

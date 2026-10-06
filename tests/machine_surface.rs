@@ -1,6 +1,6 @@
 //! The real `cozy-machine serve` process behind its TLS/gRPC API, called as the CLI calls it.
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use cozy_machine::journal::Journal;
+use tensord::journal::Journal;
 use ed25519_dalek::SigningKey;
 use std::{
     collections::BTreeMap,
@@ -93,7 +93,7 @@ fn actor_of(key: &[u8; 32]) -> String {
 fn launch(root: &Path, extra: &[std::ffi::OsString]) -> (Child, String) {
     let state = root.join("state");
     let _ = fs::remove_file(state.join("api-ready.json"));
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cozy-machine"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tensord"))
         .args(["serve", "--state"])
         .arg(&state)
         .arg("--machine-config")
@@ -159,7 +159,7 @@ print(json.dumps({"identity": generation.identity}))
     .unwrap();
     Journal::open(&state.join("execution"))
         .unwrap()
-        .bind_installation(cozy_machine::journal::Installation {
+        .bind_installation(tensord::journal::Installation {
             actor: actor.into(),
             alias: "fixture".into(),
             generation: identity.into(),
@@ -172,7 +172,7 @@ print(json.dumps({"identity": generation.identity}))
 
 mod v1_api {
     use super::*;
-    use cozy_machine::api::{
+    use tensord::api::{
         capability::{mint, Grant, MACHINE},
         v1,
     };
@@ -479,7 +479,7 @@ mod v1_api {
             let mut journal = Journal::open(&state.join("execution")).unwrap();
             let held = journal.installations(actor).unwrap().remove(0);
             journal
-                .bind_installation(cozy_machine::journal::Installation {
+                .bind_installation(tensord::journal::Installation {
                     actor: actor_of(&OTHER),
                     ..held
                 })
@@ -1506,7 +1506,7 @@ mod v1_api {
             .map(|g| g.path().join("env/bin/python"))
             .find(|p| p.exists())
             .unwrap();
-        let (digest, callees) = cozy_machine::published::describe_environment(
+        let (digest, callees) = tensord::published::describe_environment(
             python.to_str().unwrap(),
             "cozy-machine-cpu-caller",
             "",

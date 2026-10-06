@@ -1,5 +1,5 @@
 //! Real process/socket/filesystem checks, not full Runtime/CLI qualification.
-use cozy_machine::{execution, journal};
+use tensord::{execution, journal};
 
 use execution::{process_birth, Engine, RunnerConfig};
 use journal::{Invocation, Journal, State};
@@ -821,7 +821,7 @@ fn actual_owner_death_kills_its_runner_then_fails_without_repeating_effects() {
             .unwrap();
     assert_eq!(observed.completed_units, 1);
     let birth = record.process.unwrap();
-    let runner = cozy_machine::process::Exact::open(&birth).unwrap();
+    let runner = tensord::process::Exact::open(&birth).unwrap();
     owner.0.kill().unwrap();
     owner.0.wait().unwrap();
     // Parent-death SIGKILL: authored code does not outlive the machine that owns it.
@@ -1140,7 +1140,7 @@ fn a_failed_cpu_run_keeps_a_triage_bundle_with_the_runner_stderr() {
 
 #[test]
 fn caches_expire_but_held_named_and_uncollected_work_stays() {
-    use cozy_machine::{catalog::Catalog, reclaim};
+    use tensord::{catalog::Catalog, reclaim};
     let fixture = Fixture::new();
     // Two completed runs: one collected by its client, one not.
     let collected = fixture.submit("infer");

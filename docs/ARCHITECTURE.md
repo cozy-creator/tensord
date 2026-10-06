@@ -1,6 +1,6 @@
 # Architecture
 
-`cozy-machine` is the machine: one Rust process that owns the API, the execution journal,
+`tensord` is the machine: one Rust process that owns the API, the execution journal,
 scheduling, the TensorFS store (sole writer) and executor supervision. Package code runs in
 Python executors (cozy-runtime) inside each package environment. The machine never loads CUDA;
 executors own their device contexts. NVML is read only on each GPU's sampler thread (`memory`).
@@ -131,7 +131,7 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 ## Build and test
 
 ```sh
-export CARGO_TARGET_DIR=~/cozy/.cargo-target/cozy-machine
+export CARGO_TARGET_DIR=~/cozy/.cargo-target/tensord
 L=~/cozy_v2/outputs/cozy-machine-takeover-20261002/locks
 flock $L/rust-build.lock nice -n 19 cargo clippy --all-targets -j 2 -- -D warnings
 flock $L/rust-build.lock nice -n 19 cargo test -j 2 -- --test-threads=2

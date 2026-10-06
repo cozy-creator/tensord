@@ -3,7 +3,7 @@
 //! the paused one its children's results); the first tier of every pressured sweep
 //! (`gc::collect`, run here in the process that owns the store, as the machine runs it) then
 //! collects whatever nothing holds. Both runs are resumed and must finish whole.
-use cozy_machine::{
+use tensord::{
     api::install::InstallerConfig,
     execution::Engine,
     jobs::Jobs,

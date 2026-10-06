@@ -4,7 +4,7 @@
 mod common;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use cozy_machine::api::{
+use tensord::api::{
     capability::{self, Grant},
     v1::{self, machine_client::MachineClient},
 };
@@ -54,7 +54,7 @@ fn free_port() -> u16 {
 
 fn spawn(root: &Path, port: u16, store: Option<&Path>, stderr: Stdio) -> Child {
     let owner = SigningKey::from_bytes(&OWNER).verifying_key();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_cozy-machine"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tensord"));
     command
         .env_clear()
         .env("PATH", "/usr/bin:/bin")

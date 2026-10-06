@@ -1,5 +1,5 @@
 //! Native cancellation uses real SQLite transactions and the TLS machine API. No SDK/GPU needed.
-use cozy_machine::{
+use tensord::{
     api::{
         self,
         auth::VerifiedActor,
@@ -104,9 +104,9 @@ impl Server {
         )
         .unwrap();
         let paths =
-            cozy_machine::machine::update::Paths::new(&root.join("state"), &root.join("image"));
+            tensord::machine::update::Paths::new(&root.join("state"), &root.join("image"));
         identity.updates = Some(
-            cozy_machine::machine::update::Updates::open(paths, Box::new(|| true), None).unwrap(),
+            tensord::machine::update::Updates::open(paths, Box::new(|| true), None).unwrap(),
         );
         let pem = identity.cert_pem.clone();
         let mut backend = NativeBackend::new(service.clone(), identity.authority.clone(), store);
@@ -266,10 +266,10 @@ async fn canceled_ids_refuse_updates_and_another_actors_update_never_shadows_the
     server.stop().await;
     // The update payload journal remains machine-wide; its retained status must not shadow
     // another signer's canceled ordinary run with the same text ID.
-    let status = cozy_machine::machine::update::Status {
+    let status = tensord::machine::update::Status {
         operation: "shared".into(),
         state: "succeeded".into(),
-        history: vec![cozy_machine::machine::update::Step {
+        history: vec![tensord::machine::update::Step {
             state: "succeeded".into(),
             at_ms: 1,
         }],

@@ -1,5 +1,5 @@
 //! Owned CPU installation component gate, not a public machine intake route.
-use cozy_machine::api::{
+use tensord::api::{
     auth::VerifiedActor,
     install::{prepare_uploaded, InstallerConfig},
     domain,

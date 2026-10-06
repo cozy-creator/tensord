@@ -211,9 +211,18 @@ mod tests {
     use super::*;
     #[test]
     fn truncated_descriptor_batch_closes_delivered_prefix() {
+        use std::os::unix::fs::MetadataExt;
         let (send, receive) = UnixStream::pair().unwrap();
         let file = crate::os::memfd().unwrap();
-        let baseline = std::fs::read_dir("/proc/self/fd").unwrap().count();
+        let identity = file.metadata().unwrap();
+        let owned_descriptors = || {
+            std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(|entry| std::fs::metadata(entry.ok()?.path()).ok())
+                .filter(|entry| entry.dev() == identity.dev() && entry.ino() == identity.ino())
+                .count()
+        };
+        let baseline = owned_descriptors();
         let rights = vec![file.as_raw_fd(); 32];
         sendmsg::<()>(
             send.as_raw_fd(),
@@ -224,9 +233,6 @@ mod tests {
         )
         .unwrap();
         assert!(recv_fd(&receive).is_err());
-        assert_eq!(
-            std::fs::read_dir("/proc/self/fd").unwrap().count(),
-            baseline
-        );
+        assert_eq!(owned_descriptors(), baseline);
     }
 }

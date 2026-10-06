@@ -23,16 +23,16 @@ uv run --locked --extra test pytest -q
 ## Release
 
 The version is `Cargo.toml`'s; a release is the tag `v<version>`, cut on the commit the gates ran
-on. This repository publishes nothing: cozy-runtime's `cozy-machine.pin` names that commit for
+on. This repository publishes nothing: cozy-runtime's `tensord.pin` names that commit for
 candidates and the tag at publish. The Runtime build runs `task release` (manylinux_2_28
 container: glibc 2.28 floor, `version --json` names the commit) and bundles the binary into its
-Linux x86_64 wheel as `cozy-machine`. Worker images and `cozy machine install` take it from there.
+Linux x86_64 wheel as `tensord`. Worker images and `cozy machine install` take it from there.
 
 ## Run
 
 ```sh
-target/debug/cozy-machine version --json
-target/debug/cozy-machine serve --state PATH [--generations PATH] [--host-bytes N] \
+target/debug/tensord version --json
+target/debug/tensord serve --state PATH [--generations PATH] [--host-bytes N] \
   [--cpu-parallelism N] [--gpu-config FILE] [--machine-config FILE --listen ADDR]
 ```
 

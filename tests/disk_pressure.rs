@@ -2,7 +2,7 @@
 //! bytes an unlink frees count, local caches go before models, compiled kernels last.
 //! The disk's free space is each test's own figure (it cannot fill a real filesystem); what
 //! is deleted, and what that frees, is real.
-use cozy_machine::{
+use tensord::{
     catalog::Catalog,
     execution::Engine,
     journal::{Invocation, Outcome},

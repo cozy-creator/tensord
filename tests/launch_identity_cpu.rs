@@ -1,5 +1,5 @@
 //! Real installed SDK trampoline CPU proof; no executor/model/GPU imports.
-use cozy_machine::launch_identity::{trampoline, LaunchIdentity};
+use tensord::launch_identity::{trampoline, LaunchIdentity};
 use serde_json::Value;
 use std::{fs, path::PathBuf};
 
@@ -101,7 +101,7 @@ fn pool_launcher_keeps_retained_child_usable_after_requesting_thread_exits() {
         sync::Arc,
     };
     let python = PathBuf::from(std::env::var("COZY_MACHINE_CPU_TEST_PYTHON").unwrap());
-    let launcher = Arc::new(cozy_machine::child_launcher::ChildLauncher::new().unwrap());
+    let launcher = Arc::new(tensord::child_launcher::ChildLauncher::new().unwrap());
     let owner = launcher.clone();
     let (mut child,mut stdout)=std::thread::spawn(move || {
         let mut command=trampoline(&python, None, None).unwrap();
