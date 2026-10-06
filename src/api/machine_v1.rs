@@ -13,7 +13,7 @@ use crate::gpu_service::Level;
 use serde_json::Value;
 use std::{
     collections::HashMap,
-    io::Read,
+    io::{Read, Seek, SeekFrom},
     pin::Pin,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -750,7 +750,7 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
         let request = request.into_inner();
         let actor = caller.actor;
         let (offset, if_rev) = (request.offset, request.if_rev);
-        let (meta, bytes): (v1::ReadFrame, Box<dyn Read + Send>) = match request.target {
+        let (meta, bytes): (v1::ReadFrame, Bytes) = match request.target {
             Some(v1::read_request::Target::Output(target)) => {
                 let index = (target.index > 0).then_some(target.index);
                 caller.run(&target.run, Some((&target.output, index)))?;
@@ -775,11 +775,7 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
                     media_type: snapshot.media_type.clone(),
                     data: vec![],
                 };
-                let reader = snapshot.parts.into_iter().fold(
-                    Box::new(std::io::empty()) as Box<dyn Read + Send>,
-                    |chain, (file, length)| Box::new(chain.chain(file.take(length))),
-                );
-                (meta, reader)
+                (meta, Bytes::Parts(snapshot.parts))
             }
             Some(v1::read_request::Target::Triage(run)) => {
                 caller.run(&run, None)?;
@@ -804,7 +800,7 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
                     media_type: "application/json".into(),
                     data: vec![],
                 };
-                (meta, Box::new(std::io::Cursor::new(bytes)))
+                (meta, Bytes::Held(bytes))
             }
             Some(v1::read_request::Target::Log(name)) => {
                 caller.machine()?;
@@ -835,22 +831,19 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
                     media_type: "text/plain".into(),
                     data: vec![],
                 };
-                (meta, Box::new(std::io::Cursor::new(bytes)))
+                (meta, Bytes::Held(bytes))
             }
             None => return Err(Status::invalid_argument("read names a target")),
         };
         if offset > meta.length {
             return Err(Status::out_of_range("offset is past the end"));
         }
+        let bytes = from_offset(bytes, offset).map_err(|e| Status::data_loss(e.to_string()))?;
         let (sender, receiver) = tokio::sync::mpsc::channel(4);
         tokio::task::spawn_blocking(move || {
             let (mut bytes, mut left) = (bytes, meta.length - offset);
             let ended_early = || Err(Status::data_loss("output bytes ended early"));
             if sender.blocking_send(Ok(meta)).is_err() {
-                return;
-            }
-            if std::io::copy(&mut (&mut bytes).take(offset), &mut std::io::sink()).ok() != Some(offset) {
-                let _ = sender.blocking_send(ended_early());
                 return;
             }
             let mut buffer = vec![0; 1 << 20];
@@ -983,9 +976,94 @@ pub(super) async fn stream_run<B: MachineBackend>(
     }
 }
 
+/// What a Read answers: an output's parts on disk, or bytes held in memory.
+enum Bytes {
+    Parts(Vec<(std::fs::File, u64)>),
+    Held(Vec<u8>),
+}
+
+/// The bytes from `offset`. Parts before it are skipped and the part it falls in is seeked
+/// into, so a resumed download costs the machine only its tail.
+fn from_offset(bytes: Bytes, mut offset: u64) -> std::io::Result<Box<dyn Read + Send>> {
+    let parts = match bytes {
+        Bytes::Held(held) => {
+            let mut cursor = std::io::Cursor::new(held);
+            cursor.set_position(offset);
+            return Ok(Box::new(cursor));
+        }
+        Bytes::Parts(parts) => parts,
+    };
+    let mut reader: Box<dyn Read + Send> = Box::new(std::io::empty());
+    for (mut file, length) in parts {
+        if offset >= length {
+            offset -= length;
+            continue;
+        }
+        file.seek(SeekFrom::Current(offset as i64))?;
+        reader = Box::new(reader.chain(file.take(length - offset)));
+        offset = 0;
+    }
+    Ok(reader)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A read from any offset answers exactly the bytes after it, across parts, and reads
+    /// none before it: the parts it skips are not read at all.
+    #[test]
+    fn a_read_from_an_offset_reads_only_the_tail() {
+        let root = std::env::temp_dir().join(format!("cm-read-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let lengths = [3u64, 0, 4 << 20, 5];
+        let mut whole = vec![];
+        for (i, length) in lengths.iter().enumerate() {
+            let bytes: Vec<u8> = (0..*length).map(|b| (b % 251) as u8 ^ i as u8).collect();
+            std::fs::write(root.join(i.to_string()), &bytes).unwrap();
+            whole.extend(bytes);
+        }
+        let parts = || {
+            let open = |i: usize| std::fs::File::open(root.join(i.to_string())).unwrap();
+            lengths
+                .iter()
+                .enumerate()
+                .map(|(i, l)| (open(i), *l))
+                .collect()
+        };
+        let total = whole.len() as u64;
+        for offset in [0, 1, 3, 4, 2 << 20, total - 5, total - 1, total] {
+            let mut read = vec![];
+            from_offset(Bytes::Parts(parts()), offset)
+                .unwrap()
+                .read_to_end(&mut read)
+                .unwrap();
+            assert_eq!(read, whole[offset as usize..], "from {offset}");
+        }
+        // This thread's read syscalls carry the tail, not the 4 MiB before it.
+        let read_bytes = || {
+            let io = std::fs::read_to_string("/proc/thread-self/io").unwrap();
+            let line = io.lines().find(|l| l.starts_with("rchar:")).unwrap();
+            line[6..].trim().parse::<u64>().unwrap()
+        };
+        let opened = parts();
+        let before = read_bytes();
+        let mut tail = vec![];
+        from_offset(Bytes::Parts(opened), total - 5)
+            .unwrap()
+            .read_to_end(&mut tail)
+            .unwrap();
+        let read = read_bytes() - before;
+        assert!(read < 4096, "a read of 5 bytes read {read}");
+        assert_eq!(tail, whole[whole.len() - 5..]);
+        let mut held = vec![];
+        from_offset(Bytes::Held(b"triage".to_vec()), 2)
+            .unwrap()
+            .read_to_end(&mut held)
+            .unwrap();
+        assert_eq!(held, b"iage");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn authored() -> v1::RunSpec {
         let input = |field: &str, hex: &str, order| v1::InputFile {
