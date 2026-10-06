@@ -9,8 +9,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-/// Pinned CPU bytes Runtime holds outside TensorD's tier (its own staging buffers or an older
-/// peer's store-reading path). Adopting a sealed layout page-locks the shared pages instead.
+/// Pinned CPU bytes Runtime holds outside TensorD's tier: page-locked copies of the sealed
+/// regions it streams where its GPU will not lock the shared pages (consumer GPUs). Invisible in
+/// its PSS, so only what it reports counts.
 #[derive(Default)]
 pub struct HostLedger {
     private: Mutex<BTreeMap<String, u64>>,
@@ -25,7 +26,7 @@ impl HostLedger {
         };
     }
 
-    fn private_total(&self) -> u64 {
+    pub fn private_total(&self) -> u64 {
         self.private.lock().unwrap().values().sum()
     }
 }
