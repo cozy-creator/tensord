@@ -5,7 +5,8 @@ from __future__ import annotations
 import msgspec
 
 from cozy_runtime.author import App, Context, ImageAsset, Outputs
-from cpu_memo import Probe, greet, measure, nested, paint, restricted
+from cozy_runtime.derive.operations import QuantizationPlan, quantize
+from cpu_memo import Probe, greet, measure, nested, paint, produce, restricted
 
 app = App()
 
@@ -70,3 +71,22 @@ async def portrait(ctx: Context, payload: Sitting, out: Outputs) -> Portraits:
 
 
 app.job(portrait, emits_media=True)
+
+
+class Requantize(msgspec.Struct):
+    encoding: str = "fp8-rowwise/1"
+
+
+class Requantized(msgspec.Struct):
+    source: str
+    result: str
+
+
+async def requantize(ctx: Context, payload: Requantize) -> Requantized:
+    """The Runtime's own quantize operation, called on another package's model."""
+    source = await produce()
+    result = await quantize(source=source, plan=QuantizationPlan(components=("body",)), encoding=payload.encoding)
+    return Requantized(source.manifest.digest, result.manifest.digest)
+
+
+app.job(requantize)

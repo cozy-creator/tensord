@@ -1584,6 +1584,28 @@ mod v1_api {
             seen.push(digest);
         }
         assert_ne!(seen[0], seen[1], "each reference is its own image");
+        // The Runtime's own operations are callees of every environment: a job quantizes
+        // another package's model with the Runtime's `quantize`, as a child run of its own.
+        let mut requantize = spec.clone();
+        requantize.entrypoint = "requantize".into();
+        requantize.payload = b"{}".to_vec();
+        let events = collect(client.run(authorized(v1::RunRequest {
+            id: "requantize-1".into(), after: 0, spec: Some(requantize),
+        }, &all)).await.unwrap().into_inner()).await.unwrap();
+        let done = outcome(&events);
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        let calls: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.event {
+                Some(v1::run_event::Event::Call(call)) => Some(call.function.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls, ["produce", "quantize"], "{events:?}");
+        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        let (source, quantized) = (result["source"].as_str().unwrap(), result["result"].as_str().unwrap());
+        assert!(source.starts_with("sha256:") && quantized.starts_with("sha256:"), "{result}");
+        assert_ne!(source, quantized, "quantize wrote a model of its own");
         let mut nested = spec.clone();
         nested.entrypoint = "relay_nested".into();
         let events = collect(client.run(authorized(v1::RunRequest {

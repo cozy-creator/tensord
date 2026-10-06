@@ -11,6 +11,10 @@ from .package_records import (Callee, Describe, DescribeEnvironment, DescribeIns
                               DescribedEnvironment, DescribeFailed)
 
 
+#: The package a Runtime's built-in operations run as (the Runtime's rows name them `builtin`).
+BUILTIN_PACKAGE = "runtime/operations"
+
+
 class Undescribed(Exception):
     def __init__(self, code: str, detail: str):
         self.code = code
@@ -36,6 +40,14 @@ def environment(root: str, packages: dict[str, str], hub_origin: str) -> Describ
         callees.append(Callee(name, distribution.version, applications[0].value,
                               msgspec.Raw(msgspec.json.encode(document)), record_digest(distribution),
                               package_name(distribution, packages, hub_origin)))
+    runtime = found.get("cozy-runtime")
+    if runtime is not None and hasattr(static_interface, "build_builtin"):
+        # The Runtime's own operations (quantize, prepare_model) are an App every environment
+        # holds: a job calls them as child runs, keyed by this Runtime's exact install.
+        document = static_interface.build_builtin("operations")
+        callees.append(Callee("cozy-runtime-operations", runtime.version, document["application"],
+                              msgspec.Raw(msgspec.json.encode(document)), record_digest(runtime),
+                              BUILTIN_PACKAGE))
     return DescribedEnvironment(record_digest(found.get(normalized(root))), callees)
 
 

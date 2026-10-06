@@ -1237,10 +1237,12 @@ fn invocables(
     // A callee module's typed callers need only its own callables: its first row carries that
     // part of its App's interface, so the whole App travels once, not once per export.
     let mut documented = std::collections::HashSet::new();
-    let apps = std::iter::once((application, own))
-        .chain(std::iter::once((generation.application.as_str(), &generation.interface)))
-        .chain(generation.callees.iter().map(|c| (c.application.as_str(), &c.interface)));
-    for (owner, interface) in apps {
+    let apps = std::iter::once((application, own, false))
+        .chain(std::iter::once((generation.application.as_str(), &generation.interface, false)))
+        .chain(generation.callees.iter().map(|c| {
+            (c.application.as_str(), &c.interface, c.package == crate::catalog::BUILTIN_PACKAGE)
+        }));
+    for (owner, interface, builtin) in apps {
         let own = owner == application;
         for (declared, entry, kind) in declarations(interface) {
             let (Some(module), Some(export), Some(name)) = (
@@ -1268,8 +1270,10 @@ fn invocables(
                 interface_path: if own { path.into() } else { PathBuf::new() },
                 self_call: own,
                 kind: kind.into(),
-                interface_document: (!own && documented.insert(module.to_string()))
+                // The Runtime binds its own operations from its own code, not a document.
+                interface_document: (!own && !builtin && documented.insert(module.to_string()))
                     .then(|| module_interface(interface, module)),
+                builtin: (builtin && !own).then(|| "operations".into()),
             });
         }
     }
