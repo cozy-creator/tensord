@@ -86,6 +86,9 @@ class LongFormOutput(msgspec.Struct):
     attempts: int = 1
     #: Segment checkpoints an earlier attempt had already declared.
     replayed: int = 0
+    #: Each segment's file as its child returned it, published as it lands (H3 shows each
+    #: reference its qwen-image-2 callee generates this way).
+    rendered: list[Video] = msgspec.field(default_factory=list)
 
 
 async def long_form(
@@ -101,7 +104,7 @@ async def long_form(
     counted = state / "attempts"
     attempts = int(counted.read_text()) + 1 if counted.exists() else 1
     counted.write_text(str(attempts))
-    film, context, replayed, parts = b"", "", 0, []
+    film, context, replayed, parts, rendered = b"", "", 0, [], []
     on_segment = tel.step_callback(len(payload.segments), stage="segments")
     for index, prompt in enumerate(payload.segments):
         ctx.raise_if_cancelled()
@@ -130,6 +133,8 @@ async def long_form(
             context = result.context
             parts.append(out.save_bytes(result.video.read_bytes(), media_type="video/mp4"))
             out.publish("parts", parts[-1], label=f"Segment {index + 1}")
+            out.publish("rendered", result.video, label=f"Segment {index + 1} as rendered")
+            rendered.append(result.video)
             kept = state / f"film-{index}"
             kept.write_bytes(film)
             replayed += checkpoints.declare(f"film-{index}", kept).replayed
@@ -143,6 +148,7 @@ async def long_form(
         parts=parts,
         attempts=attempts,
         replayed=replayed,
+        rendered=rendered,
     )
 
 
