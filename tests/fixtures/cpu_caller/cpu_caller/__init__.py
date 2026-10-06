@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import msgspec
 
-from cozy_runtime.author import App, Context
-from cpu_memo import Probe, greet, measure, nested, restricted
+from cozy_runtime.author import App, Context, ImageAsset, Outputs
+from cpu_memo import Probe, greet, measure, nested, paint, restricted
 
 app = App()
 
@@ -48,3 +48,25 @@ async def relay_restricted(ctx: Context, payload: Relay) -> Relayed:
 
 
 app.job(relay_restricted)
+
+
+class Sitting(msgspec.Struct):
+    names: list[str]
+
+
+class Portraits(msgspec.Struct):
+    references: list[ImageAsset]
+
+
+async def portrait(ctx: Context, payload: Sitting, out: Outputs) -> Portraits:
+    """H3's long_form references: each image another package's entrypoint returns is shown as
+    this job's own output the moment it exists, and returned at the end."""
+    references = []
+    for index, name in enumerate(payload.names):
+        result = await paint(prompt=name, shade=40 * (index + 1))
+        out.publish("references", result.image, label=f"Reference: {name}")
+        references.append(result.image)
+    return Portraits(references)
+
+
+app.job(portrait, emits_media=True)
