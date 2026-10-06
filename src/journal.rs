@@ -370,6 +370,9 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS run_objects(execution INTEGER NOT NULL REFERENCES executions(id),sha256 TEXT NOT NULL,length INTEGER NOT NULL,PRIMARY KEY(execution,sha256));
             CREATE INDEX IF NOT EXISTS run_objects_digest ON run_objects(sha256);
             CREATE TABLE IF NOT EXISTS job_contexts(execution INTEGER PRIMARY KEY REFERENCES executions(id),record BLOB NOT NULL);
+            CREATE TABLE IF NOT EXISTS held_memos(actor TEXT NOT NULL,computation TEXT NOT NULL,record BLOB NOT NULL,PRIMARY KEY(actor,computation));
+            CREATE TABLE IF NOT EXISTS held_memo_objects(actor TEXT NOT NULL,computation TEXT NOT NULL,sha256 TEXT NOT NULL,PRIMARY KEY(actor,computation,sha256));
+            CREATE INDEX IF NOT EXISTS held_memo_objects_digest ON held_memo_objects(sha256);
             CREATE TABLE IF NOT EXISTS checkpoints(execution INTEGER NOT NULL REFERENCES executions(id),operation_key TEXT NOT NULL,logical_key TEXT NOT NULL,content_digest TEXT NOT NULL,length INTEGER NOT NULL,attempt INTEGER NOT NULL,receipt TEXT NOT NULL,at_ms INTEGER NOT NULL,PRIMARY KEY(execution,operation_key,logical_key));
             CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_request ON executions(actor,request_id) WHERE actor IS NOT NULL;
             CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_submission ON executions(actor,submission_id) WHERE actor IS NOT NULL;
@@ -726,6 +729,37 @@ impl Journal {
         Ok(())
     }
     /// The length of an object this signer wrote (`objects`), or None.
+    /// A memoized call's result with files, reusable while this machine holds every file:
+    /// the child's result record, keyed by its signer and computation.
+    pub fn hold_memo(&mut self, actor: &str, computation: &str, record: &[u8], objects: &[String]) -> io::Result<()> {
+        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_error)?;
+        tx.execute("INSERT OR REPLACE INTO held_memos(actor,computation,record) VALUES(?1,?2,?3)",
+            params![actor, computation, record]).map_err(db_error)?;
+        tx.execute("DELETE FROM held_memo_objects WHERE actor=?1 AND computation=?2", params![actor, computation])
+            .map_err(db_error)?;
+        for sha256 in objects {
+            tx.execute("INSERT OR IGNORE INTO held_memo_objects(actor,computation,sha256) VALUES(?1,?2,?3)",
+                params![actor, computation, sha256]).map_err(db_error)?;
+        }
+        tx.commit().map_err(db_error)
+    }
+    pub fn held_memo(&self, actor: &str, computation: &str) -> io::Result<Option<Vec<u8>>> {
+        self.connection
+            .query_row("SELECT record FROM held_memos WHERE actor=?1 AND computation=?2",
+                params![actor, computation], |r| r.get(0))
+            .optional()
+            .map_err(db_error)
+    }
+    /// Every held memo naming `sha256` goes with it (its file is no longer this machine's).
+    pub fn drop_held_memos(&mut self, sha256: &str) -> io::Result<usize> {
+        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_error)?;
+        let dropped = tx.execute("DELETE FROM held_memos WHERE (actor,computation) IN
+            (SELECT actor,computation FROM held_memo_objects WHERE sha256=?1)", params![sha256]).map_err(db_error)?;
+        tx.execute("DELETE FROM held_memo_objects WHERE (actor,computation) NOT IN
+            (SELECT actor,computation FROM held_memos)", []).map_err(db_error)?;
+        tx.commit().map_err(db_error)?;
+        Ok(dropped)
+    }
     pub fn object(&self, actor: &str, sha256: &str) -> io::Result<Option<u64>> {
         self.connection
             .query_row(

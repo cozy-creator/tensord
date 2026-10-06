@@ -159,6 +159,7 @@ fn film(manifest: &str, reference: &(String, u64), segments: &[&str], hold_at: i
         publication: String::new(),
         owner: ACTOR.into(),
         known: vec![],
+        held: None,
         application: String::new(),
         digest: format!("{}-{hold_at}", reference.0),
     }

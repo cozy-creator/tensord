@@ -10,7 +10,7 @@ import msgspec
 import tensorfs
 from tensorfs.derived import Derivation, Part, Target, Tensor
 
-from cozy_runtime.author import (App, Context, ImageAsset, ImageFrame, ModelArtifact, Outputs, WeightsOutput,
+from cozy_runtime.author import (App, Context, FileAsset, ImageAsset, ImageFrame, ModelArtifact, Outputs, WeightsOutput,
                                  invocable)
 
 app = App()
@@ -117,3 +117,19 @@ async def produce(ctx: Context) -> ModelArtifact:
 
 
 app.job(produce, weights=(WeightsOutput("model", max_new_bytes=65536),))
+
+
+class Noted(msgspec.Struct):
+    file: FileAsset
+    value: int
+
+
+@invocable(memoize=True)
+async def note(ctx: Context, *, payload: Probe, out: Outputs) -> Noted:
+    """A memoized call whose result is a file: counted each time it truly runs."""
+    counter = Path(payload.counter)
+    counter.write_text(str(int(counter.read_text()) + 1 if counter.exists() else 1))
+    return Noted(out.save_bytes(f"note {payload.value}".encode(), media_type="text/plain"), payload.value)
+
+
+app.job(note)

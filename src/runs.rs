@@ -70,6 +70,8 @@ pub struct Spec {
     /// Memoized calls' results the caller already holds: (computation digest, result JSON).
     /// A job's calls are answered from them; a child's one entry is its answer.
     pub known: Vec<(String, String)>,
+    /// A child's memoized result this machine holds with its files: its answer.
+    pub held: Option<ResultRecord>,
     /// A child run of a callee: the other package's App its parent's environment holds.
     pub application: String,
     /// The spec's identity (its token excluded): a resubmitted id must carry the same.
@@ -501,7 +503,10 @@ impl Runs {
     /// The run's code and models made ready: Ok(None) once it is dispatchable, Ok(Some) for a
     /// warm run's result.
     fn prepare(&self, actor: &str, id: &str, spec: Spec) -> Result<Option<ResultRecord>, Refused> {
-        // A memoized call answered from a result its caller already holds runs nothing.
+        // A memoized call answered from a result its caller or this machine holds runs nothing.
+        if let (false, Some(held)) = (spec.parent.is_empty(), &spec.held) {
+            return Ok(Some(held.clone()));
+        }
         if let (false, Some((_, result))) = (spec.parent.is_empty(), spec.known.first()) {
             let value = serde_json::from_str(result)
                 .map_err(|_| refused("invalid_request", "a known result is not JSON"))?;
@@ -837,6 +842,7 @@ impl Runs {
         input: Value,
         inputs: Vec<InputFile>,
         answer: Option<String>,
+        held: Option<ResultRecord>,
         passed: Vec<domain::ModelChoice>,
     ) -> Result<Execution, Refused> {
         let actor = parent.submission.as_ref().map(|s| s.actor.clone()).unwrap_or_default();
@@ -849,6 +855,7 @@ impl Runs {
         spec.known = answer
             .map(|result| vec![(String::new(), result)])
             .unwrap_or_default();
+        spec.held = held;
         // A model the caller passed by value is that slot's choice, over any other for it.
         spec.models.retain(|choice| !passed.iter().any(|p| p.parameter == choice.parameter));
         spec.models.extend(passed);
@@ -950,6 +957,7 @@ impl Runs {
             publication: String::new(),
             owner: context.owner,
             known: vec![],
+            held: None,
             application: application.into(),
             digest: digest.into(),
         })
@@ -1265,6 +1273,7 @@ mod tests {
             publication: String::new(),
             owner: "alice".into(),
             known: vec![],
+            held: None,
             application: String::new(),
             digest: digest.into(),
         }

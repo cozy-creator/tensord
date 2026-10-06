@@ -1606,6 +1606,40 @@ mod v1_api {
         let (source, quantized) = (result["source"].as_str().unwrap(), result["result"].as_str().unwrap());
         assert!(source.starts_with("sha256:") && quantized.starts_with("sha256:"), "{result}");
         assert_ne!(source, quantized, "quantize wrote a model of its own");
+        // A memoized call whose result is a file is answered from this machine's own memo while
+        // it holds the file, for any later job of its signer; once the file is gone, it runs.
+        let noted = machine.root.join("noted");
+        let annotate = |id: &str| {
+            let mut spec = spec.clone();
+            spec.entrypoint = "annotate".into();
+            spec.payload = serde_json::to_vec(&serde_json::json!({"values": [5, 6], "counter": noted})).unwrap();
+            authorized(v1::RunRequest { id: id.into(), after: 0, spec: Some(spec) }, &all)
+        };
+        let mut notes = vec![];
+        for id in ["annotate-1", "annotate-2"] {
+            let events = collect(client.run(annotate(id)).await.unwrap().into_inner()).await.unwrap();
+            assert_eq!(outcome(&events).status, "succeeded", "{events:?}");
+            let mut files = vec![];
+            for index in 1..=2u32 {
+                let target = v1::OutputTarget { run: id.into(), output: "files".into(), index, ..Default::default() };
+                let request = v1::ReadRequest { target: Some(v1::read_request::Target::Output(target)), ..Default::default() };
+                files.push(read(&mut client, &all, request).await.unwrap().1);
+            }
+            notes.push(files);
+        }
+        assert_eq!(notes[0], [b"note 5".to_vec(), b"note 6".to_vec()]);
+        assert_eq!(notes[1], notes[0], "the reused result is the same files");
+        assert_eq!(fs::read_to_string(&noted).unwrap(), "2", "the second job ran its calls again");
+        // The store loses one file (as its GC does once reclaim released it): that call runs.
+        let hex = tensorfs_core::sha256::hex_digest(b"note 5");
+        let blob = walkdir(&machine.root.join("state/tensorfs"))
+            .into_iter()
+            .find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().contains(&hex)))
+            .expect("the note's object is in the store");
+        fs::remove_file(blob).unwrap();
+        let events = collect(client.run(annotate("annotate-3")).await.unwrap().into_inner()).await.unwrap();
+        assert_eq!(outcome(&events).status, "succeeded", "{events:?}");
+        assert_eq!(fs::read_to_string(&noted).unwrap(), "3", "only the call whose file is gone ran");
         let mut nested = spec.clone();
         nested.entrypoint = "relay_nested".into();
         let events = collect(client.run(authorized(v1::RunRequest {
@@ -2711,4 +2745,18 @@ mod v1_api {
         );
         let _ = fs::remove_dir_all(tools);
     }
+}
+
+/// Every file under `root`.
+fn walkdir(root: &Path) -> Vec<std::path::PathBuf> {
+    let mut found = vec![];
+    for entry in fs::read_dir(root).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(walkdir(&path));
+        } else {
+            found.push(path);
+        }
+    }
+    found
 }
