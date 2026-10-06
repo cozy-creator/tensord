@@ -5,7 +5,7 @@ when Run has not accepted it. The journal creates a terminal canceled record in 
 actor/ID namespace as Run acceptance, with an internal marker that no spec was accepted.
 SQLite immediate transactions serialize cancellation and acceptance.
 
-If cancellation wins, every later Run spec for that actor/ID returns the canceled record
+If cancellation wins, every later ordinary Run spec for that actor/ID returns the canceled record
 without preparing or executing it. `Run(id)` observes its ordinary canceled state and outcome,
 including after restart. Repeated cancellation returns the same record. Other actors keep
 their independent IDs. Pause and Resume still require an existing run. Completed outcomes
