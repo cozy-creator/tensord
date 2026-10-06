@@ -362,6 +362,15 @@ impl Publisher {
         manifest: &str,
         bytes: &(dyn Fn(u64, u64) + Sync),
     ) -> Result<(), Refused> {
+        // A checkpoint this store already holds whole, in that repository, asks the Hub nothing.
+        if let Some(sha256) = manifest.strip_prefix("sha256:") {
+            if let Ok(meta) = std::fs::metadata(self.store.manifest_path(sha256)) {
+                let held = tensorfs_core::ids::ObjectRef { sha256: sha256.to_string(), length: meta.len() };
+                if tensorfs_core::checkpoint_root::check_source(&self.store, repository, &held).is_ok() {
+                    return Ok(());
+                }
+            }
+        }
         let catalog = Catalog::new(source).map_err(|e| Refused {
             code: "catalog_read_failed",
             message: e.0,

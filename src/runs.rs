@@ -647,7 +647,7 @@ impl Runs {
             return warm_result(installed, models);
         }
         if spec.job {
-            let inputs = self.job_inputs(&spec, &installation, &interface, hub.as_ref(), &*observe)?;
+            let inputs = self.job_inputs(actor, &spec, &installation, &interface, hub.as_ref(), &*observe)?;
             let context = JobContext {
                 installation: installation.alias.clone(),
                 application: spec.application.clone(),
@@ -1019,6 +1019,7 @@ impl Runs {
     /// Hub checkpoint downloaded by its exact manifest, a provider source made.
     fn job_inputs(
         &self,
+        actor: &str,
         spec: &Spec,
         installation: &Installation,
         interface: &Value,
@@ -1067,18 +1068,35 @@ impl Runs {
                 let hub = hub.ok_or_else(|| {
                     refused("hub_access_absent", "a Hub model downloads with the run's Hub access, and this run carries none")
                 })?;
-                let catalog = hub::Catalog::new(hub).map_err(|e| refused("catalog_read_failed", e.0))?;
-                observe(&format!("resolving the model for {path}"), 0, 0);
+                // Resolved once per installation, slot, choice, owner, binding revision and GPU,
+                // then kept: a warm run asks the Hub nothing; `cozy package bind` moves the
+                // revision, and so the key.
                 let (gpu, width) = crate::published::machine_gpu(&self.service);
-                let (repository, manifest) = crate::published::job_input(
-                    &catalog,
-                    installation,
-                    &row,
-                    choice,
-                    &spec.owner,
-                    (&gpu, width),
-                )
-                .map_err(|(code, message)| refused(code, message))?;
+                let key = serde_json::to_string(&json!(["job-input/1", installation.alias, path, choice.map(|c| json!([
+                    c.repository, c.release, c.lane, c.manifest.as_ref().map(|m| (tensorfs_core::sha256::hex(&m.digest), m.length))
+                ])), spec.owner, spec.binding_revision, gpu, width]))
+                .map_err(io::Error::other)?;
+                let kept = self.service.engine.with_journal(|j| j.job_input(actor, &key))?;
+                let (repository, manifest) = match kept {
+                    Some(kept) => kept,
+                    None => {
+                        let catalog = hub::Catalog::new(hub).map_err(|e| refused("catalog_read_failed", e.0))?;
+                        observe(&format!("resolving the model for {path}"), 0, 0);
+                        let resolved = crate::published::job_input(
+                            &catalog,
+                            installation,
+                            &row,
+                            choice,
+                            &spec.owner,
+                            (&gpu, width),
+                        )
+                        .map_err(|(code, message)| refused(code, message))?;
+                        self.service
+                            .engine
+                            .with_journal(|j| j.bind_job_input(actor, &key, &resolved.0, &resolved.1))?;
+                        resolved
+                    }
+                };
                 let stage = format!("downloading {repository}");
                 publisher.download(&self.service, hub, &repository, &manifest, &|done, total| {
                     observe(&stage, done, total)
@@ -1403,10 +1421,10 @@ mod tests {
         spec.input = json!({"source": artifact(&held), "factor": 2});
         let installation = Installation { actor: "alice".into(), alias: "pkg".into(), generation: String::new(),
             package: "local/pkg".into(), release: "0.1.0".into(), interface: vec![] };
-        let inputs = runs.job_inputs(&spec, &installation, &interface, None, &|_, _, _| ()).unwrap();
+        let inputs = runs.job_inputs("owner", &spec, &installation, &interface, None, &|_, _, _| ()).unwrap();
         assert_eq!(inputs["source"], ("Source".to_string(), ObjectRef { sha256: held, length: 8 }));
         spec.input = json!({"source": artifact(&"cd".repeat(32)), "factor": 2});
-        let absent = runs.job_inputs(&spec, &installation, &interface, None, &|_, _, _| ()).unwrap_err();
+        let absent = runs.job_inputs("owner", &spec, &installation, &interface, None, &|_, _, _| ()).unwrap_err();
         assert_eq!(absent.code, "checkpoint_absent", "{}", absent.message);
         fs::remove_dir_all(root).unwrap();
     }
