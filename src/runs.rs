@@ -1027,7 +1027,22 @@ impl Runs {
             let publisher = self.publisher.as_ref().ok_or_else(|| {
                 refused("capability_unavailable", "this machine prepares no models")
             })?;
-            let manifest = if let Some(choice) = choice.filter(|c| !c.source.is_empty()) {
+            // A model passed by value (a `ModelArtifact` another run here produced) is the call's
+            // own argument: its exact checkpoint, as this machine holds it.
+            let passed = spec.input.get(&parameter).and_then(|value| {
+                let digest = value["manifest"]["digest"].as_str()?.strip_prefix("sha256:")?;
+                Some((digest.to_string(), value["manifest"]["length"].as_u64()?))
+            });
+            let manifest = if let Some((sha256, length)) = passed {
+                let held = std::fs::metadata(publisher.store().manifest_path(&sha256)).map(|m| m.len());
+                if held.ok() != Some(length) {
+                    return Err(refused(
+                        "checkpoint_absent",
+                        format!("the model passed to {parameter:?} (sha256:{sha256}) is not held on this machine"),
+                    ));
+                }
+                ObjectRef { sha256, length }
+            } else if let Some(choice) = choice.filter(|c| !c.source.is_empty()) {
                 publisher
                     .make_source(&choice.source, &choice.profiles, &spec.providers, observe)?
                     .manifest
@@ -1348,6 +1363,37 @@ mod tests {
         assert!(theirs.message.contains(&manifest), "{}", theirs.message);
         assert!(service.engine.get_public("bob", "run-1").is_err());
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// A model passed by value to a job's model slot (a `ModelArtifact` a sibling produced
+    /// here) is that exact checkpoint; one this machine does not hold is refused by name.
+    #[test]
+    fn a_model_passed_by_value_is_its_exact_checkpoint() {
+        let root = std::env::temp_dir().join(format!("cm-by-value-{}", uuid::Uuid::new_v4()));
+        let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
+        let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
+        let publisher = Publisher::new(&root.join("published"), Default::default(), store.clone()).unwrap();
+        let objects = Arc::new(Objects::new(&root.join("writes"), store.clone(), service.engine.clone()).unwrap());
+        let runs = Runs { service: service.clone(), objects, publisher: Some(publisher), local: None,
+            own_hub: None, jobs: Default::default() };
+        let held = "ab".repeat(32);
+        let path = store.manifest_path(&held);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"manifest").unwrap();
+        let interface = json!({"jobs":[{"name":"compute","models":[{"path":"compute.models.source","class":"Source"}]}]});
+        let artifact = |hex: &str| json!({"producer_request_id":"job-1/0","output_slot":"weights",
+            "manifest":{"digest":format!("sha256:{hex}"),"length":8},"tensorfs_receipt_digest":format!("sha256:{hex}")});
+        let mut spec = spec(Source::Models, false, "d");
+        (spec.job, spec.entrypoint) = (true, "compute".into());
+        spec.input = json!({"source": artifact(&held), "factor": 2});
+        let installation = Installation { actor: "alice".into(), alias: "pkg".into(), generation: String::new(),
+            package: "local/pkg".into(), release: "0.1.0".into(), interface: vec![] };
+        let inputs = runs.job_inputs(&spec, &installation, &interface, None, &|_, _, _| ()).unwrap();
+        assert_eq!(inputs["source"], ("Source".to_string(), ObjectRef { sha256: held, length: 8 }));
+        spec.input = json!({"source": artifact(&"cd".repeat(32)), "factor": 2});
+        let absent = runs.job_inputs(&spec, &installation, &interface, None, &|_, _, _| ()).unwrap_err();
+        assert_eq!(absent.code, "checkpoint_absent", "{}", absent.message);
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// A job's child that is itself a job runs as one, as its held package declares it.
