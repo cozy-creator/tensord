@@ -231,8 +231,8 @@ impl Lifecycle {
 pub async fn keep_authority(hub: Arc<Hub>, keys: Keys) {
     loop {
         let delay = match hub.authorized_keys().await {
-            Ok((current, lease)) => {
-                keys.renew(current, lease);
+            Ok((current, lease, bindings)) => {
+                keys.renew(current, lease, bindings);
                 lease / 2
             }
             Err(Refusal::Denied) => {

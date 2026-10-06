@@ -620,7 +620,15 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
                 .map(|events| Response::new(self.authority(&caller).wrap(events)));
         }
         let mut request = request;
-        let spec = request.spec.take();
+        // A rental's owner may rebind from any computer or the Hub: the revision its authority
+        // poll carries joins the run's own, so its models resolve again after a change.
+        let hub_bindings = self.identity.authority.keys.bindings_revision();
+        let spec = request.spec.take().map(|mut spec| {
+            if hub_bindings > 0 {
+                spec.binding_revision = format!("{}+hub.{hub_bindings}", spec.binding_revision);
+            }
+            spec
+        });
         // A new run is admitted before it is accepted: an update's activation and a rental's
         // idle release wait for it. The observer that follows holds no admission.
         let admitted = match &spec {
