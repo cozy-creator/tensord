@@ -691,6 +691,8 @@ pub struct Frame {
     pub attribution: Value,
     pub execution: Value,
     pub observations: Value,
+    /// `invoke`: some attention site of the call applied the request's pin.
+    pub attention_applied: bool,
     // `child_*` (a job's managed calls): the call's index, callee and canonical request.
     pub call_index: u64,
     pub module: String,
