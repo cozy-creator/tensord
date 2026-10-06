@@ -8,6 +8,7 @@ pub mod lifecycle;
 pub mod net;
 pub mod player;
 pub mod probe;
+pub mod provider;
 pub mod pypi;
 pub mod receipt;
 pub mod ssh;

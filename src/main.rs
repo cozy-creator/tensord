@@ -213,6 +213,7 @@ fn run_machine(
         identity.hubs = vec![(hub.origin.clone(), hub.worker_id.clone())];
         let hub = Arc::new(cozy_machine::machine::hub::Hub::new(hub)?);
         let service = service.clone();
+        let provider = grant.provider.clone();
         std::thread::Builder::new()
             .name("rental-lifecycle".into())
             .spawn(move || {
@@ -226,9 +227,9 @@ fn run_machine(
                         keys,
                     ));
                     let busy = move || !service.idle().unwrap_or(false);
-                    cozy_machine::machine::lifecycle::release_when_idle(lifecycle, hub, busy).await;
+                    cozy_machine::machine::lifecycle::release_when_idle(lifecycle, hub, provider, busy).await;
                 });
-                // The Hub accepted the release: this rental ends, and this process with it.
+                // The Hub accepted the release, or the rental ended itself: this process ends.
                 std::process::exit(0);
             })?;
     }
