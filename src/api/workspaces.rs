@@ -1,5 +1,5 @@
 //! Deployed resumable package carriers, scoped by verified owner key. No execution journal.
-use super::{auth::VerifiedActor, pb};
+use super::{auth::VerifiedActor, domain};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -35,8 +35,8 @@ pub(crate) struct Carrier {
     #[serde(default)]
     digest: Vec<u8>,
 }
-impl From<&pb::LocalPackageFileRef> for Carrier {
-    fn from(file: &pb::LocalPackageFileRef) -> Self {
+impl From<&domain::LocalPackageFileRef> for Carrier {
+    fn from(file: &domain::LocalPackageFileRef) -> Self {
         Self {
             filename: file.filename.clone(),
             length: file.length,
@@ -143,7 +143,7 @@ impl WorkspaceUploads {
     pub fn begin(
         self: &Arc<Self>,
         actor: VerifiedActor,
-        header: &pb::LocalPackageUploadHeader,
+        header: &domain::LocalPackageUploadHeader,
     ) -> Result<UploadSession, Status> {
         valid_operation(&header.operation_id)?;
         let carrier = Carrier::from(
@@ -240,7 +240,7 @@ impl WorkspaceUploads {
     pub fn package(
         &self,
         actor: VerifiedActor,
-        selected: &pb::DesiredLocalPackageSet,
+        selected: &domain::DesiredLocalPackageSet,
     ) -> Result<Option<UploadedPackage>, Status> {
         let root = root_set(selected)?;
         let directory = self.directory(actor, &root.operation_id)?;
@@ -328,7 +328,7 @@ impl UploadSession {
     pub fn verified(&self) -> bool {
         self.record.object.is_some()
     }
-    pub fn append(&mut self, chunk: pb::LocalPackageUploadChunk) -> Result<(), Status> {
+    pub fn append(&mut self, chunk: domain::LocalPackageUploadChunk) -> Result<(), Status> {
         if self.verified()
             || chunk.data.is_empty()
             || chunk.data.len() > MAX_CHUNK
@@ -463,7 +463,7 @@ fn valid_carrier(file: &Carrier) -> Result<(), Status> {
     }
     Ok(())
 }
-fn root_set(selected: &pb::DesiredLocalPackageSet) -> Result<RootSet, Status> {
+fn root_set(selected: &domain::DesiredLocalPackageSet) -> Result<RootSet, Status> {
     valid_operation(&selected.operation_id)?;
     let package = selected
         .package

@@ -1131,7 +1131,7 @@ impl GpuPool {
         &self,
         installed: &crate::journal::Installation,
         entrypoint: &str,
-        choices: &[crate::api::pb::ModelChoice],
+        choices: &[crate::api::domain::ModelChoice],
         resolved: &[ModelGrant],
         degree: u32,
     ) -> io::Result<GpuPlan> {

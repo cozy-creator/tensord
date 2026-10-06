@@ -4,7 +4,7 @@
 //! release's locked requirements with uv; model by owner binding ladder, then a TensorFS
 //! download) with its `release_root_preparing` progress answers.
 use crate::{
-    api::pb,
+    api::domain,
     gpu_service::{GpuPlan, GpuPool, ModelGrant},
     hub::{self, Catalog},
     journal::{Installation, Preparation},
@@ -69,7 +69,7 @@ pub struct Request {
     /// Provider tokens for source models (memory only).
     pub providers: Providers,
     pub entrypoint: String,
-    pub choices: Vec<pb::ModelChoice>,
+    pub choices: Vec<domain::ModelChoice>,
 }
 
 /// The caller's provider tokens; empty reads public sources anonymously.
@@ -276,7 +276,7 @@ impl Publisher {
         &self,
         installation: &Installation,
         path: &str,
-        choice: &pb::ModelChoice,
+        choice: &domain::ModelChoice,
         providers: &Providers,
         job: &Job,
     ) -> Result<ModelGrant, Failure> {
@@ -1156,7 +1156,7 @@ pub(crate) fn job_input(
     catalog: &Catalog,
     installation: &Installation,
     slot: &Value,
-    choice: Option<&pb::ModelChoice>,
+    choice: Option<&domain::ModelChoice>,
     owner: &str,
     (gpu, width): (&str, usize),
 ) -> Result<(String, String), Failure> {
@@ -1343,7 +1343,7 @@ fn refused(code: &'static str, refusal: tensorfs_core::err::Refusal) -> Failure 
 /// smallest), returned as (repository, "sha256:<hex>").
 fn resolve_adapter(
     catalog: &Catalog,
-    adapter: &pb::DownloadAdapterRef,
+    adapter: &domain::DownloadAdapterRef,
 ) -> Result<(String, String), Failure> {
     let model = adapter.model.clone();
     let Some((org, name)) = model.split_once('/') else {
@@ -1446,7 +1446,7 @@ fn resolve_adapter(
 fn apply_adapters(
     store: &Store,
     catalog: &Catalog,
-    choice: &pb::ModelChoice,
+    choice: &domain::ModelChoice,
     grant: &mut ModelGrant,
     keep: &[String],
     providers: &Providers,
@@ -1847,7 +1847,7 @@ mod tests {
             release: "1".into(),
             interface: vec![],
         };
-        let choice = pb::ModelChoice {
+        let choice = domain::ModelChoice {
             parameter: "unet".into(),
             source: "hf://hf-internal-testing/tiny-sdxl-pipe@20594cbc343cfcfe447af5c87cdaf6c436b453f2/unet/diffusion_pytorch_model.safetensors".into(),
             ..Default::default()
@@ -1927,14 +1927,14 @@ mod tests {
         };
         let slot = json!({"path":"touch.models.source","class":"probe.Probe",
             "default_ladder":[{"gpu":"*","lane":"proof/probe@1.0.0/bf16"}]});
-        let named = pb::ModelChoice { parameter: "source".into(), repository: "proof/probe".into(), ..Default::default() };
+        let named = domain::ModelChoice { parameter: "source".into(), repository: "proof/probe".into(), ..Default::default() };
         let resolved = job_input(&catalog, &installation, &slot, Some(&named), "alice", ("", 0)).unwrap();
         assert_eq!(resolved, ("proof/probe".to_string(), format!("sha256:{manifest}")));
         let defaulted = job_input(&catalog, &installation, &slot, None, "alice", ("", 0)).unwrap();
         assert_eq!(defaulted.1, format!("sha256:{manifest}"));
-        let exact = pb::ModelChoice {
+        let exact = domain::ModelChoice {
             repository: "proof/probe".into(),
-            manifest: Some(pb::Ref { digest: vec![7; 32], ..Default::default() }),
+            manifest: Some(domain::Ref { digest: vec![7; 32], ..Default::default() }),
             ..Default::default()
         };
         assert_eq!(job_input(&catalog, &installation, &slot, Some(&exact), "alice", ("", 0)).unwrap().1, format!("sha256:{}", "07".repeat(32)));

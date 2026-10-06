@@ -1123,8 +1123,8 @@ mod tests {
         fn workspace(
             &self,
             _: VerifiedActor,
-            _: super::super::pb::MachineExecutionWorkspaceQuery,
-        ) -> Result<super::super::pb::MachineExecutionWorkspace, tonic::Status> {
+            _: super::super::domain::MachineExecutionWorkspaceQuery,
+        ) -> Result<super::super::domain::MachineExecutionWorkspace, tonic::Status> {
             Ok(Default::default())
         }
     }

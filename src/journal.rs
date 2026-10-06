@@ -244,7 +244,7 @@ impl Execution {
     }
 }
 
-/// One journaled product of an execution's output log (`api::pb::RunProduct` bytes).
+/// One journaled product of an execution's output log (`api::domain::RunProduct` bytes).
 #[derive(Clone, Debug)]
 pub struct StoredProduct {
     pub sequence: u64,
@@ -493,8 +493,7 @@ impl Journal {
         receipt: Option<Vec<u8>>,
         abort: bool,
     ) -> io::Result<crate::native_inputs::IntakeState> {
-        use crate::{api::pb, native_inputs::IntakeState};
-        use prost::Message;
+        use crate::{api::domain, native_inputs::IntakeState};
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -514,7 +513,7 @@ impl Journal {
             .map_err(db_error)?;
         if let Some(receipt) = receipt {
             let result =
-                pb::NativeByteRetentionResult::decode(receipt.as_slice()).map_err(db_error)?;
+                crate::archive::decode_native_byte_retention_result(receipt.as_slice()).map_err(db_error)?;
             if result.retention_id != retention || result.source.is_none() {
                 return Err(db_error("native input receipt differs from bound intake"));
             }
@@ -525,11 +524,10 @@ impl Journal {
             }
             state.receipt = Some(receipt);
             if !state.released && !abort {
-                let source = pb::NativeByteRetentionRequest {
+                let source = crate::archive::encode_native_byte_retention_request(&domain::NativeByteRetentionRequest {
                     source: result.source,
                     retention_id: retention.into(),
-                }
-                .encode_to_vec();
+                });
                 let owner: Option<String> = tx
                     .query_row(
                         "SELECT actor FROM native_outputs WHERE owner=?1 LIMIT 1",
@@ -2253,7 +2251,7 @@ impl Journal {
     }
 }
 
-/// Why a run did not complete, in the outcome body's terms (cozy.worker.v1 enums:
+/// Why a run did not complete, in the retained outcome body's terms (numeric codes:
 /// status FAILED=3/REFUSED=2/ABANDONED=5; cause codes and origins as numbered there).
 /// Stored as JSON in `Execution::failure`; older plain text reads as an executor fault.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

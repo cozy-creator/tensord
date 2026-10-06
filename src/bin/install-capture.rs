@@ -2,7 +2,7 @@
 use cozy_machine::api::{
     auth::VerifiedActor,
     install::{prepare_uploaded, InstallerConfig},
-    pb,
+    domain,
     workspaces::WorkspaceUploads,
 };
 use std::{fs, io::Read, path::PathBuf, sync::Arc};
@@ -39,15 +39,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let actor = VerifiedActor {
         public_key: [19; 32],
     };
-    let file = pb::LocalPackageFileRef {
+    let file = domain::LocalPackageFileRef {
         filename: "source.tar".into(),
         length,
         ..Default::default()
     };
-    let header = pb::LocalPackageUploadHeader {
+    let header = domain::LocalPackageUploadHeader {
         operation_id: "installer-component-gate".into(),
         file: Some(file.clone()),
-        ..Default::default()
     };
     let mut session = uploads.begin(actor, &header)?;
     if !session.verified() {
@@ -59,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
             let offset = session.received();
-            session.append(pb::LocalPackageUploadChunk {
+            session.append(domain::LocalPackageUploadChunk {
                 offset,
                 data: buffer[..count].to_vec(),
             })?;
@@ -69,11 +68,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("incomplete archive".into());
     }
     drop(session);
-    let selected = pb::DesiredLocalPackageSet {
+    let selected = domain::DesiredLocalPackageSet {
         operation_id: header.operation_id.clone(),
         source_archive: "source.tar".into(),
         files: vec![file],
-        package: Some(pb::DevelopmentPackage {
+        package: Some(domain::DevelopmentPackage {
             package: package.ok_or("--package is required")?,
             release: release.ok_or("--release is required")?,
             installation_id: "installation-component-gate".into(),

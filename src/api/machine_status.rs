@@ -1,7 +1,7 @@
 //! Status (G/API.md, D2). Anyone who reaches the machine gets one identity frame with the sealed
 //! readiness receipt; a machine-scope cap gets the whole picture, sent again whenever it changes.
 //! An open stream is not activity: only `keepalive` resets the idle deadline, once.
-use super::{auth::VerifiedActor, backend::MachineBackend, pb, v1, MachineIdentity};
+use super::{auth::VerifiedActor, backend::MachineBackend, domain, v1, MachineIdentity};
 use std::{pin::Pin, sync::Arc, time::Duration};
 use tokio_stream::Stream;
 use tonic::Status;
@@ -196,7 +196,7 @@ fn held(
     backend: &impl MachineBackend,
     actor: VerifiedActor,
 ) -> Result<(Vec<v1::RunState>, Vec<v1::Environment>), Status> {
-    let query = pb::MachineExecutionListQuery {
+    let query = domain::MachineExecutionListQuery {
         limit: 256,
         states: LIVE.map(String::from).to_vec(),
         ..Default::default()
@@ -207,7 +207,7 @@ fn held(
         .collect();
     let packages = held_or_none(
         backend
-            .list_packages(actor, pb::PackageListQuery::default())
+            .list_packages(actor, domain::PackageListQuery::default())
             .map(|l| l.packages),
     )?;
     let levels = backend.levels(actor)?;

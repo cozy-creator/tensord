@@ -2,7 +2,8 @@
 
 Every client of a machine uses it: the CLI, the Hub, the browser player, and a run's own child runs.
 A laptop's machine and a rental's are the same. `worker.v1` (`PodHost`, `WorkerControl`,
-`RuntimePreparation`) and the HTTPS routes are deleted at cutover, not adapted.
+`RuntimePreparation`) and their HTTPS execution routes are removed. The old URL namespace only
+returns an upgrade refusal; no worker bindings or service implementations are built.
 
 **Five gRPC calls** (`cozy.machine.v1.Machine`) on the machine's one TLS listener, whose leaf the
 client pins by fingerprint. **One browser channel**: WebRTC `cozy/1`. **One credential**:
@@ -125,4 +126,5 @@ forever.
 2. Write and Run sources/warm (D1); Status and readiness (D2).
 3. Child runs and jobs (G, with I for H3 long-form); cache; pause/resume; `cozy/1` from Read.
 4. Hub readiness and public serving on Status/Run/Control; the browser player on the same caps.
-5. Delete `worker.v1` and the HTTPS routes from machine, CLI and Hub once F's gate has run.
+5. The machine builds only `cozy.machine.v1`. Current domain values and private persisted codecs
+   are separate; worker RPC generation/vendor files and Claim verification are removed.

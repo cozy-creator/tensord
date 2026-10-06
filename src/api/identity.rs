@@ -66,6 +66,7 @@ impl MachineIdentity {
     /// Failure never replaces an existing identity or touches the execution journal.
     pub fn retained(config: &MachineConfig) -> io::Result<Self> {
         config.validate()?;
+        config.validate()?;
         private_directory(&config.identity_directory)?;
         let lock = OpenOptions::new()
             .create(true)
@@ -155,10 +156,8 @@ impl MachineIdentity {
         let authority = Authority {
             worker_id: retained.worker_id,
             boot_id,
-            leaf_digest: tensorfs_core::sha256::digest(&cert_der),
             keys: keys.into(),
         };
-        authority.transcript(1).map_err(other)?;
         Ok(Self {
             authority,
             cert_pem: retained.certificate_pem,
@@ -192,10 +191,8 @@ impl MachineIdentity {
         let authority = Authority {
             worker_id,
             boot_id: lifetime.boot_id,
-            leaf_digest: tensorfs_core::sha256::digest(&lifetime.cert_der),
             keys,
         };
-        authority.transcript(1).map_err(other)?;
         Ok(Self {
             authority,
             cert_pem: lifetime.cert_pem,

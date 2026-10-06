@@ -5,12 +5,11 @@
 //! by each publish (SET); a list output grows (APPEND). The returned result publishes only
 //! what the log does not already show.
 use crate::{
-    api::pb,
+    api::domain,
     device_executor::{Answer, Frame},
     execution::Engine,
     journal::StoredProduct,
 };
-use prost::Message;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -32,7 +31,7 @@ fn storage(error: impl std::fmt::Display) -> io::Error {
 }
 
 /// Retain one byte string as a sealed one-file native tree named by `owner`, bound to `actor`
-/// so a reader with that actor's Claim can fetch it. Idempotent per owner.
+/// so a reader with that actor's capability can fetch it. Idempotent per owner.
 pub fn retain(
     store: &Store,
     engine: &Engine,
@@ -40,7 +39,7 @@ pub fn retain(
     owner: &str,
     source: &mut File,
     object: &ObjectRef,
-) -> io::Result<pb::NativeByteRetentionRequest> {
+) -> io::Result<domain::NativeByteRetentionRequest> {
     let tree = Draft {
         entries: vec![("payload".into(), Entry::File(object.clone()))],
     }
@@ -58,11 +57,11 @@ pub fn retain(
     }
     let root = writer.finish(&tree).map_err(storage)?;
     let receipt = root.receipt().map_err(storage)?;
-    let native = pb::NativeByteRetentionRequest {
-        source: Some(pb::NativeByteTreeRef {
+    let native = domain::NativeByteRetentionRequest {
+        source: Some(domain::NativeByteTreeRef {
             producer_root_id: root.producer,
             receipt_digest: sha256::digest(&receipt).to_vec(),
-            manifest: Some(pb::Ref {
+            manifest: Some(domain::Ref {
                 digest: unhex(&root.manifest.sha256)?,
                 length: root.manifest.length,
             }),
@@ -70,7 +69,7 @@ pub fn retain(
         }),
         retention_id: owner.into(),
     };
-    engine.bind_native_output(actor, owner, &native.encode_to_vec())?;
+    engine.bind_native_output(actor, owner, &crate::archive::encode_native_byte_retention_request(&native))?;
     Ok(native)
 }
 
@@ -152,7 +151,7 @@ fn hash_file(path: &Path) -> io::Result<ObjectRef> {
 
 /// How a declared result field takes products: a single asset is SET, a list of assets grows
 /// by APPEND. Anything else is not a publishable output.
-fn output_op(result: &Value, output: &str) -> Option<pb::RunProductOp> {
+fn output_op(result: &Value, output: &str) -> Option<domain::RunProductOp> {
     let mut schema = result;
     for name in output.split('.') {
         schema = schema
@@ -163,16 +162,16 @@ fn output_op(result: &Value, output: &str) -> Option<pb::RunProductOp> {
             .get("type")?;
     }
     if schema.get("asset").is_some() {
-        Some(pb::RunProductOp::Set)
+        Some(domain::RunProductOp::Set)
     } else if schema.get("list")?.get("asset").is_some() {
-        Some(pb::RunProductOp::Append)
+        Some(domain::RunProductOp::Append)
     } else {
         None
     }
 }
 
-pub fn decode(stored: &StoredProduct) -> io::Result<pb::RunProduct> {
-    pb::RunProduct::decode(stored.product.as_slice())
+pub fn decode(stored: &StoredProduct) -> io::Result<domain::RunProduct> {
+    crate::archive::decode_run_product(stored.product.as_slice())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "journaled product is corrupt"))
 }
 
@@ -232,7 +231,7 @@ fn commit(
     spool: &Path,
     frame: &Frame,
     appended: Option<&mut std::collections::HashMap<String, usize>>,
-) -> io::Result<(pb::Ref, u64)> {
+) -> io::Result<(domain::Ref, u64)> {
     let record = engine.get(id)?;
     let context = record
         .submission
@@ -268,7 +267,7 @@ fn commit(
     if frame.parts.len() > MAX_PARTS {
         return Err(storage(format!("a product has at most {MAX_PARTS} parts")));
     }
-    let retain_file = |path: &Path| -> io::Result<(pb::Ref, pb::NativeByteRetentionRequest)> {
+    let retain_file = |path: &Path| -> io::Result<(domain::Ref, domain::NativeByteRetentionRequest)> {
         let object = hash_file(path)?;
         // One hold per distinct byte string of the run; TensorFS names owners by digest.
         let named = format!(
@@ -287,14 +286,14 @@ fn commit(
             &object,
         )?;
         Ok((
-            pb::Ref {
+            domain::Ref {
                 digest: unhex(&object.sha256)?,
                 length: object.length,
             },
             source,
         ))
     };
-    let mut product = pb::RunProduct {
+    let mut product = domain::RunProduct {
         output: frame.output.clone(),
         op: op as i32,
         media_type: frame.media_type.clone(),
@@ -314,13 +313,13 @@ fn commit(
             let mut file = File::open(&path)?;
             length += io::copy(&mut file, &mut whole)?;
             let (content, source) = retain_file(&path)?;
-            product.parts.push(pb::RunProductPart {
+            product.parts.push(domain::RunProductPart {
                 content: Some(content),
                 source: Some(source),
                 duration_us: part.duration_us,
             });
         }
-        product.content = Some(pb::Ref {
+        product.content = Some(domain::Ref {
             digest: whole.finalize().to_vec(),
             length,
         });
@@ -328,7 +327,7 @@ fn commit(
     let content = product.content.clone().unwrap_or_default();
     let sequence = engine.append_product(id, |prior| {
         let prior = prior.iter().map(decode).collect::<io::Result<Vec<_>>>()?;
-        if op == pb::RunProductOp::Append {
+        if op == domain::RunProductOp::Append {
             let items: Vec<_> = prior
                 .iter()
                 .filter(|p| p.output == product.output && p.op == op as i32)
@@ -352,7 +351,7 @@ fn commit(
         {
             return Ok(None); // the log already shows these bytes
         }
-        Ok(Some(product.encode_to_vec()))
+        Ok(Some(encode(&product)))
     })?;
     Ok((content, sequence))
 }
@@ -361,13 +360,13 @@ fn commit(
 /// manifest (`weights::MANIFEST_MEDIA`), held in the machine's store; a resumed attempt that
 /// adopts the same manifest adds nothing.
 pub fn record_manifest(engine: &Engine, id: &str, output: &str, manifest: &tensorfs_core::ids::ObjectRef) -> io::Result<u64> {
-    let content = pb::Ref {
+    let content = domain::Ref {
         digest: unhex(&manifest.sha256)?,
         length: manifest.length,
     };
-    let product = pb::RunProduct {
+    let product = domain::RunProduct {
         output: output.into(),
-        op: pb::RunProductOp::Set as i32,
+        op: domain::RunProductOp::Set as i32,
         media_type: crate::weights::MANIFEST_MEDIA.into(),
         label: output.into(),
         content: Some(content.clone()),
@@ -380,22 +379,22 @@ pub fn record_manifest(engine: &Engine, id: &str, output: &str, manifest: &tenso
             .rev()
             .find(|p| p.output == product.output)
             .is_some_and(|current| current.content.as_ref() == Some(&content));
-        Ok((!held).then(|| product.encode_to_vec()))
+        Ok((!held).then(|| encode(&product)))
     })
 }
 
 /// The canonical body of one product event.
-pub fn document(product: &pb::RunProduct) -> io::Result<Value> {
+pub fn document(product: &domain::RunProduct) -> io::Result<Value> {
     let missing = || io::Error::new(io::ErrorKind::InvalidData, "product reference absent");
-    let reference = |content: &pb::Ref| json!({"digest":format!("sha256:{}",sha256::hex(&content.digest)),"length":content.length});
-    let source = |source: &pb::NativeByteRetentionRequest| -> io::Result<Value> {
+    let reference = |content: &domain::Ref| json!({"digest":format!("sha256:{}",sha256::hex(&content.digest)),"length":content.length});
+    let source = |source: &domain::NativeByteRetentionRequest| -> io::Result<Value> {
         let tree = source.source.as_ref().ok_or_else(missing)?;
         let manifest = tree.manifest.as_ref().ok_or_else(missing)?;
         Ok(
             json!({"retention_id":source.retention_id,"source":{"producer_root_id":tree.producer_root_id,"receipt_digest":format!("sha256:{}",sha256::hex(&tree.receipt_digest)),"manifest":reference(manifest),"content_bytes":tree.content_bytes}}),
         )
     };
-    let mut document = json!({"format":"cozy.worker.v1.RunProduct/1","output":product.output,"op":product.op,
+    let mut document = json!({"format":"cozy.machine.product/1","output":product.output,"op":product.op,
         "content":reference(product.content.as_ref().ok_or_else(missing)?),"media_type":product.media_type});
     if let Some(held) = &product.source {
         document["source"] = source(held)?;
@@ -429,8 +428,8 @@ pub fn document(product: &pb::RunProduct) -> io::Result<Value> {
 
 /// Whether the log already shows a returned product: the same bytes as the last SET of that
 /// output, or an APPEND at an index the log already holds.
-pub fn shown(log: &[pb::RunProduct], product: &pb::RunProduct) -> bool {
-    if product.op == pb::RunProductOp::Append as i32 {
+pub fn shown(log: &[domain::RunProduct], product: &domain::RunProduct) -> bool {
+    if product.op == domain::RunProductOp::Append as i32 {
         log.iter()
             .any(|p| p.output == product.output && p.op == product.op && p.index == product.index)
     } else {
@@ -440,3 +439,6 @@ pub fn shown(log: &[pb::RunProduct], product: &pb::RunProduct) -> bool {
             .is_some_and(|current| current.content == product.content)
     }
 }
+
+/// The product bytes held by the execution journal.
+pub fn encode(product: &domain::RunProduct) -> Vec<u8> { crate::archive::encode_run_product(product) }

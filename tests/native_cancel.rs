@@ -4,7 +4,7 @@ use cozy_machine::{
         self,
         auth::VerifiedActor,
         capability::{self, Grant},
-        pb, v1, MachineBackend, MachineIdentity,
+        domain, v1, MachineBackend, MachineIdentity,
     },
     execution::Engine,
     journal::{Invocation, Journal, Outcome, ResultRecord, State},
@@ -230,14 +230,12 @@ async fn canceled_ids_refuse_updates_and_another_actors_update_never_shadows_the
             VerifiedActor {
                 public_key: SigningKey::from_bytes(&BOB).verifying_key().to_bytes(),
             },
-            pb::MachineExecutionControl {
-                execution: Some(pb::MachineExecutionQuery {
+            domain::MachineExecutionControl {
+                execution: Some(domain::MachineExecutionQuery {
                     request_id: "shared".into(),
                     expected_execution_workspace_id: server.service.engine.workspace_id(),
-                    ..Default::default()
                 }),
-                action: pb::MachineExecutionAction::Cancel as i32,
-                ..Default::default()
+                action: domain::MachineExecutionAction::Cancel as i32,
             },
         )
         .unwrap_err();

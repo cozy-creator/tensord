@@ -1,6 +1,5 @@
 //! Native input custody over released TensorFS and the service's sole journal.
-use crate::api::{auth::VerifiedActor, backend::InputTreeReceiver, pb};
-use prost::Message;
+use crate::api::{auth::VerifiedActor, backend::InputTreeReceiver, domain};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -78,7 +77,7 @@ impl SourceIntake {
         staging: &Path,
         workspace: &str,
         actor: VerifiedActor,
-        header: pb::InputTreeImportHeader,
+        header: domain::InputTreeImportHeader,
     ) -> Result<Box<dyn InputTreeReceiver>, Status> {
         if header.request_id.is_empty()
             || header.request_id.len() > 128
@@ -190,14 +189,14 @@ impl SourceIntake {
             _writer: writer,
         }))
     }
-    fn result(&self, released: bool) -> Result<pb::NativeByteRetentionResult, Status> {
+    fn result(&self, released: bool) -> Result<domain::NativeByteRetentionResult, Status> {
         let root =
             source_artifact::read(&self.store, &self.state.spec.retention_id).map_err(native)?;
         let source = match root {
-            Some(root) if root.complete => Some(pb::NativeByteTreeRef {
+            Some(root) if root.complete => Some(domain::NativeByteTreeRef {
                 producer_root_id: root.producer.clone(),
                 receipt_digest: sha256::digest(&root.receipt().map_err(native)?).to_vec(),
-                manifest: Some(pb::Ref {
+                manifest: Some(domain::Ref {
                     digest: decode_hex(&root.manifest.sha256)?,
                     length: root.manifest.length,
                 }),
@@ -205,7 +204,7 @@ impl SourceIntake {
             }),
             _ => None,
         };
-        Ok(pb::NativeByteRetentionResult {
+        Ok(domain::NativeByteRetentionResult {
             source,
             retention_id: self.state.spec.retention_id.clone(),
             released,
@@ -222,7 +221,7 @@ impl SourceIntake {
     }
 }
 impl InputTreeReceiver for SourceIntake {
-    fn blob(&mut self, blob: pb::InputTreeImportBlob) -> Result<(), Status> {
+    fn blob(&mut self, blob: domain::InputTreeImportBlob) -> Result<(), Status> {
         if self.state.released {
             return Err(Status::failed_precondition(
                 "input intake is permanently released",
@@ -282,8 +281,8 @@ impl InputTreeReceiver for SourceIntake {
     }
     fn commit(
         self: Box<Self>,
-        commit: pb::InputTreeImportCommit,
-    ) -> Result<pb::NativeByteRetentionResult, Status> {
+        commit: domain::InputTreeImportCommit,
+    ) -> Result<domain::NativeByteRetentionResult, Status> {
         if commit.abort || self.state.released {
             self.journal
                 .abort_intake(&self.state.spec.actor, &self.state.spec.retention_id)
@@ -334,18 +333,18 @@ impl InputTreeReceiver for SourceIntake {
             .finish_intake(
                 &self.state.spec.actor,
                 &self.state.spec.retention_id,
-                result.encode_to_vec(),
+                crate::archive::encode_native_byte_retention_result(&result),
             )
             .map_err(database)?;
         if committed.released {
             self.release_native()?;
-            return Ok(pb::NativeByteRetentionResult {
+            return Ok(domain::NativeByteRetentionResult {
                 released: true,
                 ..result
             });
         }
         if let Some(receipt) = committed.receipt {
-            return pb::NativeByteRetentionResult::decode(receipt.as_slice())
+            return crate::archive::decode_native_byte_retention_result(receipt.as_slice())
                 .map_err(|_| Status::data_loss("committed intake receipt is invalid"));
         }
         Err(Status::data_loss(

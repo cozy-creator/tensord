@@ -1,5 +1,5 @@
 //! One adapter into the owned execution engine. This module owns no journal.
-use super::{auth::VerifiedActor, pb, v1};
+use super::{auth::VerifiedActor, domain, v1};
 use std::collections::BTreeMap;
 use tonic::Status;
 
@@ -11,8 +11,8 @@ pub trait MachineBackend: Send + Sync + 'static {
     fn list_packages(
         &self,
         _: VerifiedActor,
-        _: pb::PackageListQuery,
-    ) -> Result<pb::PackageList, Status> {
+        _: domain::PackageListQuery,
+    ) -> Result<domain::PackageList, Status> {
         unsupported()
     }
     /// What each of the caller's installations holds now (`Environment.level`), by
@@ -27,46 +27,46 @@ pub trait MachineBackend: Send + Sync + 'static {
     fn workspace(
         &self,
         _: VerifiedActor,
-        _: pb::MachineExecutionWorkspaceQuery,
-    ) -> Result<pb::MachineExecutionWorkspace, Status>;
+        _: domain::MachineExecutionWorkspaceQuery,
+    ) -> Result<domain::MachineExecutionWorkspace, Status>;
     fn get(
         &self,
         _: VerifiedActor,
-        _: pb::MachineExecutionQuery,
-    ) -> Result<pb::MachineExecutionState, Status> {
+        _: domain::MachineExecutionQuery,
+    ) -> Result<domain::MachineExecutionState, Status> {
         unsupported()
     }
     fn events(
         &self,
         _: VerifiedActor,
-        _: pb::MachineExecutionEventsQuery,
-    ) -> Result<pb::MachineExecutionEventPage, Status> {
+        _: domain::MachineExecutionEventsQuery,
+    ) -> Result<domain::MachineExecutionEventPage, Status> {
         unsupported()
     }
     /// What a run's executor measured (canonical JSON), when it ran on a device.
     fn measurements(
         &self,
         _: VerifiedActor,
-        _: pb::MachineExecutionQuery,
+        _: domain::MachineExecutionQuery,
     ) -> Result<Option<Vec<u8>>, Status> {
         Ok(None)
     }
     /// A run's own time running its callable, every attempt summed (0: unknown).
-    fn execution_ms(&self, _: VerifiedActor, _: pb::MachineExecutionQuery) -> Result<u64, Status> {
+    fn execution_ms(&self, _: VerifiedActor, _: domain::MachineExecutionQuery) -> Result<u64, Status> {
         Ok(0)
     }
     fn control(
         &self,
         _: VerifiedActor,
-        _: pb::MachineExecutionControl,
-    ) -> Result<pb::MachineExecutionState, Status> {
+        _: domain::MachineExecutionControl,
+    ) -> Result<domain::MachineExecutionState, Status> {
         unsupported()
     }
     fn list(
         &self,
         _: VerifiedActor,
-        _: pb::MachineExecutionListQuery,
-    ) -> Result<pb::MachineExecutionList, Status> {
+        _: domain::MachineExecutionListQuery,
+    ) -> Result<domain::MachineExecutionList, Status> {
         unsupported()
     }
     /// One run output's current bytes (`GET /v1/runs/{run}/outputs/{output}[/{index}]`).
@@ -97,14 +97,14 @@ pub trait MachineBackend: Send + Sync + 'static {
     fn read_triage(
         &self,
         _: VerifiedActor,
-        _: pb::MachineExecutionTriageQuery,
-    ) -> Result<pb::MachineExecutionTriage, Status> {
+        _: domain::MachineExecutionTriageQuery,
+    ) -> Result<domain::MachineExecutionTriage, Status> {
         unsupported()
     }
     fn read_machine_log(
         &self,
         _: VerifiedActor,
-        _: pb::MachineLogQuery,
+        _: domain::MachineLogQuery,
     ) -> Result<Vec<u8>, Status> {
         unsupported()
     }
@@ -128,11 +128,11 @@ pub struct OutputSnapshot {
 /// membership, contiguous offsets, native custody and durable commit/abort semantics.
 /// Dropping a disconnected transfer never supplies execution cancellation authority.
 pub trait InputTreeReceiver: Send {
-    fn blob(&mut self, blob: pb::InputTreeImportBlob) -> Result<(), Status>;
+    fn blob(&mut self, blob: domain::InputTreeImportBlob) -> Result<(), Status>;
     fn commit(
         self: Box<Self>,
-        commit: pb::InputTreeImportCommit,
-    ) -> Result<pb::NativeByteRetentionResult, Status>;
+        commit: domain::InputTreeImportCommit,
+    ) -> Result<domain::NativeByteRetentionResult, Status>;
 }
 
 fn unsupported<T>() -> Result<T, Status> {

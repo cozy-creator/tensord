@@ -1,12 +1,11 @@
 //! `cozy.machine.v1` (G/API.md): Run, Control and Read over the machine's engine, every call
-//! authorized by one `Cozy-Cap`. Until `worker.v1` is deleted at cutover this service reuses
-//! the backend's operations; Status and `Run kind: update` are `machine_status` and
-//! `machine_update` (D2); Write (D1) answers UNIMPLEMENTED until it lands.
+//! authorized by one `Cozy-Cap`. The adapter consumes current native domain values. Status
+//! and software-update runs are handled by `machine_status` and `machine_update`.
 use super::{
     auth::{StreamAuthority, VerifiedActor},
     backend::MachineBackend,
     capability::{self, Grant},
-    pb, v1, MachineIdentity,
+    domain, v1, MachineIdentity,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use crate::gpu_service::Level;
@@ -140,17 +139,16 @@ pub(super) fn query(
     backend: &impl MachineBackend,
     actor: VerifiedActor,
     id: &str,
-) -> Result<pb::MachineExecutionQuery, Status> {
-    let workspace = backend.workspace(actor, pb::MachineExecutionWorkspaceQuery::default())?;
-    Ok(pb::MachineExecutionQuery {
+) -> Result<domain::MachineExecutionQuery, Status> {
+    let workspace = backend.workspace(actor, domain::MachineExecutionWorkspaceQuery::default())?;
+    Ok(domain::MachineExecutionQuery {
         request_id: id.into(),
         expected_execution_workspace_id: workspace.execution_workspace_id,
-        ..Default::default()
     })
 }
 
 /// The run's state as the log's first frame (sequence 0: a snapshot, not a log entry).
-pub(super) fn state(id: &str, state: &pb::MachineExecutionState) -> v1::RunState {
+pub(super) fn state(id: &str, state: &domain::MachineExecutionState) -> v1::RunState {
     v1::RunState {
         id: id.into(),
         number: state.number,
@@ -165,10 +163,10 @@ pub(super) fn state(id: &str, state: &pb::MachineExecutionState) -> v1::RunState
 }
 
 /// A run's model choices as the preparation path reads them.
-fn choices(sent: Vec<v1::ModelChoice>) -> Result<Vec<pb::ModelChoice>, Status> {
+fn choices(sent: Vec<v1::ModelChoice>) -> Result<Vec<domain::ModelChoice>, Status> {
     sent.into_iter()
-        .map(|choice| -> Result<pb::ModelChoice, Status> {
-            Ok(pb::ModelChoice {
+        .map(|choice| -> Result<domain::ModelChoice, Status> {
+            Ok(domain::ModelChoice {
                 parameter: choice.parameter,
                 repository: choice.repository,
                 release: choice.release,
@@ -176,7 +174,7 @@ fn choices(sent: Vec<v1::ModelChoice>) -> Result<Vec<pb::ModelChoice>, Status> {
                 manifest: if choice.manifest.is_empty() {
                     None
                 } else {
-                    Some(pb::Ref {
+                    Some(domain::Ref {
                         digest: digest(&choice.manifest)?,
                         length: choice.manifest_length,
                     })
@@ -186,7 +184,7 @@ fn choices(sent: Vec<v1::ModelChoice>) -> Result<Vec<pb::ModelChoice>, Status> {
                 adapters: choice
                     .adapters
                     .into_iter()
-                    .map(|a| pb::DownloadAdapterRef {
+                    .map(|a| domain::DownloadAdapterRef {
                         component: a.component,
                         model: a.model,
                         release: a.release,
@@ -430,7 +428,7 @@ struct Log {
     parts: HashMap<(String, u32), Parts>,
 }
 impl Log {
-    fn event(&mut self, event: pb::MachineExecutionEvent) -> Option<v1::RunEvent> {
+    fn event(&mut self, event: domain::MachineExecutionEvent) -> Option<v1::RunEvent> {
         let body: Value =
             serde_json::from_slice(&event.body_canonical_bytes).unwrap_or(Value::Null);
         let kind = match event.kind.as_str() {
@@ -500,7 +498,7 @@ impl Log {
             }),
             "product" => {
                 let product = event.product?;
-                let list = product.op == pb::RunProductOp::Append as i32;
+                let list = product.op == domain::RunProductOp::Append as i32;
                 let index = if list { product.index + 1 } else { 0 };
                 let rev = self
                     .revisions
@@ -575,6 +573,10 @@ impl Log {
 
 #[tonic::async_trait]
 impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
+    type StatusStream = Events<v1::StatusFrame>;
+    type RunStream = Events<v1::RunEvent>;
+    type ReadStream = Events<v1::ReadFrame>;
+
     async fn status(
         &self,
         request: Request<v1::StatusRequest>,
@@ -716,13 +718,13 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
             return Err(refused("update_control_unsupported", "software update runs do not support Control"));
         }
         let action = match v1::Action::try_from(request.action) {
-            Ok(v1::Action::Cancel) => pb::MachineExecutionAction::Cancel,
-            Ok(v1::Action::Pause) => pb::MachineExecutionAction::Pause,
-            Ok(v1::Action::Resume) => pb::MachineExecutionAction::Resume,
+            Ok(v1::Action::Cancel) => domain::MachineExecutionAction::Cancel,
+            Ok(v1::Action::Pause) => domain::MachineExecutionAction::Pause,
+            Ok(v1::Action::Resume) => domain::MachineExecutionAction::Resume,
             _ => return Err(Status::invalid_argument("control names an action")),
         };
         let _admitted = match action {
-            pb::MachineExecutionAction::Resume => self.admit()?,
+            domain::MachineExecutionAction::Resume => self.admit()?,
             _ => None,
         };
         let actor = caller.actor;
@@ -730,11 +732,9 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
         let changed = Self::call(&self.backend, move |backend| {
             backend.control(
                 actor,
-                pb::MachineExecutionControl {
+                domain::MachineExecutionControl {
                     execution: Some(query(backend, actor, &id)?),
-                    command_id: uuid::Uuid::new_v4().to_string(),
                     action: action as i32,
-                    ..Default::default()
                 },
             )
         })
@@ -785,7 +785,7 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
                 let triage = Self::call(&self.backend, move |backend| {
                     backend.read_triage(
                         actor,
-                        pb::MachineExecutionTriageQuery {
+                        domain::MachineExecutionTriageQuery {
                             execution: Some(query(backend, actor, &run)?),
                             attempt_ordinal: 0,
                         },
@@ -805,7 +805,7 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
             Some(v1::read_request::Target::Log(name)) => {
                 caller.machine()?;
                 let log = match name.as_str() {
-                    "tensorfs-transport" => pb::MachineLog::TensorfsTransport,
+                    "tensorfs-transport" => domain::MachineLog::TensorfsTransport,
                     _ => {
                         return Err(Status::not_found(format!(
                             "this machine keeps no log {name}"
@@ -816,10 +816,9 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
                 let bytes = Self::call(&self.backend, move |backend| {
                     backend.read_machine_log(
                         actor,
-                        pb::MachineLogQuery {
+                        domain::MachineLogQuery {
                             log: log as i32,
                             tail_bytes: tail,
-                            ..Default::default()
                         },
                     )
                 })
@@ -931,7 +930,7 @@ pub(super) async fn stream_run<B: MachineBackend>(
         let page = tokio::task::spawn_blocking(move || {
             page_backend.events(
                 actor,
-                pb::MachineExecutionEventsQuery {
+                domain::MachineExecutionEventsQuery {
                     execution: Some(query(&*page_backend, actor, &page_id)?),
                     after,
                     limit: 256,

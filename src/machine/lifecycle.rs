@@ -433,19 +433,10 @@ mod hub_tests {
         let authority = crate::api::auth::Authority {
             worker_id: "ra-1".into(),
             boot_id: "boot".into(),
-            leaf_digest: [9; 32],
             keys: keys.clone(),
         };
-        let claim = |key: &SigningKey| crate::api::pb::Claim {
-            record_owner_epoch: 1,
-            worker_id: "ra-1".into(),
-            worker_boot_id: "boot".into(),
-            proof: ed25519_dalek::Signer::sign(key, &authority.transcript(1).unwrap())
-                .to_bytes()
-                .to_vec(),
-            ..Default::default()
-        };
-        authority.verify(Some(&claim(&owner))).unwrap();
+        let authorized = |key: &SigningKey| authority.keys.admitted().contains(&key.verifying_key());
+        assert!(authorized(&owner));
         let lease = |key: &SigningKey| {
             (200, serde_json::json!({"worker_id": "ra-1", "authorized_keys": [URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes())], "lease_seconds": 60}).to_string())
         };
@@ -458,15 +449,15 @@ mod hub_tests {
         let task = tokio::spawn(keep_authority(hub.clone(), keys));
         // 425 (not yet ready) keeps the boot keys; the lease then replaces them.
         tokio::time::sleep(Duration::from_millis(1500)).await;
-        assert!(authority.verify(Some(&claim(&owner))).is_err());
-        authority.verify(Some(&claim(&other))).unwrap();
+        assert!(!authorized(&owner));
+        assert!(authorized(&other));
         task.abort();
         // An explicit denial revokes at once.
         let keys = authority.keys.clone();
         let task = tokio::spawn(keep_authority(hub.clone(), keys));
         tokio::time::sleep(Duration::from_millis(300)).await;
         task.abort();
-        assert!(authority.verify(Some(&claim(&other))).is_err());
+        assert!(!authorized(&other));
         hub.release().await.unwrap();
         let seen = seen.lock().unwrap().clone();
         assert_eq!(

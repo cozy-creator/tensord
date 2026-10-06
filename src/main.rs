@@ -48,13 +48,13 @@ fn run() -> io::Result<()> {
         Some("version") => {
             #[derive(serde::Serialize)]
             struct Version { name: &'static str, implementation: &'static str, version: &'static str, #[serde(skip_serializing_if = "Option::is_none")] commit: Option<&'static str>,
-                tensorfs: &'static str, api: [&'static str; 1], wire_minor: u32, minimum_wire_minor: u32, capabilities: Vec<&'static str> }
+                tensorfs: &'static str, api: [&'static str; 1], capabilities: Vec<&'static str> }
             // Machine contracts beside the private socket's: clients choose by capability.
             let capabilities = cozy_machine::api::CAPABILITIES.iter().chain(CAPS).copied().collect();
             // `api` names the client API it serves (G/API.md): a controller chooses its machine by it.
             // `commit` is the source a release build was made from (`task release`).
             let record = Version { name: "cozy-machine", implementation: "rust", version: env!("CARGO_PKG_VERSION"), commit: option_env!("COZY_MACHINE_COMMIT"), tensorfs: tensorfs_core::VERSION, api: ["cozy.machine.v1"],
-                wire_minor: cozy_machine::api::WIRE_MINOR, minimum_wire_minor: cozy_machine::api::WIRE_MINIMUM, capabilities };
+                capabilities };
             println!("{}", serde_json::to_string(&record)?); Ok(())
         }
         Some("host-memory") => {

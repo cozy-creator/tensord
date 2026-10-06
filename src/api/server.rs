@@ -51,10 +51,8 @@ impl MachineIdentity {
         let authority = Authority {
             worker_id,
             boot_id,
-            leaf_digest: tensorfs_core::sha256::digest(&cert_der),
             keys: keys.into(),
         };
-        authority.transcript(1)?;
         Ok(Self {
             authority,
             cert_pem: cert.pem(),

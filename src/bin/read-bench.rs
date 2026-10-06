@@ -6,12 +6,11 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use cozy_machine::{
     api::{
         capability::{mint, Grant, MACHINE},
-        pb, v1,
+        domain, v1,
     },
     journal::{Invocation, Journal, Outcome, ProcessBirth, SubmissionContext},
 };
 use ed25519_dalek::SigningKey;
-use prost::Message;
 use std::{
     io::{self, Read},
     path::PathBuf,
@@ -95,17 +94,17 @@ fn seed(state: PathBuf, gib: u64, key_seed: &str) -> io::Result<()> {
     let birth = cozy_machine::execution::process_birth(holder.id())?;
     journal.register_process(&record.id, ProcessBirth { ..birth })?;
     journal.running(&record.id, None)?;
-    let product = pb::RunProduct {
+    let product = domain::RunProduct {
         output: "blob".into(),
-        op: pb::RunProductOp::Set as i32,
-        content: Some(pb::Ref {
+        op: domain::RunProductOp::Set as i32,
+        content: Some(domain::Ref {
             digest: hash.to_vec(),
             length,
         }),
         media_type: "application/octet-stream".into(),
         ..Default::default()
     };
-    journal.append_product(&record.id, None, &product.encode_to_vec())?;
+    journal.append_product(&record.id, None, &cozy_machine::products::encode(&product))?;
     journal.finish(&record.id, Outcome::Failed("bench output seeded".into()))?;
     let _ = holder.kill();
     let _ = holder.wait();

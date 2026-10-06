@@ -1,4 +1,4 @@
-use cozy_machine::api::{auth::VerifiedActor, pb, workspaces::WorkspaceUploads};
+use cozy_machine::api::{auth::VerifiedActor, domain, workspaces::WorkspaceUploads};
 use std::{fs, io::Read, path::PathBuf, sync::Arc};
 use tensorfs_core::store::Store;
 
@@ -30,10 +30,10 @@ fn actor(key: u8) -> VerifiedActor {
         public_key: [key; 32],
     }
 }
-fn make_header(operation: &str, name: &str, bytes: &[u8]) -> pb::LocalPackageUploadHeader {
-    pb::LocalPackageUploadHeader {
+fn make_header(operation: &str, name: &str, bytes: &[u8]) -> domain::LocalPackageUploadHeader {
+    domain::LocalPackageUploadHeader {
         operation_id: operation.into(),
-        file: Some(pb::LocalPackageFileRef {
+        file: Some(domain::LocalPackageFileRef {
             filename: name.into(),
             length: bytes.len() as u64,
             digest: if name == "source.tar" {
@@ -42,13 +42,12 @@ fn make_header(operation: &str, name: &str, bytes: &[u8]) -> pb::LocalPackageUpl
                 tensorfs_core::sha256::digest(bytes).to_vec()
             },
         }),
-        ..Default::default()
     }
 }
-fn selected(header: &pb::LocalPackageUploadHeader) -> pb::DesiredLocalPackageSet {
-    pb::DesiredLocalPackageSet {
+fn selected(header: &domain::LocalPackageUploadHeader) -> domain::DesiredLocalPackageSet {
+    domain::DesiredLocalPackageSet {
         operation_id: header.operation_id.clone(),
-        package: Some(pb::DevelopmentPackage {
+        package: Some(domain::DevelopmentPackage {
             package: "local/fixture".into(),
             release: "0.0.1".into(),
             installation_id: "install-fixture".into(),
@@ -103,7 +102,7 @@ fn resumed_prefix_is_durable_owner_scoped_and_root_descriptor_immutable() {
     let header = make_header("resume", "fixture-0.0.1-py3-none-any.whl", bytes);
     let mut session = uploads.begin(actor(1), &header).unwrap();
     session
-        .append(pb::LocalPackageUploadChunk {
+        .append(domain::LocalPackageUploadChunk {
             offset: 0,
             data: bytes[..8].to_vec(),
         })
@@ -117,7 +116,7 @@ fn resumed_prefix_is_durable_owner_scoped_and_root_descriptor_immutable() {
     let mut session = uploads.begin(actor(1), &header).unwrap();
     assert_eq!(session.received(), 8);
     session
-        .append(pb::LocalPackageUploadChunk {
+        .append(domain::LocalPackageUploadChunk {
             offset: 8,
             data: bytes[8..].to_vec(),
         })
@@ -158,7 +157,7 @@ fn source_archive_is_statically_inspected_and_imported_into_tensorfs() {
     let header = make_header("static-source", "source.tar", &bytes);
     let mut session = uploads.begin(actor(1), &header).unwrap();
     session
-        .append(pb::LocalPackageUploadChunk {
+        .append(domain::LocalPackageUploadChunk {
             offset: 0,
             data: bytes.clone(),
         })
@@ -198,7 +197,7 @@ fn corrupt_and_unsafe_carriers_never_acknowledge_verified_custody() {
     let header = make_header("bad-digest", "fixture-0.0.1-py3-none-any.whl", good);
     let mut session = uploads.begin(actor(1), &header).unwrap();
     assert!(session
-        .append(pb::LocalPackageUploadChunk {
+        .append(domain::LocalPackageUploadChunk {
             offset: 0,
             data: vec![0; good.len()]
         })
@@ -219,7 +218,7 @@ fn corrupt_and_unsafe_carriers_never_acknowledge_verified_custody() {
         let header = make_header(&format!("unsafe-{index}"), "source.tar", &bytes);
         let mut session = uploads.begin(actor(1), &header).unwrap();
         assert!(session
-            .append(pb::LocalPackageUploadChunk {
+            .append(domain::LocalPackageUploadChunk {
                 offset: 0,
                 data: bytes
             })

@@ -1,9 +1,10 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use cozy_machine::api::{
+    capability::{self, Grant, MACHINE},
     identity::{AuthorizedKeys, MachineConfig, ReadinessSecret},
-    pb, MachineIdentity,
+    MachineIdentity,
 };
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
 
 struct Area(PathBuf);
@@ -48,17 +49,26 @@ fn private(path: &std::path::Path, value: &impl serde::Serialize) {
     fs::write(path, serde_json::to_vec(value).unwrap()).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
 }
-fn claim(identity: &MachineIdentity, key: &SigningKey) -> pb::Claim {
-    pb::Claim {
-        record_owner_epoch: 1,
-        worker_id: identity.authority.worker_id.clone(),
-        worker_boot_id: identity.authority.boot_id.clone(),
-        proof: key
-            .sign(&identity.authority.transcript(1).unwrap())
-            .to_bytes()
-            .to_vec(),
-        ..Default::default()
-    }
+fn capability(identity: &MachineIdentity, key: &SigningKey) -> String {
+    capability::mint(
+        key,
+        Grant {
+            machine: identity.authority.worker_id.clone(),
+            action: MACHINE.into(),
+            expires: i64::MAX,
+            ..Default::default()
+        },
+    )
+}
+fn allowed(identity: &MachineIdentity, token: &str) -> bool {
+    capability::verify_signer(
+        token,
+        &identity.authority.worker_id,
+        &identity.authority.keys.admitted(),
+        1,
+        MACHINE,
+    )
+    .is_ok()
 }
 
 #[test]
@@ -69,7 +79,7 @@ fn pinned_leaf_and_lifetime_survive_restart_and_keys_refresh() {
     let journal = area.0.join("execution-journal-witness");
     fs::write(&journal, b"durable engine is owned elsewhere").unwrap();
     let first = MachineIdentity::retained(&config).unwrap();
-    let before = claim(&first, &key);
+    let before = capability(&first, &key);
     let next = MachineIdentity::retained(&config).unwrap();
     assert_eq!(first.cert_der, next.cert_der);
     assert_eq!(first.key_pem, next.key_pem);
@@ -81,8 +91,8 @@ fn pinned_leaf_and_lifetime_survive_restart_and_keys_refresh() {
             .len(),
         32
     );
-    next.authority.verify(Some(&before)).unwrap();
-    next.authority.verify(Some(&claim(&next, &key))).unwrap();
+    assert!(allowed(&next, &before));
+    assert!(allowed(&next, &capability(&next, &key)));
     let new_key = SigningKey::from_bytes(&[2; 32]);
     private(
         &config.authorized_keys_file,
@@ -92,14 +102,8 @@ fn pinned_leaf_and_lifetime_survive_restart_and_keys_refresh() {
     );
     let rotated = MachineIdentity::retained(&config).unwrap();
     assert_eq!(first.cert_der, rotated.cert_der);
-    assert!(rotated
-        .authority
-        .verify(Some(&claim(&rotated, &key)))
-        .is_err());
-    rotated
-        .authority
-        .verify(Some(&claim(&rotated, &new_key)))
-        .unwrap();
+    assert!(!allowed(&rotated, &capability(&rotated, &key)));
+    assert!(allowed(&rotated, &capability(&rotated, &new_key)));
     assert_eq!(
         fs::read(journal).unwrap(),
         b"durable engine is owned elsewhere"

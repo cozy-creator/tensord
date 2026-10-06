@@ -6,7 +6,7 @@ use cozy_machine::api::{
     auth::{Keys, VerifiedActor},
     backend::OutputSnapshot,
     capability::{self, Grant},
-    pb, v1, MachineBackend, MachineIdentity,
+    domain, v1, MachineBackend, MachineIdentity,
 };
 use ed25519_dalek::SigningKey;
 use std::{
@@ -31,24 +31,24 @@ impl MachineBackend for Run {
     fn workspace(
         &self,
         _: VerifiedActor,
-        _: pb::MachineExecutionWorkspaceQuery,
-    ) -> Result<pb::MachineExecutionWorkspace, tonic::Status> {
-        Ok(pb::MachineExecutionWorkspace { execution_workspace_id: "w".into(), ..Default::default() })
+        _: domain::MachineExecutionWorkspaceQuery,
+    ) -> Result<domain::MachineExecutionWorkspace, tonic::Status> {
+        Ok(domain::MachineExecutionWorkspace { execution_workspace_id: "w".into(), ..Default::default() })
     }
     fn get(
         &self,
         _: VerifiedActor,
-        _: pb::MachineExecutionQuery,
-    ) -> Result<pb::MachineExecutionState, tonic::Status> {
+        _: domain::MachineExecutionQuery,
+    ) -> Result<domain::MachineExecutionState, tonic::Status> {
         let state = if self.live { "running" } else { "failed" };
-        Ok(pb::MachineExecutionState { number: 1, state: state.into(), ..Default::default() })
+        Ok(domain::MachineExecutionState { number: 1, state: state.into(), ..Default::default() })
     }
     fn events(
         &self,
         _: VerifiedActor,
-        query: pb::MachineExecutionEventsQuery,
-    ) -> Result<pb::MachineExecutionEventPage, tonic::Status> {
-        let progress = |sequence| pb::MachineExecutionEvent {
+        query: domain::MachineExecutionEventsQuery,
+    ) -> Result<domain::MachineExecutionEventPage, tonic::Status> {
+        let progress = |sequence| domain::MachineExecutionEvent {
             sequence,
             kind: "progress".into(),
             body_canonical_bytes: br#"{"payload":{"stage":"the author's prompt"}}"#.to_vec(),
@@ -58,13 +58,13 @@ impl MachineBackend for Run {
             std::thread::sleep(Duration::from_millis(20));
             vec![progress(query.after + 1)]
         } else {
-            let product = |sequence, output: &str, byte| pb::MachineExecutionEvent {
+            let product = |sequence, output: &str, byte| domain::MachineExecutionEvent {
                 sequence,
                 kind: "product".into(),
-                product: Some(pb::RunProduct {
+                product: Some(domain::RunProduct {
                     output: output.into(),
-                    op: pb::RunProductOp::Set as i32,
-                    content: Some(pb::Ref { digest: vec![byte; 32], length: 8 }),
+                    op: domain::RunProductOp::Set as i32,
+                    content: Some(domain::Ref { digest: vec![byte; 32], length: 8 }),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -75,10 +75,10 @@ impl MachineBackend for Run {
                 product(2, "image", 2),
                 product(3, "private", 3),
                 progress(4),
-                pb::MachineExecutionEvent {
+                domain::MachineExecutionEvent {
                     sequence: 5,
                     kind: "outcome".into(),
-                    outcome: Some(pb::AttemptOutcome {
+                    outcome: Some(domain::AttemptOutcome {
                         outcome_canonical_bytes: outcome.to_vec(),
                         ..Default::default()
                     }),
@@ -89,9 +89,9 @@ impl MachineBackend for Run {
             .filter(|event| event.sequence > query.after)
             .collect()
         };
-        Ok(pb::MachineExecutionEventPage { events, next_after: query.after + 1, ..Default::default() })
+        Ok(domain::MachineExecutionEventPage { events, next_after: query.after + 1, ..Default::default() })
     }
-    fn measurements(&self, _: VerifiedActor, _: pb::MachineExecutionQuery) -> Result<Option<Vec<u8>>, tonic::Status> {
+    fn measurements(&self, _: VerifiedActor, _: domain::MachineExecutionQuery) -> Result<Option<Vec<u8>>, tonic::Status> {
         Ok(Some(br#"{"device":"the owner's"}"#.to_vec()))
     }
     fn open_output(

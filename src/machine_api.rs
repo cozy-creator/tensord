@@ -2,7 +2,7 @@
 use crate::{
     api::{
         auth::{Authority, VerifiedActor},
-        pb, v1,
+        domain, v1,
         MachineBackend,
     },
     gpu_service::{without_gpus, KeptMember, Level},
@@ -62,7 +62,7 @@ impl NativeBackend {
     fn query(
         &self,
         actor: VerifiedActor,
-        query: pb::MachineExecutionQuery,
+        query: domain::MachineExecutionQuery,
     ) -> Result<Execution, Status> {
         if query.expected_execution_workspace_id != self.workspace_id() {
             return Err(refusal(
@@ -75,7 +75,7 @@ impl NativeBackend {
             .get_public(&actor_id(actor), &query.request_id)
             .map_err(problem)
     }
-    fn state(&self, record: &Execution) -> Result<pb::MachineExecutionState, Status> {
+    fn state(&self, record: &Execution) -> Result<domain::MachineExecutionState, Status> {
         let context = record
             .submission
             .as_ref()
@@ -86,14 +86,14 @@ impl NativeBackend {
             .public_terminal(&record.id)
             .map_err(problem)?
             .map(|held| {
-                pb::MachineExecutionEventPage::decode(held.events.as_slice())
+                crate::archive::decode_machine_execution_event_page(held.events.as_slice())
                     .map(|page| page.head_sequence)
                     .map_err(|_| Status::data_loss("durable event projection corrupt"))
             })
             .transpose()?
             .unwrap_or(record.revision)
             .max(record.revision);
-        Ok(pb::MachineExecutionState {
+        Ok(domain::MachineExecutionState {
             request_id: context.request_id.clone(),
             attempt_ordinal: record.attempt.max(1) as u64,
             generation: record.attempt as u64,
@@ -126,18 +126,17 @@ impl NativeBackend {
                 .map_err(|_| Status::internal("invalid journal run number"))?,
             accepted_at_ms: record.accepted_at_ms,
             finished_at_ms: record.finished_at_ms,
-            target: Some(pb::MachineExecutionTarget {
+            target: Some(domain::MachineExecutionTarget {
                 package: record.invocation.package.clone(),
                 entrypoint: record.invocation.entrypoint.clone(),
                 installation_id: record.invocation.generation.clone(),
                 ..Default::default()
             }),
-            ..Default::default()
         })
     }
     /// The run's journaled log: its published products, its memoized calls' results and its
     /// settled calls, as events with their journaled sequences.
-    fn product_events(&self, record: &Execution) -> Result<Vec<pb::MachineExecutionEvent>, Status> {
+    fn product_events(&self, record: &Execution) -> Result<Vec<domain::MachineExecutionEvent>, Status> {
         let attempt = record.attempt.max(1) as u64;
         let engine = &self.service.engine;
         let mut events = engine
@@ -146,7 +145,7 @@ impl NativeBackend {
             .iter()
             .map(|stored| {
                 let product = crate::products::decode(stored).map_err(problem)?;
-                Ok(pb::MachineExecutionEvent {
+                Ok(domain::MachineExecutionEvent {
                     sequence: stored.sequence,
                     attempt_ordinal: attempt,
                     at_ms: stored.at_ms,
@@ -161,7 +160,7 @@ impl NativeBackend {
         let calls = engine.calls(&record.id).map_err(problem)?.into_iter().map(|c| ("call", c));
         let logs = engine.logs(&record.id).map_err(problem)?.into_iter().map(|l| ("log", l));
         for (kind, stored) in memos.chain(calls).chain(logs) {
-            events.push(pb::MachineExecutionEvent {
+            events.push(domain::MachineExecutionEvent {
                 sequence: stored.sequence,
                 attempt_ordinal: attempt,
                 at_ms: stored.at_ms,
@@ -173,7 +172,7 @@ impl NativeBackend {
         events.sort_by_key(|event| event.sequence);
         Ok(events)
     }
-    fn terminal(&self, record: &Execution) -> Result<pb::MachineExecutionEventPage, Status> {
+    fn terminal(&self, record: &Execution) -> Result<domain::MachineExecutionEventPage, Status> {
         let _guard = self.projection.lock().unwrap();
         if let Some(held) = self
             .service
@@ -181,7 +180,7 @@ impl NativeBackend {
             .public_terminal(&record.id)
             .map_err(problem)?
         {
-            return pb::MachineExecutionEventPage::decode(held.events.as_slice())
+            return crate::archive::decode_machine_execution_event_page(held.events.as_slice())
                 .map_err(|_| Status::data_loss("durable event projection is corrupt"));
         }
         if !record.state.terminal() {
@@ -271,7 +270,7 @@ impl NativeBackend {
                         .get("result")
                         .ok_or_else(|| Status::data_loss("result schema absent"))?,
                     "",
-                    pb::RunProductOp::Set,
+                    domain::RunProductOp::Set,
                     0,
                     &references,
                     &mut products,
@@ -285,7 +284,7 @@ impl NativeBackend {
         let shown: Vec<_> = events.iter().filter_map(|e| e.product.clone()).collect();
         // An observer that last saw it queued still sees it start before it ends.
         if record.running_revision > 0 {
-            events.push(pb::MachineExecutionEvent {
+            events.push(domain::MachineExecutionEvent {
                 sequence: record.running_revision,
                 attempt_ordinal: record.attempt.max(1) as u64,
                 at_ms: record.started_at_ms,
@@ -303,7 +302,7 @@ impl NativeBackend {
             .into_iter()
             .filter(|product| !crate::products::shown(&shown, product));
         for (index, product) in fresh.enumerate() {
-            events.push(pb::MachineExecutionEvent {
+            events.push(domain::MachineExecutionEvent {
                 sequence: first_sequence + index as u64,
                 attempt_ordinal: record.attempt.max(1) as u64,
                 at_ms: record.finished_at_ms,
@@ -329,7 +328,7 @@ impl NativeBackend {
         }
         facts.push(("run.timing", timing));
         for (kind, body) in facts {
-            events.push(pb::MachineExecutionEvent {
+            events.push(domain::MachineExecutionEvent {
                 sequence: first_sequence + events.len() as u64,
                 attempt_ordinal: attempt,
                 at_ms: record.finished_at_ms,
@@ -338,7 +337,7 @@ impl NativeBackend {
                 ..Default::default()
             });
         }
-        let mut body = json!({"format":"cozy.worker.v1.AttemptOutcomeBody/1", "request_id":context.request_id, "attempt_ordinal":record.attempt.max(1), "invocation_spec_digest":context.invocation_digest});
+        let mut body = json!({"format":"cozy.machine.outcome/1", "request_id":context.request_id, "attempt_ordinal":record.attempt.max(1), "invocation_spec_digest":context.invocation_digest});
         if record.process.is_some() {
             body["execution_started"] = json!(true);
         }
@@ -380,7 +379,7 @@ impl NativeBackend {
         }
         let bytes = canonical(&body)?;
         let digest = sha256::digest(&bytes);
-        let outcome = pb::AttemptOutcome {
+        let outcome = domain::AttemptOutcome {
             worker_boot_id: record.acceptance_boot_id.clone(),
             request_id: context.request_id.clone(),
             attempt_ordinal: record.attempt.max(1) as u64,
@@ -392,13 +391,12 @@ impl NativeBackend {
             outcome_id: format!("out-{}", sha256::hex(&digest)),
             outcome_digest: digest.to_vec(),
             outcome_canonical_bytes: bytes,
-            ..Default::default()
         };
         let sequence = events
             .last()
             .map_or(record.revision, |event| event.sequence.max(record.revision))
             + 1;
-        events.push(pb::MachineExecutionEvent {
+        events.push(domain::MachineExecutionEvent {
             sequence,
             attempt_ordinal: outcome.attempt_ordinal,
             at_ms: record.finished_at_ms,
@@ -411,7 +409,7 @@ impl NativeBackend {
             outcome: Some(outcome.clone()),
             ..Default::default()
         });
-        let page = pb::MachineExecutionEventPage {
+        let page = domain::MachineExecutionEventPage {
             events,
             next_after: sequence,
             head_sequence: sequence,
@@ -423,12 +421,12 @@ impl NativeBackend {
             .commit_public_terminal(
                 &record.id,
                 PublicTerminal {
-                    outcome: outcome.encode_to_vec(),
-                    events: page.encode_to_vec(),
+                    outcome: crate::archive::encode_attempt_outcome(&outcome),
+                    events: crate::archive::encode_machine_execution_event_page(&page),
                 },
             )
             .map_err(problem)?;
-        pb::MachineExecutionEventPage::decode(committed.events.as_slice())
+        crate::archive::decode_machine_execution_event_page(committed.events.as_slice())
             .map_err(|_| Status::data_loss("durable event projection is corrupt"))
     }
 }
@@ -472,10 +470,10 @@ impl MachineBackend for NativeBackend {
         };
         let (op, position) = match index {
             Some(index) => (
-                pb::RunProductOp::Append,
+                domain::RunProductOp::Append,
                 index.checked_sub(1).ok_or_else(absent)?,
             ),
-            None => (pb::RunProductOp::Set, 0),
+            None => (domain::RunProductOp::Set, 0),
         };
         let revisions: Vec<_> = events
             .into_iter()
@@ -487,7 +485,7 @@ impl MachineBackend for NativeBackend {
             .content
             .as_ref()
             .ok_or_else(|| Status::data_loss("product content absent"))?;
-        let refs: Vec<&pb::Ref> = if current.parts.is_empty() {
+        let refs: Vec<&domain::Ref> = if current.parts.is_empty() {
             vec![content]
         } else {
             current
@@ -554,8 +552,8 @@ impl MachineBackend for NativeBackend {
     fn read_triage(
         &self,
         actor: VerifiedActor,
-        request: pb::MachineExecutionTriageQuery,
-    ) -> Result<pb::MachineExecutionTriage, Status> {
+        request: domain::MachineExecutionTriageQuery,
+    ) -> Result<domain::MachineExecutionTriage, Status> {
         let record = self.query(
             actor,
             request
@@ -572,8 +570,8 @@ impl MachineBackend for NativeBackend {
             .triage(&record.id)
             .map_err(problem)?
             .ok_or_else(|| Status::not_found("this attempt kept no triage bundle"))?;
-        Ok(pb::MachineExecutionTriage {
-            bundle: Some(pb::TriageBundleRef {
+        Ok(domain::MachineExecutionTriage {
+            bundle: Some(domain::TriageBundleRef {
                 subject_id: triage.subject_id,
                 write_receipt_digest: digest_bytes(&format!("sha256:{}", triage.sha256))?,
                 length: triage.length,
@@ -584,9 +582,9 @@ impl MachineBackend for NativeBackend {
     fn read_machine_log(
         &self,
         _: VerifiedActor,
-        request: pb::MachineLogQuery,
+        request: domain::MachineLogQuery,
     ) -> Result<Vec<u8>, Status> {
-        if request.log != pb::MachineLog::TensorfsTransport as i32 {
+        if request.log != domain::MachineLog::TensorfsTransport as i32 {
             return Err(Status::not_found(format!(
                 "this machine keeps no log {}",
                 request.log
@@ -626,8 +624,8 @@ impl MachineBackend for NativeBackend {
     fn list_packages(
         &self,
         actor: VerifiedActor,
-        _: pb::PackageListQuery,
-    ) -> Result<pb::PackageList, Status> {
+        _: domain::PackageListQuery,
+    ) -> Result<domain::PackageList, Status> {
         let mut packages = vec![];
         for installed in self
             .service
@@ -645,7 +643,7 @@ impl MachineBackend for NativeBackend {
                 .dependencies
                 .into_iter()
                 .filter(|d| matches!(d.name.as_str(), "cozy-runtime" | "tensorfs"))
-                .map(|d| pb::ImageDistribution {
+                .map(|d| domain::ImageDistribution {
                     distribution: d.name,
                     version: d.version,
                 })
@@ -660,7 +658,7 @@ impl MachineBackend for NativeBackend {
                 .filter_map(|e| e.get("name").and_then(Value::as_str).map(str::to_string))
                 .collect::<Vec<_>>();
             entrypoints.sort();
-            packages.push(pb::MachinePackage {
+            packages.push(domain::MachinePackage {
                 installation_id: installed.alias,
                 package: installed.package,
                 release: installed.release,
@@ -677,7 +675,7 @@ impl MachineBackend for NativeBackend {
                 &b.installation_id,
             ))
         });
-        Ok(pb::PackageList { packages })
+        Ok(domain::PackageList { packages })
     }
     fn levels(&self, actor: VerifiedActor) -> Result<BTreeMap<String, &'static str>, Status> {
         let (actor, gpu) = (actor_id(actor), self.service.gpu());
@@ -741,42 +739,32 @@ impl MachineBackend for NativeBackend {
     fn workspace(
         &self,
         _: VerifiedActor,
-        query: pb::MachineExecutionWorkspaceQuery,
-    ) -> Result<pb::MachineExecutionWorkspace, Status> {
-        if query.describe.is_some() {
-            return Err(Status::unimplemented(
-                "published release description is not qualified by this CPU build",
-            ));
-        }
-        Ok(pb::MachineExecutionWorkspace {
+        _: domain::MachineExecutionWorkspaceQuery,
+    ) -> Result<domain::MachineExecutionWorkspace, Status> {
+        Ok(domain::MachineExecutionWorkspace {
             worker_id: self.authority.worker_id.clone(),
             worker_boot_id: self.authority.boot_id.clone(),
             execution_workspace_id: self.workspace_id(),
-            accelerator_backend: "none".into(),
-            run_output_log: true,
-            release_root_owner: true,
-            submission_close: true,
-            ..Default::default()
         })
     }
     fn get(
         &self,
         actor: VerifiedActor,
-        query: pb::MachineExecutionQuery,
-    ) -> Result<pb::MachineExecutionState, Status> {
+        query: domain::MachineExecutionQuery,
+    ) -> Result<domain::MachineExecutionState, Status> {
         self.state(&self.query(actor, query)?)
     }
     fn execution_ms(
         &self,
         actor: VerifiedActor,
-        query: pb::MachineExecutionQuery,
+        query: domain::MachineExecutionQuery,
     ) -> Result<u64, Status> {
         Ok(self.query(actor, query)?.executed_ms)
     }
     fn measurements(
         &self,
         actor: VerifiedActor,
-        query: pb::MachineExecutionQuery,
+        query: domain::MachineExecutionQuery,
     ) -> Result<Option<Vec<u8>>, Status> {
         let record = self.query(actor, query)?;
         Ok(self
@@ -787,8 +775,8 @@ impl MachineBackend for NativeBackend {
     fn events(
         &self,
         actor: VerifiedActor,
-        request: pb::MachineExecutionEventsQuery,
-    ) -> Result<pb::MachineExecutionEventPage, Status> {
+        request: domain::MachineExecutionEventsQuery,
+    ) -> Result<domain::MachineExecutionEventPage, Status> {
         let query = request
             .execution
             .ok_or_else(|| Status::invalid_argument("execution query absent"))?;
@@ -823,8 +811,8 @@ impl MachineBackend for NativeBackend {
         let event = |sequence: u64,
                      kind: &str,
                      body: &Value|
-         -> Result<pb::MachineExecutionEvent, Status> {
-            Ok(pb::MachineExecutionEvent {
+         -> Result<domain::MachineExecutionEvent, Status> {
+            Ok(domain::MachineExecutionEvent {
                 sequence,
                 attempt_ordinal: attempt,
                 at_ms: now_ms(),
@@ -875,7 +863,7 @@ impl MachineBackend for NativeBackend {
         } else {
             request.limit.min(256)
         } as usize);
-        Ok(pb::MachineExecutionEventPage {
+        Ok(domain::MachineExecutionEventPage {
             next_after: events.last().map(|e| e.sequence).unwrap_or(request.after),
             events,
             head_sequence: record.revision,
@@ -885,11 +873,11 @@ impl MachineBackend for NativeBackend {
     fn control(
         &self,
         actor: VerifiedActor,
-        request: pb::MachineExecutionControl,
-    ) -> Result<pb::MachineExecutionState, Status> {
+        request: domain::MachineExecutionControl,
+    ) -> Result<domain::MachineExecutionState, Status> {
         let query = request.execution
             .ok_or_else(|| Status::invalid_argument("execution query absent"))?;
-        if request.action == pb::MachineExecutionAction::Cancel as i32 {
+        if request.action == domain::MachineExecutionAction::Cancel as i32 {
             if query.expected_execution_workspace_id != self.workspace_id() {
                 return Err(refusal("execution_workspace_changed", "the requested execution journal is not this workspace"));
             }
@@ -904,21 +892,17 @@ impl MachineBackend for NativeBackend {
             return self.state(&canceled);
         }
         let record = self.query(actor, query)?;
-        if request.expected_generation != 0 && request.expected_generation != record.attempt as u64
-        {
-            return Err(Status::aborted("execution generation changed"));
-        }
         let actor = actor_id(actor);
         let jobs = self.service.jobs();
         let typed = |refused: crate::objects::Refused| {
             refusal(refused.code, &format!("{}: {}", refused.code, refused.message))
         };
-        let changed = match pb::MachineExecutionAction::try_from(request.action) {
-            Ok(pb::MachineExecutionAction::Pause) => jobs
+        let changed = match domain::MachineExecutionAction::try_from(request.action) {
+            Ok(domain::MachineExecutionAction::Pause) => jobs
                 .ok_or_else(|| refusal("pause_unsupported", "this machine runs no jobs"))?
                 .pause(&record, &actor)
                 .map_err(typed)?,
-            Ok(pb::MachineExecutionAction::Resume) => jobs
+            Ok(domain::MachineExecutionAction::Resume) => jobs
                 .ok_or_else(|| refusal("run_not_paused", "this machine runs no jobs"))?
                 .resume(&record)
                 .map_err(typed)?,
@@ -929,8 +913,8 @@ impl MachineBackend for NativeBackend {
     fn list(
         &self,
         actor: VerifiedActor,
-        request: pb::MachineExecutionListQuery,
-    ) -> Result<pb::MachineExecutionList, Status> {
+        request: domain::MachineExecutionListQuery,
+    ) -> Result<domain::MachineExecutionList, Status> {
         let actor = actor_id(actor);
         let head_number = self.service.engine.actor_head(&actor).map_err(problem)?;
         let records = self
@@ -966,7 +950,7 @@ impl MachineBackend for NativeBackend {
                 "list wait is not qualified by this build",
             ));
         }
-        Ok(pb::MachineExecutionList {
+        Ok(domain::MachineExecutionList {
             executions,
             head_number,
             execution_workspace_id: self.workspace_id(),
@@ -1085,17 +1069,17 @@ type AssetSources = std::collections::HashMap<
     (
         crate::journal::Artifact,
         String,
-        pb::NativeByteRetentionRequest,
+        domain::NativeByteRetentionRequest,
     ),
 >;
 fn rewrite_assets(
     value: &mut Value,
     schema: &Value,
     path: &str,
-    op: pb::RunProductOp,
+    op: domain::RunProductOp,
     index: u32,
     sources: &AssetSources,
-    products: &mut Vec<pb::RunProduct>,
+    products: &mut Vec<domain::RunProduct>,
 ) -> Result<(), Status> {
     if value.is_null() {
         return Ok(());
@@ -1115,11 +1099,11 @@ fn rewrite_assets(
                 "digest".into(),
                 json!(format!("sha256:{}", artifact.sha256)),
             );
-            products.push(pb::RunProduct {
+            products.push(domain::RunProduct {
                 output: path.into(),
                 op: op as i32,
                 index,
-                content: Some(pb::Ref {
+                content: Some(domain::Ref {
                     digest: digest_bytes(&format!("sha256:{}", artifact.sha256))?,
                     length: artifact.length,
                 }),
@@ -1168,7 +1152,7 @@ fn rewrite_assets(
                     child,
                     element,
                     path,
-                    pb::RunProductOp::Append,
+                    domain::RunProductOp::Append,
                     position.try_into().map_err(|_| {
                         Status::out_of_range("list output index is outside deployed protocol")
                     })?,
@@ -1190,19 +1174,19 @@ fn rewrite_assets(
     }
     Ok(())
 }
-fn product_document(product: &pb::RunProduct) -> Result<Vec<u8>, Status> {
+fn product_document(product: &domain::RunProduct) -> Result<Vec<u8>, Status> {
     canonical(
         &crate::products::document(product)
             .map_err(|_| Status::data_loss("product reference absent"))?,
     )
 }
 
-fn output_entries(products: &[pb::RunProduct]) -> Result<Vec<Value>, Status> {
+fn output_entries(products: &[domain::RunProduct]) -> Result<Vec<Value>, Status> {
     let mut entries = std::collections::BTreeMap::new();
     for product in products {
         let document: Value = serde_json::from_slice(&product_document(product)?)
             .map_err(|_| Status::internal("product document is invalid"))?;
-        let output_id = if product.op == pb::RunProductOp::Append as i32 {
+        let output_id = if product.op == domain::RunProductOp::Append as i32 {
             format!("{}[{}]", product.output, product.index)
         } else {
             product.output.clone()
@@ -1310,7 +1294,7 @@ print(json.dumps({"identity": generation.identity}))
         Ok(())
     }
 
-    fn products(page: &pb::MachineExecutionEventPage) -> Vec<(u64, String, i32, u32, String)> {
+    fn products(page: &domain::MachineExecutionEventPage) -> Vec<(u64, String, i32, u32, String)> {
         page.events
             .iter()
             .filter_map(|event| {
@@ -1579,22 +1563,21 @@ print(json.dumps({"identity": generation.identity}))
             );
             assert!(std::time::Instant::now() < self.until, "run made no progress");
         }
-        fn query(&self, after: u64) -> pb::MachineExecutionEventsQuery {
-            pb::MachineExecutionEventsQuery {
+        fn query(&self, after: u64) -> domain::MachineExecutionEventsQuery {
+            domain::MachineExecutionEventsQuery {
                 execution: Some(self.execution()),
                 after,
                 limit: 0,
                 wait: true,
             }
         }
-        fn execution(&self) -> pb::MachineExecutionQuery {
-            pb::MachineExecutionQuery {
+        fn execution(&self) -> domain::MachineExecutionQuery {
+            domain::MachineExecutionQuery {
                 request_id: "request-1".into(),
                 expected_execution_workspace_id: self.engine.workspace_id(),
-                ..Default::default()
             }
         }
-        fn terminal_page(&self) -> pb::MachineExecutionEventPage {
+        fn terminal_page(&self) -> domain::MachineExecutionEventPage {
             loop {
                 self.check();
                 let page = self.backend.events(self.actor, self.query(0)).unwrap();
@@ -1613,8 +1596,8 @@ print(json.dumps({"identity": generation.identity}))
         let check = || fixture.check();
         let query = |after| fixture.query(after);
         let (append, set) = (
-            pb::RunProductOp::Append as i32,
-            pb::RunProductOp::Set as i32,
+            domain::RunProductOp::Append as i32,
+            domain::RunProductOp::Set as i32,
         );
         // While the run waits at its gate, the log already shows its first two products.
         let mut cursor = 0;
@@ -1707,7 +1690,7 @@ print(json.dumps({"identity": generation.identity}))
             .backend
             .read_triage(
                 fixture.actor,
-                pb::MachineExecutionTriageQuery {
+                domain::MachineExecutionTriageQuery {
                     execution: Some(fixture.execution()),
                     attempt_ordinal: 0,
                 },
@@ -1734,7 +1717,7 @@ print(json.dumps({"identity": generation.identity}))
         // A later attempt ordinal names no bundle on this machine.
         let later = fixture.backend.read_triage(
             fixture.actor,
-            pb::MachineExecutionTriageQuery {
+            domain::MachineExecutionTriageQuery {
                 execution: Some(fixture.execution()),
                 attempt_ordinal: 9,
             },
@@ -1781,12 +1764,11 @@ mod terminal_tests {
             journal.finish(&queued.id, Outcome::Failed("author_failed: it stopped".into()))?;
             Ok((queued, started))
         }).unwrap();
-        let execution = pb::MachineExecutionQuery {
+        let execution = domain::MachineExecutionQuery {
             request_id: "request-1".into(),
             expected_execution_workspace_id: engine.workspace_id(),
-            ..Default::default()
         };
-        let query = pb::MachineExecutionEventsQuery { execution: Some(execution), after: queued.revision, limit: 0, wait: false };
+        let query = domain::MachineExecutionEventsQuery { execution: Some(execution), after: queued.revision, limit: 0, wait: false };
         let kinds: Vec<_> = backend.events(actor, query).unwrap().events.into_iter().map(|e| (e.kind, e.sequence)).collect();
         assert_eq!(kinds.first(), Some(&("running".to_string(), started.running_revision)), "{kinds:?}");
         assert_eq!(kinds.last().map(|(kind, _)| kind.as_str()), Some("outcome"));

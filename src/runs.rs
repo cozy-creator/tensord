@@ -4,7 +4,7 @@
 //! preparation (and a job's life, which its children prepare with); a restart before it
 //! completes ends the run FAILED (`journal::PREPARING`).
 use crate::{
-    api::pb,
+    api::domain,
     gpu_service::{without_gpus, KeptMember, Level, Member},
     hub,
     journal::{Execution, Failure, InputFile, Installation, Outcome, Preparation, ResultRecord},
@@ -36,7 +36,7 @@ pub enum Source {
 pub struct SetItem {
     pub source: Source,
     pub entrypoint: String,
-    pub models: Vec<pb::ModelChoice>,
+    pub models: Vec<domain::ModelChoice>,
     pub level: Level,
     /// The item as the caller sent it, for Status.
     pub sent: Vec<u8>,
@@ -55,7 +55,7 @@ pub struct Spec {
     pub entrypoint: String,
     pub input: Value,
     pub inputs: Vec<InputFile>,
-    pub models: Vec<pb::ModelChoice>,
+    pub models: Vec<domain::ModelChoice>,
     pub binding_revision: String,
     pub attention_kernel: String,
     /// The run's Hub access, held in memory for this preparation only.
@@ -99,7 +99,7 @@ pub struct JobContext {
     owner: String,
     binding_revision: String,
     attention_kernel: String,
-    models: Vec<pb::ModelChoice>,
+    models: Vec<domain::ModelChoice>,
     /// The job's own model inputs, made present: parameter -> (class, manifest).
     inputs: BTreeMap<String, (String, ObjectRef)>,
     weights_destination: String,
@@ -139,7 +139,7 @@ impl Durable {
             owner: context.owner.clone(),
             binding_revision: context.binding_revision.clone(),
             attention_kernel: context.attention_kernel.clone(),
-            models: context.models.iter().map(prost::Message::encode_to_vec).collect(),
+            models: context.models.iter().map(crate::archive::encode_model_choice).collect(),
             inputs: context
                 .inputs
                 .iter()
@@ -162,7 +162,7 @@ impl Durable {
             models: self
                 .models
                 .iter()
-                .map(|m| <pb::ModelChoice as prost::Message>::decode(m.as_slice()))
+                .map(|m| crate::archive::decode_model_choice(m.as_slice()))
                 .collect::<Result<_, _>>()
                 .map_err(io::Error::other)?,
             inputs: self
@@ -186,7 +186,7 @@ pub(crate) fn job_models(journaled: &[u8]) -> io::Result<Vec<String>> {
 }
 
 /// A job's own model input: a bare parameter, or one under the job's own name.
-fn own_input(choice: &pb::ModelChoice, job: &str) -> bool {
+fn own_input(choice: &domain::ModelChoice, job: &str) -> bool {
     match choice.parameter.split_once(".models.") {
         None => true,
         Some((callable, _)) => callable == job,
@@ -763,7 +763,7 @@ impl Runs {
         hub: Option<hub::Source>,
         spec: &Spec,
         entrypoint: &str,
-        choices: &[pb::ModelChoice],
+        choices: &[domain::ModelChoice],
         observe: crate::published::Observer,
     ) -> Result<(Installation, Option<crate::gpu_service::GpuPlan>), Refused> {
         let needs_hub = held
@@ -912,7 +912,7 @@ impl Runs {
                 .filter_map(|choice| {
                     let path = addressed(&choice.parameter, &installed.package, &callee_interface)
                         .filter(|path| path.starts_with(&prefix))?;
-                    Some(pb::ModelChoice { parameter: path, ..choice })
+                    Some(domain::ModelChoice { parameter: path, ..choice })
                 })
                 .collect(),
             // The owner's binding revision covers every package: a callee's rebinding is seen too.
@@ -1095,7 +1095,7 @@ impl Runs {
         actor: &str,
         installed: &Installation,
         entrypoint: &str,
-        choices: &[pb::ModelChoice],
+        choices: &[domain::ModelChoice],
     ) -> Result<Option<crate::gpu_service::GpuPlan>, Refused> {
         if !declares_models(installed, entrypoint) {
             if !choices.is_empty() {
@@ -1485,8 +1485,8 @@ mod tests {
             installation:"caller".into(),application:String::new(),hub:Some(source),providers:Default::default(),
             owner:"alice".into(),binding_revision:"caller-binding".into(),attention_kernel:String::new(),
             models:vec![
-                pb::ModelChoice { parameter:"second/callee/render.models.network".into(),repository:"second/chosen".into(),..Default::default() },
-                pb::ModelChoice { parameter:"render.models.absent".into(),repository:"second/nowhere".into(),..Default::default() },
+                domain::ModelChoice { parameter:"second/callee/render.models.network".into(),repository:"second/chosen".into(),..Default::default() },
+                domain::ModelChoice { parameter:"render.models.absent".into(),repository:"second/nowhere".into(),..Default::default() },
             ],
             inputs:Default::default(),weights_destination:String::new(),publication:String::new(),known:vec![],
         });
