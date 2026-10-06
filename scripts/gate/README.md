@@ -105,6 +105,9 @@ a list of requests (model names, or `{"model", "input"}` payloads) or `{"request
 - an arm with `command` runs another engine's own driver on the host (ComfyUI) and returns the same record;
 - `target_args` adds per-model arguments (e.g. `model.model=...`), `cell_facts` records a host command per cell,
   `continue_on_failure` records a failed timed cell and goes on, then returns nonzero.
+- a `prime` item with `warm` (e.g. `{"model": "sdxl", "warm": "imported"}`) is `cozy run <target> --warm=<level>`: the
+  machine readies the function and runs nothing; a cell's `unwarm` models get `--warm=off` before anything else (a cold
+  cell, or the other engine's cell, so the machine keeps nothing ready);
 - a warm cell's `prime` requests (`{"model", "input"}`, e.g. one per model) run first, one at a time and outside the clock, so
   each engine's processes exist and its models are loaded when the timed requests start; an engine with its own driver gets
   the same requests through its `command`. A failed prime stops immediately, before submitting
