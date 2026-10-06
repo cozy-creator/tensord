@@ -567,15 +567,32 @@ mod v1_api {
         };
         let refused = read(&mut client, &theirs, other).await.unwrap_err();
         assert_eq!(refused.code(), tonic::Code::NotFound);
+        // Their cancel of the id fences it in their own namespace (canceled before acceptance)
+        // and never reaches our run, which stays succeeded.
         let cancel = v1::ControlRequest {
             id: "only-ours".into(),
             action: v1::Action::Cancel as i32,
         };
-        let refused = client
+        let fenced = client
             .control(authorized(cancel, &theirs))
             .await
-            .unwrap_err();
-        assert_eq!(refused.code(), tonic::Code::NotFound);
+            .unwrap()
+            .into_inner();
+        assert_eq!(fenced.state, "canceled", "{fenced:?}");
+        let ours_after = collect(
+            client
+                .run(authorized(request("only-ours", None), &ours))
+                .await
+                .unwrap()
+                .into_inner(),
+        )
+        .await
+        .unwrap();
+        let Some(v1::run_event::Event::State(state)) = &ours_after[0].event else {
+            panic!("{ours_after:?}")
+        };
+        assert_ne!(state.number, fenced.number, "their fence is a record of their own");
+        assert_eq!(outcome(&ours_after).status, "succeeded", "{ours_after:?}");
     }
 
     #[tokio::test]
