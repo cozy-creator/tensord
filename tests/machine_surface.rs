@@ -1395,6 +1395,21 @@ mod v1_api {
             .unwrap();
         assert_eq!(squares(&second), serde_json::json!([9, 25]));
         assert_eq!(measured(), 3, "the held call ran again");
+        // Each call says how it was answered: the second job's call for 3 is memoized, with the
+        // first job's computation; its call for 5 ran.
+        let calls = |events: &[v1::RunEvent]| -> Vec<(bool, String)> {
+            events
+                .iter()
+                .filter_map(|e| match &e.event {
+                    Some(v1::run_event::Event::Call(call)) => Some((call.memoized, call.computation_digest.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        let (first, second) = (calls(&first), calls(&second));
+        assert!(first.iter().all(|(memoized, digest)| !memoized && digest.starts_with("sha256:")), "{first:?}");
+        assert_eq!(second[0], (true, first[0].1.clone()), "{second:?}");
+        assert!(!second[1].0 && second[1].1.starts_with("sha256:") && second[1].1 != first[1].1, "{second:?}");
         let _ = fs::remove_dir_all(tools);
     }
 

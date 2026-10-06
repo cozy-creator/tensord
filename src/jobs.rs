@@ -1649,6 +1649,8 @@ fn record_call(
         "label": call.label, "status": status, "error": error,
         "called_unix_ms": record.accepted_at_ms, "finished_unix_ms": record.finished_at_ms,
         "measurements": measurements, "computation_digest": call.computation,
+        // Answered from a held result: a memoized call that did not run (its `memo` is unset).
+        "memoized": call.computation.is_some() && call.memo.is_none(),
     });
     match engine.append_call(&parent.id, &record.id, &crate::boundary_json::exact(&body)) {
         Ok(_) => true,
