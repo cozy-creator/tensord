@@ -26,6 +26,7 @@ const NAMES: &[&str] = &[
     "COZY_AUTHORIZED_KEYS",
     "COZY_REPO_CACHE_ROOT",
     "COZY_SSH_PUBLIC_KEY",
+    super::provider::API_ORIGIN,
     RECEIPT_KEY,
     RECEIPT_KEY_FILE,
     "TENSORHUB_ORIGIN",
@@ -72,6 +73,8 @@ pub struct Grant {
     /// WORKER_MODE=development with COZY_SSH_PUBLIC_KEY (else PUBLIC_KEY, which a provider such as
     /// vast may own): serve SSH maintenance.
     pub developer_key: Option<String>,
+    /// The pod's own provider credential, which ends it when the Hub cannot.
+    pub provider: Option<super::provider::ProviderSelf>,
     pub ignored: Vec<String>,
 }
 
@@ -246,6 +249,7 @@ impl Grant {
             authorized,
             receipt_key,
             developer_key,
+            provider: super::provider::ProviderSelf::from_env(env),
             ignored,
         })
     }
