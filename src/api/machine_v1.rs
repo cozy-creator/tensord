@@ -458,6 +458,8 @@ impl Log {
                     Value::Null => vec![],
                     measured => crate::boundary_json::exact(measured),
                 },
+                memoized: body["memoized"].as_bool().unwrap_or_default(),
+                computation_digest: body["computation_digest"].as_str().unwrap_or_default().into(),
                 reason: match body["error"].as_str().unwrap_or_default() {
                     "" => None,
                     message => Some(v1::Reason {

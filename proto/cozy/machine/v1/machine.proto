@@ -220,6 +220,8 @@ message Call {
   int64 finished_at_ms = 7;
   bytes measurements = 8;   // its executor's, as canonical JSON (Outcome.measurements)
   Reason reason = 9;        // why it did not succeed
+  bool memoized = 10;       // answered from a result this machine held; nothing ran
+  string computation_digest = 11;  // a memoized call's computation (sha256:<hex>), ran or answered
 }
 
 // ---- Control -----------------------------------------------------------------------------
