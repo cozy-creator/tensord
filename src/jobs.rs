@@ -1168,20 +1168,30 @@ fn conclude(
 const MEMO_RESULT_BYTES: usize = 48 << 10;
 
 /// `(module, export)` of each memoized invocable of the environment (the root's and its
-/// callees') and its operation identity: its package's installed files, the module and the
-/// export, the same on every machine. A package with no recorded source digest memoizes nothing.
+/// callees') and its operation identity, the same on every machine: a callee's own function
+/// (its package and the identity this machine's description of it read from its installed
+/// source), else its package's installed files; with the module and the export. A package with
+/// neither memoizes nothing. The root's own description is its caller's, so it keys by files.
 fn memoized(generation: &crate::catalog::Generation) -> HashMap<(String, String), String> {
     let mut memoized = HashMap::new();
-    let apps = std::iter::once((&generation.interface, &generation.source_digest))
-        .chain(generation.callees.iter().map(|c| (&c.interface, &c.source_digest)));
-    for (interface, digest) in apps.filter(|(_, digest)| !digest.is_empty()) {
+    let apps = std::iter::once((&generation.interface, &generation.source_digest, None))
+        .chain(generation.callees.iter().map(|c| (&c.interface, &c.source_digest, Some(c.package.as_str()))));
+    for (interface, digest, callee) in apps {
         for (declared, _, _) in declarations(interface) {
             if let (Some(module), Some(export), Some(true)) = (
                 declared["module"].as_str(),
                 declared["export"].as_str(),
                 declared["memoize"].as_bool(),
             ) {
-                let identity = format!("{digest}\0{module}\0{export}");
+                let function = declared["operation_identity"].as_str().filter(|identity| {
+                    identity.strip_prefix("sha256:").is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+                });
+                let base = match (callee, function) {
+                    (Some(package), Some(identity)) => format!("{package}\0{identity}"),
+                    _ if !digest.is_empty() => digest.clone(),
+                    _ => continue,
+                };
+                let identity = format!("{base}\0{module}\0{export}");
                 memoized.insert(
                     (module.into(), export.into()),
                     format!(
@@ -1652,6 +1662,45 @@ fn record_call(
 #[cfg(test)]
 mod exact_tests {
     use super::*;
+
+    /// A callee's memoized function is keyed by its package and the identity this machine read
+    /// from its installed source: a new release that leaves it unchanged keeps its memos, one
+    /// that changes it does not. Without an identity, and always for the root's own functions
+    /// (whose description is its caller's), the package's installed files key it.
+    #[test]
+    fn a_callees_unchanged_function_keeps_its_memo_key_across_releases() {
+        let job = |name: &str, identity: Option<&str>| {
+            let mut invocable = json!({"module": "lib", "export": name, "memoize": true});
+            if let Some(identity) = identity {
+                invocable["operation_identity"] = identity.into();
+            }
+            json!({"name": name, "invocable": invocable})
+        };
+        let (same, changed) = (format!("sha256:{}", "a".repeat(64)), format!("sha256:{}", "b".repeat(64)));
+        let generation = |files: &str, second: &str| -> crate::catalog::Generation {
+            serde_json::from_value(json!({
+                "identity": "g", "package": "local/root", "version": "1", "application": "root:app",
+                "python": "/p", "source_digest": "sha256:root",
+                "interface": {"jobs": [{"name": "own", "invocable": {"module": "root", "export": "own",
+                    "memoize": true, "operation_identity": same}}]},
+                "callees": [{"distribution": "lib", "version": "1", "application": "lib:app",
+                    "source_digest": files, "package": "local/lib",
+                    "interface": {"jobs": [job("first", Some(&same)), job("second", Some(second)), job("third", None)]}}],
+            }))
+            .unwrap()
+        };
+        let before = memoized(&generation("sha256:one", &same));
+        let after = memoized(&generation("sha256:two", &changed));
+        let key = |m: &HashMap<(String, String), String>, module: &str, export: &str| m[&(module.to_string(), export.to_string())].clone();
+        assert_eq!(key(&before, "lib", "first"), key(&after, "lib", "first"), "an unchanged function keeps its key");
+        assert_ne!(key(&before, "lib", "second"), key(&after, "lib", "second"), "a changed function does not");
+        assert_ne!(key(&before, "lib", "third"), key(&after, "lib", "third"), "without an identity, the files key it");
+        // The root's declared identity is not this machine's reading: its files key it.
+        let root = generation("sha256:one", &same);
+        let mut moved = root.clone();
+        moved.source_digest = "sha256:other".into();
+        assert_ne!(key(&memoized(&root), "root", "own"), key(&memoized(&moved), "root", "own"));
+    }
 
     /// A serving call (the Runtime's typed caller of another package's entrypoint) is its
     /// request plus models: a passed ModelArtifact is the exact checkpoint of the callee's slot,
