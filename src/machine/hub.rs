@@ -70,7 +70,7 @@ impl Hub {
         body: Option<Vec<u8>>,
     ) -> Result<(StatusCode, Bytes), Refusal> {
         let exchange = async {
-            let tcp = tokio::net::TcpStream::connect((self.host.as_str(), self.port)).await?;
+            let tcp = super::net::connect(&self.host, self.port).await?;
             let name = ServerName::try_from(self.host.clone()).map_err(io::Error::other)?;
             let tls = tokio_rustls::TlsConnector::from(self.tls.clone())
                 .connect(name, tcp)
