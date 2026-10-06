@@ -7,6 +7,7 @@ use fs2::FileExt;
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Seek, SeekFrom, Write},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::{Arc, MutexGuard},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -180,16 +181,27 @@ impl Objects {
             return Ok(writer);
         }
         fs::create_dir_all(&dir)?;
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&writer.part)?;
-        file.try_lock_exclusive().map_err(|_| {
-            refused(
-                "object_write_busy",
-                "another write of this object is in progress",
-            )
-        })?;
+        // Writes of one object take turns (a client's concurrent first calls each send the
+        // package source): the next continues from what the last left, or finds it stored.
+        let file = loop {
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&writer.part)?;
+            file.lock_exclusive()?;
+            if self.path(actor, digest)?.is_some_and(|(_, l)| l == length) {
+                writer.held = length;
+                return Ok(writer);
+            }
+            // The last write may have stored or dropped the part this handle opened.
+            let held = file.metadata()?;
+            match fs::metadata(&writer.part) {
+                Ok(at) if (at.dev(), at.ino()) == (held.dev(), held.ino()) => break file,
+                Ok(_) => continue,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            }
+        };
         writer.held = file.metadata()?.len();
         if writer.held > length {
             file.set_len(0)?;
@@ -345,6 +357,56 @@ mod tests {
         bad.append(b"abc").unwrap();
         assert_eq!(bad.finish().err().unwrap().code, "object_digest_mismatch");
         assert_eq!(objects.begin("alice", &wrong, 3, 0).unwrap().held(), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A client's concurrent first calls each send the package source: the second write
+    /// waits for the first, then finds the object stored instead of being refused.
+    #[test]
+    fn a_second_write_of_an_object_waits_for_the_first() {
+        let root = std::env::temp_dir().join(format!("cm-objects-{}", uuid::Uuid::new_v4()));
+        let service =
+            crate::service::Service::open(&root.join("state"), &root.join("g"), 1).unwrap();
+        let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
+        let objects = Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap();
+        let bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 241) as u8).collect();
+        let digest = format!("sha256:{}", sha256::hex_digest(&bytes));
+        let length = bytes.len() as u64;
+
+        let mut first = objects.begin("alice", &digest, length, 0).unwrap();
+        first.append(&bytes[..100_000]).unwrap();
+        let part = first.part.clone();
+        let waiting = format!(":{} ", fs::metadata(&part).unwrap().ino());
+        let (sent, answer) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let second = objects
+                    .begin("alice", &digest, length, 0)
+                    .map(|writer| writer.held());
+                sent.send(second.map_err(|refused| refused.code)).unwrap();
+            });
+            // The second write either answers or blocks on the first's lock.
+            let early = loop {
+                if let Ok(answer) = answer.try_recv() {
+                    break Some(answer);
+                }
+                let locks = fs::read_to_string("/proc/locks").unwrap();
+                if locks
+                    .lines()
+                    .any(|l| l.contains("->") && l.contains(&waiting))
+                {
+                    break None;
+                }
+                std::thread::yield_now();
+            };
+            assert_eq!(early, None, "the second write did not wait for the first");
+            first.append(&bytes[100_000..]).unwrap();
+            assert_eq!(first.finish().unwrap(), length);
+            assert_eq!(answer.recv().unwrap(), Ok(length));
+        });
+        assert!(!part.exists());
+        let (path, held) = objects.path("alice", &digest).unwrap().unwrap();
+        assert_eq!((fs::read(path).unwrap(), held), (bytes, length));
         let _ = fs::remove_dir_all(root);
     }
 }
