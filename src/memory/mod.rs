@@ -294,11 +294,13 @@ impl GpuMemory {
 
     /// Until `free_bytes` are free beside the floor: holdings `plan`'s own executor let go
     /// are dropped, then idle tenants give room (weights first, then processes); then `plan`'s
-    /// cap rises into what is there. None: no NVML.
+    /// cap rises into what is there. Its rank cell, when present, receives the grant before
+    /// the ledger records it. None: no NVML, no grant or cell update.
     pub fn make_room(
         &self,
         plan: &str,
         free_bytes: u64,
+        cell: Option<&File>,
         holdings: impl Fn() -> Vec<Holding>,
         mut carry_out: impl FnMut(&Step) -> io::Result<bool>,
     ) -> io::Result<Option<u64>> {
@@ -330,18 +332,25 @@ impl GpuMemory {
                 Some(step) => {
                     carry_out(&step)?;
                 }
-                None => {
-                    return Ok(Some(self.with(|gpu| {
-                        let cap = gpu
-                            .room(plan, &sample)
-                            .max(gpu.tenant(plan).map_or(0, |t| t.cap))
-                            .max(gpu.physical_cap(plan, &sample));
-                        gpu.set_cap(plan, cap);
-                        cap
-                    })));
-                }
+                None => return self.grant_room(plan, &sample, cell).map(Some),
             }
         }
+    }
+
+    /// Grant reclaimed room and notify this rank through its existing budget cell. The
+    /// ledger lock serializes the grant and its publication with the floor watchdog.
+    fn grant_room(&self, plan: &str, sample: &Sample, cell: Option<&File>) -> io::Result<u64> {
+        self.with(|gpu| {
+            let cap = gpu
+                .room(plan, sample)
+                .max(gpu.tenant(plan).map_or(0, |t| t.cap))
+                .max(gpu.physical_cap(plan, sample));
+            if let Some(cell) = cell {
+                ask_cap(cell, cap)?;
+            }
+            gpu.set_cap(plan, cap);
+            Ok(cap)
+        })
     }
 
     /// Host pinned budgets, `first` ahead and then most recently used first, from the live
@@ -443,5 +452,118 @@ impl GpuMemory {
     pub fn finished(&self, plan: &str) {
         *self.running.lock().unwrap() = None;
         self.with(|gpu| gpu.idle(plan));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use policy::HEADLESS_FLOOR;
+
+    fn memory() -> GpuMemory {
+        let mut gpu = Gpu::default();
+        gpu.starting("plan", 0);
+        gpu.active("plan", 0);
+        GpuMemory {
+            ledger: Arc::new(Mutex::new(gpu)),
+            running: Arc::new(Mutex::new(None)),
+            sampler: None,
+        }
+    }
+
+    fn sample(room: u64) -> Sample {
+        Sample {
+            total: room + HEADLESS_FLOOR,
+            free: room + HEADLESS_FLOOR,
+            ..Default::default()
+        }
+    }
+
+    fn read_cell(cell: &File) -> [i64; 4] {
+        let mut bytes = [0u8; 32];
+        cell.read_exact_at(&mut bytes, 0).unwrap();
+        std::array::from_fn(|i| i64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap()))
+    }
+
+    #[test]
+    fn room_grants_reach_each_rank_without_borrowing_another_gpus_cap() {
+        let leader = crate::os::memfd().unwrap();
+        leader.set_len(32).unwrap();
+        let follower = crate::os::memfd().unwrap();
+        follower.set_len(32).unwrap();
+        let leader_memory = memory();
+        let follower_memory = memory();
+        assert_eq!(
+            leader_memory
+                .grant_room("plan", &sample(30), Some(&leader))
+                .unwrap(),
+            30
+        );
+        assert_eq!(
+            follower_memory
+                .grant_room("plan", &sample(20), Some(&follower))
+                .unwrap(),
+            20
+        );
+        assert_eq!(read_cell(&leader), [1, CELL_CAP - 30, 0, 0]);
+        assert_eq!(read_cell(&follower), [1, CELL_CAP - 20, 0, 0]);
+        assert_eq!(
+            leader_memory.with(|gpu| gpu.tenant("plan").unwrap().cap),
+            30
+        );
+        assert_eq!(
+            follower_memory.with(|gpu| gpu.tenant("plan").unwrap().cap),
+            20
+        );
+
+        // The floor watchdog's later reduction uses the same sequence. A following
+        // room grant starts from the reduced authority, not the previous grant.
+        follower_memory.with(|gpu| {
+            ask_cap(&follower, 5).unwrap();
+            gpu.set_cap("plan", 5);
+        });
+        assert_eq!(read_cell(&follower), [2, CELL_CAP - 5, 0, 0]);
+        assert_eq!(
+            follower_memory
+                .grant_room("plan", &sample(10), Some(&follower))
+                .unwrap(),
+            10
+        );
+        assert_eq!(read_cell(&follower), [3, CELL_CAP - 10, 0, 0]);
+    }
+
+    #[test]
+    fn a_missing_room_cell_keeps_the_scalar_grant_available() {
+        let memory = memory();
+        assert_eq!(memory.grant_room("plan", &sample(30), None).unwrap(), 30);
+        assert_eq!(memory.with(|gpu| gpu.tenant("plan").unwrap().cap), 30);
+    }
+
+    #[test]
+    fn an_unmeasured_gpu_publishes_no_room_grant() {
+        let cell = crate::os::memfd().unwrap();
+        cell.set_len(32).unwrap();
+        let memory = memory();
+        assert_eq!(
+            memory
+                .make_room("plan", 30, Some(&cell), Vec::new, |_| {
+                    panic!("an unmeasured GPU must not reclaim another tenant")
+                })
+                .unwrap(),
+            None
+        );
+        assert_eq!(memory.with(|gpu| gpu.tenant("plan").unwrap().cap), 0);
+        assert_eq!(read_cell(&cell), [0; 4]);
+    }
+
+    #[test]
+    fn a_failed_room_cell_does_not_record_an_unpublished_cap() {
+        let cell = crate::os::memfd().unwrap();
+        cell.set_len(32).unwrap();
+        crate::os::seal(&cell).unwrap();
+        let memory = memory();
+        assert!(memory.grant_room("plan", &sample(30), Some(&cell)).is_err());
+        assert_eq!(memory.with(|gpu| gpu.tenant("plan").unwrap().cap), 0);
+        assert_eq!(read_cell(&cell), [0; 4]);
     }
 }
