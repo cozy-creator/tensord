@@ -1483,6 +1483,56 @@ mod v1_api {
         assert!(events
             .iter()
             .any(|e| matches!(&e.event, Some(v1::run_event::Event::Memo(m)) if m.result == br#"{"square":9}"#)));
+        // H3's references (run 4830): the job shows each image another package's entrypoint
+        // returns as its own output the moment it exists, and returns them all at the end.
+        let mut sitting = spec.clone();
+        sitting.entrypoint = "portrait".into();
+        sitting.payload = serde_json::to_vec(&serde_json::json!({"names": ["Lighthouse", "Keeper"]})).unwrap();
+        let events = collect(client.run(authorized(v1::RunRequest {
+            id: "portrait-1".into(), after: 0, spec: Some(sitting),
+        }, &all)).await.unwrap().into_inner()).await.unwrap();
+        let done = outcome(&events);
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        let calls: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.event {
+                Some(v1::run_event::Event::Call(call)) => Some(call.function.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls, ["paint", "paint"], "{events:?}");
+        let shown: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.event {
+                Some(v1::run_event::Event::Product(p)) if p.output == "references" => Some(p.label.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shown, ["Reference: Lighthouse", "Reference: Keeper"], "{events:?}");
+        let returned = String::from_utf8_lossy(&done.result).into_owned();
+        let mut seen = Vec::new();
+        for index in 1..=2u32 {
+            let (_, image) = read(
+                &mut client,
+                &all,
+                v1::ReadRequest {
+                    target: Some(v1::read_request::Target::Output(v1::OutputTarget {
+                        run: "portrait-1".into(),
+                        output: "references".into(),
+                        index,
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert!(image.starts_with(b"\x89PNG"), "reference {index} is no PNG");
+            let digest = tensorfs_core::sha256::hex_digest(&image);
+            assert!(returned.contains(&digest), "reference {index} ({digest}) is not the one returned: {returned}");
+            seen.push(digest);
+        }
+        assert_ne!(seen[0], seen[1], "each reference is its own image");
         let mut nested = spec.clone();
         nested.entrypoint = "relay_nested".into();
         let events = collect(client.run(authorized(v1::RunRequest {
