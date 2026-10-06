@@ -94,7 +94,7 @@ impl Server {
         let objects = Arc::new(
             Objects::new(&root.join("writes"), store.clone(), service.engine.clone()).unwrap(),
         );
-        let identity = MachineIdentity::ephemeral(
+        let mut identity = MachineIdentity::ephemeral(
             "cancel-proof".into(),
             [ALICE, BOB]
                 .map(|key| SigningKey::from_bytes(&key).verifying_key())
@@ -102,6 +102,11 @@ impl Server {
             vec![7; 32],
         )
         .unwrap();
+        let paths =
+            cozy_machine::machine::update::Paths::new(&root.join("state"), &root.join("image"));
+        identity.updates = Some(
+            cozy_machine::machine::update::Updates::open(paths, Box::new(|| true), None).unwrap(),
+        );
         let pem = identity.cert_pem.clone();
         let mut backend = NativeBackend::new(service.clone(), identity.authority.clone(), store);
         backend.runs = Some(Arc::new(Runs {
@@ -185,6 +190,201 @@ impl Server {
         self.task.abort();
         let _ = self.task.await;
     }
+}
+
+#[tokio::test]
+async fn canceled_ids_refuse_updates_and_another_actors_update_never_shadows_them() {
+    let root = Root::new();
+    let mut server = Server::open(&root.0).await;
+    let canceled = server.cancel("shared", ALICE).await;
+    let update = v1::RunSpec {
+        kind: v1::RunKind::Update as i32,
+        payload: br#"{"runtime":"0.19.0"}"#.to_vec(),
+        ..Default::default()
+    };
+    let error = server
+        .client
+        .run(request(
+            v1::RunRequest {
+                id: "shared".into(),
+                spec: Some(update),
+                after: 0,
+            },
+            ALICE,
+            None,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    server
+        .service
+        .engine
+        .with_journal(|journal| journal.reserve_update_run(&actor(BOB), "shared"))
+        .unwrap();
+    let error = server
+        .client
+        .control(request(
+            v1::ControlRequest {
+                id: "shared".into(),
+                action: v1::Action::Cancel as i32,
+            },
+            BOB,
+            None,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::Unimplemented);
+    assert_eq!(server.cancel("shared", ALICE).await, canceled);
+    server.canceled("shared", None).await;
+    server.stop().await;
+    // The update payload journal remains machine-wide; its retained status must not shadow
+    // another signer's canceled ordinary run with the same text ID.
+    let status = cozy_machine::machine::update::Status {
+        operation: "shared".into(),
+        state: "succeeded".into(),
+        history: vec![cozy_machine::machine::update::Step {
+            state: "succeeded".into(),
+            at_ms: 1,
+        }],
+        ..Default::default()
+    };
+    fs::write(
+        root.0.join("state/update/status.json"),
+        serde_json::to_vec(&status).unwrap(),
+    )
+    .unwrap();
+    let mut restarted = Server::open(&root.0).await;
+    let error = restarted
+        .client
+        .control(request(
+            v1::ControlRequest {
+                id: "shared".into(),
+                action: v1::Action::Cancel as i32,
+            },
+            BOB,
+            None,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::Unimplemented);
+    assert_eq!(
+        restarted.cancel("shared", ALICE).await.number,
+        canceled.number
+    );
+    restarted.canceled("shared", None).await;
+    let error = restarted
+        .client
+        .run(request(
+            v1::RunRequest {
+                id: "shared".into(),
+                spec: None,
+                after: 0,
+            },
+            BOB,
+            Some("shared"),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::PermissionDenied);
+    let mut update = restarted
+        .client
+        .run(request(
+            v1::RunRequest {
+                id: "shared".into(),
+                spec: None,
+                after: 0,
+            },
+            BOB,
+            None,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut observed = false;
+    while let Some(event) = update.message().await.unwrap() {
+        if let Some(v1::run_event::Event::Outcome(outcome)) = event.event {
+            assert_eq!(outcome.status, "succeeded");
+            observed = true;
+        }
+    }
+    assert!(observed);
+    restarted.stop().await;
+}
+
+#[test]
+fn update_and_cancel_admission_serialize_across_real_sqlite_connections() {
+    let root = Root::new();
+    let mut journal = Journal::open(&root.0).unwrap();
+    journal.reserve_update_run("alice", "update-first").unwrap();
+    assert_eq!(
+        journal
+            .reserve_run_cancellation("alice", "update-first")
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    assert_eq!(
+        journal
+            .accept_run("alice", "update-first", "spec", Invocation::default())
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    journal
+        .reserve_run_cancellation("alice", "cancel-first")
+        .unwrap();
+    assert_eq!(
+        journal
+            .reserve_update_run("alice", "cancel-first")
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    journal.reserve_update_run("bob", "cancel-first").unwrap();
+    drop(journal);
+    for n in 0..24 {
+        let id = format!("update-race-{n}");
+        let mut updater = Journal::open(&root.0).unwrap();
+        let mut canceller = Journal::open(&root.0).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let start = barrier.clone();
+        let update_id = id.clone();
+        let update = std::thread::spawn(move || {
+            start.wait();
+            updater.reserve_update_run("alice", &update_id)
+        });
+        barrier.wait();
+        let canceled = canceller.reserve_run_cancellation("alice", &id);
+        let updated = update.join().unwrap();
+        match (updated, canceled) {
+            (Ok(()), Err(error)) => assert_eq!(error.kind(), std::io::ErrorKind::Unsupported),
+            (Err(error), Ok(record)) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+                assert!(record.canceled_before_acceptance && record.state == State::Canceled);
+            }
+            results => panic!("both admissions won or failed: {results:?}"),
+        }
+    }
+    let mut restarted = Journal::open(&root.0).unwrap();
+    assert!(restarted
+        .update_run_reserved("alice", "update-first")
+        .unwrap());
+    assert!(restarted
+        .update_run_reserved("bob", "cancel-first")
+        .unwrap());
+    assert!(
+        restarted
+            .get_public("alice", "cancel-first")
+            .unwrap()
+            .canceled_before_acceptance
+    );
+    assert_eq!(
+        restarted
+            .reserve_run_cancellation("alice", "update-first")
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::Unsupported
+    );
 }
 
 #[tokio::test]

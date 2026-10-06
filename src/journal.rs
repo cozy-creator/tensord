@@ -351,6 +351,7 @@ impl Journal {
             }
         }
         connection.execute_batch("BEGIN; CREATE TABLE IF NOT EXISTS machine_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS update_run_ids(actor TEXT NOT NULL,id TEXT NOT NULL,PRIMARY KEY(actor,id));
             CREATE TABLE IF NOT EXISTS submission_closures(actor TEXT NOT NULL,submission_id TEXT NOT NULL,request_id TEXT NOT NULL,workspace_id TEXT NOT NULL,closed_ms INTEGER NOT NULL,PRIMARY KEY(actor,submission_id));
             CREATE TABLE IF NOT EXISTS installations(actor TEXT NOT NULL,alias TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,alias));
             CREATE TABLE IF NOT EXISTS preparations(actor TEXT NOT NULL,id TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,id));
@@ -1147,6 +1148,9 @@ impl Journal {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_error)?;
+        if update_run_reserved(&tx, actor, id)? {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "this run id names a software update"));
+        }
         let prior: Option<String> = tx
             .query_row(
                 "SELECT record FROM executions WHERE idempotency_key=?1",
@@ -1197,6 +1201,9 @@ impl Journal {
         let key = format!("run:{}", encoded(&(actor, id))?);
         let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_error)?;
+        if update_run_reserved(&tx, actor, id)? {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "software update runs do not support Control"));
+        }
         if let Some(prior) = public_prior(&tx, actor, id, id)? {
             return serde_json::from_str(&prior).map_err(db_error);
         }
@@ -1213,6 +1220,23 @@ impl Journal {
             params![encoded(&record)?, timestamp(), record.id]).map_err(db_error)?;
         tx.commit().map_err(db_error)?;
         Ok(record)
+    }
+
+    /// Updates keep their payload journal, but share actor/ID ownership with Run and CANCEL.
+    pub fn reserve_update_run(&mut self, actor: &str, id: &str) -> io::Result<()> {
+        validate_scope(actor, id, id)?;
+        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        if public_prior(&tx, actor, id, id)?.is_some() {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "this run id already names an ordinary run"));
+        }
+        tx.execute("INSERT OR IGNORE INTO update_run_ids(actor,id) VALUES(?1,?2)", params![actor, id])
+            .map_err(db_error)?;
+        tx.commit().map_err(db_error)
+    }
+
+    pub fn update_run_reserved(&self, actor: &str, id: &str) -> io::Result<bool> {
+        update_run_reserved(&self.connection, actor, id)
     }
 
     /// A preparing run's code and models are ready: it names them and becomes dispatchable.
@@ -2343,6 +2367,11 @@ fn public_prior(
     )
     .optional()
     .map_err(db_error)
+}
+
+fn update_run_reserved(connection: &Connection, actor: &str, id: &str) -> io::Result<bool> {
+    connection.query_row("SELECT EXISTS(SELECT 1 FROM update_run_ids WHERE actor=?1 AND id=?2)",
+        params![actor, id], |row| row.get(0)).map_err(db_error)
 }
 
 #[cfg(test)]

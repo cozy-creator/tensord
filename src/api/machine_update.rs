@@ -14,13 +14,37 @@ use tonic::Status;
 pub(super) type Events = Pin<Box<dyn Stream<Item = Result<v1::RunEvent, Status>> + Send>>;
 
 /// The update `request` submits or attaches to, if it is one.
-pub(super) fn owns(identity: &MachineIdentity, request: &v1::RunRequest) -> bool {
+pub(super) fn owns(
+    identity: &MachineIdentity,
+    backend: &impl MachineBackend,
+    actor: VerifiedActor,
+    request: &v1::RunRequest,
+) -> Result<bool, Status> {
     match &request.spec {
-        Some(spec) => spec.kind == v1::RunKind::Update as i32,
-        None => identity
-            .updates
-            .as_ref()
-            .is_some_and(|u| u.update(&request.id).is_some()),
+        Some(spec) => Ok(spec.kind == v1::RunKind::Update as i32),
+        None => {
+            if let Some(runs) = backend.runs() {
+                let actor = crate::machine_api::actor_id(actor);
+                // Another signer's machine-wide update never shadows this actor's own run.
+                match runs.service.engine.get_public(&actor, &request.id) {
+                    Ok(_) => return Ok(false),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                    Err(error) => return Err(Status::internal(error.to_string())),
+                }
+                if runs
+                    .service
+                    .engine
+                    .with_journal(|journal| journal.update_run_reserved(&actor, &request.id))
+                    .map_err(|error| Status::internal(error.to_string()))?
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(identity
+                .updates
+                .as_ref()
+                .is_some_and(|u| u.update(&request.id).is_some()))
+        }
     }
 }
 
@@ -45,6 +69,23 @@ pub(super) async fn run<B: MachineBackend>(
         .clone()
         .ok_or_else(|| Status::failed_precondition("this machine does not update in place"))?;
     let id = request.id.clone();
+    // SQLite serializes this ID's ownership with ordinary acceptance and cancellation.
+    let runs = backend
+        .runs()
+        .ok_or_else(|| Status::unimplemented("this machine reserves no update run ids"))?;
+    let owner = crate::machine_api::actor_id(actor);
+    let reserved_id = id.clone();
+    tokio::task::spawn_blocking(move || {
+        runs.service
+            .engine
+            .with_journal(|journal| journal.reserve_update_run(&owner, &reserved_id))
+    })
+    .await
+    .map_err(|_| Status::internal("machine operation stopped"))?
+    .map_err(|error| match error.kind() {
+        std::io::ErrorKind::AlreadyExists => Status::failed_precondition(error.to_string()),
+        _ => Status::internal(error.to_string()),
+    })?;
     if let Some(spec) = request.spec.filter(|_| updates.update(&id).is_none()) {
         if !identity.readiness.proved() {
             return Err(Status::unavailable(
