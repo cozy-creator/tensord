@@ -6,7 +6,7 @@ from pathlib import Path
 
 import msgspec
 
-from cozy_runtime.author import App, Context, invocable
+from cozy_runtime.author import App, Context, ImageAsset, ImageFrame, Outputs, invocable
 
 app = App()
 
@@ -77,3 +77,18 @@ def greet(ctx: Context, payload: Greeting) -> Greeted:
     """A serving entrypoint another package calls with its request's fields, as H3 calls
     qwen-image-2's generate_image."""
     return Greeted(" ".join([payload.text] * payload.times))
+
+
+class Painting(msgspec.Struct):
+    prompt: str
+    shade: int = 120
+
+
+class Painted(msgspec.Struct):
+    image: ImageAsset
+
+
+@app.entrypoint
+def paint(ctx: Context, payload: Painting, out: Outputs) -> Painted:
+    """A serving entrypoint that returns an image, as qwen-image-2's generate_image does."""
+    return Painted(out.save_image(ImageFrame(8, 8, bytes([payload.shade, 90, 160]) * 64), format="png"))
