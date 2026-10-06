@@ -1,9 +1,19 @@
 # Architecture
 
-`cozy-machine` is the machine: one Rust process that owns the API, the execution journal,
-scheduling, the TensorFS store (sole writer) and executor supervision. Package code runs in
-Python executors (cozy-runtime) inside each package environment. The machine never loads CUDA;
+TensorD (`cozy-machine`) is the persistent Rust daemon that owns the API, execution journal,
+node scheduling, memory budgets and executor supervision. TensorFS is an embedded library;
+ordinary processes can share its store for reads and writes. Package code runs in Python
+executors (cozy-runtime) inside each package environment. The machine never loads CUDA;
 executors own their device contexts. NVML is read only on each GPU's sampler thread (`memory`).
+
+TensorD makes allocation and eviction decisions across workloads. Runtime reports each rank's
+needs and measured use and acts on its grants; the TensorFS weight plane moves and accounts for
+bytes within those grants. TensorFS `Store::ensure_owned` retains the store claim through live
+handles and read leases, coordinates GC pins and excludes outside collectors. Its
+[owned-store contract](https://github.com/cozy-creator/tensorfs/blob/master/docs/owned-store.md)
+describes collector compatibility. TensorD retains the node-specific sealed memfd cache, host
+tiers, GPU-region custody and peer/process leases. [Recovery](RECOVERY.md) distinguishes
+executor replacement, daemon restart and software activation guarantees.
 
 Plan of record and workstream IDs (A–F):
 `~/cozy_v2/outputs/cozy-machine-takeover-20261002/PLAN.md`.
@@ -86,7 +96,7 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 | `reclaim.rs` | Self-managing caches: TTL and storage pressure for spools, logs, collected results, generations | `Disk`, `Swept`, `sweep` | E |
 | `child_launcher.rs` | Pool-owned spawn thread (PDEATHSIG follows the creating thread) | `ChildLauncher` | E |
 | `os.rs` | memfd, seals, peer credentials (`SO_PEERPIDFD`, `pidfd_open` fallback), pidfd exit | — | E |
-| `owner.rs` | TensorFS store owner: import, sealed memfd cache (LRU/TTL), leases per pidfd | `Owner` | B1 |
+| `owner.rs` | Weight peers, import, sealed memfd cache (LRU/TTL), leases per pidfd; store claim through TensorFS `ensure_owned` | `Owner` | B1 |
 | `protocol.rs` | Private control-socket protocol (length-prefixed JSON + `SCM_RIGHTS`) | `Request`, `Command`, `Reply` | E |
 | `host_tier.rs` | Degree 1 host tier: machine-filled sealed layouts, adopted read-only, sized by live headroom | `HostTier`, `HostGrant`, `TierLimit`, `HostTierFacts` | B1 |
 | `host_memory.rs` | Live host headroom (cgroup v1/v2 path, `MemAvailable`) | `HostMemory` | B1 |
@@ -120,6 +130,7 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 ## Contracts
 
 - [Durable execution](DURABLE-EXECUTION.md): journal states, acceptance, cancellation, custody.
+- [Recovery](RECOVERY.md): executor and daemon lifetimes, update publication and rollback.
 - [Front door](FRONT-DOOR.md): the listener, TLS identity, install.
 - [Package bridge](PACKAGE-BRIDGE.md): CPU runner and generation install.
 - [Device executor](DEVICE-EXECUTOR.md): executor launch and control seam.
