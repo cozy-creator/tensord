@@ -382,24 +382,29 @@ impl Jobs {
             appended: HashMap::new(),
             weights: Some((&self.weights, &grant)),
         };
-        let reply = executor.command(
-            &DeviceCommand::RunJob {
-                request_id: id.into(),
-                job: record.invocation.entrypoint.clone(),
-                payload: record.invocation.input.clone(),
-                application,
-                package_interface: interface,
-                spool: spool.clone(),
-                scratch,
-                deadline_s: None,
-                inputs: inputs.inputs,
-                trees: inputs.trees,
-                call_interfaces,
-                models,
-                weights: true,
-            },
-            &mut services,
-        );
+        let command = DeviceCommand::RunJob {
+            request_id: id.into(),
+            job: record.invocation.entrypoint.clone(),
+            payload: record.invocation.input.clone(),
+            application,
+            package_interface: interface,
+            spool: spool.clone(),
+            scratch,
+            deadline_s: None,
+            inputs: inputs.inputs,
+            trees: inputs.trees,
+            call_interfaces,
+            models,
+            weights: true,
+        };
+        // A command over the control frame fails its run by name; the executor never sees it.
+        if let Some(why) = oversized(&command) {
+            self.parents.lock().unwrap().remove(id);
+            executor.shutdown()?;
+            let failure = Failure::executor("refused", "runtime", "job_command_too_large", &why);
+            return engine.finish(id, Outcome::Failed(failure.encode())).map(drop);
+        }
+        let reply = executor.command(&command, &mut services);
         self.parents.lock().unwrap().remove(id);
         conclude(engine, id, &executor, &spool, command_ok(reply?)?)?;
         executor.shutdown()
@@ -1229,6 +1234,9 @@ fn invocables(
 ) -> (Vec<CallInterface>, Callables) {
     let mut rows = vec![];
     let mut callables: Callables = HashMap::new();
+    // A callee module's typed callers need only its own callables: its first row carries that
+    // part of its App's interface, so the whole App travels once, not once per export.
+    let mut documented = std::collections::HashSet::new();
     let apps = std::iter::once((application, own))
         .chain(std::iter::once((generation.application.as_str(), &generation.interface)))
         .chain(generation.callees.iter().map(|c| (c.application.as_str(), &c.interface)));
@@ -1260,11 +1268,52 @@ fn invocables(
                 interface_path: if own { path.into() } else { PathBuf::new() },
                 self_call: own,
                 kind: kind.into(),
-                interface_document: (!own).then(|| interface.clone()),
+                interface_document: (!own && documented.insert(module.to_string()))
+                    .then(|| module_interface(interface, module)),
             });
         }
     }
     (rows, callables)
+}
+
+/// Why `command` cannot travel in one executor control frame, naming its largest parts; None
+/// when it fits.
+fn oversized(command: &DeviceCommand) -> Option<String> {
+    let size = serde_json::to_vec(command).map_or(usize::MAX, |b| b.len());
+    if size <= crate::device_executor::MAX_DEVICE_FRAME {
+        return None;
+    }
+    let mut by_part = BTreeMap::<String, usize>::new();
+    if let DeviceCommand::RunJob { call_interfaces, payload, .. } = command {
+        for row in call_interfaces {
+            let bytes = row.interface_document.as_ref().and_then(|d| serde_json::to_vec(d).ok()).map_or(0, |b| b.len());
+            *by_part.entry(format!("{}'s interface", row.module)).or_default() += bytes;
+        }
+        by_part.insert("the job's payload".into(), serde_json::to_vec(payload).map_or(0, |b| b.len()));
+    }
+    let mut parts: Vec<(usize, String)> = by_part.into_iter().map(|(part, bytes)| (bytes, part)).collect();
+    parts.sort_by(|a, b| b.cmp(a));
+    let largest: Vec<String> = parts.iter().take(3).map(|(bytes, part)| format!("{part} {bytes} B")).collect();
+    Some(format!(
+        "the job's command encodes to {size} B, over the executor control frame's {} B (largest: {})",
+        crate::device_executor::MAX_DEVICE_FRAME,
+        largest.join(", ")
+    ))
+}
+
+/// An App's interface narrowed to one module's exported callables (the Runtime generates that
+/// module's callers from it).
+fn module_interface(interface: &Value, module: &str) -> Value {
+    let mut narrowed = interface.clone();
+    for rows in ["entrypoints", "jobs"] {
+        if let Some(Value::Array(entries)) = narrowed.get_mut(rows) {
+            entries.retain(|entry| {
+                entry["invocable"]["module"].as_str() == Some(module)
+                    && entry["internal"].as_bool() != Some(true)
+            });
+        }
+    }
+    narrowed
 }
 
 /// A serving call's request and the model choices it carries: each `models` entry that is a
@@ -1607,6 +1656,49 @@ mod exact_tests {
         assert_eq!((tensorfs_core::sha256::hex(&reference.digest), reference.length), (hex, 812));
         assert!(choices[0].repository.is_empty());
         assert!(serving_call(&json!({"prompt": "a fox"}), "generate_image").is_err());
+    }
+
+    /// A callee App with many exports across modules: each module's first row carries only its
+    /// own callables, so the job's command fits the control frame where one full interface per
+    /// export (cozy-eval 0.7.5: 8.7 KB on 9 rows) did not. One that cannot fit fails by name.
+    #[test]
+    fn a_callee_interface_travels_once_per_module_and_an_oversized_command_is_named() {
+        let entry = |module: &str, name: &str| json!({"name": name, "description": "x".repeat(900),
+            "invocable": {"module": module, "export": name}});
+        let modules = ["eval.a", "eval.b", "eval.c", "eval.d", "eval.e", "eval.f"];
+        let mut entries: Vec<Value> = modules.iter().flat_map(|m| [entry(m, &format!("{}_1", &m[5..])), entry(m, &format!("{}_2", &m[5..]))]).collect();
+        entries.push(json!({"name": "hidden", "internal": true, "invocable": {"module": "eval.a", "export": "hidden"}}));
+        let callee = json!({"application": "eval:app", "format": "interface/1", "entrypoints": entries});
+        let own = json!({"jobs": [{"name": "root", "invocable": {"module": "root", "export": "root"}}]});
+        let mut generation: crate::catalog::Generation = serde_json::from_value(json!({
+            "identity": "a".repeat(32), "package": "root", "version": "1", "application": "root:app",
+            "python": "/usr/bin/python3", "interface": own,
+        })).unwrap();
+        generation.callees.push(crate::catalog::Callee {
+            distribution: "eval".into(), package: "local/eval".into(), version: "1".into(),
+            application: "eval:app".into(), source_digest: String::new(), interface: callee.clone(),
+        });
+        let (rows, _) = invocables(&generation, "root:app", &own, Path::new("interface.json"));
+        let documented: Vec<_> = rows.iter().filter_map(|r| Some((r.module.as_str(), r.interface_document.as_ref()?))).collect();
+        assert_eq!(documented.iter().map(|(m, _)| *m).collect::<Vec<_>>(), modules);
+        for (module, document) in &documented {
+            let names: Vec<_> = document["entrypoints"].as_array().unwrap().iter().map(|e| e["invocable"]["module"].as_str().unwrap()).collect();
+            assert_eq!(names, [*module, *module], "only its own exported callables");
+            assert_eq!(document["application"], "eval:app");
+        }
+        let command = |call_interfaces| DeviceCommand::RunJob {
+            request_id: "job".into(), job: "root".into(), payload: json!({}), application: "root:app".into(),
+            package_interface: "interface.json".into(), spool: "spool".into(), scratch: "scratch".into(),
+            deadline_s: None, inputs: Default::default(), trees: Default::default(), call_interfaces,
+            models: Default::default(), weights: true,
+        };
+        assert_eq!(oversized(&command(rows.clone())), None);
+        let each_row: Vec<_> = rows.iter().cloned().map(|mut r| {
+            r.interface_document = (!r.self_call).then(|| callee.clone());
+            r
+        }).collect();
+        let why = oversized(&command(each_row)).expect("one full interface per export overflows");
+        assert!(why.contains("over the executor control frame's 65536 B") && why.contains("eval.f's interface 23794 B"), "{why}");
     }
 
     #[test]
