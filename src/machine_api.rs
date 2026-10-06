@@ -156,10 +156,9 @@ impl NativeBackend {
                 })
             })
             .collect::<Result<Vec<_>, Status>>()?;
-        let memos = engine.memos(&record.id).map_err(problem)?.into_iter().map(|m| ("memo", m));
         let calls = engine.calls(&record.id).map_err(problem)?.into_iter().map(|c| ("call", c));
         let logs = engine.logs(&record.id).map_err(problem)?.into_iter().map(|l| ("log", l));
-        for (kind, stored) in memos.chain(calls).chain(logs) {
+        for (kind, stored) in calls.chain(logs) {
             events.push(domain::MachineExecutionEvent {
                 sequence: stored.sequence,
                 attempt_ordinal: attempt,

@@ -156,6 +156,9 @@ pub struct ProcessBirth {
     pub start_ticks: u64,
 }
 
+/// Memoized results each signer keeps, its most recently used first.
+pub const MAX_HELD_MEMOS: i64 = 4096;
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Artifact {
     pub name: String,
@@ -355,7 +358,6 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS public_terminals(execution INTEGER PRIMARY KEY REFERENCES executions(id),outcome BLOB NOT NULL,events BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS run_products(execution INTEGER NOT NULL REFERENCES executions(id),sequence INTEGER NOT NULL,at_ms INTEGER NOT NULL,product BLOB NOT NULL,PRIMARY KEY(execution,sequence));
             CREATE TABLE IF NOT EXISTS run_measurements(execution INTEGER PRIMARY KEY REFERENCES executions(id),measurements BLOB NOT NULL);
-            CREATE TABLE IF NOT EXISTS run_memos(execution INTEGER NOT NULL REFERENCES executions(id),sequence INTEGER NOT NULL,at_ms INTEGER NOT NULL,record BLOB NOT NULL,PRIMARY KEY(execution,sequence));
             CREATE TABLE IF NOT EXISTS run_logs(execution INTEGER NOT NULL REFERENCES executions(id),sequence INTEGER NOT NULL,at_ms INTEGER NOT NULL,record BLOB NOT NULL,PRIMARY KEY(execution,sequence));
             CREATE TABLE IF NOT EXISTS attention_applied(execution INTEGER PRIMARY KEY REFERENCES executions(id));
             CREATE TABLE IF NOT EXISTS run_calls(execution INTEGER NOT NULL REFERENCES executions(id),sequence INTEGER NOT NULL,at_ms INTEGER NOT NULL,call TEXT NOT NULL,record BLOB NOT NULL,PRIMARY KEY(execution,sequence),UNIQUE(execution,call));
@@ -370,7 +372,7 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS run_objects(execution INTEGER NOT NULL REFERENCES executions(id),sha256 TEXT NOT NULL,length INTEGER NOT NULL,PRIMARY KEY(execution,sha256));
             CREATE INDEX IF NOT EXISTS run_objects_digest ON run_objects(sha256);
             CREATE TABLE IF NOT EXISTS job_contexts(execution INTEGER PRIMARY KEY REFERENCES executions(id),record BLOB NOT NULL);
-            CREATE TABLE IF NOT EXISTS held_memos(actor TEXT NOT NULL,computation TEXT NOT NULL,record BLOB NOT NULL,PRIMARY KEY(actor,computation));
+            CREATE TABLE IF NOT EXISTS held_memos(actor TEXT NOT NULL,computation TEXT NOT NULL,record BLOB NOT NULL,used_ms INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(actor,computation));
             CREATE TABLE IF NOT EXISTS held_memo_objects(actor TEXT NOT NULL,computation TEXT NOT NULL,sha256 TEXT NOT NULL,PRIMARY KEY(actor,computation,sha256));
             CREATE INDEX IF NOT EXISTS held_memo_objects_digest ON held_memo_objects(sha256);
             CREATE TABLE IF NOT EXISTS checkpoints(execution INTEGER NOT NULL REFERENCES executions(id),operation_key TEXT NOT NULL,logical_key TEXT NOT NULL,content_digest TEXT NOT NULL,length INTEGER NOT NULL,attempt INTEGER NOT NULL,receipt TEXT NOT NULL,at_ms INTEGER NOT NULL,PRIMARY KEY(execution,operation_key,logical_key));
@@ -729,12 +731,18 @@ impl Journal {
         Ok(())
     }
     /// The length of an object this signer wrote (`objects`), or None.
-    /// A memoized call's result with files, reusable while this machine holds every file:
-    /// the child's result record, keyed by its signer and computation.
+    /// A memoized call's result, reusable while this machine holds every file it names: the
+    /// child's result record, keyed by its signer and computation. Each signer keeps its
+    /// `MAX_HELD_MEMOS` most recently used.
     pub fn hold_memo(&mut self, actor: &str, computation: &str, record: &[u8], objects: &[String]) -> io::Result<()> {
         let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_error)?;
-        tx.execute("INSERT OR REPLACE INTO held_memos(actor,computation,record) VALUES(?1,?2,?3)",
-            params![actor, computation, record]).map_err(db_error)?;
+        tx.execute("INSERT OR REPLACE INTO held_memos(actor,computation,record,used_ms) VALUES(?1,?2,?3,?4)",
+            params![actor, computation, record, timestamp()]).map_err(db_error)?;
+        tx.execute("DELETE FROM held_memos WHERE actor=?1 AND computation NOT IN
+            (SELECT computation FROM held_memos WHERE actor=?1 ORDER BY used_ms DESC LIMIT ?2)",
+            params![actor, MAX_HELD_MEMOS]).map_err(db_error)?;
+        tx.execute("DELETE FROM held_memo_objects WHERE actor=?1 AND computation NOT IN
+            (SELECT computation FROM held_memos WHERE actor=?1)", params![actor]).map_err(db_error)?;
         tx.execute("DELETE FROM held_memo_objects WHERE actor=?1 AND computation=?2", params![actor, computation])
             .map_err(db_error)?;
         for sha256 in objects {
@@ -744,11 +752,16 @@ impl Journal {
         tx.commit().map_err(db_error)
     }
     pub fn held_memo(&self, actor: &str, computation: &str) -> io::Result<Option<Vec<u8>>> {
-        self.connection
+        let record = self.connection
             .query_row("SELECT record FROM held_memos WHERE actor=?1 AND computation=?2",
                 params![actor, computation], |r| r.get(0))
             .optional()
-            .map_err(db_error)
+            .map_err(db_error)?;
+        if record.is_some() {
+            self.connection.execute("UPDATE held_memos SET used_ms=?3 WHERE actor=?1 AND computation=?2",
+                params![actor, computation, timestamp()]).map_err(db_error)?;
+        }
+        Ok(record)
     }
     /// Every held memo naming `sha256` goes with it (its file is no longer this machine's).
     pub fn drop_held_memos(&mut self, sha256: &str) -> io::Result<usize> {
@@ -1777,15 +1790,6 @@ impl Journal {
         Ok(record.revision)
     }
 
-    /// One memoized call's result in the run's log (a `memo` event), at the next sequence.
-    pub fn append_memo(
-        &mut self,
-        id: &str,
-        progress: Option<&ProgressSnapshot>,
-        memo: &[u8],
-    ) -> io::Result<u64> {
-        self.append_entry("INSERT INTO run_memos(execution,sequence,at_ms,record) VALUES(?1,?2,?3,?4)", id, progress, memo)
-    }
     /// One line of the run's log the machine itself writes (a `log` event: a warning about
     /// its request), at the next sequence.
     pub fn append_log(
@@ -1904,12 +1908,6 @@ impl Journal {
     pub fn logs(&self, id: &str) -> io::Result<Vec<StoredProduct>> {
         self.stored(
             "SELECT sequence,at_ms,record FROM run_logs WHERE execution=?1 ORDER BY sequence",
-            id,
-        )
-    }
-    pub fn memos(&self, id: &str) -> io::Result<Vec<StoredProduct>> {
-        self.stored(
-            "SELECT sequence,at_ms,record FROM run_memos WHERE execution=?1 ORDER BY sequence",
             id,
         )
     }

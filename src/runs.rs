@@ -67,10 +67,7 @@ pub struct Spec {
     /// The machine-publication authorization the weights destination is written under.
     pub publication: String,
     pub owner: String,
-    /// Memoized calls' results the caller already holds: (computation digest, result JSON).
-    /// A job's calls are answered from them; a child's one entry is its answer.
-    pub known: Vec<(String, String)>,
-    /// A child's memoized result this machine holds with its files: its answer.
+    /// A child's memoized result this machine holds: its answer.
     pub held: Option<ResultRecord>,
     /// A child run of a callee: the other package's App its parent's environment holds.
     pub application: String,
@@ -106,8 +103,6 @@ pub struct JobContext {
     inputs: BTreeMap<String, (String, ObjectRef)>,
     weights_destination: String,
     publication: String,
-    /// Memoized calls' known results (memory only: after a restart its calls run).
-    known: Vec<(String, String)>,
 }
 
 /// What a job's weights grant reads of its context (`jobs.rs`).
@@ -174,7 +169,6 @@ impl Durable {
                 .collect(),
             weights_destination: self.weights_destination,
             publication: self.publication,
-            known: vec![],
         })
     }
 }
@@ -503,18 +497,9 @@ impl Runs {
     /// The run's code and models made ready: Ok(None) once it is dispatchable, Ok(Some) for a
     /// warm run's result.
     fn prepare(&self, actor: &str, id: &str, spec: Spec) -> Result<Option<ResultRecord>, Refused> {
-        // A memoized call answered from a result its caller or this machine holds runs nothing.
+        // A memoized call answered from a result this machine holds runs nothing.
         if let (false, Some(held)) = (spec.parent.is_empty(), &spec.held) {
             return Ok(Some(held.clone()));
-        }
-        if let (false, Some((_, result))) = (spec.parent.is_empty(), spec.known.first()) {
-            let value = serde_json::from_str(result)
-                .map_err(|_| refused("invalid_request", "a known result is not JSON"))?;
-            return Ok(Some(ResultRecord {
-                value,
-                artifacts: vec![],
-                asset_bindings: vec![],
-            }));
         }
         let engine = self.service.engine.clone();
         let run = id.to_string();
@@ -673,7 +658,6 @@ impl Runs {
                 inputs,
                 weights_destination: spec.weights_destination.clone(),
                 publication: spec.publication.clone(),
-                known: spec.known.clone(),
             };
             let durable = serde_json::to_vec(&Durable::of(&context)).map_err(io::Error::other)?;
             self.service
@@ -830,7 +814,8 @@ impl Runs {
 
     /// A child call of a running job: a run `<request>` under the job's signer, idempotent on
     /// `intent`, preparing inside itself with the job's context and the choices addressed to
-    /// its callable. `answer`, a memoized call's known result, completes it without running.
+    /// its callable. `held`, a memoized call's result this machine holds, completes it without
+    /// running.
     #[allow(clippy::too_many_arguments)]
     pub fn child(
         self: &Arc<Self>,
@@ -841,7 +826,6 @@ impl Runs {
         entrypoint: &str,
         input: Value,
         inputs: Vec<InputFile>,
-        answer: Option<String>,
         held: Option<ResultRecord>,
         passed: Vec<domain::ModelChoice>,
     ) -> Result<Execution, Refused> {
@@ -852,24 +836,11 @@ impl Runs {
         }
         let mut spec =
             self.child_spec(&actor, &parent.id, application, entrypoint, input, inputs, intent)?;
-        spec.known = answer
-            .map(|result| vec![(String::new(), result)])
-            .unwrap_or_default();
         spec.held = held;
         // A model the caller passed by value is that slot's choice, over any other for it.
         spec.models.retain(|choice| !passed.iter().any(|p| p.parameter == choice.parameter));
         spec.models.extend(passed);
         self.submit(&actor, request, spec)
-    }
-
-    /// The result a job's caller already holds for a memoized call's computation, if any.
-    pub fn known(&self, parent: &str, digest: &str) -> Option<String> {
-        let jobs = self.jobs.lock().unwrap();
-        let known = &jobs.get(parent)?.known;
-        known
-            .iter()
-            .find(|(d, _)| d == digest)
-            .map(|(_, r)| r.clone())
     }
 
     /// The installation as a callee's child runs see it: the callee's package, release and
@@ -956,7 +927,6 @@ impl Runs {
             weights_destination: String::new(),
             publication: String::new(),
             owner: context.owner,
-            known: vec![],
             held: None,
             application: application.into(),
             digest: digest.into(),
@@ -1272,7 +1242,6 @@ mod tests {
             weights_destination: String::new(),
             publication: String::new(),
             owner: "alice".into(),
-            known: vec![],
             held: None,
             application: String::new(),
             digest: digest.into(),
@@ -1541,7 +1510,7 @@ mod tests {
                 domain::ModelChoice { parameter:"second/callee/render.models.network".into(),repository:"second/chosen".into(),..Default::default() },
                 domain::ModelChoice { parameter:"render.models.absent".into(),repository:"second/nowhere".into(),..Default::default() },
             ],
-            inputs:Default::default(),weights_destination:String::new(),publication:String::new(),known:vec![],
+            inputs:Default::default(),weights_destination:String::new(),publication:String::new(),
         });
         let child = runs.child_spec("alice","7","callee:app","render",json!({}),vec![],"child").unwrap();
         let chosen: Vec<_> = child.models.iter().map(|c| (c.parameter.as_str(), c.repository.as_str())).collect();
@@ -1571,7 +1540,6 @@ mod tests {
             application: String::new(),
             binding_revision: String::new(), attention_kernel: String::new(), models: vec![],
             inputs: Default::default(), weights_destination: String::new(), publication: String::new(),
-            known: vec![],
         });
         let child = |name: &str| runs.child_spec("alice", "7", "", name, json!({}), vec![], "d");
         assert!(child("leaf-job").unwrap().job);

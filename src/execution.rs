@@ -336,21 +336,6 @@ impl Engine {
     pub fn products(&self, id: &str) -> io::Result<Vec<crate::journal::StoredProduct>> {
         self.journal.lock().unwrap().products(id)
     }
-    /// A memoized call's result, recorded in the run's log.
-    pub fn append_memo(&self, id: &str, memo: &[u8]) -> io::Result<u64> {
-        let progress = self.progress.lock().unwrap();
-        let sequence = self
-            .journal
-            .lock()
-            .unwrap()
-            .append_memo(id, progress.get(id), memo)?;
-        drop(progress);
-        self.notify_activity();
-        Ok(sequence)
-    }
-    pub fn memos(&self, id: &str) -> io::Result<Vec<crate::journal::StoredProduct>> {
-        self.journal.lock().unwrap().memos(id)
-    }
     /// A line the machine writes to the run's log (`{"level", "text"}`).
     pub fn append_log(&self, id: &str, level: &str, text: &str) -> io::Result<u64> {
         let line = serde_json::to_vec(&serde_json::json!({"level": level, "text": text}))?;
