@@ -1,6 +1,8 @@
 //! A rental idle past its deadline whose Hub never answered through that whole idle window cannot
 //! be ended by the Hub, so it ends itself at its provider and billing stops: the real binary,
-//! a stand-in provider API, and a Hub that cannot be reached.
+//! a stand-in provider API, and a Hub that cannot be reached. The provider key it ends itself
+//! with is the machine's alone: gone from every process environment and from the files the
+//! provider copies it into, and still handed to an activated Runtime update's service.
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::SigningKey;
 use std::{
@@ -116,6 +118,19 @@ fn a_rental_the_hub_cannot_hear_ends_itself_at_its_provider() {
         .unwrap()
         .port();
     let (provider_port, received) = provider();
+    // Where RunPod's tooling copies the environment for login shells.
+    std::fs::create_dir_all(root.join("etc")).unwrap();
+    std::fs::create_dir_all(root.join("root")).unwrap();
+    std::fs::write(
+        root.join("etc/rp_environment"),
+        "export RUNPOD_POD_ID=\"pod-standin\"\nexport RUNPOD_API_KEY=\"key-standin\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("root/.bashrc"),
+        "source /etc/rp_environment\nexport KEY=key-standin\n",
+    )
+    .unwrap();
 
     // The first launch proves this boot; within its idle window nothing ends.
     let mut machine = launch(&root, port, provider_port);
@@ -136,6 +151,19 @@ fn a_rental_the_hub_cannot_hear_ends_itself_at_its_provider() {
         received.recv_timeout(Duration::from_secs(3)).is_err(),
         "a rental within its idle window ended itself"
     );
+    let holders = environments_holding(machine.0.id(), "key-standin");
+    assert!(
+        holders.is_empty(),
+        "processes still hold the key: {holders:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("etc/rp_environment")).unwrap(),
+        "export RUNPOD_POD_ID=\"pod-standin\"\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("root/.bashrc")).unwrap(),
+        "source /etc/rp_environment\n"
+    );
     nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(machine.0.id() as i32),
         nix::sys::signal::Signal::SIGTERM,
@@ -143,7 +171,11 @@ fn a_rental_the_hub_cannot_hear_ends_itself_at_its_provider() {
     .unwrap();
     machine.0.wait().unwrap();
 
-    // The same boot after its idle deadline, the Hub silent the whole window.
+    // The same boot after its idle deadline, the Hub silent the whole window, now serving an
+    // activated Runtime update: the parent hands the key to that service.
+    let agent = root.join("var/lib/cozy/rust-machine/agent");
+    std::fs::create_dir_all(&agent).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_cozy-machine"), agent.join("current")).unwrap();
     let ledger = root.join("var/lib/cozy/machine/idle.json");
     let mut idle: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
@@ -180,4 +212,27 @@ fn a_rental_the_hub_cannot_hear_ends_itself_at_its_provider() {
     assert_eq!(released["released"], true);
     drop(machine);
     std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// Each process in `pid`'s tree whose environment holds `needle`.
+fn environments_holding(pid: u32, needle: &str) -> Vec<u32> {
+    let mut tree = vec![pid];
+    let mut held = vec![];
+    while let Some(pid) = tree.pop() {
+        let children =
+            std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).unwrap_or_default();
+        tree.extend(
+            children
+                .split_whitespace()
+                .filter_map(|c| c.parse::<u32>().ok()),
+        );
+        let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+        if environ
+            .windows(needle.len())
+            .any(|w| w == needle.as_bytes())
+        {
+            held.push(pid);
+        }
+    }
+    held
 }

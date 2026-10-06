@@ -3,8 +3,9 @@
 //! the Go guardian restarts its request plane. A clean exit (a stop or an accepted release)
 //! ends it, and so does a second consecutive exit before readiness: measured progress, no timer.
 //! The parent is never replaced: an activated Runtime update runs as the service child
-//! (`cozy-machine service`, readiness pipe on fd 3, this boot's readiness key on fd 4), and a
-//! candidate that never proves readiness is rolled back by this same parent.
+//! (`cozy-machine service`, readiness pipe on fd 3, this boot's readiness key on fd 4, the
+//! provider credential on fd 5), and a candidate that never proves readiness is rolled back by
+//! this same parent.
 use nix::{
     errno::Errno,
     fcntl::OFlag,
@@ -31,7 +32,11 @@ const KEY_FD: i32 = 4;
 /// it reports readiness on; the parent exits with the service's final status. An activated
 /// binary's service gets the readiness `key` on KEY_FD: it proves this boot as the first
 /// service would have.
-pub fn supervise(paths: &super::update::Paths, key: Option<&[u8]>) -> io::Result<Ready> {
+pub fn supervise(
+    paths: &super::update::Paths,
+    key: Option<&[u8]>,
+    provider: Option<&super::provider::ProviderSelf>,
+) -> io::Result<Ready> {
     let mut signals = SigSet::empty();
     for signal in [Signal::SIGTERM, Signal::SIGINT, Signal::SIGCHLD] {
         signals.add(signal);
@@ -58,7 +63,7 @@ pub fn supervise(paths: &super::update::Paths, key: Option<&[u8]>) -> io::Result
                 let Some(binary) = activated else {
                     return Ok(Ready(Some(File::from(write))));
                 };
-                exec_service(&binary, write, key);
+                exec_service(&binary, write, key, provider);
             }
             ForkResult::Parent { child } => child,
         };
@@ -95,7 +100,12 @@ pub fn supervise(paths: &super::update::Paths, key: Option<&[u8]>) -> io::Result
 }
 
 /// Runs an activated machine binary as this service child; never returns.
-fn exec_service(binary: &std::path::Path, ready: std::os::fd::OwnedFd, key: Option<&[u8]>) -> ! {
+fn exec_service(
+    binary: &std::path::Path,
+    ready: std::os::fd::OwnedFd,
+    key: Option<&[u8]>,
+    provider: Option<&super::provider::ProviderSelf>,
+) -> ! {
     use std::os::unix::process::CommandExt;
     if !inherit(ready, READY_FD) {
         std::process::exit(1);
@@ -116,13 +126,21 @@ fn exec_service(binary: &std::path::Path, ready: std::os::fd::OwnedFd, key: Opti
             libc::close(KEY_FD);
         },
     }
+    match provider {
+        Some(provider) if !super::provider::hand_on(provider) => std::process::exit(1),
+        Some(_) => (),
+        // SAFETY: as above.
+        None => unsafe {
+            libc::close(super::provider::CREDENTIAL_FD);
+        },
+    }
     let error = std::process::Command::new(binary).arg("service").exec();
     eprintln!("cozy-machine: cannot run {}: {error}", binary.display());
     std::process::exit(1)
 }
 
 /// Places `fd` at `at` for the exec'd service to inherit (dup2 clears close-on-exec on the copy).
-fn inherit(fd: std::os::fd::OwnedFd, at: i32) -> bool {
+pub(super) fn inherit(fd: std::os::fd::OwnedFd, at: i32) -> bool {
     // SAFETY: plain fd calls in a single-threaded child.
     let placed = unsafe {
         if fd.as_raw_fd() == at {
