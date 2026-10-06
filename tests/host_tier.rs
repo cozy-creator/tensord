@@ -12,7 +12,7 @@ use std::{
     io::Write,
     os::{
         fd::{AsRawFd, FromRawFd},
-        unix::fs::FileExt,
+        unix::{fs::FileExt, process::CommandExt},
     },
     path::PathBuf,
     process::{Child, Command},
@@ -400,6 +400,61 @@ fn unheld_layouts_go_oldest_first_and_held_ones_never() {
     assert_eq!((facts.windows, facts.ledger.released), (0, 2), "{facts:?}");
     assert!(facts.ledger.released_bytes >= 8 * MIB as u64, "{facts:?}");
     assert_eq!(facts.entries, 1);
+}
+
+/// A layout a process still holds after its executor exits (a descendant that kept the file)
+/// frees nothing when the tier lets go of it: its bytes stay charged, so the next model
+/// streams instead of being given room that is not there.
+#[test]
+fn a_released_layout_something_still_holds_stays_charged() {
+    let small = Fixture::new("small", &[8 * MIB]);
+    let other = Fixture::new("other", &[8 * MIB]);
+    let size = small.layout().nbytes;
+    let tier = HostTier::new(
+        small.store.clone(),
+        HostTierConfig {
+            fill_threads: 2,
+            ttl: Duration::from_secs(3600),
+            plans: None,
+        },
+        Box::new(Fixed(size + size / 2)),
+    )
+    .unwrap();
+    let (first, a) = Executor::spawn(&tier);
+    let granted = ask(&tier, a, &small).unwrap();
+    small.adopt(&granted);
+    // A process the tier never met keeps the layout's file open.
+    let fd = granted.as_raw_fd();
+    let mut command = Command::new("sleep");
+    command.arg("1000");
+    // SAFETY: only async-signal-safe fcntl on a descriptor this test keeps open through spawn.
+    unsafe {
+        command.pre_exec(move || match libc::fcntl(fd, libc::F_SETFD, 0) {
+            0 => Ok(()),
+            _ => Err(std::io::Error::last_os_error()),
+        });
+    }
+    let mut holder = command.spawn().unwrap();
+    drop(granted);
+    first.exit();
+    copy_store(&other, &small);
+    let (_second, b) = Executor::spawn(&tier);
+    let (plan, sha256, length) = other.plan(&["unet"]);
+    let request = SealedRequest {
+        sha256: &sha256,
+        length,
+        stage: None,
+    };
+    drop(
+        tier.seal(b, &[other.grant()], request, plan)
+            .unwrap()
+            .expect("streamed"),
+    );
+    let facts = tier.facts();
+    assert_eq!((facts.ledger.released, facts.windows), (1, 1), "{facts:?}");
+    assert!(facts.ledger.stranded_bytes >= 8 * MIB as u64, "{facts:?}");
+    holder.kill().unwrap();
+    holder.wait().unwrap();
 }
 
 /// Copy `from`'s objects and manifest into `into`'s store (as a download would put them).
