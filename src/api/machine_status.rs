@@ -226,6 +226,7 @@ fn held(
                 .find(|d| d.distribution == "cozy-runtime")
                 .map(|d| d.version)
                 .unwrap_or_default(),
+            warning: p.warning,
         })
         .collect();
     Ok((runs, environments))

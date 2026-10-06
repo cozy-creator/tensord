@@ -35,6 +35,10 @@ pub struct Generation {
     /// Other packages' Apps this environment holds as dependencies: a job calls them here.
     #[serde(default)]
     pub callees: Vec<Callee>,
+    /// Empty when this machine's own Runtime and TensorFS installed; else why the release's
+    /// locked SDK runs instead, and which (every run of it says so).
+    #[serde(default)]
+    pub sdk_fallback: String,
 }
 /// Another package's App installed in an environment: its calls run as child runs of its own
 /// package, from the caller's environment.
