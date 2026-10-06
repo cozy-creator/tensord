@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import msgspec
 
-from cozy_runtime.author import App, Context, ImageAsset, Outputs
+from cozy_runtime.author import App, Context, FileAsset, ImageAsset, Outputs
 from cozy_runtime.derive.operations import QuantizationPlan, quantize
-from cpu_memo import Probe, greet, measure, nested, paint, produce, restricted
+from cpu_memo import Probe, greet, measure, nested, note, paint, produce, restricted
 
 app = App()
 
@@ -90,3 +90,15 @@ async def requantize(ctx: Context, payload: Requantize) -> Requantized:
 
 
 app.job(requantize)
+
+
+class Notes(msgspec.Struct):
+    files: list[FileAsset]
+
+
+async def annotate(ctx: Context, payload: Relay) -> Notes:
+    """Each value's note file, from another package's memoized call."""
+    return Notes([(await note(payload=Probe(value, payload.counter))).file for value in payload.values])
+
+
+app.job(annotate)

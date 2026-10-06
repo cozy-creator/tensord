@@ -780,14 +780,22 @@ impl Jobs {
         let answer = memo
             .as_ref()
             .and_then(|(_, digest)| runs.known(&parent.id, digest));
+        // A result with files is answered where its files are: from this machine's own memo.
+        let held = match (&memo, &answer) {
+            (Some((_, digest)), None) => runs
+                .objects
+                .held_memo(&parent.actor, digest)
+                .map_err(|e| ("child_call_refused", e.to_string()))?,
+            _ => None,
+        };
         let computation = memo.as_ref().map(|(_, digest)| digest.clone());
-        let memo = memo.filter(|_| answer.is_none());
+        let memo = memo.filter(|_| answer.is_none() && held.is_none());
         let job = service
             .engine
             .get(&parent.id)
             .map_err(|e| ("child_call_refused", e.to_string()))?;
         let record = runs
-            .child(&job, &request, &intent, application, entrypoint, request_input, inputs, answer, choices)
+            .child(&job, &request, &intent, application, entrypoint, request_input, inputs, answer, held, choices)
             .map_err(|refusal| match refusal.code {
                 "run_id_conflict" => (
                     "child_call_refused",
@@ -886,6 +894,19 @@ impl Jobs {
                                 media_type: row["media_type"].as_str().unwrap_or_default().into(),
                             },
                         );
+                    }
+                    // A memoized call's result with files: this machine reuses it while it holds
+                    // them (a tree's members are not held as one result; it runs again).
+                    if let (Some((_, digest)), false) = (&call.memo, settled.1.is_empty()) {
+                        if !settled.1.iter().any(|grant| grant["kind"] == "tree") {
+                            let (record, objects) = held_memo(result);
+                            let kept = service.engine.with_journal(|j| {
+                                j.hold_memo(&parent.actor, digest, &record, &objects)
+                            });
+                            if let Err(error) = kept {
+                                eprintln!("job {}: memo of call {}: {error}", parent.id, frame.call_index);
+                            }
+                        }
                     }
                     // A memoized call's file-less result: any machine its caller runs on may reuse it.
                     if let (Some((operation, digest)), true, true) = (
@@ -1403,6 +1424,20 @@ fn child_inputs(
             })
         })
         .collect()
+}
+
+/// A child's result record as this machine keeps it for reuse: its value and file bindings,
+/// each file named by its digest only (its path is the store's when reused), and those digests.
+fn held_memo(result: &crate::journal::ResultRecord) -> (Vec<u8>, Vec<String>) {
+    let artifacts: Vec<_> = result
+        .artifacts
+        .iter()
+        .filter(|a| result.asset_bindings.iter().any(|b| b.relative_path == a.name))
+        .map(|a| crate::journal::Artifact { path: String::new(), ..a.clone() })
+        .collect();
+    let objects = artifacts.iter().map(|a| a.sha256.clone()).collect();
+    let record = crate::journal::ResultRecord { value: result.value.clone(), artifacts, asset_bindings: result.asset_bindings.clone() };
+    (serde_json::to_vec(&record).unwrap_or_default(), objects)
 }
 
 /// A completed child's result as its parent receives it: each file leaf named by its bytes

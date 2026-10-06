@@ -344,6 +344,7 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
             .filter(|(_, result)| serde_json::from_str::<serde_json::Value>(result).is_ok())
             .take(256)
             .collect(),
+        held: None,
         application: String::new(),
         digest: identity_digest,
     })

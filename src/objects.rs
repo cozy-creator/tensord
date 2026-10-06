@@ -112,6 +112,8 @@ impl Objects {
                 .with_journal(|j| j.object_releasable(&object.sha256, before_ms))?
                 && object_roots::remove(&self.store, &object.sha256).map_err(io::Error::other)?
             {
+                // A memo answered from this file cannot be answered any more.
+                self.engine.with_journal(|j| j.drop_held_memos(&object.sha256))?;
                 released += 1;
             }
         }
@@ -128,6 +130,28 @@ impl Objects {
         };
         let path = self.store.object_path(&hex);
         Ok(path.is_file().then_some((path, length)))
+    }
+
+    /// A memoized call's held result for this signer, its files at their store paths; None when
+    /// there is none or a file is gone (the memo goes with it).
+    pub fn held_memo(&self, actor: &str, computation: &str) -> io::Result<Option<crate::journal::ResultRecord>> {
+        let _custody = self.guard();
+        let Some(raw) = self.engine.with_journal(|j| j.held_memo(actor, computation))? else {
+            return Ok(None);
+        };
+        let Ok(mut record) = serde_json::from_slice::<crate::journal::ResultRecord>(&raw) else {
+            return Ok(None);
+        };
+        for artifact in &mut record.artifacts {
+            match self.path(actor, &format!("sha256:{}", artifact.sha256))? {
+                Some((path, length)) if length == artifact.length => artifact.path = path.display().to_string(),
+                _ => {
+                    self.engine.with_journal(|j| j.drop_held_memos(&artifact.sha256))?;
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(Some(record))
     }
 
     /// A file this machine produced for the signer (a child run's result) as its object, so a
@@ -357,6 +381,40 @@ mod tests {
         bad.append(b"abc").unwrap();
         assert_eq!(bad.finish().err().unwrap().code, "object_digest_mismatch");
         assert_eq!(objects.begin("alice", &wrong, 3, 0).unwrap().held(), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A held memo answers with its file at the store's path while its signer holds the file;
+    /// when reclaim releases the file, the memo goes with it.
+    #[test]
+    fn a_held_memo_answers_while_its_file_is_held_and_goes_with_it() {
+        let root = std::env::temp_dir().join(format!("cm-objects-{}", uuid::Uuid::new_v4()));
+        let service =
+            crate::service::Service::open(&root.join("state"), &root.join("g"), 1).unwrap();
+        let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
+        let objects = Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap();
+        let bytes = b"note 5".to_vec();
+        let hex = sha256::hex_digest(&bytes);
+        let mut writer = objects.begin("alice", &format!("sha256:{hex}"), 6, 0).unwrap();
+        writer.append(&bytes).unwrap();
+        writer.finish().unwrap();
+        let record = crate::journal::ResultRecord {
+            value: serde_json::json!({"file": {"asset_ref": "attempt:1/file/0001"}}),
+            artifacts: vec![crate::journal::Artifact { name: "file-0001".into(), path: String::new(), sha256: hex.clone(), length: 6 }],
+            asset_bindings: vec![crate::journal::AssetBinding {
+                relative_path: "file-0001".into(), asset_ref: "attempt:1/file/0001".into(), media_type: "text/plain".into(),
+                checksum: crate::journal::OutputChecksum { algorithm: "sha256".into(), value: hex.clone() }, length: 6,
+            }],
+        };
+        let engine = service.engine.clone();
+        engine.with_journal(|j| j.hold_memo("alice", "sha256:c", &serde_json::to_vec(&record).unwrap(), std::slice::from_ref(&hex))).unwrap();
+        let held = objects.held_memo("alice", "sha256:c").unwrap().unwrap();
+        assert_eq!(fs::read(&held.artifacts[0].path).unwrap(), bytes);
+        assert_eq!(held.value, record.value);
+        assert!(objects.held_memo("bob", "sha256:c").unwrap().is_none(), "a memo is its signer's");
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(objects.release(Duration::ZERO).unwrap(), 1);
+        assert!(engine.with_journal(|j| j.held_memo("alice", "sha256:c")).unwrap().is_none(), "reclaim dropped the memo");
         let _ = fs::remove_dir_all(root);
     }
 
