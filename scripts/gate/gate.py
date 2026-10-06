@@ -156,12 +156,15 @@ class Host:
 
     def __init__(self, m: dict):
         self.dir = m.get("work_dir", POD_DIR)
+        self.rental, self.hub, self.cli = m.get("rental"), m.get("hub"), m.get("rental_cli", "cozy")
         if m.get("rental"):
             info = json.loads(subprocess.check_output(["cozy", "rental", "ssh-info", m["rental"], "--json", f"--tensorhub={m['hub']}"]))
             host, port = info["ssh_address"].rsplit(":", 1)
             key = Path(m.get("ssh_identity", "~/.ssh/cozy_rental")).expanduser()   # the rental's key, not the agent's list
             ident = ["-o", "IdentitiesOnly=yes", "-i", str(key)] if key.exists() else []
+            # a lost pod must fail the command, not hang it: the connection is dropped when the pod stops answering
             self.ssh = ["ssh", "-p", port, "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes", *ident,
+                        "-o", "ConnectTimeout=20", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
                         "-o", "ControlPath=/tmp/gate-ssh-%C", "-o", "ControlMaster=auto", "-o", "ControlPersist=900",
                         f"root@{host}"]
         else:
@@ -176,6 +179,15 @@ class Host:
             done = subprocess.run(self.ssh + [command], capture_output=True, text=True)
             if done.returncode != 255 or self.ssh[0] != "ssh":
                 break
+            if self.rental:   # the provider may have lost the pod (a replan): stop rather than wait on a pod that is gone
+                shown = subprocess.run([self.cli, "rental", "show", self.rental, "--json", f"--tensorhub={self.hub}"],
+                                       capture_output=True, text=True)
+                try:
+                    state = json.loads(shown.stdout).get("state")
+                except ValueError:
+                    state = None
+                if state is not None and state != "ready":
+                    raise RuntimeError(f"rental {self.rental} left ready ({state}); ssh: {done.stderr.strip()[-300:]}")
             if "Permission denied" in done.stderr or "authentication failures" in done.stderr:
                 refused += 1   # another sshd may answer for a moment while arms switch; a standing refusal is final
                 if refused > 15:
