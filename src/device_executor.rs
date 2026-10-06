@@ -354,6 +354,10 @@ pub struct CallInterface {
     #[serde(rename = "self")]
     pub self_call: bool,
     pub kind: String,
+    /// Another package's interface: the Runtime installs its typed callers from it (a caller
+    /// imports the callee's function and calls it with its request's fields as arguments).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interface_document: Option<Value>,
 }
 impl DeviceCommand {
     /// The run a command executes and the spool its executor reads and writes.

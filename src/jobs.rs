@@ -71,6 +71,9 @@ struct Parent {
     pure: bool,
     /// The callables declared `memoize=True` (with or without an operation identity).
     pure_callables: std::collections::HashSet<(String, String)>,
+    /// Other packages' entrypoints: the Runtime's typed callers send them a serving call,
+    /// `{"payload": <request>, "models": {<slot>: ModelArtifact | null}}`.
+    serving: std::collections::HashSet<(String, String)>,
     /// The parent's own file inputs: a child may be handed any of them.
     inputs: Vec<InputFile>,
     calls: Mutex<Calls>,
@@ -332,6 +335,11 @@ impl Jobs {
         let inputs = stage_inputs(&self.store, self.identity, &spool, &record.invocation.inputs)?;
         let (call_interfaces, callables) =
             invocables(&held.record, &application, &document, &interface);
+        let serving = call_interfaces
+            .iter()
+            .filter(|row| !row.self_call && row.kind == "entrypoint")
+            .map(|row| (row.module.clone(), row.export.clone()))
+            .collect();
         let parent = Arc::new(Parent {
             id: id.into(),
             request: record
@@ -352,6 +360,7 @@ impl Jobs {
                     && declared["memoize"].as_bool() == Some(true)
             }),
             pure_callables: pure_callables(&held.record),
+            serving,
             inputs: record.invocation.inputs.clone(),
             calls: Mutex::new(Calls::default()),
         });
@@ -739,12 +748,18 @@ impl Jobs {
                 "call request must be an object".into(),
             ));
         }
+        // A serving call's request, and the models it passed by value to the callee's slots
+        // (null leaves a slot to the callee's own ladder and the owner's bindings).
+        let (request_input, choices) = match parent.serving.contains(&callable) {
+            true => serving_call(&input, entrypoint)?,
+            false => (input.clone(), vec![]),
+        };
         let runs = self
             .runs
             .upgrade()
             .ok_or(("child_call_refused", "machine is stopping".into()))?;
         let mut calls = parent.calls.lock().unwrap();
-        let inputs = child_inputs(&input, parent, &calls.received);
+        let inputs = child_inputs(&request_input, parent, &calls.received);
         let request = format!("{}/{}", parent.request, frame.call_index);
         let intent = child_intent(&frame.module, &frame.export, &input);
         // A memoized call's computation: its operation identity and its request. A result the
@@ -767,7 +782,7 @@ impl Jobs {
             .get(&parent.id)
             .map_err(|e| ("child_call_refused", e.to_string()))?;
         let record = runs
-            .child(&job, &request, &intent, application, entrypoint, input, inputs, answer)
+            .child(&job, &request, &intent, application, entrypoint, request_input, inputs, answer, choices)
             .map_err(|refusal| match refusal.code {
                 "run_id_conflict" => (
                     "child_call_refused",
@@ -1245,10 +1260,40 @@ fn invocables(
                 interface_path: if own { path.into() } else { PathBuf::new() },
                 self_call: own,
                 kind: kind.into(),
+                interface_document: (!own).then(|| interface.clone()),
             });
         }
     }
     (rows, callables)
+}
+
+/// A serving call's request and the model choices it carries: each `models` entry that is a
+/// ModelArtifact becomes the exact checkpoint of the callee's slot `<entrypoint>.models.<name>`.
+fn serving_call(
+    call: &Value,
+    entrypoint: &str,
+) -> Result<(Value, Vec<crate::api::domain::ModelChoice>), (&'static str, String)> {
+    let refuse = |why: &str| ("child_call_refused", format!("serving call {why}"));
+    let request = call.get("payload").filter(|p| p.is_object()).ok_or_else(|| refuse("has no request object"))?;
+    let mut choices = vec![];
+    for (name, artifact) in call["models"].as_object().into_iter().flatten() {
+        if artifact.is_null() {
+            continue;
+        }
+        let digest = artifact["manifest"]["digest"].as_str().and_then(|d| d.strip_prefix("sha256:"))
+            .filter(|d| d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit()))
+            .ok_or_else(|| refuse(&format!("passes {name} without an exact checkpoint")))?;
+        let digest = (0..64).step_by(2).map(|i| u8::from_str_radix(&digest[i..i + 2], 16).unwrap()).collect();
+        choices.push(crate::api::domain::ModelChoice {
+            parameter: format!("{entrypoint}.models.{name}"),
+            manifest: Some(crate::api::domain::Ref {
+                digest,
+                length: artifact["manifest"]["length"].as_u64().unwrap_or_default(),
+            }),
+            ..Default::default()
+        });
+    }
+    Ok((request.clone(), choices))
 }
 
 /// The child's file inputs: every string of its request naming a file the parent holds (its
@@ -1543,6 +1588,27 @@ fn record_call(
 mod exact_tests {
     use super::*;
 
+    /// A serving call (the Runtime's typed caller of another package's entrypoint) is its
+    /// request plus models: a passed ModelArtifact is the exact checkpoint of the callee's slot,
+    /// a null one leaves the slot to the callee's ladder.
+    #[test]
+    fn a_serving_call_unwraps_into_its_request_and_the_callees_slot_choices() {
+        let hex = "ab".repeat(32);
+        let call = json!({"payload": {"prompt": "a fox", "steps": 4}, "models": {
+            "model": {"producer_request_id": "job-1/0", "output_slot": "weights",
+                "manifest": {"digest": format!("sha256:{hex}"), "length": 812},
+                "tensorfs_receipt_digest": format!("sha256:{hex}")},
+            "vae": null}});
+        let (request, choices) = serving_call(&call, "generate_image").unwrap();
+        assert_eq!(request, json!({"prompt": "a fox", "steps": 4}));
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].parameter, "generate_image.models.model");
+        let reference = choices[0].manifest.as_ref().unwrap();
+        assert_eq!((tensorfs_core::sha256::hex(&reference.digest), reference.length), (hex, 812));
+        assert!(choices[0].repository.is_empty());
+        assert!(serving_call(&json!({"prompt": "a fox"}), "generate_image").is_err());
+    }
+
     #[test]
     fn a_shared_export_is_refused_only_when_different_apps_own_it() {
         let own = json!({"entrypoints":[
@@ -1571,7 +1637,7 @@ mod exact_tests {
         let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
         let jobs = Jobs::configure(&service,store,None).unwrap();
         let parent = Parent { id:"parent".into(),request:"parent".into(),actor:"alice".into(),spool:root.clone(),
-            callables:calls,memoized:Default::default(),pure:false,pure_callables:Default::default(),
+            callables:calls,memoized:Default::default(),pure:false,pure_callables:Default::default(),serving:Default::default(),
             inputs:vec![],calls:Default::default() };
         let frame = Frame { module:"shared".into(),export:"apply".into(),..Default::default() };
         assert_eq!(jobs.child_call(&parent,&frame).unwrap_err().0,"child_ambiguous");

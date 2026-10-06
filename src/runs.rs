@@ -829,6 +829,7 @@ impl Runs {
         input: Value,
         inputs: Vec<InputFile>,
         answer: Option<String>,
+        passed: Vec<domain::ModelChoice>,
     ) -> Result<Execution, Refused> {
         let actor = parent.submission.as_ref().map(|s| s.actor.clone()).unwrap_or_default();
         // An earlier attempt's call is already its run (a resumed job): nothing prepares.
@@ -840,6 +841,9 @@ impl Runs {
         spec.known = answer
             .map(|result| vec![(String::new(), result)])
             .unwrap_or_default();
+        // A model the caller passed by value is that slot's choice, over any other for it.
+        spec.models.retain(|choice| !passed.iter().any(|p| p.parameter == choice.parameter));
+        spec.models.extend(passed);
         self.submit(&actor, request, spec)
     }
 

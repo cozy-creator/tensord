@@ -5,7 +5,7 @@ from __future__ import annotations
 import msgspec
 
 from cozy_runtime.author import App, Context
-from cpu_memo import Probe, measure, nested, restricted
+from cpu_memo import Probe, greet, measure, nested, restricted
 
 app = App()
 
@@ -17,13 +17,16 @@ class Relay(msgspec.Struct):
 
 class Relayed(msgspec.Struct):
     squares: list[int]
+    greeting: str = ""
 
 
 async def relay(ctx: Context, payload: Relay) -> Relayed:
     squares = []
     for value in payload.values:
         squares.append((await measure(payload=Probe(value, payload.counter))).square)
-    return Relayed(squares=squares)
+    # Another package's serving entrypoint, called with its request's fields (H3 -> qwen).
+    greeted = await greet(text="squared", times=len(squares))
+    return Relayed(squares=squares, greeting=greeted.text)
 
 
 app.job(relay)
