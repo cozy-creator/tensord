@@ -3006,22 +3006,22 @@ impl GpuPool {
         plan: &str,
         degree: u32,
         free_bytes: u64,
+        cells: &BTreeMap<u32, File>,
         others: &mut BTreeMap<String, Session>,
     ) -> io::Result<Option<u64>> {
-        let mut cap: Option<u64> = None;
+        let mut caps = Vec::new();
         for (index, device) in self.lane(degree)?.iter().enumerate() {
-            let got = device.memory.make_room(
+            caps.push(device.memory.make_room(
                 plan,
                 free_bytes,
+                cells.get(&(index as u32)),
                 || if index == 0 { self.holdings() } else { vec![] },
                 |step| self.carry_out(step, others),
-            )?;
-            cap = match (cap, got) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            };
+            )?);
         }
-        Ok(cap)
+        // Each rank's own cell carries its cap. The scalar reply belongs to rank 0 alone,
+        // just as in Load and Invoke; a sibling's cap says nothing about its GPU.
+        Ok(rank_grant(&caps).0)
     }
 }
 
@@ -3931,9 +3931,13 @@ impl Services for Callbacks<'_> {
                     };
                     self.pool.first().observe(self.plan, facts, None);
                 }
-                let cap =
-                    self.pool
-                        .room_for(self.plan, self.degree, frame.free_bytes, self.others)?;
+                let cap = self.pool.room_for(
+                    self.plan,
+                    self.degree,
+                    frame.free_bytes,
+                    self.cells,
+                    self.others,
+                )?;
                 answer.ok = true;
                 answer.cap_bytes = cap.map_or(-1, |cap| i64::try_from(cap).unwrap_or(i64::MAX));
             }
@@ -3959,6 +3963,9 @@ mod tests {
         // A GPU that cannot say lifts only its own rank's cap.
         let (cap, group) = rank_grant(&[Some(30), None]);
         assert_eq!((cap, group.rank_caps), (Some(30), vec![30, -1]));
+        // A sibling's reading cannot manufacture an unmeasured leader's authority.
+        let (cap, group) = rank_grant(&[None, Some(20)]);
+        assert_eq!((cap, group.rank_caps), (None, vec![-1, 20]));
         let (cap, group) = rank_grant(&[Some(30)]);
         assert_eq!((cap, group.is_empty()), (Some(30), true));
         assert_eq!(rank_grant(&[]).0, None);
