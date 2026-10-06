@@ -843,7 +843,7 @@ impl Jobs {
                         .spool
                         .join("child-results")
                         .join(frame.call_index.to_string());
-                    let settled = grant(&service.engine.root, result, &directory, self.identity)
+                    let settled = grant(&service.engine.root, result, &parent.spool, &directory, self.identity)
                         .map_err(|e| ("child_result_unavailable", e.to_string()))?;
                     // Each file is the signer's object too: a later child may be handed it.
                     let runs = self
@@ -1314,6 +1314,7 @@ fn child_inputs(
 fn grant(
     root: &Path,
     result: &crate::journal::ResultRecord,
+    spool: &Path,
     directory: &Path,
     identity: Option<LaunchIdentity>,
 ) -> io::Result<(String, Vec<Value>)> {
@@ -1369,6 +1370,12 @@ fn grant(
         fs::copy(root.join(&artifact.path), &local)?;
         if let Some(identity) = identity {
             identity.readable(&local)?;
+        }
+        // The parent may return it as its own output, by the digest it now names it by: the
+        // spool binds `sha256:<hex>` to its `sha256-<hex>` file (`device_executor::blob`).
+        match fs::hard_link(&local, spool.join(format!("sha256-{}", artifact.sha256))) {
+            Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err(error),
+            _ => (),
         }
         let digest = format!("sha256:{}", artifact.sha256);
         node["asset_ref"] = digest.clone().into();
@@ -1544,7 +1551,7 @@ mod exact_tests {
         assert_eq!(intent(&first), intent(&seed(r#" {"nested":{"a":1,"b":2}, "seed":9007199254740992} "#)));
         assert_ne!(intent(&first), intent(&seed(r#"{"seed":9007199254740993,"nested":{"b":2,"a":1}}"#)));
         let result = crate::journal::ResultRecord { value: json!({"seed": u64::MAX, "float": 1.0}), artifacts: vec![], asset_bindings: vec![] };
-        let (sent, _) = grant(Path::new("unused"), &result, Path::new("unused"), None).unwrap();
+        let (sent, _) = grant(Path::new("unused"), &result, Path::new("unused"), Path::new("unused"), None).unwrap();
         let received = crate::boundary_json::parse(sent.as_bytes()).unwrap();
         assert_eq!(received["seed"].as_u64(), Some(u64::MAX));
         assert!(received["float"].is_f64());

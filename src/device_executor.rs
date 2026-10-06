@@ -1248,6 +1248,12 @@ fn encode_native(spool: &Path, reply: &Frame) -> io::Result<Option<Vec<AssetBind
     }
     let invalid = |detail: &str| io::Error::new(io::ErrorKind::InvalidData, detail.to_string());
     let blob = |reference: &str| -> io::Result<String> {
+        // A file a child returned, which this run hands on as its own (`jobs::grant`).
+        if let Some(hex) = reference.strip_prefix("sha256:").filter(|h| {
+            h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())
+        }) {
+            return Ok(format!("sha256-{hex}"));
+        }
         let tail: Vec<_> = reference.rsplitn(3, '/').collect();
         match tail.as_slice() {
             [name, kind, _]
@@ -1330,7 +1336,11 @@ fn encode_native(spool: &Path, reply: &Frame) -> io::Result<Option<Vec<AssetBind
             .finalize_variable(&mut digest)
             .map_err(io::Error::other)?;
         let producer = format!("blake2b:{}", tensorfs_core::sha256::hex(&digest));
-        if !output.digest.is_empty() && output.digest != producer
+        // A forwarded child file names its bytes by their SHA-256 (`jobs::grant`).
+        let forwarded = output.digest.strip_prefix("sha256:").is_some_and(|hex| {
+            hex == tensorfs_core::sha256::hex_digest(&encoded)
+        });
+        if !output.digest.is_empty() && output.digest != producer && !forwarded
             || output.size_bytes.is_some_and(|n| n != encoded.len() as u64)
         {
             return Err(invalid("SDK output bytes changed before custody"));

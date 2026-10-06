@@ -17,6 +17,10 @@ from cozy_runtime.author._codec import FRAME_MEDIA_TYPES, encode_frame
 
 
 def blob_path(spool, ref):
+    # A file a child returned, which this run hands on as its own (the machine's jobs::grant).
+    digest = ref.removeprefix("sha256:")
+    if digest != ref and len(digest) == 64 and all(c in "0123456789abcdef" for c in digest):
+        return spool / f"sha256-{digest}"
     tail = ref.rsplit("/", 2)
     if len(tail) < 3 or not tail[-1] or tail[-1] != Path(tail[-1]).name:
         return None
@@ -64,7 +68,9 @@ def encode(request, directory):
             raise ValueError("SDK output has no owned spool binding")
         encoded = read_regular(directory, destination.name)
         producer = digest_bytes(encoded)
-        if output.get("digest") and output["digest"] != producer:
+        # A forwarded child file names its bytes by their SHA-256 (the machine's jobs::grant).
+        forwarded = output.get("digest") == "sha256:" + hashlib.sha256(encoded).hexdigest()
+        if output.get("digest") and output["digest"] != producer and not forwarded:
             raise ValueError("SDK producer checksum differs from retained output")
         if output.get("size_bytes") is not None and output["size_bytes"] != len(encoded):
             raise ValueError("SDK output byte length changed")
