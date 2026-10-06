@@ -929,14 +929,14 @@ impl GpuPool {
             eprintln!("warm set: mapping {}: {} {}", plan.id, reply.code, reply.detail);
             return Ok("its weights could not be mapped (the machine's log says why)");
         }
-        let (mapped, weights) = (reply.mapped_bytes.unwrap_or(0), self.first().with(|gpu| gpu.facts(&plan.id).weights));
+        // Every region on the card, placed or attached from custody (`complete`), is `gpu`.
+        let complete = reply.mapped_bytes.unwrap_or(0) > 0 && reply.complete.unwrap_or(true);
         let facts = plane_facts(reply.plane.as_ref());
-        self.observe(&plan.id, 1, facts, &reply.rank_planes, Some(mapped > 0));
-        if weights.is_some_and(|weights| mapped < weights) {
-            self.levels.lock().unwrap().entry(plan.id.clone()).and_modify(|(_, l)| *l = Level::Host);
-            return Ok("part of its weights stay in host memory: the GPU has no room for them all");
+        self.observe(&plan.id, 1, facts, &reply.rank_planes, Some(complete));
+        match complete {
+            true => Ok("mapped"),
+            false => Ok("part of its weights stay in host memory: the GPU has no room for them all"),
         }
-        Ok("mapped")
     }
     /// What each of `actor`'s members holds now, and why that is lower than it asked.
     pub fn members(&self, actor: &str) -> Vec<(Level, &'static str)> {

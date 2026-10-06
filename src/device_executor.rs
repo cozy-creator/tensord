@@ -649,8 +649,10 @@ pub struct Frame {
     pub holding_bytes: Option<i64>,
     pub facts: Option<LoadFacts>,
     pub plane: Option<PlaneFacts>,
-    /// `map`: the device bytes the construction's weights hold after it.
+    /// `map`: the device bytes the construction's weights hold after it, and whether that
+    /// is every weight.
     pub mapped_bytes: Option<u64>,
+    pub complete: Option<bool>,
     /// A group's followers' own plane facts, rank 1 first (None: not stated yet).
     pub rank_planes: Vec<Option<PlaneFacts>>,
     pub metrics: Option<Metrics>,
