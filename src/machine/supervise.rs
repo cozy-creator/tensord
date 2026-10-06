@@ -3,8 +3,8 @@
 //! the Go guardian restarts its request plane. A clean exit (a stop or an accepted release)
 //! ends it, and so does a second consecutive exit before readiness: measured progress, no timer.
 //! The parent is never replaced: an activated Runtime update runs as the service child
-//! (`cozy-machine service`, readiness pipe on fd 3), and a candidate that never proves
-//! readiness is rolled back by this same parent.
+//! (`cozy-machine service`, readiness pipe on fd 3, this boot's readiness key on fd 4), and a
+//! candidate that never proves readiness is rolled back by this same parent.
 use nix::{
     errno::Errno,
     fcntl::OFlag,
@@ -22,10 +22,16 @@ use std::{
 
 /// The fd an exec'd service reports readiness on.
 const READY_FD: i32 = 3;
+/// The fd an exec'd service reads this boot's readiness key from: open only when the parent
+/// placed the key there. The key is never in an environment or an argument, the service closes
+/// the fd once it has read it, and a service that predates it ignores it.
+const KEY_FD: i32 = 4;
 
 /// Forks the service. Returns only in a service child that runs this executable, with the pipe
-/// it reports readiness on; the parent exits with the service's final status.
-pub fn supervise(paths: &super::update::Paths) -> io::Result<Ready> {
+/// it reports readiness on; the parent exits with the service's final status. An activated
+/// binary's service gets the readiness `key` on KEY_FD: it proves this boot as the first
+/// service would have.
+pub fn supervise(paths: &super::update::Paths, key: Option<&[u8]>) -> io::Result<Ready> {
     let mut signals = SigSet::empty();
     for signal in [Signal::SIGTERM, Signal::SIGINT, Signal::SIGCHLD] {
         signals.add(signal);
@@ -51,7 +57,7 @@ pub fn supervise(paths: &super::update::Paths) -> io::Result<Ready> {
                 let Some(binary) = activated else {
                     return Ok(Ready(Some(File::from(write))));
                 };
-                exec_service(&binary, write);
+                exec_service(&binary, write, key);
             }
             ForkResult::Parent { child } => child,
         };
@@ -88,23 +94,63 @@ pub fn supervise(paths: &super::update::Paths) -> io::Result<Ready> {
 }
 
 /// Runs an activated machine binary as this service child; never returns.
-fn exec_service(binary: &std::path::Path, ready: std::os::fd::OwnedFd) -> ! {
+fn exec_service(binary: &std::path::Path, ready: std::os::fd::OwnedFd, key: Option<&[u8]>) -> ! {
     use std::os::unix::process::CommandExt;
-    // SAFETY: plain fd calls in a single-threaded child; dup2 clears close-on-exec on the copy.
-    let placed = unsafe {
-        if ready.as_raw_fd() == READY_FD {
-            libc::fcntl(READY_FD, libc::F_SETFD, 0)
-        } else {
-            libc::dup2(ready.as_raw_fd(), READY_FD)
-        }
-    };
-    if placed < 0 {
+    if !inherit(ready, READY_FD) {
         std::process::exit(1);
     }
-    std::mem::forget(ready);
+    match key {
+        Some(key) => {
+            // The whole key fits a pipe's buffer: written and closed before the exec.
+            let Ok((read, write)) = pipe2(OFlag::O_CLOEXEC) else {
+                std::process::exit(1)
+            };
+            if File::from(write).write_all(key).is_err() || !inherit(read, KEY_FD) {
+                std::process::exit(1);
+            }
+        }
+        // Whatever this process inherited there is not a key.
+        // SAFETY: closing an fd nothing in this single-threaded child uses.
+        None => unsafe {
+            libc::close(KEY_FD);
+        },
+    }
     let error = std::process::Command::new(binary).arg("service").exec();
     eprintln!("cozy-machine: cannot run {}: {error}", binary.display());
     std::process::exit(1)
+}
+
+/// Places `fd` at `at` for the exec'd service to inherit (dup2 clears close-on-exec on the copy).
+fn inherit(fd: std::os::fd::OwnedFd, at: i32) -> bool {
+    // SAFETY: plain fd calls in a single-threaded child.
+    let placed = unsafe {
+        if fd.as_raw_fd() == at {
+            libc::fcntl(at, libc::F_SETFD, 0)
+        } else {
+            libc::dup2(fd.as_raw_fd(), at)
+        }
+    };
+    if fd.as_raw_fd() == at {
+        std::mem::forget(fd);
+    }
+    placed >= 0
+}
+
+/// The readiness key the parent handed this exec'd service, read once (the fd is then closed);
+/// None when it handed none.
+pub fn inherited_key() -> Option<Vec<u8>> {
+    // SAFETY: KEY_FD is the parent's key pipe, or not open (F_GETFD then fails).
+    if unsafe { libc::fcntl(KEY_FD, libc::F_GETFD) } < 0 {
+        return None;
+    }
+    // SAFETY: the open fd is owned by nothing else in this process. The pipe was written and
+    // closed before the exec, so a read never waits on it.
+    let mut pipe = unsafe { File::from_raw_fd(KEY_FD) };
+    unsafe { libc::fcntl(KEY_FD, libc::F_SETFL, libc::O_NONBLOCK) };
+    let mut key = vec![0u8; 33];
+    let read = pipe.read(&mut key).ok()?;
+    key.truncate(read);
+    (read == 32).then_some(key)
 }
 
 /// The readiness pipe an exec'd service inherited from its parent.
