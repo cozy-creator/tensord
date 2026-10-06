@@ -701,6 +701,12 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
         let caller = self.caller(request.metadata())?;
         caller.machine()?;
         let request = request.into_inner();
+        if request.id.is_empty() || request.id.len() > 256 {
+            return Err(Status::invalid_argument("a run id is 1-256 bytes"));
+        }
+        if self.identity.updates.as_ref().is_some_and(|updates| updates.update(&request.id).is_some()) {
+            return Err(Status::unimplemented("software update runs do not support Control"));
+        }
         let action = match v1::Action::try_from(request.action) {
             Ok(v1::Action::Cancel) => pb::MachineExecutionAction::Cancel,
             Ok(v1::Action::Pause) => pb::MachineExecutionAction::Pause,

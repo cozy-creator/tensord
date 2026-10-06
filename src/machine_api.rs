@@ -384,7 +384,11 @@ impl NativeBackend {
             worker_boot_id: record.acceptance_boot_id.clone(),
             request_id: context.request_id.clone(),
             attempt_ordinal: record.attempt.max(1) as u64,
-            invocation_spec_digest: digest_bytes(&context.invocation_digest)?,
+            invocation_spec_digest: if record.canceled_before_acceptance {
+                Vec::new() // cancellation accepted no invocation spec
+            } else {
+                digest_bytes(&context.invocation_digest)?
+            },
             outcome_id: format!("out-{}", sha256::hex(&digest)),
             outcome_digest: digest.to_vec(),
             outcome_canonical_bytes: bytes,
@@ -883,12 +887,19 @@ impl MachineBackend for NativeBackend {
         actor: VerifiedActor,
         request: pb::MachineExecutionControl,
     ) -> Result<pb::MachineExecutionState, Status> {
-        let record = self.query(
-            actor,
-            request
-                .execution
-                .ok_or_else(|| Status::invalid_argument("execution query absent"))?,
-        )?;
+        let query = request.execution
+            .ok_or_else(|| Status::invalid_argument("execution query absent"))?;
+        if request.action == pb::MachineExecutionAction::Cancel as i32 {
+            if query.expected_execution_workspace_id != self.workspace_id() {
+                return Err(refusal("execution_workspace_changed", "the requested execution journal is not this workspace"));
+            }
+            let canceled = self.service.engine.cancel_run(&actor_id(actor), &query.request_id).map_err(problem)?;
+            if let Some(jobs) = self.service.jobs() {
+                jobs.canceled(&canceled);
+            }
+            return self.state(&canceled);
+        }
+        let record = self.query(actor, query)?;
         if request.expected_generation != 0 && request.expected_generation != record.attempt as u64
         {
             return Err(Status::aborted("execution generation changed"));
@@ -899,17 +910,6 @@ impl MachineBackend for NativeBackend {
             refusal(refused.code, &format!("{}: {}", refused.code, refused.message))
         };
         let changed = match pb::MachineExecutionAction::try_from(request.action) {
-            Ok(pb::MachineExecutionAction::Cancel) => {
-                let canceled = self
-                    .service
-                    .engine
-                    .cancel(&record.id, &actor)
-                    .map_err(problem)?;
-                if let Some(jobs) = &jobs {
-                    jobs.canceled(&canceled);
-                }
-                canceled
-            }
             Ok(pb::MachineExecutionAction::Pause) => jobs
                 .ok_or_else(|| refusal("pause_unsupported", "this machine runs no jobs"))?
                 .pause(&record, &actor)

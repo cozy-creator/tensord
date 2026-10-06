@@ -16,4 +16,9 @@ the terminal outcome; a missing run or a transport/authentication failure never 
 cancellation. Closing an observer has no cancellation authority. This adds no RPC, generation
 selector, legacy submission closure or deployment compatibility gate.
 
+Review gap: software-update runs have a separate journal/admission path. Control refuses known
+update IDs. An unknown cancellation racing a later UPDATE still needs a shared atomic actor/ID
+reservation between both journals; a preflight-only lookup cannot close that race. This draft
+proves ordinary call/job/warm cancellation and is not ready for merge until this gap is resolved.
+
 Tracker: https://github.com/cozy-creator/tracker/issues/331

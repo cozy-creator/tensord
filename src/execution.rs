@@ -697,10 +697,32 @@ impl Engine {
             overlay_observation(&mut record, &owned, &progress);
             record
         };
+        self.deliver_cancellation(&record);
+        Ok(record)
+    }
+
+    /// Explicit native cancellation also fences an actor/ID not yet accepted by Run.
+    pub fn cancel_run(&self, actor: &str, id: &str) -> io::Result<Execution> {
+        let record = {
+            let owned = self.owned.lock().unwrap();
+            let mut progress = self.progress.lock().unwrap();
+            let mut journal = self.journal.lock().unwrap();
+            let prior = journal.reserve_run_cancellation(actor, id)?;
+            let mut record = journal.cancel_observed(&prior.id, actor, progress.get(&prior.id))?;
+            progress.remove(&prior.id);
+            overlay_observation(&mut record, &owned, &progress);
+            record
+        };
+        self.deliver_cancellation(&record);
+        Ok(record)
+    }
+
+    fn deliver_cancellation(&self, record: &Execution) {
         self.notify_activity();
         if record.state.terminal() {
-            return Ok(record);
+            return;
         }
+        let id = &record.id;
         let active = self.active.lock().unwrap().get(id).cloned();
         if let Some(active) = active {
             // Delivery failure does not revoke the already committed cancellation authority.
@@ -716,7 +738,6 @@ impl Engine {
                 ActiveRun::Managed(cancel) => cancel(),
             };
         }
-        Ok(record)
     }
 
     /// Pause (`Journal::pause`); a started attempt is stopped as a cancel stops it, and the

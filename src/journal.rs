@@ -215,6 +215,9 @@ pub struct Execution {
     pub waiting_reason: Option<String>,
     pub process: Option<ProcessBirth>,
     pub cancel_actor: Option<String>,
+    /// Explicit cancellation reserved this actor/ID before any Run spec was accepted.
+    #[serde(default)]
+    pub canceled_before_acceptance: bool,
     /// Who paused it: the run is paused, or pauses once its started attempt stops (or, while
     /// preparing, once prepared). `resume` clears it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1154,6 +1157,9 @@ impl Journal {
             .map_err(db_error)?;
         if let Some(prior) = prior {
             let execution: Execution = serde_json::from_str(&prior).map_err(db_error)?;
+            if execution.canceled_before_acceptance && execution.state == State::Canceled {
+                return Ok((execution, false));
+            }
             if execution
                 .submission
                 .as_ref()
@@ -1182,6 +1188,31 @@ impl Journal {
         reference_objects(&tx, &execution.id, objects)?;
         tx.commit().map_err(db_error)?;
         Ok((execution, true))
+    }
+
+    /// Reserves an absent run as canceled in the same transaction namespace as acceptance.
+    /// An accepted run is returned for normal cancellation; its spec/outcome is never replaced.
+    pub fn reserve_run_cancellation(&mut self, actor: &str, id: &str) -> io::Result<Execution> {
+        validate_scope(actor, id, id)?;
+        let key = format!("run:{}", encoded(&(actor, id))?);
+        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        if let Some(prior) = public_prior(&tx, actor, id, id)? {
+            return serde_json::from_str(&prior).map_err(db_error);
+        }
+        let context = SubmissionContext {
+            actor: actor.into(), request_id: id.into(), submission_id: id.into(),
+            ..Default::default()
+        };
+        let mut record = insert(&tx, &key, Invocation::default(), Some(context), "", None)?;
+        record.state = State::Canceled;
+        record.cancel_actor = Some(actor.into());
+        record.canceled_before_acceptance = true;
+        record.finished_at_ms = timestamp().max(0) as u64;
+        tx.execute("UPDATE executions SET record=?1,state='canceled',updated_ms=?2 WHERE id=?3",
+            params![encoded(&record)?, timestamp(), record.id]).map_err(db_error)?;
+        tx.commit().map_err(db_error)?;
+        Ok(record)
     }
 
     /// A preparing run's code and models are ready: it names them and becomes dispatchable.
@@ -1341,6 +1372,7 @@ fn insert(
         waiting_reason: waiting.map(String::from),
         process: None,
         cancel_actor: None,
+        canceled_before_acceptance: false,
         pause_actor: None,
         completed_units: 0,
         progress: None,
