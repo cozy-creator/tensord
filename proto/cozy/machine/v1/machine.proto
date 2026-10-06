@@ -261,6 +261,7 @@ message OutputTarget {
   string run = 1;
   string output = 2;
   uint32 index = 3;  // a list item's 1-based index; 0 for a single output
+  string member = 4; // one file of a tree output, by its manifest path; empty: the manifest
 }
 // The first frame describes the bytes (data may be empty); the rest carry data in order.
 message ReadFrame {

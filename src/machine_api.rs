@@ -244,6 +244,21 @@ impl NativeBackend {
                     &object,
                 )
                 .map_err(problem)?;
+                // A tree's members are held too: Read serves them, a child may be handed it.
+                if binding.media_type == crate::gpu_service::TREE_MEDIA {
+                    let mut manifest = Vec::new();
+                    self.service.engine.open_result(&record.id, index).map_err(problem)?
+                        .read_to_end(&mut manifest).map_err(problem)?;
+                    for (sha, length) in crate::execution::tree_members(&manifest).map_err(problem)? {
+                        let member = result.artifacts.iter().position(|a| a.sha256 == sha && a.length == length)
+                            .ok_or_else(|| Status::data_loss("a tree member is not held"))?;
+                        let owner = identity(&json!({"workspace":self.workspace_id(),"actor":context.actor,
+                            "request":context.request_id,"asset":binding.asset_ref,"member":sha}))?;
+                        crate::products::retain(&self.store, &self.service.engine, &context.actor, &owner,
+                            &mut self.service.engine.open_result(&record.id, member).map_err(problem)?,
+                            &ObjectRef { sha256: sha, length }).map_err(problem)?;
+                    }
+                }
                 references.insert(
                     binding.asset_ref.clone(),
                     (artifact.clone(), binding.media_type.clone(), native),
@@ -494,6 +509,42 @@ impl MachineBackend for NativeBackend {
             rev: revisions.len() as u64,
             media_type: current.media_type.clone(),
             sha256: terminal.then(|| format!("sha256:{}", sha256::hex(&content.digest))),
+        })
+    }
+    fn open_member(
+        &self,
+        actor: VerifiedActor,
+        run: u64,
+        output: &str,
+        index: Option<u32>,
+        member: &str,
+    ) -> Result<crate::api::backend::OutputSnapshot, Status> {
+        let tree = self.open_output(actor, run, output, index)?;
+        if tree.media_type != crate::gpu_service::TREE_MEDIA {
+            return Err(Status::invalid_argument("only a tree output has members"));
+        }
+        let mut manifest = Vec::new();
+        for (file, length) in tree.parts {
+            file.take(length).read_to_end(&mut manifest).map_err(problem)?;
+        }
+        let document: Value = serde_json::from_slice(&manifest)
+            .map_err(|_| Status::data_loss("tree manifest is not JSON"))?;
+        let entry = document["entries"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|entry| entry["path"] == member)
+            .ok_or_else(|| Status::not_found("the tree has no such member"))?;
+        let (Some(sha), Some(length)) = (entry["blob"]["sha256"].as_str(), entry["blob"]["length"].as_u64()) else {
+            return Err(Status::data_loss("tree member names no blob"));
+        };
+        let file = self.store.open_verified(sha).map_err(storage)?.into_file();
+        Ok(crate::api::backend::OutputSnapshot {
+            parts: vec![(file, length)],
+            length,
+            rev: tree.rev,
+            media_type: "application/octet-stream".into(),
+            sha256: Some(format!("sha256:{sha}")),
         })
     }
     fn read_triage(
@@ -1045,7 +1096,8 @@ fn rewrite_assets(
     if value.is_null() {
         return Ok(());
     }
-    if schema.get("asset").is_some() {
+    // A returned tree (`{"input": "tree"}`) is an output like an asset: its manifest's bytes.
+    if schema.get("asset").is_some() || schema["input"] == "tree" {
         let object = value
             .as_object_mut()
             .ok_or_else(|| Status::data_loss("asset result differs from declared schema"))?;

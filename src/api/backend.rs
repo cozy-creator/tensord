@@ -81,6 +81,17 @@ pub trait MachineBackend: Send + Sync + 'static {
     ) -> Result<OutputSnapshot, Status> {
         unsupported()
     }
+    /// One file of a tree output (`member`, its manifest path), at the output's revision.
+    fn open_member(
+        &self,
+        _: VerifiedActor,
+        _run: u64,
+        _output: &str,
+        _index: Option<u32>,
+        _member: &str,
+    ) -> Result<OutputSnapshot, Status> {
+        unsupported()
+    }
     /// One kept log's bytes, oldest first (wire 72). A log not written yet is empty.
     /// A failed attempt's retained triage bundle.
     fn read_triage(

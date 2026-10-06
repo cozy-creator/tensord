@@ -168,7 +168,7 @@ async fn read(
     client: &mut v1::machine_client::MachineClient<Channel>,
     offset: u64,
 ) -> tonic::Streaming<v1::ReadFrame> {
-    let target = v1::OutputTarget { run: "run".into(), output: "image".into(), index: 0 };
+    let target = v1::OutputTarget { run: "run".into(), output: "image".into(), index: 0, ..Default::default() };
     let request = v1::ReadRequest { target: Some(v1::read_request::Target::Output(target)), offset, ..Default::default() };
     client.read(authorized(request, &machine_cap())).await.unwrap().into_inner()
 }

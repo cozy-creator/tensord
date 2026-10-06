@@ -198,6 +198,7 @@ async fn measure(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     run: "bench".into(),
                     output: "blob".into(),
                     index: 0,
+                    ..Default::default()
                 })),
                 ..Default::default()
             });

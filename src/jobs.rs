@@ -843,24 +843,22 @@ impl Jobs {
                         .spool
                         .join("child-results")
                         .join(frame.call_index.to_string());
-                    let settled = grant(&service.engine.root, result, &parent.spool, &directory, self.identity)
+                    let (text, rows, held) = grant(&service.engine.root, result, &parent.spool, &directory, self.identity)
                         .map_err(|e| ("child_result_unavailable", e.to_string()))?;
+                    let settled = (text, rows);
                     // Each file is the signer's object too: a later child may be handed it.
                     let runs = self
                         .runs
                         .upgrade()
                         .ok_or(("child_call_refused", "machine is stopping".into()))?;
+                    for (local, object) in &held {
+                        runs.objects
+                            .adopt(&parent.actor, &parent.id, local, object)
+                            .map_err(|e| ("child_result_unavailable", e.to_string()))?;
+                    }
                     for row in &settled.1 {
                         let digest = row["digest"].as_str().unwrap_or_default();
                         let length = row["length"].as_u64().unwrap_or_default();
-                        let object = tensorfs_core::ids::ObjectRef {
-                            sha256: digest.trim_start_matches("sha256:").into(),
-                            length,
-                        };
-                        let local = Path::new(row["local"].as_str().unwrap_or_default());
-                        runs.objects
-                            .adopt(&parent.actor, &parent.id, local, &object)
-                            .map_err(|e| ("child_result_unavailable", e.to_string()))?;
                         received.insert(
                             digest.into(),
                             Received {
@@ -1311,13 +1309,16 @@ fn child_inputs(
 
 /// A completed child's result as its parent receives it: each file leaf named by its bytes
 /// (`asset_ref` = `digest` = sha256) and granted at a copy in the parent's spool.
+/// The files a parent now holds from a child's result, to adopt as its own objects.
+type Held = Vec<(PathBuf, tensorfs_core::ids::ObjectRef)>;
+
 fn grant(
     root: &Path,
     result: &crate::journal::ResultRecord,
     spool: &Path,
     directory: &Path,
     identity: Option<LaunchIdentity>,
-) -> io::Result<(String, Vec<Value>)> {
+) -> io::Result<(String, Vec<Value>, Held)> {
     fn leaves(value: &Value, path: &mut Vec<String>, found: &mut Vec<String>) {
         match value {
             Value::Object(fields) if fields.contains_key("asset_ref") => found.push(path.join(".")),
@@ -1341,7 +1342,18 @@ fn grant(
     let mut value = result.value.clone();
     let mut paths = vec![];
     leaves(&value, &mut vec![], &mut paths);
-    let mut grants = vec![];
+    let (mut grants, mut held) = (vec![], vec![]);
+    // Each file the parent now holds, also in its spool as `sha256-<hex>`: it may return it
+    // as its own output by the digest it names it by (`device_executor::tree_binding`).
+    let mut hold = |local: &Path, sha: &str, length: u64| -> io::Result<()> {
+        match fs::hard_link(local, spool.join(format!("sha256-{sha}"))) {
+            Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err(error),
+            _ => (),
+        }
+        let object = tensorfs_core::ids::ObjectRef { sha256: sha.into(), length };
+        held.push((local.to_path_buf(), object));
+        Ok(())
+    };
     for output_id in paths {
         let pointer = format!("/{}", output_id.replace('.', "/"));
         let node = value
@@ -1371,13 +1383,45 @@ fn grant(
         if let Some(identity) = identity {
             identity.readable(&local)?;
         }
-        // The parent may return it as its own output, by the digest it now names it by: the
-        // spool binds `sha256:<hex>` to its `sha256-<hex>` file (`device_executor::blob`).
-        match fs::hard_link(&local, spool.join(format!("sha256-{}", artifact.sha256))) {
-            Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err(error),
-            _ => (),
-        }
+        hold(&local, &artifact.sha256, artifact.length)?;
         let digest = format!("sha256:{}", artifact.sha256);
+        if binding.media_type == crate::gpu_service::TREE_MEDIA {
+            // A tree: its manifest's members materialized as the directory the parent reads.
+            let tree = directory.join(format!("{}-tree-{}", grants.len(), artifact.sha256));
+            let manifest: Value = serde_json::from_slice(&fs::read(&local)?).map_err(io::Error::other)?;
+            let mut content = 0;
+            for entry in manifest["entries"].as_array().into_iter().flatten() {
+                let (Some(path), Some(sha), Some(length)) = (entry["path"].as_str(),
+                    entry["blob"]["sha256"].as_str(), entry["blob"]["length"].as_u64()) else {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "child tree manifest has an invalid entry"));
+                };
+                let relative = Path::new(path);
+                if !relative.components().all(|c| matches!(c, std::path::Component::Normal(_))) {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "child tree member leaves its tree"));
+                }
+                let member = result.artifacts.iter().find(|a| a.sha256 == sha && a.length == length)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "child tree member is not held"))?;
+                let target = tree.join(relative);
+                fs::create_dir_all(target.parent().unwrap_or(&tree))?;
+                fs::copy(root.join(&member.path), &target)?;
+                if let Some(identity) = identity {
+                    identity.readable(&target)?;
+                }
+                hold(&target, sha, length)?;
+                content += length;
+            }
+            if let Some(identity) = identity {
+                for entry in crate::gpu_service::walk_dirs(&tree)? {
+                    identity.readable(&entry)?;
+                }
+            }
+            node["asset_ref"] = digest.clone().into();
+            node["digest"] = digest.clone().into();
+            node["size_bytes"] = content.into();
+            grants.push(json!({"output_id": output_id, "kind": "tree", "digest": digest, "local": tree,
+                "length": artifact.length, "content_bytes": content, "media_type": binding.media_type}));
+            continue;
+        }
         node["asset_ref"] = digest.clone().into();
         node["digest"] = digest.clone().into();
         node["size_bytes"] = artifact.length.into();
@@ -1393,7 +1437,7 @@ fn grant(
         }));
     }
     let exact = String::from_utf8(crate::boundary_json::exact(&value)).map_err(io::Error::other)?;
-    Ok((exact, grants))
+    Ok((exact, grants, held))
 }
 
 /// A child call's intent: its callable and its input, numbers exact.
@@ -1551,7 +1595,7 @@ mod exact_tests {
         assert_eq!(intent(&first), intent(&seed(r#" {"nested":{"a":1,"b":2}, "seed":9007199254740992} "#)));
         assert_ne!(intent(&first), intent(&seed(r#"{"seed":9007199254740993,"nested":{"b":2,"a":1}}"#)));
         let result = crate::journal::ResultRecord { value: json!({"seed": u64::MAX, "float": 1.0}), artifacts: vec![], asset_bindings: vec![] };
-        let (sent, _) = grant(Path::new("unused"), &result, Path::new("unused"), Path::new("unused"), None).unwrap();
+        let (sent, _, _) = grant(Path::new("unused"), &result, Path::new("unused"), Path::new("unused"), None).unwrap();
         let received = crate::boundary_json::parse(sent.as_bytes()).unwrap();
         assert_eq!(received["seed"].as_u64(), Some(u64::MAX));
         assert!(received["float"].is_f64());

@@ -1206,10 +1206,20 @@ pub fn postprocess(
 ) -> io::Result<(Value, Vec<AssetBinding>)> {
     let result = read_result(spool, reply)?;
     let directory = File::open(spool)?;
-    let post = match encode_native(spool, reply)? {
+    // A tree is held as its manifest and member files; the encoders bind every other output.
+    let (trees, files): (Vec<_>, Vec<_>) =
+        reply.outputs.iter().cloned().partition(|o| o.kind == "tree");
+    let reply = &Frame {
+        outputs: files,
+        ..reply.clone()
+    };
+    let mut post = match encode_native(spool, reply)? {
         Some(bindings) => PostReply { bindings },
         None => codec.encode(spool, reply)?,
     };
+    for tree in &trees {
+        post.bindings.push(tree_binding(spool, tree)?);
+    }
     for binding in &post.bindings {
         let mut file = open_artifact(spool, Path::new(&binding.name))?;
         let mut hash = tensorfs_core::sha256::Sha256::new();
@@ -1235,6 +1245,98 @@ pub fn postprocess(
     directory.sync_all()?;
     Ok((result, post.bindings))
 }
+/// An output tree as the machine holds it: each regular file of its spool directory linked as
+/// the spool's `sha256-<hex>`, and a manifest naming them by path (`gpu_service::TREE_MEDIA`),
+/// which the output binds to. A tree forwarded from a child (`sha256:<manifest>`) is already
+/// both.
+fn tree_binding(spool: &Path, output: &Output) -> io::Result<AssetBinding> {
+    let invalid = |why: &str| io::Error::new(io::ErrorKind::InvalidData, format!("output tree: {why}"));
+    let hash = |path: &Path| -> io::Result<(String, u64)> {
+        let mut file = open_artifact(spool, path)?;
+        let mut hash = tensorfs_core::sha256::Sha256::new();
+        let length = io::copy(&mut file, &mut HashWriter(&mut hash))?;
+        Ok((tensorfs_core::sha256::hex(&hash.finish()), length))
+    };
+    let name = match output.asset_ref.strip_prefix("sha256:") {
+        Some(hex) if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            format!("sha256-{hex}")
+        }
+        _ => {
+            let tail: Vec<_> = output.asset_ref.rsplitn(3, '/').collect();
+            let [n, "tree", _] = tail.as_slice() else {
+                return Err(invalid("its reference names no spool directory"));
+            };
+            let directory = format!("tree-{n}");
+            let mut entries = vec![];
+            let mut pending = vec![std::path::PathBuf::new()];
+            while let Some(relative) = pending.pop() {
+                for entry in fs::read_dir(spool.join(&directory).join(&relative))? {
+                    let entry = entry?;
+                    let (kind, path) = (entry.file_type()?, relative.join(entry.file_name()));
+                    if kind.is_dir() {
+                        pending.push(path);
+                        continue;
+                    } else if !kind.is_file() {
+                        return Err(invalid("it holds something other than files and directories"));
+                    }
+                    let member = Path::new(&directory).join(&path);
+                    let (sha, length) = hash(&member)?;
+                    match fs::hard_link(spool.join(&member), spool.join(format!("sha256-{sha}"))) {
+                        Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err(error),
+                        _ => (),
+                    }
+                    let path = path.to_str().ok_or_else(|| invalid("a path is not UTF-8"))?;
+                    entries.push(serde_json::json!({"kind": "file", "path": path,
+                        "blob": {"sha256": sha, "length": length}}));
+                }
+            }
+            if entries.is_empty() {
+                return Err(invalid("it holds no file"));
+            }
+            entries.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+            let manifest = crate::boundary_json::exact(&serde_json::json!({"entries": entries}));
+            let name = format!("{directory}-manifest");
+            fs::write(spool.join(&name), manifest)?;
+            name
+        }
+    };
+    let (sha, length) = hash(Path::new(&name))?;
+    let manifest: Value = serde_json::from_slice(&fs::read(spool.join(&name))?)
+        .map_err(|_| invalid("its manifest is not JSON"))?;
+    let mut content = 0;
+    for entry in manifest["entries"].as_array().ok_or_else(|| invalid("no entries"))? {
+        let member = format!("sha256-{}", entry["blob"]["sha256"].as_str().unwrap_or_default());
+        if hash(Path::new(&member))?.1 != entry["blob"]["length"].as_u64().unwrap_or(u64::MAX) {
+            return Err(invalid("a member differs from its manifest"));
+        }
+        content += entry["blob"]["length"].as_u64().unwrap_or_default();
+    }
+    if output.size_bytes.is_some_and(|size| size != content) {
+        return Err(invalid("its files differ from the size the SDK reported"));
+    }
+    Ok(AssetBinding {
+        output_id: output.output_id.clone(),
+        asset_ref: output.asset_ref.clone(),
+        name,
+        kind: "tree".into(),
+        media_type: crate::gpu_service::TREE_MEDIA.into(),
+        length,
+        producer_digest: format!("sha256:{sha}"),
+        sha256: sha,
+    })
+}
+
+struct HashWriter<'a>(&'a mut tensorfs_core::sha256::Sha256);
+impl Write for HashWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Encodes registered PNG/WebP frames in this process exactly as the SDK's post thread
 /// does (lossless RGB; PNG at zlib's fastest level, WebP lossless) and binds every output
 /// to its spool file. None when a frame needs a codec only the SDK has.

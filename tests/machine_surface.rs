@@ -362,6 +362,7 @@ mod v1_api {
                 run: "run-1".into(),
                 output: "report".into(),
                 index: 0,
+                ..Default::default()
             })),
             offset,
             ..Default::default()
@@ -527,6 +528,7 @@ mod v1_api {
                 run: "run-1".into(),
                 output: "report".into(),
                 index: 0,
+                ..Default::default()
             })),
             ..Default::default()
         };
@@ -559,6 +561,7 @@ mod v1_api {
                 run: "only-ours".into(),
                 output: "report".into(),
                 index: 0,
+                ..Default::default()
             })),
             ..Default::default()
         };
@@ -1218,6 +1221,59 @@ mod v1_api {
         let _ = fs::remove_dir_all(tools);
     }
 
+    /// A tree a child made (`out.save_tree`) reaches its parent as a directory, goes to a
+    /// sibling as that one's input tree, and is the job's own output: its manifest and each
+    /// member file are read back over Read.
+    #[tokio::test]
+    async fn a_childs_tree_is_handed_on_and_returned_as_the_jobs_output() {
+        let (machine, tools) = installing_machine().await;
+        let mut client = client(&machine).await;
+        let all = cap(Grant {
+            action: MACHINE.into(),
+            ..Default::default()
+        });
+        let manifest = write_package(&mut client, &all, "cpu_tree", "local/cozy-machine-cpu-tree").await;
+        let spec = v1::RunSpec {
+            kind: v1::RunKind::Job as i32,
+            source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
+            entrypoint: "survey".into(),
+            payload: serde_json::to_vec(&serde_json::json!({ "text": "verified" })).unwrap(),
+            owner: "alice".into(),
+            ..Default::default()
+        };
+        let request = v1::RunRequest { id: "survey".into(), after: 0, spec: Some(spec) };
+        let events = collect(client.run(authorized(request, &all)).await.unwrap().into_inner())
+            .await
+            .unwrap();
+        let done = outcome(&events);
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        assert_eq!(result["files"], serde_json::json!(["b.txt", "empty.txt", "nested/a.txt"]), "{result}");
+        let product = done.outputs.iter().find(|p| p.output == "tree").expect("the tree is an output");
+        assert_eq!(product.media_type, "application/vnd.cozy.tree-manifest");
+        assert_eq!(result["tree"]["digest"], product.digest, "{result}");
+        let target = |member: &str| v1::ReadRequest {
+            target: Some(v1::read_request::Target::Output(v1::OutputTarget {
+                run: "survey".into(),
+                output: "tree".into(),
+                index: 0,
+                member: member.into(),
+            })),
+            ..Default::default()
+        };
+        let (meta, tree) = read(&mut client, &all, target("")).await.unwrap();
+        assert_eq!(meta.digest, product.digest);
+        let tree: serde_json::Value = serde_json::from_slice(&tree).unwrap();
+        let paths: Vec<_> = tree["entries"].as_array().unwrap().iter().map(|e| e["path"].clone()).collect();
+        assert_eq!(paths, ["b.txt", "empty.txt", "nested/a.txt"], "{tree}");
+        let (meta, member) = read(&mut client, &all, target("nested/a.txt")).await.unwrap();
+        assert_eq!(member, b"verified");
+        assert_eq!(meta.digest, format!("sha256:{}", tensorfs_core::sha256::hex_digest(b"verified")));
+        assert_eq!(read(&mut client, &all, target("empty.txt")).await.unwrap().1, b"");
+        assert_eq!(read(&mut client, &all, target("absent")).await.unwrap_err().code(), tonic::Code::NotFound);
+        let _ = fs::remove_dir_all(tools);
+    }
+
     fn outcome(events: &[v1::RunEvent]) -> v1::Outcome {
         match &events.last().unwrap().event {
             Some(v1::run_event::Event::Outcome(outcome)) => outcome.clone(),
@@ -1812,6 +1868,7 @@ mod v1_api {
                     run: "film".into(),
                     output: "video".into(),
                     index: 0,
+                    ..Default::default()
                 })),
                 ..Default::default()
             },
@@ -2184,6 +2241,7 @@ mod v1_api {
                     run: "film".into(),
                     output: "video".into(),
                     index: 0,
+                    ..Default::default()
                 })),
                 ..Default::default()
             },
@@ -2464,6 +2522,7 @@ mod v1_api {
                     run: "broken".into(),
                     output: "video".into(),
                     index: 0,
+                    ..Default::default()
                 })),
                 ..Default::default()
             },

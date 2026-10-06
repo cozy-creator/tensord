@@ -3495,7 +3495,7 @@ fn materialize_tree(
     Ok(())
 }
 
-fn walk_dirs(root: &Path) -> io::Result<Vec<PathBuf>> {
+pub(crate) fn walk_dirs(root: &Path) -> io::Result<Vec<PathBuf>> {
     let mut found = vec![root.to_path_buf()];
     let mut index = 0;
     while index < found.len() {

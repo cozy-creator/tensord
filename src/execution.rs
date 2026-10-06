@@ -1006,6 +1006,12 @@ impl Engine {
         bindings: Vec<crate::journal::AssetBinding>,
     ) -> io::Result<Execution> {
         let mut paths: Vec<_> = bindings.iter().map(|b| b.relative_path.clone()).collect();
+        // A tree's member files are held beside its manifest, by digest (`tree_binding`).
+        for tree in bindings.iter().filter(|b| b.media_type == crate::gpu_service::TREE_MEDIA) {
+            let mut manifest = Vec::new();
+            open_artifact(source, Path::new(&tree.relative_path))?.read_to_end(&mut manifest)?;
+            paths.extend(tree_members(&manifest)?.into_iter().map(|(sha, _)| format!("sha256-{sha}")));
+        }
         paths.sort();
         paths.dedup();
         let result = self.bound_custody(id, source, value, paths, bindings)?;
@@ -1516,6 +1522,21 @@ impl Drop for Spool {
 }
 
 /// Walk relative components using openat+NOFOLLOW: no symlink or parent escape races.
+/// A tree manifest's members: each file's (sha256 hex, length).
+pub(crate) fn tree_members(manifest: &[u8]) -> io::Result<Vec<(String, u64)>> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "tree manifest has an invalid entry");
+    let document: Value = serde_json::from_slice(manifest).map_err(|_| invalid())?;
+    document["entries"]
+        .as_array()
+        .ok_or_else(invalid)?
+        .iter()
+        .map(|entry| {
+            let sha = entry["blob"]["sha256"].as_str().filter(|h| h.len() == 64).ok_or_else(invalid)?;
+            Ok((sha.to_string(), entry["blob"]["length"].as_u64().ok_or_else(invalid)?))
+        })
+        .collect()
+}
+
 pub(crate) fn open_artifact(root: &Path, path: &Path) -> io::Result<File> {
     let parts: Vec<_> = path
         .components()
