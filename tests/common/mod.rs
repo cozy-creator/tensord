@@ -1,5 +1,5 @@
 //! What every readiness test asks a machine root's listener.
-use cozy_machine::api::v1::{machine_client::MachineClient, StatusRequest};
+use tensord::api::v1::{machine_client::MachineClient, StatusRequest};
 use std::path::Path;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
 

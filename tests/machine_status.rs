@@ -4,7 +4,7 @@
 mod common;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use cozy_machine::api::{
+use tensord::api::{
     capability::{self, Grant},
     v1::{self, machine_client::MachineClient},
 };
@@ -34,7 +34,7 @@ impl Drop for Machine {
 fn boot(root: &Path, port: u16, lifetime: &str) -> Machine {
     let owner = SigningKey::from_bytes(&OWNER).verifying_key();
     Machine(
-        Command::new(env!("CARGO_BIN_EXE_cozy-machine"))
+        Command::new(env!("CARGO_BIN_EXE_tensord"))
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("COZY_MACHINE_ROOT", root)
@@ -141,7 +141,7 @@ async fn status_answers_identity_to_anyone_and_the_machine_to_its_owner() {
         .unwrap()
         .port();
     // The store holds two models before the machine starts; Status lists them.
-    cozy_machine::held_models::fixture(&root.join("var/lib/tensorfs")).unwrap();
+    tensord::held_models::fixture(&root.join("var/lib/tensorfs")).unwrap();
     let mut machine = boot(&root, port, "rental");
     let sealed = receipt(&mut machine, &root, port);
     let pem = std::fs::read(root.join("run/cozy/bootstrap/tls.crt")).unwrap();
@@ -164,7 +164,7 @@ async fn status_answers_identity_to_anyone_and_the_machine_to_its_owner() {
     for (key, refused) in [(OWNER, false), ([9; 32], true)] {
         let key = SigningKey::from_bytes(&key);
         assert_eq!(
-            cozy_machine::machine::probe::refuses_capability_of(port, &leaf, WORKER, &key).await,
+            tensord::machine::probe::refuses_capability_of(port, &leaf, WORKER, &key).await,
             refused
         );
     }

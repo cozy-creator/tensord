@@ -2,11 +2,11 @@
 //! weights through the machine's real `ResidentCustody` and seam. Measures what Degree 2 buys:
 //! a replacement's first image with attached weights against a private fill, the bytes two
 //! live executors hold (NVML total), the release after a revoke, and output equality.
-use cozy_machine::device_executor::{
+use tensord::device_executor::{
     postprocess, Answer, Baseline, Binding, Budgets, DeviceCommand, DeviceExecutor, ExecutorConfig,
     Frame, Kind, Services,
 };
-use cozy_machine::resident_custody::{HoldingKey, Offered, Reader, ResidentCustody};
+use tensord::resident_custody::{HoldingKey, Offered, Reader, ResidentCustody};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -37,7 +37,7 @@ struct Config {
 
 struct Pilot {
     custody: Arc<Mutex<ResidentCustody>>,
-    reader: Option<(cozy_machine::journal::ProcessBirth, File)>,
+    reader: Option<(tensord::journal::ProcessBirth, File)>,
     budget: i64,
     cells: Vec<File>,
     log: File,
@@ -132,7 +132,7 @@ struct Image {
     first_image_ms: f64,
     digests: Vec<String>,
     h2d_bytes: Option<u64>,
-    plane: Option<cozy_machine::device_executor::PlaneFacts>,
+    plane: Option<tensord::device_executor::PlaneFacts>,
 }
 
 struct Exec {
@@ -170,7 +170,7 @@ fn exec(
     let root = config.root.join(name);
     fs::create_dir_all(&root)?;
     let configured = |name: &str| config.environment.get(name).cloned();
-    let mut seal = cozy_machine::launch_identity::Seal::prepare(
+    let mut seal = tensord::launch_identity::Seal::prepare(
         &config.root,
         None,
         "pilot",

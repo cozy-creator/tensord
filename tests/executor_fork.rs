@@ -2,7 +2,7 @@
 //! `tests/fixtures/cpu_lifecycle`, no doubles. CUDA is hidden by the seal; the GPU half is
 //! proven on a rental. `COZY_MACHINE_FORK_GENERATIONS` names installed generations whose
 //! Runtime offers `fork/1`.
-use cozy_machine::{
+use tensord::{
     device_executor::{
         Baseline, Binding, Budgets, DeviceCommand, DeviceExecutor, ExecutorConfig, Forked, FORK,
     },

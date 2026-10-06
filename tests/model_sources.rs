@@ -1,6 +1,6 @@
 //! A session's model selection: its authority, its headers and its encoded size, and the
 //! header and assets it serves an executor that reads no store.
-use cozy_machine::model_sources::{ModelSources, SelectedManifest};
+use tensord::model_sources::{ModelSources, SelectedManifest};
 use sha2::{Digest, Sha256};
 use std::{
     fs, io,
@@ -136,7 +136,7 @@ fn a_selection_grants_its_headers_and_sizes_and_nothing_else() {
     fs::remove_dir_all(root).unwrap();
 }
 
-fn frame(manifest: &str, name: &str) -> cozy_machine::device_executor::Frame {
+fn frame(manifest: &str, name: &str) -> tensord::device_executor::Frame {
     serde_json::from_value(serde_json::json!({
         "event": "request", "seq": 7, "kind": "model_source", "manifest": manifest, "name": name,
     }))

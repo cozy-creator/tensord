@@ -1,5 +1,5 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use cozy_machine::api::{
+use tensord::api::{
     capability::{self, Grant, MACHINE},
     identity::{AuthorizedKeys, MachineConfig, ReadinessSecret},
     MachineIdentity,

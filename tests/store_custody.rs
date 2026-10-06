@@ -1,6 +1,6 @@
 //! Write objects keep durable TensorFS roots while an unfinished run names them; the store's
 //! GC takes them only once released.
-use cozy_machine::{
+use tensord::{
     execution::Engine,
     journal::{InputFile, Invocation, State},
     objects::Objects,
@@ -132,7 +132,7 @@ fn unsubmitted_writes_and_crash_orphans_age_out() {
     let area = Area::new();
     let unsubmitted = area.write(b"write never submitted");
     // Within the TTL an acknowledged Write waits for its run.
-    assert_eq!(area.objects.release(cozy_machine::reclaim::TTL).unwrap(), 0);
+    assert_eq!(area.objects.release(tensord::reclaim::TTL).unwrap(), 0);
     // A root written just before a crash, with no journal row.
     let orphan = area
         .store
@@ -145,7 +145,7 @@ fn unsubmitted_writes_and_crash_orphans_age_out() {
         .obj;
     object_roots::retain(&area.store, &orphan).unwrap();
     assert_eq!(
-        area.objects.release(cozy_machine::reclaim::IDLE).unwrap(),
+        area.objects.release(tensord::reclaim::IDLE).unwrap(),
         0
     );
     assert_eq!(area.collect(), 2);

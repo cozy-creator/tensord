@@ -7,7 +7,7 @@
 //! (model names), `output` (JSON lines), and optional `squeeze: {at, start, release}`: before
 //! request `at`, run `start` (a ballast taking device memory while the call runs) and create
 //! `release` once that request ends.
-use cozy_machine::{
+use tensord::{
     gpu_service::{GpuConfig, GpuPool},
     journal::{Preparation, State, SubmissionContext},
     service::Service,
@@ -128,7 +128,7 @@ fn published_models_alternate_on_one_gpu_under_the_memory_policy() {
             .submit_public(
                 context,
                 &installed.generation,
-                cozy_machine::service::Call {
+                tensord::service::Call {
                     entrypoint: model.entrypoint.clone(),
                     input: input.clone(),
                     ..Default::default()

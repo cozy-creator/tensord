@@ -43,7 +43,7 @@ fn client_wheel() -> Result<(), Box<dyn std::error::Error>> {
         members.push((format!("cozy_machine_client/{name}"), std::fs::read(&path)?));
     }
     members.push((format!("{info}/METADATA"), format!("Metadata-Version: 2.1\nName: cozy-machine-client\nVersion: {version}\nRequires-Python: >=3.11\nRequires-Dist: msgspec<1,>=0.18\nProvides-Extra: installer\nRequires-Dist: packaging<27,>=24; extra == \"installer\"\n").into_bytes()));
-    members.push((format!("{info}/WHEEL"), b"Wheel-Version: 1.0\nGenerator: cozy-machine build.rs\nRoot-Is-Purelib: true\nTag: py3-none-any\n".to_vec()));
+    members.push((format!("{info}/WHEEL"), b"Wheel-Version: 1.0\nGenerator: tensord build.rs\nRoot-Is-Purelib: true\nTag: py3-none-any\n".to_vec()));
     let mut record = String::new();
     for (name, body) in &members {
         let digest = URL_SAFE_NO_PAD.encode(Sha256::digest(body));

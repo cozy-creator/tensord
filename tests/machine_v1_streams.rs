@@ -1,7 +1,7 @@
 //! `cozy.machine.v1` streams through the real TLS server, over a backend with a fixed log:
 //! what a reattaching or output-limited observer sees, when a stream's authority ends, and
 //! how a short output read fails.
-use cozy_machine::api::{
+use tensord::api::{
     self,
     auth::{Keys, VerifiedActor},
     backend::OutputSnapshot,

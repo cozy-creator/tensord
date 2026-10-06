@@ -338,7 +338,7 @@ impl Updates {
         if let Some(status) = current.as_mut() {
             change(status);
             if let Err(error) = write_json(&self.paths.update("status.json"), status) {
-                eprintln!("cozy-machine: Runtime update status: {error}");
+                eprintln!("tensord: Runtime update status: {error}");
             }
         }
     }
@@ -393,7 +393,7 @@ impl Updates {
         }
         self.set(|s| s.enter("starting"));
         eprintln!(
-            "cozy-machine: Runtime update {}: restarting on {} / {}",
+            "tensord: Runtime update {}: restarting on {} / {}",
             request.operation, to.runtime, to.tensorfs
         );
         exit(REPLACE_EXIT);
@@ -437,7 +437,7 @@ fn existing_wheel(dir: &Path, distribution: &str) -> io::Result<PathBuf> {
 }
 
 /// Checks the wheel's METADATA names the distribution and version its file name does; returns
-/// a bundled `cozy-machine` executable when a Runtime wheel carries one.
+/// a bundled `tensord` executable when a Runtime wheel carries one.
 fn verify_wheel(path: &Path, distribution: &str) -> io::Result<Option<Vec<u8>>> {
     let name = path
         .file_name()
@@ -469,7 +469,7 @@ fn verify_wheel(path: &Path, distribution: &str) -> io::Result<Option<Vec<u8>>> 
             "{name} METADATA names another distribution or version"
         )));
     }
-    let script = format!("{distribution}-{version}.data/scripts/cozy-machine");
+    let script = format!("{distribution}-{version}.data/scripts/tensord");
     let Ok(mut entry) = archive.by_name(&script) else {
         return Ok(None);
     };
@@ -481,7 +481,7 @@ fn verify_wheel(path: &Path, distribution: &str) -> io::Result<Option<Vec<u8>>> 
 /// The bundled executable when it is a Rust machine (its `version --json` says so). A wheel
 /// bundling another machine agent leaves this one running.
 fn rust_machine(binary: &[u8], dir: &Path) -> io::Result<Option<PathBuf>> {
-    let path = dir.join("cozy-machine");
+    let path = dir.join("tensord");
     fs::write(&path, binary)?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
     let output = std::process::Command::new(&path)
@@ -497,7 +497,7 @@ fn rust_machine(binary: &[u8], dir: &Path) -> io::Result<Option<PathBuf>> {
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| serde_json::from_slice::<Identity>(&o.stdout).ok())
-        .is_some_and(|i| i.name == "cozy-machine" && i.implementation == "rust");
+        .is_some_and(|i| i.name == "tensord" && i.implementation == "rust");
     if !rust {
         fs::remove_file(&path)?;
     }
@@ -596,7 +596,7 @@ mod tests {
         .unwrap();
         if let Some(script) = script {
             zip.start_file(
-                format!("{distribution}-{version}.data/scripts/cozy-machine"),
+                format!("{distribution}-{version}.data/scripts/tensord"),
                 options,
             )
             .unwrap();
@@ -611,11 +611,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cozy-update-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        let script = b"#!/bin/sh\necho '{\"name\":\"cozy-machine\",\"implementation\":\"rust\"}'\n";
+        let script = b"#!/bin/sh\necho '{\"name\":\"tensord\",\"implementation\":\"rust\"}'\n";
         let runtime = wheel(&dir, "cozy_runtime", "0.18.103", Some(script));
         let binary = verify_wheel(&runtime, "cozy_runtime").unwrap().unwrap();
         assert!(rust_machine(&binary, &dir).unwrap().is_some());
-        let go = b"#!/bin/sh\necho '{\"name\":\"cozy-machine\",\"version\":\"0.18.103\"}'\n";
+        let go = b"#!/bin/sh\necho '{\"name\":\"tensord\",\"version\":\"0.18.103\"}'\n";
         assert!(
             rust_machine(go, &dir).unwrap().is_none(),
             "another agent leaves this machine running"
@@ -655,7 +655,7 @@ mod tests {
         )
         .unwrap();
         relink(&paths.current_sdk_link(), Some(&new)).unwrap();
-        relink(&paths.current_agent_link(), Some(&new.join("cozy-machine"))).unwrap();
+        relink(&paths.current_agent_link(), Some(&new.join("tensord"))).unwrap();
         assert!(rollback_pending(&paths, "candidate never became ready").unwrap());
         assert_eq!(fs::read_link(paths.current_sdk_link()).unwrap(), old);
         assert!(fs::symlink_metadata(paths.current_agent_link()).is_err());

@@ -1,7 +1,7 @@
 //! The machine's sealed host tier on the real path: a real TensorFS store, TensorFS's verified
 //! fill, real executor stand-in processes (their pidfds hold layouts), and TensorFS's own
 //! read-only adoption (`Plane::register_sealed`) checking every byte.
-use cozy_machine::{
+use tensord::{
     host_memory::HostMemory,
     host_tier::{HostGrant, HostTier, HostTierConfig, SealedRequest, TierLimit},
 };
@@ -282,7 +282,7 @@ fn tier(fx: &Fixture, limit: u64) -> Arc<HostTier> {
 
 /// The tier's facts once no fill is running (adopters see each region before the filler
 /// records the fill).
-fn settled(tier: &HostTier) -> cozy_machine::host_tier::HostTierFacts {
+fn settled(tier: &HostTier) -> tensord::host_tier::HostTierFacts {
     for _ in 0..500 {
         let facts = tier.facts();
         if facts.filling_bytes == 0 {
@@ -619,7 +619,7 @@ fn in_scope(memory: &[&str], name: &str) {
 #[test]
 #[ignore = "run inside a memory-limited scope by the test above"]
 fn inside_a_256_mib_scope() {
-    let host = cozy_machine::host_memory::read();
+    let host = tensord::host_memory::read();
     assert!(
         host.available > 0 && host.available <= 256 << 20,
         "{host:?}"
@@ -628,7 +628,7 @@ fn inside_a_256_mib_scope() {
     let tier = HostTier::new(
         big.store.clone(),
         HostTierConfig::default(),
-        Box::new(cozy_machine::host_tier::HalfOfHeadroom),
+        Box::new(tensord::host_tier::HalfOfHeadroom),
     )
     .unwrap();
     let (_executor, a) = Executor::spawn(&tier);
@@ -917,7 +917,7 @@ fn a_model_larger_than_its_cgroup_streams_and_checks() {
 #[test]
 #[ignore = "run inside a memory-limited scope by the test above"]
 fn inside_a_192_mib_scope() {
-    let host = cozy_machine::host_memory::read();
+    let host = tensord::host_memory::read();
     assert!(
         host.available > 0 && host.available <= 192 << 20,
         "{host:?}"
@@ -926,7 +926,7 @@ fn inside_a_192_mib_scope() {
     let tier = HostTier::new(
         fx.store.clone(),
         HostTierConfig::default(),
-        Box::new(cozy_machine::host_tier::HalfOfHeadroom),
+        Box::new(tensord::host_tier::HalfOfHeadroom),
     )
     .unwrap();
     let (_executor, a) = Executor::spawn(&tier);

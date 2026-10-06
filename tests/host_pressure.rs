@@ -3,7 +3,7 @@
 //! Against a hog beside them, giving back helps and the hog finishes; against a stall in a
 //! scope of its own (its own memory.high, so not ours to fix), giving stops after a rung or two
 //! and the warm set stays.
-use cozy_machine::host_pressure::{Feedback, HostMode, Pressure};
+use tensord::host_pressure::{Feedback, HostMode, Pressure};
 use std::{
     fs,
     io::{BufRead, BufReader},

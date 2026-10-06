@@ -1,9 +1,9 @@
 //! Explicit isolated hardware pilot; validate never launches Python or initializes a device.
 //! `run A.json B.json ...` runs each config's executor in turn in one process: with
 //! `host_tier`, their weights come from one machine host tier that outlives each executor.
-use cozy_machine::device_executor;
-use cozy_machine::host_tier::{HalfOfHeadroom, HostGrant, HostTier, HostTierConfig, SealedRequest, TierLimit};
-use cozy_machine::model_sources::{ModelSources, SelectedManifest};
+use tensord::device_executor;
+use tensord::host_tier::{HalfOfHeadroom, HostGrant, HostTier, HostTierConfig, SealedRequest, TierLimit};
+use tensord::model_sources::{ModelSources, SelectedManifest};
 
 use device_executor::{
     postprocess, Answer, Baseline, Binding, Budgets, DeviceCommand, DeviceExecutor, ExecutorConfig,
@@ -49,7 +49,7 @@ struct Pilot {
 
 struct FixedLimit(u64);
 impl TierLimit for FixedLimit {
-    fn limit(&self, _: &cozy_machine::host_memory::HostMemory, _: u64) -> u64 {
+    fn limit(&self, _: &tensord::host_memory::HostMemory, _: u64) -> u64 {
         self.0
     }
 }
@@ -73,7 +73,7 @@ impl Services for Turns {
         let request = SealedRequest { sha256: &frame.sha256, length: frame.length, stage: None };
         let files = tier.object_files(*peer, grants, request, plan)?;
         (answer.ok, answer.code, answer.detail) = (true, String::new(), String::new());
-        answer.objects_sha256 = cozy_machine::host_tier::objects_digest(&files);
+        answer.objects_sha256 = tensord::host_tier::objects_digest(&files);
         let row = serde_json::json!({"phase":self.phase,"exchange":"ObjectFiles","files":files.len()});
         writeln!(self.events, "{row}")?;
         Ok((answer, files.into_iter().map(|(_, file)| file).collect()))
@@ -256,7 +256,7 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
         .transpose()?;
     // The pilot's configured device/allocator/thread values become the executor seal.
     let configured = |name: &str| config.environment.get(name).cloned();
-    let mut seal = cozy_machine::launch_identity::Seal::prepare(
+    let mut seal = tensord::launch_identity::Seal::prepare(
         &config.root,
         None,
         "pilot",
@@ -378,9 +378,9 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
     timings.insert("load_ms", start.elapsed().as_secs_f64() * 1000.);
     let machine = serde_json::json!({
         "host_tier": tier.map(|t| t.facts()),
-        "machine": cozy_machine::host_memory::process(std::process::id()).ok(),
-        "executor": cozy_machine::host_memory::process(executor.birth.pid).ok(),
-        "host": cozy_machine::host_memory::read(),
+        "machine": tensord::host_memory::process(std::process::id()).ok(),
+        "executor": tensord::host_memory::process(executor.birth.pid).ok(),
+        "host": tensord::host_memory::read(),
         "machine_disk_read_bytes": disk_read_bytes() - disk_before,
         "machine_fds": fd_count()?,
     });

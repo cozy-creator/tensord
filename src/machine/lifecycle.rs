@@ -232,7 +232,7 @@ pub async fn keep_authority(hub: Arc<Hub>, keys: Keys) {
             }
             Err(Refusal::Denied) => {
                 eprintln!(
-                    "cozy-machine: the Hub denied rental authority; no new control is admitted"
+                    "tensord: the Hub denied rental authority; no new control is admitted"
                 );
                 keys.revoke();
                 Duration::from_secs(1)
@@ -249,7 +249,7 @@ pub async fn release_when_idle(lifecycle: Arc<Lifecycle>, hub: Arc<Hub>, busy: i
     let mut next_ask = 0;
     loop {
         if let Err(error) = lifecycle.observe(busy()) {
-            eprintln!("cozy-machine: idle ledger: {error}");
+            eprintln!("tensord: idle ledger: {error}");
         }
         let now = now_ms();
         if now >= lifecycle.deadline_ms() && now >= next_ask {
@@ -257,18 +257,18 @@ pub async fn release_when_idle(lifecycle: Arc<Lifecycle>, hub: Arc<Hub>, busy: i
                 Ok(true) => {
                     match hub.release().await {
                         Ok(()) => {
-                            eprintln!("cozy-machine: idle deadline passed; Tensorhub accepted the release");
+                            eprintln!("tensord: idle deadline passed; Tensorhub accepted the release");
                             return;
                         }
                         Err(error) => {
-                            eprintln!("cozy-machine: idle release not accepted; retrying without extending the deadline: {error}");
+                            eprintln!("tensord: idle release not accepted; retrying without extending the deadline: {error}");
                             next_ask = now + 5_000;
                         }
                     }
                 }
                 Ok(false) => (),
                 Err(error) => {
-                    eprintln!("cozy-machine: idle release could not be recorded: {error}")
+                    eprintln!("tensord: idle release could not be recorded: {error}")
                 }
             }
         }

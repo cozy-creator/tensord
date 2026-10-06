@@ -38,7 +38,7 @@ pub fn listing(root: &Path) -> Listing {
     let listing = match seen.is_empty() {
         true => Listing::default(),
         false => read(root).unwrap_or_else(|error| {
-            eprintln!("cozy-machine: held models unreadable: {error}");
+            eprintln!("tensord: held models unreadable: {error}");
             Listing::default()
         }),
     };
