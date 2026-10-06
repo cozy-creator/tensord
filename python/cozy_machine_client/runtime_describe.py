@@ -11,19 +11,28 @@ from .package_records import (Callee, Describe, DescribeEnvironment, DescribeIns
                               DescribedEnvironment, DescribeFailed)
 
 
+class Undescribed(Exception):
+    def __init__(self, code: str, detail: str):
+        self.code = code
+        super().__init__(detail)
+
+
 def environment(root: str, packages: dict[str, str], hub_origin: str) -> DescribedEnvironment:
-    """This environment's root digest and every other installed App, described statically."""
+    """This environment's root digest and every other installed App, described statically.
+    An App the reader refuses fails the description: left out, its callers would call its
+    raw function instead of the package."""
     found = {normalized(d.metadata["Name"]): d for d in importlib.metadata.distributions()}
     callees = []
     for key, distribution in sorted(found.items()):
         applications = [e for e in distribution.entry_points if e.group == "cozy.application"]
-        if key == normalized(root) or len(applications) != 1:
+        if key == normalized(root) or not applications:
             continue
         name = distribution.metadata["Name"]
         try:
             document = static_interface.build_installed(name, environment_python=Path(sys.executable))
-        except Exception:  # an App the static reader refuses is not callable from here
-            continue
+        except Exception as exc:
+            raise Undescribed(getattr(exc, "code", type(exc).__name__),
+                              f"installed package {name} {distribution.version} cannot be described: {exc}") from exc
         callees.append(Callee(name, distribution.version, applications[0].value,
                               msgspec.Raw(msgspec.json.encode(document)), record_digest(distribution),
                               package_name(distribution, packages, hub_origin)))
