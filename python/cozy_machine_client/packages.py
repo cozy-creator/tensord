@@ -206,8 +206,9 @@ def main():
         except PackageError as exc:
             print(msgspec.json.encode(InstallFailed(exc.code, str(exc))).decode())
             raise SystemExit(1)
-        except subprocess.CalledProcessError:
-            print(msgspec.json.encode(InstallFailed("package_dependency_operation_failed", "standard uv did not complete the captured dependency operation")).decode())
+        except subprocess.CalledProcessError as exc:
+            operation = " ".join(map(str, exc.cmd[:3]))
+            print(msgspec.json.encode(InstallFailed("package_dependency_operation_failed", f"{operation} exited {exc.returncode}; its output is in the machine log")).decode())
             raise SystemExit(1)
         print(msgspec.json.encode(result).decode())
         return

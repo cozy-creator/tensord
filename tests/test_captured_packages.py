@@ -1,9 +1,12 @@
 """Real captured uv installations and classifier inference; no implementation doubles."""
+import base64
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -116,3 +119,34 @@ def test_installer_only_helper_uses_locked_sdk_and_static_reader_skips_pth(captu
     assert not sentinel.exists()
     pth.unlink()  # uniquely owned authored test fixture, not user source/work
     assert_inference(generation, root / "minimal-helper-result")
+
+
+def app_wheel(directory: Path, module: str, source: str) -> Path:
+    """A one-module cozy package wheel, written as wheel bytes (nothing builds or runs it)."""
+    name, info = module.replace("_", "-"), f"{module}-0.1.0.dist-info"
+    members = {f"{module}.py": source,
+               f"{info}/METADATA": f"Metadata-Version: 2.1\nName: {name}\nVersion: 0.1.0\n",
+               f"{info}/WHEEL": "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+               f"{info}/entry_points.txt": f"[cozy.application]\ndefault = {module}:app\n"}
+    rows = "".join(f"{path},sha256={base64.urlsafe_b64encode(hashlib.sha256(text.encode()).digest()).rstrip(b'=').decode()},{len(text.encode())}\n"
+                   for path, text in members.items())
+    wheel = directory / f"{module}-0.1.0-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for path, text in members.items():
+            archive.writestr(path, text)
+        archive.writestr(f"{info}/RECORD", rows + f"{info}/RECORD,,\n")
+    return wheel
+
+
+def test_an_installed_app_the_reader_refuses_fails_the_installation_naming_it(capture):
+    """Left out of the callee rows, its callers would call its raw function instead (run 4777)."""
+    root, source, client, frozen = capture
+    wheels = root / "refused-wheels"
+    subprocess.run(["uv", "build", "--wheel", "--out-dir", str(wheels), str(source)], check=True)
+    requirements = root / "refused-requirements.txt"
+    subprocess.run(["uv", "export", "--frozen", "--no-dev", "--no-emit-project", "--project", str(source), "--output-file", str(requirements)], check=True)
+    refused = app_wheel(wheels, "refused_app", "from cozy_runtime.author import App\napp = App() if True else None\n")
+    with pytest.raises(PackageError, match="installed package refused-app 0.1.0 cannot be described"):
+        install_captured(project=None, wheels=[next(wheels.glob("cozy_machine_cpu_classifier-*.whl")), refused],
+            requirements=requirements, distribution="cozy-machine-cpu-classifier", release="0.1.0", python_requires=">=3.12",
+            python_version="3.12", generations=root / "refused-generations", client_wheel=client, python="3.12")
