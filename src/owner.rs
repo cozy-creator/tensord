@@ -401,6 +401,42 @@ mod tests {
     use super::*;
     use tensorfs_core::{meta::Meta, read, store::Fault};
 
+    #[test]
+    fn a_borrowed_store_keeps_its_owner_claim() {
+        let root = std::env::temp_dir().join(format!("cm-owner-lifetime-{}", uuid::Uuid::new_v4()));
+        let path = root.join("tensorfs");
+        let owner = Owner::new(&root.join("first"), &path, 1 << 20, Duration::from_secs(60)).unwrap();
+        let store = owner.lock().unwrap().store();
+        drop(owner);
+        assert!(
+            Owner::new(&root.join("second"), &path, 1 << 20, Duration::from_secs(60)).is_err(),
+            "a borrowed Store still serves this owner's bytes"
+        );
+        drop(store);
+        drop(Owner::new(&root.join("second"), &path, 1 << 20, Duration::from_secs(60)).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_read_lease_keeps_its_owner_claim_without_a_store_handle() {
+        let root = std::env::temp_dir().join(format!("cm-owner-lease-{}", uuid::Uuid::new_v4()));
+        let path = root.join("tensorfs");
+        let owner = Owner::new(&root.join("first"), &path, 1 << 20, Duration::from_secs(60)).unwrap();
+        let store = owner.lock().unwrap().store();
+        let meta = Meta::open(&store).unwrap();
+        let object = store.put_stream(&mut &b"served bytes"[..], None, &Fault::default()).unwrap().obj;
+        let (lease, _) = read::acquire(&store, &meta, "layout", vec![object]).unwrap();
+        drop(store);
+        drop(owner);
+        assert!(
+            Owner::new(&root.join("second"), &path, 1 << 20, Duration::from_secs(60)).is_err(),
+            "an owner read lease still serves bytes without a Store handle"
+        );
+        lease.release(&meta).unwrap();
+        drop(Owner::new(&root.join("second"), &path, 1 << 20, Duration::from_secs(60)).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// The machine owns its store: a layout's live read lease no longer stops TensorFS GC,
     /// which keeps the leased bytes and takes what nothing holds.
     #[test]
