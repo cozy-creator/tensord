@@ -58,6 +58,8 @@ struct Cohort {
     unknown: BTreeMap<String, serde_json::Value>,
 }
 
+static SUBMITTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub(super) async fn run<B: MachineBackend>(
     identity: Arc<MachineIdentity>,
     backend: Arc<B>,
@@ -86,17 +88,25 @@ pub(super) async fn run<B: MachineBackend>(
         std::io::ErrorKind::AlreadyExists => Status::failed_precondition(error.to_string()),
         _ => Status::internal(error.to_string()),
     })?;
-    if let Some(spec) = request.spec.filter(|_| updates.update(&id).is_none()) {
-        if !identity.readiness.proved() {
-            return Err(Status::unavailable(
-                "the machine is starting; update it once it is ready",
-            ));
-        }
-        let updates = updates.clone();
-        let id = id.clone();
-        tokio::task::spawn_blocking(move || submit(&updates, &*backend, actor, &id, spec))
-            .await
-            .map_err(|_| Status::internal("machine operation stopped"))??;
+    if let Some(spec) = request.spec {
+        let (updates, id, identity) = (updates.clone(), id.clone(), identity.clone());
+        tokio::task::spawn_blocking(move || {
+            // One submission at a time, its check and its staging together: a client resending
+            // an update it lost attaches to the first, even while that one is still staging
+            // and after its own client has gone.
+            let _one = SUBMITTING.lock().unwrap_or_else(|e| e.into_inner());
+            if updates.update(&id).is_some() {
+                return Ok(());
+            }
+            if !identity.readiness.proved() {
+                return Err(Status::unavailable(
+                    "the machine is starting; update it once it is ready",
+                ));
+            }
+            submit(&updates, &*backend, actor, &id, spec)
+        })
+        .await
+        .map_err(|_| Status::internal("machine operation stopped"))??;
     }
     let (sender, receiver) = tokio::sync::mpsc::channel(16);
     tokio::spawn(async move {
