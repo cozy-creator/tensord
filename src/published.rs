@@ -251,6 +251,26 @@ impl Publisher {
         answer
     }
 
+    /// The newest release of `package` at its Hub (`cozy run org/pkg/fn` names none): the
+    /// newest final release by version, else the newest pre-release; yanked ones never.
+    pub fn newest_release(&self, source: &hub::Source, package: &str) -> Result<String, Failure> {
+        let catalog = Catalog::new(source).map_err(|e| ("catalog_read_failed", e.0))?;
+        let (org, name) = package
+            .split_once('/')
+            .ok_or(("release_root_invalid", "package must be org/name".to_string()))?;
+        let card = catalog
+            .json(&format!("/v1/packages/{}/{}", hub::escape(org), hub::escape(name)))
+            .map_err(|e| ("catalog_read_failed", e.0))?;
+        let releases = card["releases"].as_array().into_iter().flatten().filter(|row| {
+            row["yanked"].as_bool() != Some(true) && row["yanked_at"].as_str().is_none_or(str::is_empty)
+        });
+        releases
+            .filter_map(|row| row["release"].as_str())
+            .max_by(|a, b| release_order(a).cmp(&release_order(b)))
+            .map(str::to_string)
+            .ok_or(("release_absent", format!("{package} has no release that is not yanked")))
+    }
+
     /// One run's preparation on the calling thread, reported through `observe`: a held
     /// installation and resolution answer at once.
     pub fn prepare_now(
@@ -1734,9 +1754,36 @@ fn split_lock(lock: &str, name: &str, release: &str, own_sdk: bool) -> Result<Lo
     })
 }
 
+/// A release's place in version order: final releases after every pre-release, then each
+/// numeric part of the release and of its pre-release tag (`1.0.0-rc.2`, `2.4.0rc1`).
+fn release_order(release: &str) -> (bool, Vec<u64>, Vec<u64>) {
+    let numbers = |text: &str| -> Vec<u64> {
+        text.split(|c: char| !c.is_ascii_digit())
+            .filter(|part| !part.is_empty())
+            .map(|part| part.parse().unwrap_or(u64::MAX))
+            .collect()
+    };
+    let split = release
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(release.len());
+    let (version, tag) = release.split_at(split);
+    (tag.is_empty(), numbers(version), numbers(tag))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_newest_release_is_by_version_and_final_before_pre_release() {
+        fn newest<'a>(releases: &[&'a str]) -> &'a str {
+            releases.iter().copied().max_by_key(|r| release_order(r)).unwrap()
+        }
+        assert_eq!(newest(&["2.9.0", "2.10.0", "2.4.1"]), "2.10.0");
+        assert_eq!(newest(&["2.6.0", "3.0.0rc1"]), "2.6.0");
+        assert_eq!(newest(&["1.0.0-rc.1", "1.0.0-rc.2"]), "1.0.0-rc.2");
+        assert_eq!(newest(&["1.0.0-rc.2", "1.0.0"]), "1.0.0");
+    }
 
     #[test]
     fn lock_keeps_indexes_pins_and_drops_sdk_rows_only_for_an_own_sdk() {
@@ -1944,3 +1991,4 @@ mod tests {
         assert!(seen[2].contains("ref=proof%2Fprobe%401.0.0") && seen[2].contains("lane=bf16"), "{seen:?}");
     }
 }
+

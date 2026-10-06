@@ -568,13 +568,24 @@ impl Runs {
             Some(installed) => Some(self.callee_view(installed, &spec.application)?),
             None => None,
         };
+        let hub = spec.hub.clone().or_else(|| self.own_hub.clone());
         let release = match &spec.source {
+            // Naming no release asks for the newest at this machine's own Hub (describe/1).
+            Source::Release { package, release } if release.is_empty() => {
+                let publisher = self.publisher.as_ref().ok_or_else(|| {
+                    refused("capability_unavailable", "this machine prepares no releases")
+                })?;
+                let source = hub.as_ref().ok_or_else(|| {
+                    refused("hub_access_absent", "a release runs with the run's Hub access, and this run carries none")
+                })?;
+                let newest = publisher.newest_release(source, package).map_err(|(code, message)| refused(code, message))?;
+                Some((package.clone(), newest))
+            }
             Source::Release { package, release } => Some((package.clone(), release.clone())),
             _ => None,
         };
         // A job's choices address its callables; its children resolve them.
         let choices = if spec.job || install_only { &[][..] } else { &spec.models[..] };
-        let hub = spec.hub.clone().or_else(|| self.own_hub.clone());
         let (installation, plan) = self.resolve(
             actor,
             held,
@@ -629,7 +640,10 @@ impl Runs {
                 true => self.warm_models(actor, id, &spec, &*observe)?,
                 false => vec![],
             };
-            let installed = json!({"package": installation.package, "release": installation.release});
+            // The installed release and its interface: a client that never read the Hub
+            // types its calls with it (describe/1).
+            let installed = json!({"package": installation.package, "release": installation.release,
+                "interface": interface});
             return warm_result(installed, models);
         }
         if spec.job {
