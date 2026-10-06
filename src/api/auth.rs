@@ -3,7 +3,10 @@ use ed25519_dalek::VerifyingKey;
 use std::{
     future::Future,
     pin::Pin,
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicI64, Ordering},
+        Arc, RwLock,
+    },
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -25,6 +28,8 @@ pub struct Authority {
 pub struct Keys {
     state: Arc<RwLock<KeyState>>,
     changes: Arc<tokio::sync::watch::Sender<u64>>,
+    /// The owner's bindings revision at the Hub, carried on the same lease answer; 0 for none.
+    bindings: Arc<AtomicI64>,
 }
 struct KeyState {
     keys: Vec<VerifyingKey>,
@@ -41,18 +46,24 @@ impl Keys {
         Self {
             state: Arc::new(RwLock::new(state)),
             changes: Arc::new(tokio::sync::watch::channel(0).0),
+            bindings: Arc::new(AtomicI64::new(0)),
         }
     }
     fn replace(&self, state: KeyState) {
         *self.state.write().unwrap() = state;
         self.changes.send_modify(|generation| *generation += 1);
     }
-    pub fn renew(&self, keys: Vec<VerifyingKey>, lease: Duration) {
+    pub fn renew(&self, keys: Vec<VerifyingKey>, lease: Duration, bindings: i64) {
+        self.bindings.store(bindings, Ordering::Release);
         self.replace(KeyState {
             keys,
             until: Some(Instant::now() + lease),
             leased: true,
         });
+    }
+    /// The owner's bindings revision as the Hub last stated it.
+    pub fn bindings_revision(&self) -> i64 {
+        self.bindings.load(Ordering::Acquire)
     }
     pub fn revoke(&self) {
         self.replace(KeyState {
