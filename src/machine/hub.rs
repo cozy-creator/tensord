@@ -7,7 +7,14 @@ use ed25519_dalek::VerifyingKey;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
-use std::{io, sync::Arc, time::Duration};
+use std::{
+    io,
+    sync::{
+        atomic::{AtomicI64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tokio_rustls::rustls::{self, pki_types::ServerName, RootCertStore};
 
 /// A bounded transport budget per call, never a limit on any work.
@@ -19,6 +26,8 @@ pub struct Hub {
     host: String,
     port: u16,
     tls: Arc<rustls::ClientConfig>,
+    /// When the Hub last answered anything (0: never in this process).
+    contact_ms: AtomicI64,
 }
 
 #[derive(Debug)]
@@ -56,11 +65,17 @@ impl Hub {
             host,
             port,
             tls: Arc::new(tls),
+            contact_ms: AtomicI64::new(0),
         })
     }
 
     pub fn origin(&self) -> &str {
         &self.grant.origin
+    }
+
+    /// When the Hub last answered this machine, whatever it said; 0: never in this process.
+    pub fn contact_ms(&self) -> i64 {
+        self.contact_ms.load(Ordering::Acquire)
     }
 
     async fn call(
@@ -101,7 +116,12 @@ impl Hub {
                 .to_bytes();
             Ok::<_, io::Error>((status, answer))
         };
-        match tokio::time::timeout(CALL_BUDGET, exchange).await {
+        let answered = tokio::time::timeout(CALL_BUDGET, exchange).await;
+        if let Ok(Ok(_)) = &answered {
+            self.contact_ms
+                .store(super::lifecycle::now_ms(), Ordering::Release);
+        }
+        match answered {
             Ok(Ok((status, _)))
                 if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN =>
             {

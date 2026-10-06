@@ -115,7 +115,9 @@ impl Lifecycle {
     pub fn activate(self: &Arc<Self>) -> Result<Activation, Status> {
         let mut state = self.state.lock().unwrap();
         if state.0.activating || state.0.released {
-            return Err(Status::unavailable("the machine is already activating or released"));
+            return Err(Status::unavailable(
+                "the machine is already activating or released",
+            ));
         }
         state.0.activating = true;
         Ok(Activation(self.clone()))
@@ -212,7 +214,10 @@ impl Lifecycle {
         if state.0.released {
             return Ok(true);
         }
-        if state.0.activating || self.admissions.load(Ordering::Acquire) > 0 || !Self::due(&state, now_ms()) {
+        if state.0.activating
+            || self.admissions.load(Ordering::Acquire) > 0
+            || !Self::due(&state, now_ms())
+        {
             return Ok(false);
         }
         state.0.released = true;
@@ -244,8 +249,15 @@ pub async fn keep_authority(hub: Arc<Hub>, keys: Keys) {
 }
 
 /// Watches activity and releases the rental once its idle deadline passed with nothing held.
-/// Returns when the Hub accepted the release.
-pub async fn release_when_idle(lifecycle: Arc<Lifecycle>, hub: Arc<Hub>, busy: impl Fn() -> bool) {
+/// Returns when the Hub accepted the release, or when the rental ended itself: idle past its
+/// deadline with no answer from the Hub through that whole idle window, the Hub cannot end it,
+/// so it ends itself at its provider (`provider`, else by stopping) and billing stops.
+pub async fn release_when_idle(
+    lifecycle: Arc<Lifecycle>,
+    hub: Arc<Hub>,
+    provider: Option<super::provider::ProviderSelf>,
+    busy: impl Fn() -> bool,
+) {
     let mut next_ask = 0;
     loop {
         if let Err(error) = lifecycle.observe(busy()) {
@@ -263,6 +275,10 @@ pub async fn release_when_idle(lifecycle: Arc<Lifecycle>, hub: Arc<Hub>, busy: i
                         Err(error) => {
                             eprintln!("cozy-machine: idle release not accepted; retrying without extending the deadline: {error}");
                             next_ask = now + 5_000;
+                            if unheard(hub.contact_ms(), lifecycle.deadline_ms()) {
+                                end_without_hub(provider.as_ref()).await;
+                                return;
+                            }
                         }
                     }
                 }
@@ -276,9 +292,42 @@ pub async fn release_when_idle(lifecycle: Arc<Lifecycle>, hub: Arc<Hub>, busy: i
     }
 }
 
+/// The Hub has not answered since this idle window began: it cannot hear the release.
+fn unheard(contact_ms: i64, deadline_ms: i64) -> bool {
+    contact_ms < deadline_ms - IDLE_GRACE_MS
+}
+
+async fn end_without_hub(provider: Option<&super::provider::ProviderSelf>) {
+    eprintln!("cozy-machine: idle past the deadline with no answer from Tensorhub through the whole idle window; ending this rental itself");
+    match provider {
+        Some(provider) => match provider.end().await {
+            Ok(()) => eprintln!("cozy-machine: the provider accepted this pod's end"),
+            Err(error) => {
+                eprintln!("cozy-machine: the provider did not end this pod ({error}); stopping")
+            }
+        },
+        None => eprintln!("cozy-machine: no provider credential; stopping"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rental_ends_itself_only_when_the_hub_was_silent_through_the_idle_window() {
+        let deadline = 10 * IDLE_GRACE_MS;
+        assert!(unheard(0, deadline), "never heard");
+        assert!(
+            unheard(deadline - IDLE_GRACE_MS - 1, deadline),
+            "last heard before the window"
+        );
+        assert!(
+            !unheard(deadline - IDLE_GRACE_MS, deadline),
+            "heard as the window began"
+        );
+        assert!(!unheard(deadline - 1, deadline), "heard during the window");
+    }
 
     #[test]
     fn keepalive_is_idempotent_work_renews_and_release_is_irreversible() {
@@ -322,7 +371,10 @@ mod tests {
         assert!(!lifecycle.claim().unwrap());
         drop(activation);
         assert!(lifecycle.claim().unwrap());
-        assert!(lifecycle.activate().is_err(), "a released rental activates nothing");
+        assert!(
+            lifecycle.activate().is_err(),
+            "a released rental activates nothing"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
@@ -435,7 +487,8 @@ mod hub_tests {
             boot_id: "boot".into(),
             keys: keys.clone(),
         };
-        let authorized = |key: &SigningKey| authority.keys.admitted().contains(&key.verifying_key());
+        let authorized =
+            |key: &SigningKey| authority.keys.admitted().contains(&key.verifying_key());
         assert!(authorized(&owner));
         let lease = |key: &SigningKey| {
             (200, serde_json::json!({"worker_id": "ra-1", "authorized_keys": [URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes())], "lease_seconds": 60}).to_string())
