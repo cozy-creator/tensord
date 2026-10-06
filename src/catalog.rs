@@ -11,6 +11,9 @@ use std::{
     sync::Arc,
 };
 
+/// The package a Runtime's built-in operations run as: every environment holds them.
+pub const BUILTIN_PACKAGE: &str = "runtime/operations";
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Dependency {
     pub name: String,

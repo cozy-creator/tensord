@@ -2,11 +2,16 @@
 request names, so a call answered from its caller's known results shows as no run."""
 from __future__ import annotations
 
+import io
+import struct
 from pathlib import Path
 
 import msgspec
+import tensorfs
+from tensorfs.derived import Derivation, Part, Target, Tensor
 
-from cozy_runtime.author import App, Context, ImageAsset, ImageFrame, Outputs, invocable
+from cozy_runtime.author import (App, Context, ImageAsset, ImageFrame, ModelArtifact, Outputs, WeightsOutput,
+                                 invocable)
 
 app = App()
 
@@ -92,3 +97,23 @@ class Painted(msgspec.Struct):
 def paint(ctx: Context, payload: Painting, out: Outputs) -> Painted:
     """A serving entrypoint that returns an image, as qwen-image-2's generate_image does."""
     return Painted(out.save_image(ImageFrame(8, 8, bytes([payload.shade, 90, 160]) * 64), format="png"))
+
+
+@invocable(memoize=True)
+async def produce(ctx: Context) -> ModelArtifact:
+    """A small f16 model this package writes, for a caller to quantize."""
+    plain = dict(tensorfs.seed_digests())["plain/1"]
+    matrix = Tensor("f16", (16, 32), plain, {"value": Part("f16", (16, 32))})
+    bias = Tensor("f16", (16,), plain, {"value": Part("f16", (16,))})
+    with ctx.output("model").open(Derivation(sources={}, targets={"body": Target(
+            add={"layer.weight": matrix, "layer.bias": bias})},
+            configs={}, order=(("body", "layer.weight"), ("body", "layer.bias")))) as output:
+        if output.receipt is not None:
+            return ctx.adopt_model(output.receipt)
+        output.add_part("body", "layer.weight", "value",
+                        io.BytesIO(struct.pack("<512e", *(i / 257 - 1 for i in range(512)))))
+        output.add_part("body", "layer.bias", "value", io.BytesIO(struct.pack("<16e", *range(16))))
+        return ctx.adopt_model(output.commit())
+
+
+app.job(produce, weights=(WeightsOutput("model", max_new_bytes=65536),))

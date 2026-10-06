@@ -358,6 +358,9 @@ pub struct CallInterface {
     /// imports the callee's function and calls it with its request's fields as arguments).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interface_document: Option<Value>,
+    /// A Runtime built-in surface (`operations`): the Runtime binds it from its own code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub builtin: Option<String>,
 }
 impl DeviceCommand {
     /// The run a command executes and the spool its executor reads and writes.
