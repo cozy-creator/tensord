@@ -21,7 +21,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tensorfs_core::{sha256, store::Store};
+use tensorfs_core::{err::Code, sha256, store::Store};
 
 const ACTOR: &str = "alice";
 
@@ -250,16 +250,26 @@ fn paused_and_unstarted_runs_keep_their_objects(restart: bool) {
 
     if restart {
         assert!(machine.service.stop().unwrap(), "the machine was not idle");
-        let previous_store = Arc::downgrade(&machine.store);
+        let store_root = machine.store.root().to_path_buf();
         drop(jobs);
         drop(machine);
         // stop() requests dispatch shutdown. Its thread may still retain Jobs and the
         // Store until it observes that request; an in-process restart must wait for that
-        // custody to end just as a process restart waits for the old process to exit.
+        // custody to end just as a process restart waits for the old process to exit. A
+        // successful claim observes the lock's release, including completion of destructors.
         let deadline = Instant::now() + Duration::from_secs(60);
-        while previous_store.upgrade().is_some() {
-            assert!(Instant::now() < deadline, "the stopped dispatcher still retains its Store");
-            std::thread::yield_now();
+        loop {
+            match Store::ensure_owned(&store_root) {
+                Ok(store) => {
+                    drop(store);
+                    break;
+                }
+                Err(error) if error.code == Code::STORE_BUSY => {
+                    assert!(Instant::now() < deadline, "the stopped dispatcher retains its Store: {error}");
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("reopen the stopped Store: {error}"),
+            }
         }
         machine = open(&root, &tools);
     }
