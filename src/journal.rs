@@ -361,6 +361,7 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS run_measurements(execution INTEGER PRIMARY KEY REFERENCES executions(id),measurements BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS run_memos(execution INTEGER NOT NULL REFERENCES executions(id),sequence INTEGER NOT NULL,at_ms INTEGER NOT NULL,record BLOB NOT NULL,PRIMARY KEY(execution,sequence));
             CREATE TABLE IF NOT EXISTS run_logs(execution INTEGER NOT NULL REFERENCES executions(id),sequence INTEGER NOT NULL,at_ms INTEGER NOT NULL,record BLOB NOT NULL,PRIMARY KEY(execution,sequence));
+            CREATE TABLE IF NOT EXISTS attention_applied(execution INTEGER PRIMARY KEY REFERENCES executions(id));
             CREATE TABLE IF NOT EXISTS run_calls(execution INTEGER NOT NULL REFERENCES executions(id),sequence INTEGER NOT NULL,at_ms INTEGER NOT NULL,call TEXT NOT NULL,record BLOB NOT NULL,PRIMARY KEY(execution,sequence),UNIQUE(execution,call));
             CREATE TABLE IF NOT EXISTS native_outputs(actor TEXT NOT NULL,owner TEXT NOT NULL,source BLOB NOT NULL,PRIMARY KEY(actor,owner));
             CREATE TABLE IF NOT EXISTS input_intakes(actor TEXT NOT NULL,retention TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,retention));
@@ -1792,6 +1793,48 @@ impl Journal {
         line: &[u8],
     ) -> io::Result<u64> {
         self.append_entry("INSERT INTO run_logs(execution,sequence,at_ms,record) VALUES(?1,?2,?3,?4)", id, progress, line)
+    }
+    /// A call of the run applied its attention pin: the pin is the root run's, whichever call
+    /// holds the attention sites.
+    pub fn apply_attention(&mut self, id: &str) -> io::Result<()> {
+        let mut root = self.get(id)?;
+        while !root.invocation.parent.is_empty() {
+            root = self.get(&root.invocation.parent)?;
+        }
+        self.connection
+            .execute(
+                "INSERT OR IGNORE INTO attention_applied(execution) VALUES(?1)",
+                [&root.id],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+    /// A root run completing with a pin none of its calls applied says so in its log: an
+    /// unused request field warns, never fails.
+    pub fn warn_unapplied_attention(
+        &mut self,
+        id: &str,
+        progress: Option<&ProgressSnapshot>,
+    ) -> io::Result<()> {
+        let record = self.get(id)?;
+        let pin = &record.invocation.attention_kernel;
+        if pin.is_empty() || !record.invocation.parent.is_empty() || record.state.terminal() {
+            return Ok(());
+        }
+        let applied: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM attention_applied WHERE execution=?1)",
+                [id],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        if applied {
+            return Ok(());
+        }
+        let text = format!("attention pin {pin} was never applied");
+        let line = serde_json::to_vec(&serde_json::json!({"level": "warning", "text": text}))?;
+        self.append_log(id, progress, &line).map(drop)
     }
     fn append_entry(
         &mut self,

@@ -364,6 +364,10 @@ impl Engine {
         self.notify_activity();
         Ok(sequence)
     }
+    /// A call of the run applied its attention pin (its executor said so).
+    pub fn apply_attention(&self, id: &str) -> io::Result<()> {
+        self.journal.lock().unwrap().apply_attention(id)
+    }
     pub fn logs(&self, id: &str) -> io::Result<Vec<crate::journal::StoredProduct>> {
         self.journal.lock().unwrap().logs(id)
     }
@@ -870,11 +874,15 @@ impl Engine {
 
     pub(crate) fn finish(&self, id: &str, outcome: Outcome) -> io::Result<Execution> {
         let mut progress = self.progress.lock().unwrap();
-        let record = self
-            .journal
-            .lock()
-            .unwrap()
-            .finish_observed(id, outcome, progress.get(id))?;
+        let mut journal = self.journal.lock().unwrap();
+        if matches!(outcome, Outcome::Completed(_)) {
+            // A warning never stands between a run and its result.
+            if let Err(error) = journal.warn_unapplied_attention(id, progress.get(id)) {
+                eprintln!("run {id}: attention pin warning not logged: {error}");
+            }
+        }
+        let record = journal.finish_observed(id, outcome, progress.get(id))?;
+        drop(journal);
         if record.state.terminal() || record.state == State::Paused {
             progress.remove(id);
         }

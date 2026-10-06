@@ -1140,6 +1140,51 @@ fn a_settled_run_keeps_one_custody_copy_and_its_logs() {
     assert!(state.join("logs").join(format!("{id}.stderr.log")).exists());
 }
 
+/// A run's attention pin is its calls': a root completing with a pin no call applied says so
+/// once in its log and completes all the same; one a call applied (a child's counts for its
+/// root) completes without it, and a run with no pin logs nothing.
+#[test]
+fn a_pin_no_call_applied_is_a_warning_in_the_runs_log() {
+    let fixture = Fixture::new();
+    let run = |key: &str, pin: &str, applied: bool| {
+        let invocation = Invocation {
+            attention_kernel: pin.into(),
+            ..fixture.invocation("wait")
+        };
+        let id = fixture.engine.submit(key, invocation.clone()).unwrap().id;
+        assert!(fixture.engine.dispatch(&id, fixture.config()).unwrap());
+        fixture.wait(&id, |record| record.state == State::Running);
+        if applied {
+            let child = Invocation {
+                parent: id.clone(),
+                ..invocation
+            };
+            let child = fixture
+                .engine
+                .submit(&format!("{key}-call"), child)
+                .unwrap();
+            fixture.engine.apply_attention(&child.id).unwrap();
+        }
+        let _ = fs::write(fixture.root.join("release"), b"continue");
+        let done = fixture.wait(&id, |record| record.state.terminal());
+        let _ = fs::remove_file(fixture.root.join("release"));
+        assert_eq!(done.state, State::Completed, "{done:?}");
+        let logs = fixture.engine.logs(&id).unwrap();
+        logs.iter()
+            .map(|log| serde_json::from_slice::<serde_json::Value>(&log.product).unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        run("unapplied", "sdpa", false),
+        [json!({"level": "warning", "text": "attention pin sdpa was never applied"})]
+    );
+    assert_eq!(
+        run("applied", "sdpa", true),
+        Vec::<serde_json::Value>::new()
+    );
+    assert_eq!(run("unpinned", "", false), Vec::<serde_json::Value>::new());
+}
+
 #[test]
 fn a_newer_or_damaged_row_never_hides_the_rest_of_the_journal() {
     let fixture = Fixture::new();

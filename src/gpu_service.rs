@@ -2718,6 +2718,11 @@ impl GpuPool {
         );
         self.record_invoke(&plan.id, first, invoked.elapsed(), &reply);
         record_measurements(engine, id, &reply);
+        if reply.attention_applied {
+            if let Err(error) = engine.apply_attention(id) {
+                eprintln!("run {id}: applied attention pin not recorded: {error}");
+            }
+        }
         let mut facts = plane_facts(reply.plane.as_ref());
         facts.activation = facts.activation.or_else(|| {
             reply
