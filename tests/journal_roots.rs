@@ -67,8 +67,7 @@ fn tools(root: &Path) -> Tools {
 fn open(root: &Path, tools: &Tools) -> Machine {
     let state = root.join("state");
     let service = Service::open(&state, &root.join("generations"), 1).unwrap();
-    let store = Arc::new(Store::ensure(&state.join("tensorfs")).unwrap());
-    tensorfs_core::meta::own(&store);
+    let store = Arc::new(Store::ensure_owned(&state.join("tensorfs")).unwrap());
     let objects =
         Arc::new(Objects::new(&root.join("writes"), store.clone(), service.engine.clone()).unwrap());
     let local = LocalSources::new(
