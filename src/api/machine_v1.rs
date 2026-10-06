@@ -256,7 +256,7 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
     let hub = spec.hub.take().filter(|hub| !hub.token.is_empty());
     let providers = spec.providers.take();
     // What the run is, not how it reaches its sources: a spec re-sent with refreshed access,
-    // binding hints, known results or a reformatted payload names the same run.
+    // binding hints or a reformatted payload names the same run.
     let identity_digest = {
         let mut identity = spec.clone();
         identity.payload = crate::boundary_json::exact(&input);
@@ -265,7 +265,6 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
             ..Default::default()
         });
         identity.binding_revision.clear();
-        identity.known_results.clear();
         identity.publication.clear();
         format!(
             "sha256:{}",
@@ -335,15 +334,6 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
         weights_destination: spec.weights_destination,
         publication: spec.publication,
         owner: spec.owner,
-        // Each a bounded JSON document; anything else is not a known result.
-        known: spec
-            .known_results
-            .into_iter()
-            .filter(|m| m.result.len() <= crate::jobs::MEMO_RESULT_BYTES)
-            .filter_map(|m| Some((m.computation_digest, String::from_utf8(m.result).ok()?)))
-            .filter(|(_, result)| serde_json::from_str::<serde_json::Value>(result).is_ok())
-            .take(256)
-            .collect(),
         held: None,
         application: String::new(),
         digest: identity_digest,
@@ -488,14 +478,6 @@ impl Log {
             "log" => v1::run_event::Event::Log(v1::LogLine {
                 level: body["level"].as_str().unwrap_or("info").into(),
                 text: body["text"].as_str().unwrap_or_default().into(),
-            }),
-            "memo" => v1::run_event::Event::Memo(v1::MemoRecord {
-                operation: body["operation"].as_str().unwrap_or_default().into(),
-                computation_digest: body["computation_digest"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .into(),
-                result: crate::boundary_json::exact(&body["result"]),
             }),
             "product" => {
                 let product = event.product?;
@@ -1087,7 +1069,6 @@ mod tests {
             inputs: vec![input("reference", "a", 0), input("reference", "b", 1)],
             models: vec![model("model", "org/first"), model("other", "org/second")],
             binding_revision: "7".into(),
-            known_results: vec![v1::MemoResult::default()],
             publication: "p1".into(),
             hub: Some(v1::HubAccess {
                 origin: "https://hub.example.test/".into(), token: "t1".into(), expires_at: i64::MAX,
@@ -1111,7 +1092,6 @@ mod tests {
             ca_der: vec![2], object_hosts: vec!["objects-2.example.test".into()],
         });
         (resent.binding_revision, resent.publication, resent.providers) = ("8".into(), "p2".into(), None);
-        resent.known_results.clear();
         assert_eq!(spec_of(resent).unwrap().digest, digest);
         let changes: [fn(&mut v1::RunSpec); 6] = [
             |s| s.payload = br#"{"seed":9007199254740992,"nested":{"a":1,"b":2}}"#.to_vec(),

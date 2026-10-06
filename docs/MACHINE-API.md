@@ -49,11 +49,9 @@ with a self-signed leaf; the CLI does not use it. Caller: the `cozy run play` li
   Write. A client that loses the stream across the restart attaches again with `Run{id, after}`.
 - **Memo, derived retention, forget and prune** become one self-managing cache: TTL plus low-disk
   eviction, delivered entries first, and no verbs.
-- **Memo across machines** is a real flow today. The CLI records each memoized operation whose
-  result is a committed Hub checkpoint (a conversion or upload), from its `memo.record` log event.
-  Later it answers lookups so a new rental skips redoing it (`machine_memo.go`). New: the CLI
-  checks with the Hub that those checkpoints still exist, then attaches the known results for the
-  run's package to the spec. The machine uses a matching one as a hit. Still no call.
+- **Memo** is the machine's own: a memoized call's result is held per signer and answers the same
+  computation while the machine holds every file it names. The client carries no results; a memo
+  answers where its results are (measured 2026-10-06: no cross-machine hit ever in the owner's runs).
 - **Jobs** are a run kind. Weights outputs are outputs; with a weights destination the machine
   pushes them to the Hub and settles the publication itself.
 - **Child runs** are Run and Control issued by a run through its executor seam, scoped to the
@@ -98,7 +96,7 @@ forever.
 | 23 | ListMachineExecutions | Status (live runs); history in the CLI |
 | 24 | ListPackages, ListModels | Status |
 | 25 | ForgetPackage | deleted (spec's binding revision) |
-| 26 | memo answer, Record/Lookup/PruneOperation | machine cache; known results in the spec; `memo.record` log events |
+| 26 | memo answer, Record/Lookup/PruneOperation | the machine's held memos |
 | 27 | seam child_call/poll/cancel/forget/events | seam Run, Control |
 | 28 | jobs | Run `kind: job` |
 | 29 | seam checkpoint, tree_member, writer | seam, internal |

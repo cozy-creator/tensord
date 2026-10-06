@@ -108,10 +108,10 @@ struct ChildCall {
     label: String,
     /// Its `call` event is in the parent's log.
     recorded: bool,
-    /// A memoized call's computation digest, whether it ran or a known result answered it.
+    /// A memoized call's computation digest, whether it ran or a held result answered it.
     computation: Option<String>,
-    /// A memoized call that ran: (operation identity, computation digest), for its `memo` event.
-    memo: Option<(String, String)>,
+    /// A memoized call that ran: its computation digest, under which its result is held.
+    memo: Option<String>,
     request: String,
     /// The answered result and grants, once the child succeeded (materialized once).
     settled: Option<(String, Vec<Value>)>,
@@ -767,35 +767,29 @@ impl Jobs {
         let inputs = child_inputs(&request_input, parent, &calls.received);
         let request = format!("{}/{}", parent.request, frame.call_index);
         let intent = child_intent(&frame.module, &frame.export, &input);
-        // A memoized call's computation: its operation identity and its request. A result the
-        // caller already holds answers it.
-        let memo = parent
+        // A memoized call's computation: its operation identity and its request. A result this
+        // machine holds for the signer answers it (where its files are, too).
+        let computation = parent
             .memoized
             .get(&(frame.module.clone(), frame.export.clone()))
             .map(|operation| {
                 let computation = crate::boundary_json::exact(&json!([operation, input]));
-                let digest = tensorfs_core::sha256::hex_digest(&computation);
-                (operation.clone(), format!("sha256:{digest}"))
+                format!("sha256:{}", tensorfs_core::sha256::hex_digest(&computation))
             });
-        let answer = memo
-            .as_ref()
-            .and_then(|(_, digest)| runs.known(&parent.id, digest));
-        // A result with files is answered where its files are: from this machine's own memo.
-        let held = match (&memo, &answer) {
-            (Some((_, digest)), None) => runs
+        let held = match &computation {
+            Some(digest) => runs
                 .objects
                 .held_memo(&parent.actor, digest)
                 .map_err(|e| ("child_call_refused", e.to_string()))?,
-            _ => None,
+            None => None,
         };
-        let computation = memo.as_ref().map(|(_, digest)| digest.clone());
-        let memo = memo.filter(|_| answer.is_none() && held.is_none());
+        let memo = computation.clone().filter(|_| held.is_none());
         let job = service
             .engine
             .get(&parent.id)
             .map_err(|e| ("child_call_refused", e.to_string()))?;
         let record = runs
-            .child(&job, &request, &intent, application, entrypoint, request_input, inputs, answer, held, choices)
+            .child(&job, &request, &intent, application, entrypoint, request_input, inputs, held, choices)
             .map_err(|refusal| match refusal.code {
                 "run_id_conflict" => (
                     "child_call_refused",
@@ -895,36 +889,19 @@ impl Jobs {
                             },
                         );
                     }
-                    // A memoized call's result with files: this machine reuses it while it holds
-                    // them (a tree's members are not held as one result; it runs again).
-                    if let (Some((_, digest)), false) = (&call.memo, settled.1.is_empty()) {
-                        if !settled.1.iter().any(|grant| grant["kind"] == "tree") {
-                            let (record, objects) = held_memo(result);
+                    // A memoized call's result: this machine reuses it for the signer while it
+                    // holds every file it names (a tree's members are not held as one result).
+                    if let Some(digest) = &call.memo {
+                        let (record, objects) = held_memo(result);
+                        if !settled.1.iter().any(|grant| grant["kind"] == "tree")
+                            && record.len() <= MEMO_RESULT_BYTES
+                        {
                             let kept = service.engine.with_journal(|j| {
                                 j.hold_memo(&parent.actor, digest, &record, &objects)
                             });
                             if let Err(error) = kept {
                                 eprintln!("job {}: memo of call {}: {error}", parent.id, frame.call_index);
                             }
-                        }
-                    }
-                    // A memoized call's file-less result: any machine its caller runs on may reuse it.
-                    if let (Some((operation, digest)), true, true) = (
-                        &call.memo,
-                        settled.1.is_empty(),
-                        settled.0.len() <= MEMO_RESULT_BYTES,
-                    ) {
-                        let result =
-                            crate::boundary_json::parse(settled.0.as_bytes()).unwrap_or_default();
-                        let memo = json!({"operation": operation, "computation_digest": digest, "result": result});
-                        let appended = service
-                            .engine
-                            .append_memo(&parent.id, &crate::boundary_json::exact(&memo));
-                        if let Err(error) = appended {
-                            eprintln!(
-                                "job {}: memo of call {}: {error}",
-                                parent.id, frame.call_index
-                            );
                         }
                     }
                     call.settled = Some(settled);
@@ -1187,8 +1164,8 @@ fn conclude(
     Ok(())
 }
 
-/// The largest memoized result kept in a run's log or answered from a caller's known results.
-pub const MEMO_RESULT_BYTES: usize = 48 << 10;
+/// The largest memoized result record this machine holds for reuse.
+const MEMO_RESULT_BYTES: usize = 48 << 10;
 
 /// `(module, export)` of each memoized invocable of the environment (the root's and its
 /// callees') and its operation identity: its package's installed files, the module and the

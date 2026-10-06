@@ -70,7 +70,7 @@ message RunSpec {
   repeated InputFile inputs = 8;  // objects uploaded with Write, bound to payload fields
   repeated ModelChoice models = 9;
   string binding_revision = 10;   // the owner's binding revision the caller knows
-  repeated MemoResult known_results = 11;
+  reserved 11;  // known results: memos are the machine's own
   string attention_kernel = 12;
   string weights_destination = 13;  // org/name: a job's weights outputs, or a warm run's source model
   HubAccess hub = 14;               // held in memory for this run's preparation only
@@ -136,11 +136,6 @@ message Adapter {
   string source = 7;
   repeated string profiles = 8;
 }
-message MemoResult {
-  string operation = 1;
-  string computation_digest = 2;  // sha256:<hex>
-  bytes result = 3;               // the recorded canonical result document
-}
 message HubAccess {
   string origin = 1;
   string token = 2;
@@ -150,6 +145,7 @@ message HubAccess {
 }
 
 message RunEvent {
+  reserved 8;  // memo records: memos are the machine's own
   uint64 sequence = 1;  // 0: a preparation progress frame before the run is accepted
   int64 at_ms = 2;
   oneof event {
@@ -158,7 +154,6 @@ message RunEvent {
     Product product = 5;
     LogLine log = 6;
     Outcome outcome = 7;
-    MemoRecord memo = 8;
     Call call = 9;
   }
 }
@@ -213,11 +208,6 @@ message Reason {
   string code = 1;
   string message = 2;
   string origin = 3;  // request, runtime, author, machine
-}
-message MemoRecord {
-  string operation = 1;
-  string computation_digest = 2;
-  bytes result = 3;
 }
 // One settled call the run made: a child run, or an effect such as its weights publication.
 message Call {
