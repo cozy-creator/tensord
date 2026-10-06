@@ -120,8 +120,16 @@ fn spool_file(spool: &Path, name: &str) -> io::Result<PathBuf> {
 }
 
 /// A saved asset's spool file, named as the SDK's post phase names it:
-/// `attempt:<request>/<kind>/<n>` lives at `<kind>-<n>`.
+/// `attempt:<request>/<kind>/<n>` lives at `<kind>-<n>`. A file a child returned is named by
+/// its digest, `sha256:<hex>`, and linked into its parent's spool as `sha256-<hex>`
+/// (`jobs::grant`), so a job can publish it as it is.
 fn spool_name(asset_ref: &str) -> String {
+    if let Some(hex) = asset_ref
+        .strip_prefix("sha256:")
+        .filter(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return format!("sha256-{hex}");
+    }
     let tail: Vec<_> = asset_ref.rsplitn(3, '/').collect();
     if tail.len() == 3 {
         format!("{}-{}", tail[1], tail[0])
