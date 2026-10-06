@@ -4,6 +4,9 @@
 (`Engine`) supervises runner processes over it. Neither schedules, installs or authenticates:
 the owner (`service.rs`) admits work and resolves an immutable environment before dispatch.
 
+[Process replacement and recovery](RECOVERY.md) distinguishes retained executor weights from
+durable daemon state, and describes the software activation transaction.
+
 ## Journal
 
 - `executions.sqlite3` in the state root, WAL with `synchronous=FULL`. A successful accept is a

@@ -119,6 +119,12 @@ fn run_machine(
     mut ready: cozy_machine::machine::supervise::Ready,
 ) -> io::Result<()> {
     use cozy_machine::machine::{grant::Lifetime, identity, receipt};
+    // An older stable parent may have selected a partially published candidate. Restore the
+    // links before opening services, then let that parent select the restored executable.
+    let paths = cozy_machine::machine::update::Paths::new(&grant.layout.engine(), &grant.layout.root);
+    if cozy_machine::machine::update::recover_activation(&paths)? {
+        std::process::exit(cozy_machine::machine::update::REPLACE_EXIT);
+    }
     for name in &grant.ignored {
         eprintln!("cozy-machine: ignoring {name}, which this machine does not read");
     }

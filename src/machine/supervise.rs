@@ -42,7 +42,8 @@ pub fn supervise(paths: &super::update::Paths, key: Option<&[u8]>) -> io::Result
     let parent = nix::unistd::getpid();
     let mut failures_before_ready = 0;
     loop {
-        let activated = super::update::activated_binary(paths);
+        super::update::recover_activation(paths)?;
+        let activated = super::update::activated_binary(paths)?;
         let (read, write) = pipe2(OFlag::O_CLOEXEC).map_err(io::Error::from)?;
         // SAFETY: no thread exists yet in this process; the child continues single-threaded.
         let child = match unsafe { fork() }.map_err(io::Error::from)? {
