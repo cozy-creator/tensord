@@ -28,13 +28,23 @@ interrupted inference. See [durable execution](DURABLE-EXECUTION.md) and
 
 ## Software updates
 
-An update first prepares its SDK and optional bundled machine executable. Activation closes
+An update first prepares its SDK and optional bundled machine executable in a fresh generation.
+Caller operation IDs identify receipts; they never select filesystem paths or replace an older
+generation's bytes. Activation closes
 admission, drains accepted work, and records rollback targets before publishing the new links.
 Only after both links are durable does the update enter `starting`. Readiness of that new service
 commits `succeeded`. An interrupted publication rolls back before service startup; an ordinary
 publication error rolls back while admission is still closed. A candidate that exits twice
 before readiness is rolled back by the stable supervisor. Healthy work is not killed by an
-update timer.
+update timer. A selected SDK or executable that has disappeared is rolled back while activation
+is pending; it never silently falls back to the image and reports success.
+
+If readiness succeeds but committing its outcome cannot write durable state, the service remains
+available and the update stays nonterminal. Its observer receives `FailedPrecondition` with
+`update_commit_blocked` instead of retrying forever or receiving a fabricated failure. Once the
+filesystem is repaired, a service restart retries the pending commit. If success was already
+durable and only pending-record cleanup failed, observers still see success; cleanup is retried
+before the next update or startup.
 
 The stable parent is deliberately not replaced during activation. A later full launch must use
 an installed supervisor that supports handing the new boot's readiness key to an activated

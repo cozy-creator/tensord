@@ -144,6 +144,10 @@ pub(super) async fn run<B: MachineBackend>(
             if update.terminal() {
                 return;
             }
+            if let Some(error) = observation_error(&update) {
+                let _ = sender.send(Err(error)).await;
+                return;
+            }
             tokio::select! {
                 _ = sender.closed() => return,
                 _ = tokio::time::sleep(Duration::from_millis(250)) => {}
@@ -247,12 +251,21 @@ fn state(id: &str, update: &Update) -> v1::RunState {
         .into(),
         sequence: update.history.len() as u64,
         attempt: 1,
-        waiting: if update.state == "waiting_activation" {
+        waiting: if observation_error(update).is_some() {
+            update.error.clone()
+        } else if update.state == "waiting_activation" {
             "waiting for the machine to be idle".into()
         } else {
             String::new()
         },
     }
+}
+
+/// A persistence blockage is an observation error, not a terminal run outcome. Unlike
+/// Unavailable, FailedPrecondition lets an update observer stop retrying and report it.
+fn observation_error(update: &Update) -> Option<Status> {
+    (!update.terminal() && update.error.starts_with("update_commit_blocked:"))
+        .then(|| Status::failed_precondition(&update.error))
 }
 
 fn step_event(update: &Update, step: &crate::machine::update::Step) -> v1::run_event::Event {
@@ -279,5 +292,25 @@ fn step_event(update: &Update, step: &crate::machine::update::Step) -> v1::run_e
             fraction: -1.0,
             ..Default::default()
         }),
+    }
+}
+
+
+#[cfg(test)]
+mod commit_observation_tests {
+    use super::*;
+
+    #[test]
+    fn a_blocked_commit_stops_observation_without_reporting_a_failed_run() {
+        let mut update = Update {
+            operation: "blocked".into(), state: "starting".into(),
+            error: "update_commit_blocked: no space left".into(), ..Default::default()
+        };
+        let error = observation_error(&update).unwrap();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(state("blocked", &update).state, "running");
+        assert_eq!(state("blocked", &update).waiting, update.error);
+        update.state = "succeeded".into();
+        assert!(observation_error(&update).is_none(), "cleanup cannot undo committed success");
     }
 }

@@ -420,6 +420,8 @@ async fn startup_recovers_interrupted_publication_before_selecting_the_service()
         ("succeeded", 2, "0.18.103", "succeeded"),
         ("rolled_back", 2, "0.18.102", "rolled_back"),
         ("starting", 2, "0.18.102", "rolled_back"),
+        ("starting", 3, "0.18.102", "rolled_back"),
+        ("starting", 4, "0.18.102", "rolled_back"),
     ] {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target/machine-update-recovery")
@@ -436,7 +438,7 @@ async fn startup_recovers_interrupted_publication_before_selecting_the_service()
                 std::fs::write(dir.join(name), bytes).unwrap();
             }
         }
-        if state != "starting" {
+        if state != "starting" || changed_links >= 3 {
             std::fs::copy(env!("CARGO_BIN_EXE_cozy-machine"), candidate.join("cozy-machine")).unwrap();
         }
         // `starting` exercises a dangling selected executable. It must fail exec and roll
@@ -452,7 +454,10 @@ async fn startup_recovers_interrupted_publication_before_selecting_the_service()
             "status": pending_status, "sdk_before": null, "agent_before": null,
         })).unwrap()).unwrap();
         std::fs::write(updates.join("status.json"), serde_json::to_vec(&status).unwrap()).unwrap();
-        if changed_links >= 1 { symlink(&candidate, engine.join("sdk/current")).unwrap(); }
+        if changed_links >= 1 && changed_links != 4 {
+            let selected = if changed_links == 3 { engine.join("sdk/missing") } else { candidate.clone() };
+            symlink(selected, engine.join("sdk/current")).unwrap();
+        }
         if changed_links >= 2 { symlink(candidate.join("cozy-machine"), engine.join("agent/current")).unwrap(); }
         let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let mut machine = launch(&root, port, Some([7; 32]), true);
@@ -463,8 +468,10 @@ async fn startup_recovers_interrupted_publication_before_selecting_the_service()
         assert_eq!(settled["state"], outcome);
         if state == "installing" {
             assert_eq!(settled["error"], "machine_restarted: software publication did not finish");
-        } else if state == "starting" {
+        } else if state == "starting" && changed_links == 2 {
             assert_eq!(settled["error"], "the service exited twice before readiness (1)");
+        } else if changed_links >= 3 {
+            assert_eq!(settled["error"], "activated SDK unavailable: no installed cozy_runtime wheel");
         }
         stop(&mut machine);
         std::fs::remove_dir_all(root).unwrap();

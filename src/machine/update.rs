@@ -120,10 +120,10 @@ impl Paths {
     /// The executors' Runtime/TensorFS wheels: the last activated pair, else the image's.
     pub fn sdk(&self) -> PathBuf {
         let link = self.current_sdk_link();
-        if link.exists() {
-            link
-        } else {
-            self.image_wheels.clone()
+        match fs::symlink_metadata(&link) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => self.image_wheels.clone(),
+            // A selected but unavailable SDK is not an instruction to use the image's pair.
+            _ => link,
         }
     }
 }
@@ -167,7 +167,14 @@ pub fn recover_activation(paths: &Paths) -> io::Result<bool> {
     };
     let status = latest(paths, pending.status)?;
     match status.state.as_str() {
-        "starting" => Ok(false),
+        "starting" => {
+            for distribution in ["cozy_runtime", "tensorfs"] {
+                if let Err(error) = existing_wheel(&paths.current_sdk_link(), distribution) {
+                    return rollback_pending(paths, &format!("activated SDK unavailable: {error}"));
+                }
+            }
+            Ok(false)
+        },
         "succeeded" => {
             remove_pending(paths)?;
             Ok(false)
@@ -220,6 +227,7 @@ impl Updates {
         lifecycle: Option<Arc<super::lifecycle::Lifecycle>>,
     ) -> io::Result<Arc<Self>> {
         fs::create_dir_all(paths.update("staged"))?;
+        fs::File::open(&paths.engine)?.sync_all()?;
         let mut status = fs::read(paths.update("status.json"))
             .ok()
             .and_then(|raw| serde_json::from_slice::<Status>(&raw).ok());
@@ -240,6 +248,18 @@ impl Updates {
 
     /// After this process proved readiness: an activation in flight is committed.
     pub fn commit(&self) -> io::Result<()> {
+        let result = self.commit_pending();
+        if let Err(error) = &result {
+            if let Some(status) = self.status.lock().unwrap().as_mut().filter(|s| !s.terminal()) {
+                // This is a live diagnostic, not an invented durable failure. The service can
+                // remain healthy while observers learn why this activation cannot settle.
+                status.error = format!("update_commit_blocked: {error}");
+            }
+        }
+        result
+    }
+
+    fn commit_pending(&self) -> io::Result<()> {
         let Some(pending) = read_pending(&self.paths)? else {
             return Ok(());
         };
@@ -248,6 +268,7 @@ impl Updates {
             return Err(invalid("cannot commit an update before software publication finished"));
         }
         status.to = pair_in(&self.paths.sdk());
+        status.error.clear();
         status.enter("succeeded");
         self.commit_status(status)
     }
@@ -255,8 +276,11 @@ impl Updates {
     /// The durable success is authoritative even if removing the rollback record fails. A
     /// later startup finishes that cleanup; observers of this live service see success now.
     fn commit_status(&self, status: Status) -> io::Result<()> {
+        // Keep the next request out until cleanup finishes; otherwise its new pending record
+        // could be removed by this previous operation's cleanup.
+        let mut current = self.status.lock().unwrap();
         write_json(&self.paths.update("status.json"), &status)?;
-        *self.status.lock().unwrap() = Some(status);
+        *current = Some(status);
         remove_pending(&self.paths)
     }
 
@@ -406,9 +430,14 @@ impl Updates {
 
     fn run(&self, request: &Request, exit: fn(i32), admitted: Option<super::lifecycle::Admission>) -> io::Result<()> {
         self.set(|s| s.enter("preparing"))?;
-        let candidate = self.paths.engine.join("sdk").join(&request.operation);
-        let _ = fs::remove_dir_all(&candidate);
-        fs::create_dir_all(&candidate)?;
+        let sdk = self.paths.engine.join("sdk");
+        fs::create_dir_all(&sdk)?;
+        // On the first update this also created engine/sdk; persist that parent entry.
+        fs::File::open(&self.paths.engine)?.sync_all()?;
+        // Caller operation IDs are receipt identities, never filesystem paths. Every attempt
+        // prepares a fresh immutable generation, including a historical operation's retry.
+        let candidate = sdk.join(format!("candidate-{}", hex(&super::identity::random::<16>()?)));
+        fs::create_dir(&candidate)?;
         let mut agent = None;
         for (distribution, choice) in [
             ("cozy_runtime", &request.runtime),
@@ -514,7 +543,7 @@ impl Updates {
 fn existing_wheel(dir: &Path, distribution: &str) -> io::Result<PathBuf> {
     wheels(dir)
         .into_iter()
-        .find(|(d, _, _)| d == distribution)
+        .find(|(d, _, path)| d == distribution && path.is_file())
         .map(|(_, _, path)| path)
         .ok_or_else(|| invalid(&format!("no installed {distribution} wheel")))
 }
@@ -645,6 +674,8 @@ fn relink(link: &Path, target: Option<&Path>) -> io::Result<()> {
         .parent()
         .ok_or_else(|| invalid("a link needs a directory"))?;
     fs::create_dir_all(dir)?;
+    // The first activation creates engine/agent. Its entry must survive along with the link.
+    fs::File::open(dir.parent().ok_or_else(|| invalid("a link directory needs a parent"))?)?.sync_all()?;
     let temp = dir.join(format!(".link-{}", hex(&super::identity::random::<8>()?)));
     symlink(target, &temp)?;
     fs::rename(&temp, link)?;
@@ -976,6 +1007,84 @@ mod tests {
         let rejected = updates.request(next, |_| panic!("unsettled cleanup started an update")).unwrap_err();
         assert_eq!(rejected.0, 500);
         assert_eq!(updates.update("transaction").unwrap().state, "succeeded");
+    }
+
+    #[test]
+    fn failed_commit_is_observable_without_a_fabricated_terminal_outcome() {
+        let transaction = Activation::prepare();
+        transaction.state("starting");
+        let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None).unwrap();
+        let before = fs::read(transaction.paths.update("status.json")).unwrap();
+        fs::remove_file(transaction.paths.update("status.json")).unwrap();
+        fs::create_dir(transaction.paths.update("status.json")).unwrap();
+        assert!(updates.commit().is_err());
+        let blocked = updates.update("transaction").unwrap();
+        assert_eq!(blocked.state, "starting");
+        assert!(!blocked.terminal());
+        assert!(blocked.error.starts_with("update_commit_blocked:"));
+        assert!(transaction.paths.update("pending.json").is_file());
+        fs::remove_dir(transaction.paths.update("status.json")).unwrap();
+        fs::write(transaction.paths.update("status.json"), before).unwrap();
+        updates.commit().unwrap();
+        let committed = updates.update("transaction").unwrap();
+        assert_eq!(committed.state, "succeeded");
+        assert!(committed.error.is_empty());
+    }
+
+    fn update_request(updates: &Arc<Updates>, id: &str, wheel: &Path) -> Request {
+        let file = wheel.file_name().unwrap().to_str().unwrap().to_owned();
+        let (sha256, _) = updates.stage(&file, &mut fs::File::open(wheel).unwrap()).unwrap();
+        Request {
+            operation: id.into(), agent: "explicit".into(), pin: None,
+            runtime: Some(Choice { file, sha256, ..Default::default() }), tensorfs: None,
+        }
+    }
+
+    #[test]
+    fn operation_ids_never_name_or_delete_software_directories() {
+        let transaction = Activation::prepare();
+        rollback_pending(&transaction.paths, "fixture").unwrap();
+        let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None).unwrap();
+        let candidate = wheel(&transaction.root, "cozy_runtime", "0.3.0", None);
+        let original = fs::read_dir(&transaction.old).unwrap().count();
+        for id in [".", ".."] {
+            let request = update_request(&updates, id, &candidate);
+            updates.request(request, |code| assert_eq!(code, REPLACE_EXIT)).unwrap();
+            state(&updates, id, "starting");
+            updates.commit().unwrap();
+            assert_eq!(fs::read_dir(&transaction.old).unwrap().count(), original);
+            assert!(transaction.paths.update("status.json").is_file());
+            let selected = fs::read_link(transaction.paths.current_sdk_link()).unwrap();
+            assert!(selected.file_name().unwrap().to_str().unwrap().starts_with("candidate-"));
+        }
+    }
+
+    #[test]
+    fn retrying_a_historical_operation_preserves_its_selected_generation() {
+        let transaction = Activation::prepare();
+        rollback_pending(&transaction.paths, "fixture").unwrap();
+        let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None).unwrap();
+        let candidate = wheel(&transaction.root, "cozy_runtime", "0.3.0", None);
+        let request = update_request(&updates, "A", &candidate);
+        updates.request(request, |code| assert_eq!(code, REPLACE_EXIT)).unwrap();
+        state(&updates, "A", "starting");
+        updates.commit().unwrap();
+        let selected = fs::read_link(transaction.paths.current_sdk_link()).unwrap();
+        let selected_wheel = existing_wheel(&selected, "cozy_runtime").unwrap();
+        let bytes = fs::read(&selected_wheel).unwrap();
+        // A subsequent failure becomes the latest operation but must not make A's live
+        // generation available for destructive replacement when the caller retries A.
+        let wrong = wheel(&transaction.root, "tensorfs", "0.4.0", None);
+        let request = update_request(&updates, "B", &wrong);
+        updates.request(request, |_| panic!("invalid candidate activated")).unwrap();
+        state(&updates, "B", "failed");
+        assert_eq!(fs::read_link(transaction.paths.current_sdk_link()).unwrap(), selected);
+        let request = update_request(&updates, "A", &candidate);
+        updates.request(request, |code| assert_eq!(code, REPLACE_EXIT)).unwrap();
+        state(&updates, "A", "starting");
+        updates.commit().unwrap();
+        assert_eq!(fs::read(&selected_wheel).unwrap(), bytes);
+        assert_ne!(fs::read_link(transaction.paths.current_sdk_link()).unwrap(), selected);
     }
 
     #[test]
