@@ -1894,6 +1894,40 @@ mod v1_api {
         .await
         .unwrap();
         assert_eq!(String::from_utf8(bytes).unwrap(), film, "{meta:?}");
+        // A child's returned file is published by the job as it is (H3 shows each reference its
+        // qwen-image-2 callee generates this way): one `rendered` product per segment, its bytes.
+        let rendered: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.event {
+                Some(v1::run_event::Event::Product(p)) if p.output == "rendered" => Some(p.label.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rendered,
+            ["Segment 1 as rendered", "Segment 2 as rendered", "Segment 3 as rendered"],
+            "{events:?}"
+        );
+        let bodies: Vec<&str> = film.split_inclusive('\n').collect();
+        for (index, body) in bodies.iter().enumerate() {
+            let (_, bytes) = read(
+                &mut client,
+                &all,
+                v1::ReadRequest {
+                    target: Some(v1::read_request::Target::Output(v1::OutputTarget {
+                        run: "film".into(),
+                        output: "rendered".into(),
+                        // A list item's index is 1-based.
+                        index: index as u32 + 1,
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(String::from_utf8(bytes).unwrap(), *body, "rendered {index}");
+        }
 
         // Every child is a run of its own under the job, settled.
         for index in 0..3 {
