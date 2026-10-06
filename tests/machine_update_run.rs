@@ -241,31 +241,7 @@ async fn an_update_run_activates_in_place_and_a_failing_candidate_ends_failed() 
         .local_addr()
         .unwrap()
         .port();
-    let owner = SigningKey::from_bytes(&OWNER).verifying_key();
-    let mut machine = Machine(
-        Command::new(env!("CARGO_BIN_EXE_cozy-machine"))
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("COZY_MACHINE_ROOT", &root)
-            .env("COZY_WORKER_ID", WORKER)
-            .env("COZY_WORKER_AUTH_TOKEN", URL_SAFE_NO_PAD.encode([1; 32]))
-            .env("COZY_WORKER_INTERNAL_PORT", port.to_string())
-            .env("COZY_LISTEN_HOST", "127.0.0.1")
-            .env(
-                "COZY_AUTHORIZED_KEYS",
-                URL_SAFE_NO_PAD.encode(owner.as_bytes()),
-            )
-            .env(
-                "COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL",
-                URL_SAFE_NO_PAD.encode([7; 32]),
-            )
-            .env("TENSORHUB_ORIGIN", "https://hub.invalid")
-            .env("CUDA_VISIBLE_DEVICES", "")
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap(),
-    );
+    let mut machine = launch(&root, port, Some([7; 32]), false);
     let before = status(&root, port).await;
     assert_eq!(
         (before.runtime.as_str(), before.tensorfs.as_str()),
@@ -363,6 +339,70 @@ async fn an_update_run_activates_in_place_and_a_failing_candidate_ends_failed() 
         machine.0.try_wait().unwrap().is_none(),
         "the machine keeps running after a rollback"
     );
-    drop(machine);
+
+    // Stopped and launched again: `cozy machine stop` / `start` on this computer (a persistent
+    // machine), then a rental's pod restarted. Each launch proves itself under a new key, which
+    // the parent hands to the updated service it runs.
+    for (persistent, key) in [(true, [8; 32]), (true, [9; 32]), (false, [10; 32])] {
+        stop(&mut machine);
+        std::fs::remove_file(root.join("run/cozy/bootstrap/readiness-envelope.json")).unwrap();
+        machine = launch(&root, port, Some(key), persistent);
+        let frame = status(&root, port).await;
+        assert_eq!(frame.runtime, "0.18.103");
+        assert!(
+            service_cmdline(machine.0.id()).contains("agent/current service"),
+            "the launch runs the activated binary"
+        );
+    }
+
+    // A launch that cannot prove its boot ends, with a status, instead of serving unready.
+    stop(&mut machine);
+    std::fs::remove_file(root.join("run/cozy/bootstrap/readiness-envelope.json")).unwrap();
+    let mut unprovable = launch(&root, port, None, true);
+    let ended = unprovable.0.wait().unwrap();
+    assert!(!ended.success(), "an unprovable launch ended {ended}");
     std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// Starts the machine on `root` as a pod (or, persistent, as this computer's CLI) does, with this
+/// launch's readiness key (none: it cannot prove readiness).
+fn launch(root: &Path, port: u16, key: Option<[u8; 32]>, persistent: bool) -> Machine {
+    let owner = SigningKey::from_bytes(&OWNER).verifying_key();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cozy-machine"));
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("COZY_MACHINE_ROOT", root)
+        .env("COZY_WORKER_ID", WORKER)
+        .env("COZY_WORKER_AUTH_TOKEN", URL_SAFE_NO_PAD.encode([1; 32]))
+        .env("COZY_WORKER_INTERNAL_PORT", port.to_string())
+        .env("COZY_LISTEN_HOST", "127.0.0.1")
+        .env(
+            "COZY_AUTHORIZED_KEYS",
+            URL_SAFE_NO_PAD.encode(owner.as_bytes()),
+        )
+        .env("TENSORHUB_ORIGIN", "https://hub.invalid")
+        .env("CUDA_VISIBLE_DEVICES", "")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    if persistent {
+        command.env("COZY_MACHINE_LIFETIME", "persistent");
+    }
+    if let Some(key) = key {
+        command.env(
+            "COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL",
+            URL_SAFE_NO_PAD.encode(key),
+        );
+    }
+    Machine(command.spawn().unwrap())
+}
+
+/// Stops the machine as `cozy machine stop` does: SIGTERM to its parent, which ends cleanly.
+fn stop(machine: &mut Machine) {
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(machine.0.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    machine.0.wait().unwrap();
 }

@@ -30,7 +30,10 @@ fn run() -> io::Result<()> {
         // environment (read before any thread starts; the one-shot key leaves the environment).
         // An activated Runtime update's service, started by the machine's stable parent.
         Some("service") if args.len() == 0 => match cozy_machine::machine::grant::from_process()? {
-            Some(grant) => run_machine(grant, cozy_machine::machine::supervise::inherited()),
+            Some(mut grant) => {
+                grant.receipt_key = grant.receipt_key.take().or_else(cozy_machine::machine::supervise::inherited_key);
+                run_machine(grant, cozy_machine::machine::supervise::inherited())
+            }
             None => Err(io::Error::other("this process has no machine grant")),
         },
         None | Some("run") if args.len() == 0 => match cozy_machine::machine::grant::from_process()? {
@@ -40,7 +43,7 @@ fn run() -> io::Result<()> {
                     cozy_machine::machine::ssh::start(key)?;
                 }
                 let paths = cozy_machine::machine::update::Paths::new(&grant.layout.engine(), &grant.layout.root);
-                let ready = cozy_machine::machine::supervise::supervise(&paths)?;
+                let ready = cozy_machine::machine::supervise::supervise(&paths, grant.receipt_key.as_deref())?;
                 run_machine(grant, ready)
             }
             None => Err(io::Error::other("this process has no machine grant (COZY_WORKER_ID and the rest of a pod's environment)")),
