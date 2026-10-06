@@ -129,34 +129,81 @@ impl Paths {
 }
 
 /// The machine binary an activated update installed, which the parent runs as its service.
-pub fn activated_binary(paths: &Paths) -> Option<PathBuf> {
+pub fn activated_binary(paths: &Paths) -> io::Result<Option<PathBuf>> {
     let link = paths.current_agent_link();
-    link.exists().then_some(link)
+    // A dangling activation is still the selected candidate. Its exec must fail and roll back,
+    // rather than silently starting the original binary and committing the candidate as ready.
+    match fs::symlink_metadata(&link) {
+        Ok(_) => Ok(Some(link)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// Restores what a failed activation replaced. True when there was one to undo.
 pub fn rollback_pending(paths: &Paths, cause: &str) -> io::Result<bool> {
-    let Ok(raw) = fs::read(paths.update("pending.json")) else {
+    let Some(pending) = read_pending(paths)? else {
         return Ok(false);
     };
-    let pending: Pending = serde_json::from_slice(&raw)?;
-    relink(&paths.current_sdk_link(), pending.sdk_before.as_deref())?;
-    relink(&paths.current_agent_link(), pending.agent_before.as_deref())?;
-    let mut status = latest(paths, pending.status);
+    let mut status = latest(paths, pending.status)?;
     status.error = cause.into();
     status.enter("rolled_back");
+    // Persist the decision before changing either link. A crash during rollback then resumes
+    // rollback, even when the candidate had already published its starting marker.
     write_json(&paths.update("status.json"), &status)?;
-    fs::remove_file(paths.update("pending.json"))?;
+    relink(&paths.current_sdk_link(), pending.sdk_before.as_deref())?;
+    relink(&paths.current_agent_link(), pending.agent_before.as_deref())?;
+    remove_pending(paths)?;
     Ok(true)
 }
 
+/// Recovers a publication interrupted before its durable `starting` marker. The parent calls
+/// this before choosing its service binary; a new service also calls it when an older parent
+/// launched it. True means links were restored and that child must let its parent select again.
+/// A succeeded marker means readiness already committed the update: only its cleanup remains.
+pub fn recover_activation(paths: &Paths) -> io::Result<bool> {
+    let Some(pending) = read_pending(paths)? else {
+        return Ok(false);
+    };
+    let status = latest(paths, pending.status)?;
+    match status.state.as_str() {
+        "starting" => Ok(false),
+        "succeeded" => {
+            remove_pending(paths)?;
+            Ok(false)
+        }
+        "rolled_back" => rollback_pending(paths, &status.error),
+        "waiting" | "preparing" | "waiting_activation" | "installing" | "failed" => {
+            rollback_pending(paths, "machine_restarted: software publication did not finish")
+        }
+        state => Err(invalid(&format!("cannot recover update state {state}"))),
+    }
+}
+
+fn read_pending(paths: &Paths) -> io::Result<Option<Pending>> {
+    match fs::read(paths.update("pending.json")) {
+        Ok(raw) => Ok(Some(serde_json::from_slice(&raw)?)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn remove_pending(paths: &Paths) -> io::Result<()> {
+    fs::remove_file(paths.update("pending.json"))?;
+    fs::File::open(paths.update(""))?.sync_all()
+}
+
 /// The activation's status as last written (its later steps), else as it was when pending.
-fn latest(paths: &Paths, pending: Status) -> Status {
-    fs::read(paths.update("status.json"))
-        .ok()
-        .and_then(|raw| serde_json::from_slice::<Status>(&raw).ok())
-        .filter(|s| s.operation == pending.operation)
-        .unwrap_or(pending)
+/// A missing status has its pending fallback; an unreadable status must not commit by accident.
+fn latest(paths: &Paths, pending: Status) -> io::Result<Status> {
+    match fs::read(paths.update("status.json")) {
+        Ok(raw) => {
+            let status: Status = serde_json::from_slice(&raw)?;
+            Ok(if status.operation == pending.operation { status } else { pending })
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(pending),
+        Err(error) => Err(error),
+    }
 }
 
 pub struct Updates {
@@ -193,17 +240,24 @@ impl Updates {
 
     /// After this process proved readiness: an activation in flight is committed.
     pub fn commit(&self) -> io::Result<()> {
-        let Ok(raw) = fs::read(self.paths.update("pending.json")) else {
+        let Some(pending) = read_pending(&self.paths)? else {
             return Ok(());
         };
-        let pending: Pending = serde_json::from_slice(&raw)?;
-        let mut status = latest(&self.paths, pending.status);
+        let mut status = latest(&self.paths, pending.status)?;
+        if !matches!(status.state.as_str(), "starting" | "succeeded") {
+            return Err(invalid("cannot commit an update before software publication finished"));
+        }
         status.to = pair_in(&self.paths.sdk());
         status.enter("succeeded");
+        self.commit_status(status)
+    }
+
+    /// The durable success is authoritative even if removing the rollback record fails. A
+    /// later startup finishes that cleanup; observers of this live service see success now.
+    fn commit_status(&self, status: Status) -> io::Result<()> {
         write_json(&self.paths.update("status.json"), &status)?;
-        fs::remove_file(self.paths.update("pending.json"))?;
         *self.status.lock().unwrap() = Some(status);
-        Ok(())
+        remove_pending(&self.paths)
     }
 
     /// The update `operation` names, if it is this machine's latest.
@@ -305,6 +359,9 @@ impl Updates {
                 ));
             }
         }
+        // A committed terminal outcome may still have cleanup to do. Finish that before a
+        // different operation overwrites its status and loses the pending decision's meaning.
+        recover_activation(&self.paths).map_err(server)?;
         // Preparing holds idle release; activation then closes admission.
         let admitted = self.lifecycle.as_ref().map(|l| l.admit()).transpose()
             .map_err(|refused| (503, refused.message().to_string()))?;
@@ -323,28 +380,32 @@ impl Updates {
             .name("runtime-update".into())
             .spawn(move || {
                 if let Err(error) = updates.run(&request, exit, admitted) {
-                    updates.set(|s| {
-                        s.error = error.to_string();
-                        s.enter("failed");
-                    });
+                    if let Err(persist) = updates.set(|s| {
+                        if !s.terminal() {
+                            s.error = error.to_string();
+                            s.enter("failed");
+                        }
+                    }) {
+                        eprintln!("cozy-machine: Runtime update failed: {error}; status: {persist}");
+                    }
                 }
             })
             .map_err(server)?;
         Ok(status)
     }
 
-    fn set(&self, change: impl FnOnce(&mut Status)) {
+    fn set(&self, change: impl FnOnce(&mut Status)) -> io::Result<()> {
         let mut current = self.status.lock().unwrap();
-        if let Some(status) = current.as_mut() {
-            change(status);
-            if let Err(error) = write_json(&self.paths.update("status.json"), status) {
-                eprintln!("cozy-machine: Runtime update status: {error}");
-            }
+        if let Some(mut status) = current.clone() {
+            change(&mut status);
+            write_json(&self.paths.update("status.json"), &status)?;
+            *current = Some(status);
         }
+        Ok(())
     }
 
     fn run(&self, request: &Request, exit: fn(i32), admitted: Option<super::lifecycle::Admission>) -> io::Result<()> {
-        self.set(|s| s.enter("preparing"));
+        self.set(|s| s.enter("preparing"))?;
         let candidate = self.paths.engine.join("sdk").join(&request.operation);
         let _ = fs::remove_dir_all(&candidate);
         fs::create_dir_all(&candidate)?;
@@ -363,35 +424,57 @@ impl Updates {
                 .ok_or_else(|| invalid("wheel name"))?
                 .to_owned();
             let bundled = verify_wheel(&wheel, distribution)?;
-            fs::copy(&wheel, candidate.join(&name))?;
+            let prepared = candidate.join(&name);
+            fs::copy(&wheel, &prepared)?;
+            fs::File::open(prepared)?.sync_all()?;
             if let Some(binary) = bundled.filter(|_| request.agent != "explicit") {
                 agent = rust_machine(&binary, &candidate)?;
             }
         }
+        fs::File::open(&candidate)?.sync_all()?;
         let to = pair_in(&candidate);
-        self.set(|s| s.to = to.clone());
+        self.set(|s| s.to = to.clone())?;
         // No new work is admitted from here; work admitted before drains first.
         let _activation = self.lifecycle.as_ref().map(|l| l.activate()).transpose()
             .map_err(|refused| io::Error::other(refused.message().to_string()))?;
         drop(admitted);
         if !(self.idle)() {
-            self.set(|s| s.enter("waiting_activation"));
+            self.set(|s| s.enter("waiting_activation"))?;
             while !(self.idle)() {
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
         }
-        self.set(|s| s.enter("installing"));
+        self.set(|s| s.enter("installing"))?;
         let pending = Pending {
             status: self.status.lock().unwrap().clone().unwrap_or_default(),
-            sdk_before: fs::read_link(self.paths.current_sdk_link()).ok(),
-            agent_before: fs::read_link(self.paths.current_agent_link()).ok(),
+            sdk_before: previous_link(&self.paths.current_sdk_link())?,
+            agent_before: previous_link(&self.paths.current_agent_link())?,
         };
-        write_json(&self.paths.update("pending.json"), &pending)?;
-        relink(&self.paths.current_sdk_link(), Some(&candidate))?;
-        if let Some(binary) = agent {
-            relink(&self.paths.current_agent_link(), Some(&binary))?;
+        let publication = (|| {
+            write_json(&self.paths.update("pending.json"), &pending)?;
+            relink(&self.paths.current_sdk_link(), Some(&candidate))?;
+            if let Some(binary) = agent {
+                relink(&self.paths.current_agent_link(), Some(&binary))?;
+            }
+            self.set(|s| s.enter("starting"))
+        })();
+        if let Err(error) = publication {
+            // Admission is still closed. Do not leave a partial SDK/binary pair available to
+            // newly accepted work, and do not overwrite a truthful rolled_back outcome.
+            match rollback_pending(&self.paths, &format!("software publication failed: {error}")) {
+                Ok(true) => {
+                    *self.status.lock().unwrap() = Some(latest(&self.paths, pending.status)?);
+                }
+                Ok(false) => {}
+                Err(rollback) => {
+                    eprintln!("cozy-machine: update publication: {error}; rollback: {rollback}");
+                    // The links cannot be trusted. Restart while admission remains closed;
+                    // startup recovers before selecting software, or refuses this launch.
+                    exit(REPLACE_EXIT);
+                }
+            }
+            return Err(error);
         }
-        self.set(|s| s.enter("starting"));
         eprintln!(
             "cozy-machine: Runtime update {}: restarting on {} / {}",
             request.operation, to.runtime, to.tensorfs
@@ -501,6 +584,9 @@ fn rust_machine(binary: &[u8], dir: &Path) -> io::Result<Option<PathBuf>> {
     if !rust {
         fs::remove_file(&path)?;
     }
+    if rust {
+        fs::File::open(&path)?.sync_all()?;
+    }
     Ok(rust.then_some(path))
 }
 
@@ -538,12 +624,21 @@ pub fn pair_in(dir: &Path) -> Pair {
     pair
 }
 
+fn previous_link(link: &Path) -> io::Result<Option<PathBuf>> {
+    match fs::read_link(link) {
+        Ok(target) => Ok(Some(target)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Points `link` at `target` atomically, or removes it.
 fn relink(link: &Path, target: Option<&Path>) -> io::Result<()> {
     let Some(target) = target else {
         return match fs::remove_file(link) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
+            Ok(()) => fs::File::open(link.parent().expect("link has a parent"))?.sync_all(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
         };
     };
     let dir = link
@@ -726,4 +821,171 @@ mod tests {
         assert!(stopped.error.starts_with("machine_restarted"));
         fs::remove_dir_all(root).unwrap();
     }
+
+    struct Activation {
+        root: PathBuf,
+        paths: Paths,
+        old: PathBuf,
+        new: PathBuf,
+    }
+    impl Activation {
+        fn prepare() -> Self {
+            let root = std::env::temp_dir().join(format!("cm-publication-{}", uuid::Uuid::new_v4()));
+            let paths = Paths::new(&root.join("engine"), &root);
+            let old = root.join("engine/sdk/old");
+            let new = root.join("engine/sdk/new");
+            for (dir, version) in [(&old, "0.1.0"), (&new, "0.2.0")] {
+                fs::create_dir_all(dir).unwrap();
+                wheel(dir, "cozy_runtime", version, None);
+                wheel(dir, "tensorfs", version, None);
+                fs::write(dir.join("cozy-machine"), b"executable").unwrap();
+            }
+            relink(&paths.current_sdk_link(), Some(&old)).unwrap();
+            relink(&paths.current_agent_link(), Some(&old.join("cozy-machine"))).unwrap();
+            let mut status = Status { operation: "transaction".into(), ..Default::default() };
+            status.enter("installing");
+            write_json(&paths.update("status.json"), &status).unwrap();
+            write_json(&paths.update("pending.json"), &Pending {
+                status,
+                sdk_before: Some(old.clone()),
+                agent_before: Some(old.join("cozy-machine")),
+            }).unwrap();
+            Self { root, paths, old, new }
+        }
+        fn state(&self, state: &str) {
+            let mut status: Status = serde_json::from_slice(&fs::read(self.paths.update("status.json")).unwrap()).unwrap();
+            status.enter(state);
+            write_json(&self.paths.update("status.json"), &status).unwrap();
+        }
+        fn links(&self, dir: &Path) {
+            assert_eq!(fs::read_link(self.paths.current_sdk_link()).unwrap(), dir);
+            assert_eq!(fs::read_link(self.paths.current_agent_link()).unwrap(), dir.join("cozy-machine"));
+        }
+    }
+    impl Drop for Activation {
+        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.root); }
+    }
+
+    #[test]
+    fn every_unpublished_activation_boundary_rolls_back_before_service_selection() {
+        // Process death after pending, after the SDK link, or after both links but before the
+        // durable starting marker: none may be reported as successfully activated.
+        for changed_links in 0..=2 {
+            let transaction = Activation::prepare();
+            if changed_links >= 1 {
+                relink(&transaction.paths.current_sdk_link(), Some(&transaction.new)).unwrap();
+            }
+            if changed_links >= 2 {
+                relink(&transaction.paths.current_agent_link(), Some(&transaction.new.join("cozy-machine"))).unwrap();
+            }
+            let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None).unwrap();
+            assert!(updates.commit().is_err(), "unpublished state committed");
+            assert!(recover_activation(&transaction.paths).unwrap());
+            transaction.links(&transaction.old);
+            assert!(!transaction.paths.update("pending.json").exists());
+            let recovered = Updates::open(transaction.paths.clone(), Box::new(|| true), None).unwrap();
+            assert_eq!(recovered.update("transaction").unwrap().state, "rolled_back");
+            assert!(!recover_activation(&transaction.paths).unwrap());
+        }
+    }
+
+    #[test]
+    fn published_activation_waits_for_readiness_and_committed_cleanup_keeps_it() {
+        let transaction = Activation::prepare();
+        relink(&transaction.paths.current_sdk_link(), Some(&transaction.new)).unwrap();
+        relink(&transaction.paths.current_agent_link(), Some(&transaction.new.join("cozy-machine"))).unwrap();
+        transaction.state("starting");
+        assert!(!recover_activation(&transaction.paths).unwrap());
+        assert!(transaction.paths.update("pending.json").exists());
+        transaction.links(&transaction.new);
+        let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None).unwrap();
+        // Keep the old pending bytes to simulate death after writing succeeded, before removal.
+        let pending = fs::read(transaction.paths.update("pending.json")).unwrap();
+        updates.commit().unwrap();
+        assert_eq!(updates.update("transaction").unwrap().state, "succeeded");
+        fs::write(transaction.paths.update("pending.json"), pending).unwrap();
+        assert!(!recover_activation(&transaction.paths).unwrap());
+        transaction.links(&transaction.new);
+        assert!(!transaction.paths.update("pending.json").exists());
+    }
+
+    #[test]
+    fn rolled_back_cleanup_can_resume_without_changing_the_outcome() {
+        let transaction = Activation::prepare();
+        let pending = fs::read(transaction.paths.update("pending.json")).unwrap();
+        rollback_pending(&transaction.paths, "candidate could not start").unwrap();
+        let settled = fs::read(transaction.paths.update("status.json")).unwrap();
+        fs::write(transaction.paths.update("pending.json"), pending).unwrap();
+        assert!(recover_activation(&transaction.paths).unwrap());
+        transaction.links(&transaction.old);
+        let expected: Status = serde_json::from_slice(&settled).unwrap();
+        let actual: Status = serde_json::from_slice(&fs::read(transaction.paths.update("status.json")).unwrap()).unwrap();
+        assert_eq!(actual.state, expected.state);
+        assert_eq!(actual.history, expected.history);
+        assert_eq!(actual.error, expected.error);
+    }
+
+    #[test]
+    fn interruption_during_rollback_resumes_the_same_decision() {
+        for restored_links in 0..=1 {
+            let transaction = Activation::prepare();
+            relink(&transaction.paths.current_sdk_link(), Some(&transaction.new)).unwrap();
+            relink(&transaction.paths.current_agent_link(), Some(&transaction.new.join("cozy-machine"))).unwrap();
+            transaction.state("starting");
+            transaction.state("rolled_back");
+            if restored_links == 1 {
+                relink(&transaction.paths.current_sdk_link(), Some(&transaction.old)).unwrap();
+            }
+            assert!(recover_activation(&transaction.paths).unwrap());
+            transaction.links(&transaction.old);
+            assert!(!transaction.paths.update("pending.json").exists());
+        }
+    }
+
+    #[test]
+    fn unreadable_transaction_files_do_not_mean_no_pending_update() {
+        let transaction = Activation::prepare();
+        fs::write(transaction.paths.update("status.json"), b"truncated").unwrap();
+        assert!(recover_activation(&transaction.paths).is_err());
+        transaction.links(&transaction.old);
+        fs::remove_file(transaction.paths.update("pending.json")).unwrap();
+        fs::create_dir(transaction.paths.update("pending.json")).unwrap();
+        assert!(recover_activation(&transaction.paths).is_err());
+        assert!(rollback_pending(&transaction.paths, "test").is_err());
+    }
+
+    #[test]
+    fn committed_success_is_visible_even_when_pending_cleanup_fails() {
+        let transaction = Activation::prepare();
+        transaction.state("starting");
+        let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None).unwrap();
+        let mut succeeded = updates.update("transaction").unwrap();
+        succeeded.enter("succeeded");
+        // Fail the actual cleanup operation after the commit decision has already been read.
+        fs::remove_file(transaction.paths.update("pending.json")).unwrap();
+        fs::create_dir(transaction.paths.update("pending.json")).unwrap();
+        assert!(updates.commit_status(succeeded).is_err());
+        assert_eq!(updates.update("transaction").unwrap().state, "succeeded");
+        let persisted: Status = serde_json::from_slice(&fs::read(transaction.paths.update("status.json")).unwrap()).unwrap();
+        assert_eq!(persisted.state, "succeeded");
+        let next = Request {
+            operation: "next".into(), agent: "explicit".into(), pin: None,
+            runtime: Some(Choice { version: "0.2.0".into(), ..Default::default() }),
+            tensorfs: None,
+        };
+        let rejected = updates.request(next, |_| panic!("unsettled cleanup started an update")).unwrap_err();
+        assert_eq!(rejected.0, 500);
+        assert_eq!(updates.update("transaction").unwrap().state, "succeeded");
+    }
+
+    #[test]
+    fn a_failed_status_write_does_not_advance_the_in_memory_state() {
+        let transaction = Activation::prepare();
+        let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None).unwrap();
+        fs::remove_file(transaction.paths.update("status.json")).unwrap();
+        fs::create_dir(transaction.paths.update("status.json")).unwrap();
+        assert!(updates.set(|s| s.enter("starting")).is_err());
+        assert_eq!(updates.update("transaction").unwrap().state, "installing");
+    }
+
 }

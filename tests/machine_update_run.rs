@@ -406,3 +406,67 @@ fn stop(machine: &mut Machine) {
     .unwrap();
     machine.0.wait().unwrap();
 }
+
+
+/// The persisted boundaries are interrupted deliberately, then a real supervisor and service
+/// start over them. A partially published SDK must never be selected or committed by readiness.
+#[tokio::test]
+async fn startup_recovers_interrupted_publication_before_selecting_the_service() {
+    use std::os::unix::fs::symlink;
+    for (state, changed_links, runtime, outcome) in [
+        ("installing", 0, "0.18.102", "rolled_back"),
+        ("installing", 1, "0.18.102", "rolled_back"),
+        ("installing", 2, "0.18.102", "rolled_back"),
+        ("succeeded", 2, "0.18.103", "succeeded"),
+        ("rolled_back", 2, "0.18.102", "rolled_back"),
+        ("starting", 2, "0.18.102", "rolled_back"),
+    ] {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/machine-update-recovery")
+            .join(uuid::Uuid::new_v4().to_string());
+        let image = root.join("opt/cozy/wheels");
+        let engine = root.join("var/lib/cozy/rust-machine");
+        let candidate = engine.join("sdk/candidate");
+        let updates = engine.join("update");
+        for dir in [&image, &candidate, &updates, &engine.join("agent")] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        for (dir, version) in [(&image, "0.18.102"), (&candidate, "0.18.103")] {
+            for (name, bytes) in [wheel("cozy_runtime", version, None), wheel("tensorfs", "0.3.94", None)] {
+                std::fs::write(dir.join(name), bytes).unwrap();
+            }
+        }
+        if state != "starting" {
+            std::fs::copy(env!("CARGO_BIN_EXE_cozy-machine"), candidate.join("cozy-machine")).unwrap();
+        }
+        // `starting` exercises a dangling selected executable. It must fail exec and roll
+        // back, never fall through to the image executable and falsely commit the update.
+        let status = serde_json::json!({
+            "operation": "interrupted", "state": state,
+            "from": {"runtime": "0.18.102", "tensorfs": "0.3.94"},
+            "to": {"runtime": "0.18.103", "tensorfs": "0.3.94"},
+        });
+        let mut pending_status = status.clone();
+        pending_status["state"] = "installing".into();
+        std::fs::write(updates.join("pending.json"), serde_json::to_vec(&serde_json::json!({
+            "status": pending_status, "sdk_before": null, "agent_before": null,
+        })).unwrap()).unwrap();
+        std::fs::write(updates.join("status.json"), serde_json::to_vec(&status).unwrap()).unwrap();
+        if changed_links >= 1 { symlink(&candidate, engine.join("sdk/current")).unwrap(); }
+        if changed_links >= 2 { symlink(candidate.join("cozy-machine"), engine.join("agent/current")).unwrap(); }
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let mut machine = launch(&root, port, Some([7; 32]), true);
+        let frame = self::status(&root, port).await;
+        assert_eq!(frame.runtime, runtime, "{state} after {changed_links} links");
+        assert!(!updates.join("pending.json").exists());
+        let settled: serde_json::Value = serde_json::from_slice(&std::fs::read(updates.join("status.json")).unwrap()).unwrap();
+        assert_eq!(settled["state"], outcome);
+        if state == "installing" {
+            assert_eq!(settled["error"], "machine_restarted: software publication did not finish");
+        } else if state == "starting" {
+            assert_eq!(settled["error"], "the service exited twice before readiness (1)");
+        }
+        stop(&mut machine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

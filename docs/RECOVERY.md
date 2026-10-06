@@ -13,7 +13,9 @@ different recovery guarantees.
 A cached model's presence does not mean its execution completed. A replacement executor can
 attach still-owned weights only through their ordinary validated descriptor and lease protocol.
 No interrupted copy, kernel, or inference result is declared complete to make recovery possible.
-The control service remains CUDA-free.
+The control service remains CUDA-free. A service's stop flag is a shutdown request, not proof
+that dispatch threads, their store references, or executors have ended. Full process-restart
+recovery applies after the old process has actually exited.
 
 After a service restart, reconciliation observes exact process births. A live or unobservably dead
 executor leaves its obligation nonterminal; it is not adopted. A starting attempt whose process
