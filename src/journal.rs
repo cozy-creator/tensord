@@ -379,6 +379,15 @@ impl Journal {
             CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_request ON executions(actor,request_id) WHERE actor IS NOT NULL;
             CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_submission ON executions(actor,submission_id) WHERE actor IS NOT NULL;
             CREATE INDEX IF NOT EXISTS executions_actor_order ON executions(actor,id) WHERE actor IS NOT NULL; COMMIT;").map_err(db_error)?;
+        // A journal from before held memos kept their use (#148's builds) gains the column.
+        let used: bool = connection
+            .query_row("SELECT COUNT(*) FROM pragma_table_info('held_memos') WHERE name='used_ms'", [], |r| r.get(0))
+            .map_err(db_error)?;
+        if !used {
+            connection
+                .execute("ALTER TABLE held_memos ADD COLUMN used_ms INTEGER NOT NULL DEFAULT 0", [])
+                .map_err(db_error)?;
+        }
         let existing: Option<String> = connection
             .query_row(
                 "SELECT value FROM machine_metadata WHERE key='workspace_id'",
