@@ -279,12 +279,6 @@ impl State {
             + self.reserved.values().map(Reservation::bytes).sum::<u64>()
             + self.ledger.stranded_bytes
     }
-    fn filling(&self) -> bool {
-        self.slots.values().any(|s| match s {
-            Slot::Opening(_) => true,
-            Slot::Open(e) => !e.complete && e.window.is_none(),
-        })
-    }
 }
 
 pub struct HostTier {
@@ -1245,9 +1239,10 @@ impl HostTier {
         }
     }
 
-    /// Close the tier's descriptor of an unheld layout. Its memory returns once the last
-    /// mapping goes; the kernel's shared-memory count says whether it did. If not, the bytes
-    /// stay charged (stranded): something still maps them.
+    /// Close the tier's descriptor of an unheld layout. Its memory returns once nothing else
+    /// holds it; a process that still does (a descriptor or a mapping of its file) leaves the
+    /// bytes charged (stranded). Asked of that file, not of the host's shared-memory total,
+    /// which every other process moves too.
     fn release_entry(&self, state: &mut State, key: &str) {
         let Some(Slot::Open(entry)) = state.slots.remove(key) else {
             return;
@@ -1260,15 +1255,14 @@ impl HostTier {
             state.ledger.released_bytes += entry.charged;
             return;
         }
-        let quiet = !state.filling();
-        let before = crate::host_memory::read().shmem;
+        let file = fs::metadata(format!("/proc/self/fd/{}", entry.fd.as_raw_fd()))
+            .map(|m| (m.dev(), m.ino()));
         drop(entry.fd);
-        let freed = (before - crate::host_memory::read().shmem).max(0) as u64;
         state.ledger.released += 1;
         state.ledger.released_bytes += entry.charged;
-        state.ledger.freed_bytes += freed;
-        if quiet && freed < entry.charged / 2 {
-            state.ledger.stranded_bytes += entry.charged;
+        match file {
+            Ok((dev, ino)) if !os::held(dev, ino) => state.ledger.freed_bytes += entry.charged,
+            _ => state.ledger.stranded_bytes += entry.charged,
         }
     }
 }
