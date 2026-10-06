@@ -250,8 +250,17 @@ fn paused_and_unstarted_runs_keep_their_objects(restart: bool) {
 
     if restart {
         assert!(machine.service.stop().unwrap(), "the machine was not idle");
+        let previous_store = Arc::downgrade(&machine.store);
         drop(jobs);
         drop(machine);
+        // stop() requests dispatch shutdown. Its thread may still retain Jobs and the
+        // Store until it observes that request; an in-process restart must wait for that
+        // custody to end just as a process restart waits for the old process to exit.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while previous_store.upgrade().is_some() {
+            assert!(Instant::now() < deadline, "the stopped dispatcher still retains its Store");
+            std::thread::yield_now();
+        }
         machine = open(&root, &tools);
     }
     collect(&machine.store);
