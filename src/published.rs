@@ -773,56 +773,14 @@ impl Publisher {
             ],
             &|read| job.bytes(read, 0),
         )?;
+        let mut sdk_fallback = String::new();
         if sdk {
             job.stage("installing the machine's Runtime and TensorFS".into());
-            let constraints = dir.join("constraints.txt").to_string_lossy().to_string();
-            let mut args = vec![
-                "pip",
-                "install",
-                "--no-config",
-                "--python",
-                &py,
-                compile(!client),
-                "--constraints",
-                &constraints,
-            ];
-            let links = self
-                .sdk
-                .find_links
-                .as_ref()
-                .map(|p| p.to_string_lossy().to_string());
-            if let Some(links) = &links {
-                args.extend(["--find-links", links]);
-            }
-            args.extend(self.sdk.requirements.iter().map(String::as_str));
-            // As the Go stack chooses: this machine's own pair where the package's bounds admit
-            // it (uv's check of every installed requirement), else the release's locked SDK.
-            // A package's bounds are never overridden.
-            let own = self
-                .uv(&args)
-                .and_then(|()| self.uv(&["pip", "check", "--no-config", "--python", &py]));
-            if let Err((code, detail)) = own {
-                if !split.sdk.lines().any(|l| !l.starts_with("--")) {
-                    return Err((code, detail));
-                }
-                write("sdk-requirements.txt", &split.sdk)?;
-                let rows = dir
-                    .join("sdk-requirements.txt")
-                    .to_string_lossy()
-                    .to_string();
-                self.uv(&[
-                    "pip",
-                    "install",
-                    "--no-config",
-                    "--python",
-                    &py,
-                    compile(!client),
-                    "--require-hashes",
-                    "--no-deps",
-                    "--requirements",
-                    &rows,
-                ])?;
+            sdk_fallback = self.install_sdk(&py, &dir, &split.sdk, compile(!client))?;
+            if !sdk_fallback.is_empty() {
                 sdk_choice = "locked";
+                eprintln!("package {} {release}: {sdk_fallback}", split.distribution);
+                job.stage(format!("warning: {sdk_fallback}"));
             }
         }
         if let Some(wheel) = &self.sdk.client_wheel {
@@ -852,7 +810,7 @@ impl Publisher {
             Some(_) => describe_environment(&py, &split.distribution, hub_origin)?,
             None => (String::new(), vec![]),
         };
-        let record = json!({"identity":identity,"package":split.distribution,"version":release,"application":application,"python":interpreter,"dependencies":[],"interface":interface,"sdk":sdk_choice,"source_digest":source_digest,"callees":callees});
+        let record = json!({"identity":identity,"package":split.distribution,"version":release,"application":application,"python":interpreter,"dependencies":installed_sdk(&env),"interface":interface,"sdk":sdk_choice,"sdk_fallback":sdk_fallback,"source_digest":source_digest,"callees":callees});
         let staged = dir.join(".generation.json.new");
         let mut file = OpenOptions::new()
             .create_new(true)
@@ -894,6 +852,43 @@ impl Publisher {
             .open(cache.join(".lock"))?;
         lock.lock_shared()?;
         Ok(Some(lock))
+    }
+
+    /// This machine's own Runtime and TensorFS in an environment holding a release's locked
+    /// requirements, where the package's bounds admit them (uv's check of every installed
+    /// requirement); else the release's locked SDK. A package's bounds are never overridden.
+    /// Returns "" for the machine's pair, else why it fell back and to what: never silent.
+    fn install_sdk(&self, py: &str, dir: &Path, locked: &str, compile: &str) -> Result<String, Failure> {
+        let constraints = dir.join("constraints.txt").to_string_lossy().to_string();
+        let mut args = vec!["pip", "install", "--no-config", "--python", py, compile, "--constraints", &constraints];
+        let links = self.sdk.find_links.as_ref().map(|p| p.to_string_lossy().to_string());
+        if let Some(links) = &links {
+            args.extend(["--find-links", links]);
+        }
+        args.extend(self.sdk.requirements.iter().map(String::as_str));
+        // uv's failure names its step (`uv pip install` or `uv pip check`) and its output.
+        let own = self.uv(&args).and_then(|()| self.uv(&["pip", "check", "--no-config", "--python", py]));
+        let Err((code, detail)) = own else {
+            return Ok(String::new());
+        };
+        let rows: Vec<&str> = locked
+            .lines()
+            .filter(|l| !l.starts_with("--"))
+            .map(|l| l.split_whitespace().next().unwrap_or(l))
+            .collect();
+        if rows.is_empty() {
+            return Err((code, detail));
+        }
+        fs::write(dir.join("sdk-requirements.txt"), locked).map_err(io_failure)?;
+        let sdk = dir.join("sdk-requirements.txt").to_string_lossy().to_string();
+        self.uv(&["pip", "install", "--no-config", "--python", py, compile, "--require-hashes", "--no-deps", "--requirements", &sdk])?;
+        let detail: Vec<&str> = detail.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        let detail = detail[detail.len().saturating_sub(12)..].join(" | ");
+        Ok(format!(
+            "this machine's own Runtime and TensorFS did not install ({code}: {}); it runs the release's locked {}",
+            detail.chars().take(2000).collect::<String>(),
+            rows.join(", ")
+        ))
     }
 
     fn uv(&self, args: &[&str]) -> Result<(), Failure> {
@@ -1725,6 +1720,25 @@ pub fn describe_environment(python: &str, root: &str, hub_origin: &str) -> Resul
     }
 }
 
+/// The Runtime and TensorFS an environment holds, by their installed distribution names.
+fn installed_sdk(env: &Path) -> Vec<Value> {
+    let mut found: Vec<Value> = fs::read_dir(env.join("lib"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .flat_map(|python| fs::read_dir(python.path().join("site-packages")).into_iter().flatten().flatten())
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let (distribution, version) = name.strip_suffix(".dist-info")?.split_once('-')?;
+            let distribution = normalized(distribution);
+            matches!(distribution.as_str(), "cozy-runtime" | "tensorfs")
+                .then(|| json!({"name": distribution, "version": version}))
+        })
+        .collect();
+    found.sort_by_key(|d| d["name"].as_str().unwrap_or_default().to_string());
+    found
+}
+
 /// The release's lock as uv input: index lines and every row, minus the SDK rows when the
 /// machine supplies its own SDK, whose resolution the other pins then constrain.
 fn split_lock(lock: &str, name: &str, release: &str, own_sdk: bool) -> Result<Lock, Failure> {
@@ -1813,6 +1827,89 @@ fn release_order(release: &str) -> (bool, Vec<u64>, Vec<u64>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wheel with nothing but its metadata: `name` `version`, requiring `requires`.
+    fn tiny_wheel(dir: &Path, name: &str, version: &str, requires: &[&str]) -> PathBuf {
+        use std::io::Write;
+        let module = name.replace('-', "_");
+        let info = format!("{module}-{version}.dist-info");
+        let path = dir.join(format!("{module}-{version}-py3-none-any.whl"));
+        let mut zip = zip::ZipWriter::new(File::create(&path).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        let mut metadata = format!("Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n");
+        for requirement in requires {
+            metadata.push_str(&format!("Requires-Dist: {requirement}\n"));
+        }
+        let files = [
+            (format!("{module}/__init__.py"), String::new()),
+            (format!("{info}/METADATA"), metadata),
+            (format!("{info}/WHEEL"), "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n".into()),
+        ];
+        let mut record = String::new();
+        for (name, body) in &files {
+            zip.start_file(name.as_str(), options).unwrap();
+            zip.write_all(body.as_bytes()).unwrap();
+            record.push_str(&format!("{name},,\n"));
+        }
+        record.push_str(&format!("{info}/RECORD,,\n"));
+        zip.start_file(format!("{info}/RECORD"), options).unwrap();
+        zip.write_all(record.as_bytes()).unwrap();
+        zip.finish().unwrap();
+        path
+    }
+
+    /// The machine's own Runtime goes into an environment whose packages admit it; one whose
+    /// bounds refuse it runs the release's locked SDK, and the generation says why (uv's own
+    /// words) and which. Real uv and wheels, no network.
+    #[test]
+    fn a_refused_machine_sdk_falls_back_to_the_locked_one_and_says_so() {
+        let root = std::env::temp_dir().join(format!("cm-sdk-{}", uuid::Uuid::new_v4()));
+        let wheels = root.join("wheels");
+        fs::create_dir_all(&wheels).unwrap();
+        let own = tiny_wheel(&wheels, "cozy-runtime", "9.0", &[]);
+        let locked = tiny_wheel(&root, "cozy-runtime", "1.0", &[]);
+        let bounded = tiny_wheel(&root, "needs-old", "1.0", &["cozy-runtime<2"]);
+        let open = tiny_wheel(&root, "takes-any", "1.0", &["cozy-runtime"]);
+        let sdk = PackageSdk {
+            uv: PathBuf::from("uv"),
+            python: "3.12".into(),
+            requirements: vec![own.to_string_lossy().into()],
+            ..Default::default()
+        };
+        let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
+        let publisher = Publisher::new(&root.join("published"), sdk, store).unwrap();
+        let lock = format!(
+            "--no-index\n--find-links {}\ncozy-runtime==1.0 --hash=sha256:{}\n",
+            root.display(),
+            sha256::hex_digest(&fs::read(&locked).unwrap())
+        );
+        let environment = |name: &str, package: &Path| {
+            let dir = root.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("constraints.txt"), "").unwrap();
+            let env = dir.join("env");
+            for args in [
+                vec!["venv".to_string(), "-q".into(), "--python".into(), "3.12".into(), env.to_string_lossy().into()],
+                vec!["pip".into(), "install".into(), "-q".into(), "--no-deps".into(), "--python".into(),
+                    env.join("bin/python").to_string_lossy().into(), package.to_string_lossy().into()],
+            ] {
+                assert!(Command::new("uv").args(&args).status().unwrap().success(), "{args:?}");
+            }
+            (dir, env)
+        };
+        let (dir, env) = environment("admits", &open);
+        let py = env.join("bin/python").to_string_lossy().to_string();
+        assert_eq!(publisher.install_sdk(&py, &dir, &lock, "--no-compile-bytecode").unwrap(), "");
+        assert_eq!(installed_sdk(&env), vec![json!({"name": "cozy-runtime", "version": "9.0"})]);
+
+        let (dir, env) = environment("refuses", &bounded);
+        let py = env.join("bin/python").to_string_lossy().to_string();
+        let why = publisher.install_sdk(&py, &dir, &lock, "--no-compile-bytecode").unwrap();
+        assert!(why.contains("uv pip check") && why.contains("needs-old"), "{why}");
+        assert!(why.ends_with("it runs the release's locked cozy-runtime==1.0"), "{why}");
+        assert_eq!(installed_sdk(&env), vec![json!({"name": "cozy-runtime", "version": "1.0"})]);
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn the_newest_release_is_by_version_and_final_before_pre_release() {

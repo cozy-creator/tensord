@@ -223,6 +223,8 @@ pub struct MachinePackage {
     pub installed_at_ms: u64,
     pub sdk: Vec<ImageDistribution>,
     pub entrypoints: Vec<String>,
+    /// Why this environment does not run the machine's own SDK; empty when it does.
+    pub warning: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

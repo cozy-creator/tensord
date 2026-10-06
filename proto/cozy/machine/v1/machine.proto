@@ -340,6 +340,7 @@ message Environment {
   repeated string entrypoints = 4;
   string runtime = 5;       // the cozy-runtime installed in it
   string level = 6;         // what it holds now (as WarmItem.holds), in a warm set or not
+  string warning = 7;       // why it does not run the machine's own Runtime; empty when it does
 }
 message Disk {
   uint64 total_bytes = 1;

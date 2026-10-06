@@ -601,6 +601,14 @@ impl Runs {
         )?;
         let interface: Value = serde_json::from_slice(&installation.interface)
             .map_err(|_| refused("package_interface_invalid", "held interface is corrupt"))?;
+        if let Ok(held) = self.service.catalog.resolve(&installation.generation) {
+            if !held.record.sdk_fallback.is_empty() {
+                let warning = format!("{} {}: {}", installation.package, installation.release, held.record.sdk_fallback);
+                if let Err(error) = self.service.engine.append_log(id, "warning", &warning) {
+                    eprintln!("run {id}: {warning} ({error})");
+                }
+            }
+        }
         let (rows, noun) = match spec.job {
             true => ("jobs", "job"),
             false => ("entrypoints", "entrypoint"),

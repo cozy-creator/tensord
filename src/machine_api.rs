@@ -638,6 +638,7 @@ impl MachineBackend for NativeBackend {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(problem(error)),
             };
+            let warning = held.record.sdk_fallback.clone();
             let sdk = held
                 .record
                 .dependencies
@@ -665,6 +666,7 @@ impl MachineBackend for NativeBackend {
                 origin: "local".into(),
                 sdk,
                 entrypoints,
+                warning,
                 ..Default::default()
             });
         }
