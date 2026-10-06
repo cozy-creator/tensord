@@ -121,7 +121,10 @@ def install_captured(*, project: Path | None, wheels: list[Path], requirements: 
         after = {canonicalize_name(row.name): row.version for row in inventory(interpreter)}
         if any(after.get(canonicalize_name(row.name)) != row.version for row in locked):
             raise PackageError("package_lock_changed", "runner installation changed the captured dependency closure")
-        subprocess.run(["uv", "pip", "check", "--python", str(interpreter)], check=True)
+        check = subprocess.run(["uv", "pip", "check", "--python", str(interpreter)], capture_output=True, text=True)
+        if check.returncode != 0:
+            conflicts = [line.strip() for line in (check.stdout + check.stderr).splitlines() if "requires" in line or "not installed" in line]
+            raise PackageError("package_dependency_conflict", "; ".join(conflicts)[:2000] or f"uv pip check exited {check.returncode}")
         interface = installed_description(metadata.name, interpreter)
         return publish_generation(root, metadata, interface, callees)
     except BaseException:
