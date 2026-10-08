@@ -24,9 +24,12 @@ pub struct Invocation {
     /// File inputs the caller imported, verified at acceptance.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<InputFile>,
-    /// An `@app.job`: it runs in a deviceless executor and calls children through its seam.
+    /// An `@app.job`: it calls managed children through its seam.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub job: bool,
+    /// Actual installed job declaration, retained for scheduling and restart fencing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub accelerator: bool,
     /// A child run's parent (its execution id): children end with it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub parent: String,
@@ -1738,7 +1741,7 @@ impl Journal {
         after: u64,
         limit: usize,
     ) -> io::Result<Vec<(u64, ProcessBirth)>> {
-        let mut statement = self.connection.prepare("SELECT id,json_extract(record,'$.process') FROM executions WHERE id>?1 AND json_extract(record,'$.submission.preparation_id') IS NOT NULL AND json_extract(record,'$.submission.preparation_id')!='' AND json_extract(record,'$.process') IS NOT NULL ORDER BY id LIMIT ?2").map_err(db_error)?;
+        let mut statement = self.connection.prepare("SELECT id,json_extract(record,'$.process') FROM executions WHERE id>?1 AND (json_extract(record,'$.submission.preparation_id')!='' OR json_extract(record,'$.invocation.accelerator')=1) AND json_extract(record,'$.process') IS NOT NULL ORDER BY id LIMIT ?2").map_err(db_error)?;
         let rows = statement
             .query_map(
                 params![

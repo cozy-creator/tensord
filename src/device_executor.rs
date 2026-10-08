@@ -342,7 +342,15 @@ pub enum DeviceCommand {
         /// This owner answers `weights_writer`: the job reads and writes weights through it.
         #[serde(skip_serializing_if = "is_false")]
         weights: bool,
+        /// The actual admitted inline-job allocation; absent fields remain CPU.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        budget: Option<JobBudget>,
     },
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct JobBudget {
+    pub gpu_count: u32,
 }
 
 /// One callable a job may call: here, the package's own invocables (`self`).

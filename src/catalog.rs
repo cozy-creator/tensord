@@ -201,6 +201,15 @@ impl HeldGeneration {
         held.record.source_digest = callee.source_digest.clone();
         Ok(held)
     }
+    pub fn accelerator_job(&self, application: &str, name: &str) -> io::Result<bool> {
+        let (_, _, interface) = self.record.app(application).ok_or_else(|| invalid("this environment holds no such application"))?;
+        let declaration = interface["jobs"].as_array().and_then(|rows| rows.iter().find(|row| row["name"].as_str() == Some(name)));
+        match declaration.and_then(|row| row.get("accelerator")) {
+            None | Some(serde_json::Value::Null) => Ok(false),
+            Some(serde_json::Value::Bool(value)) => Ok(*value),
+            _ => Err(invalid("job accelerator declaration must be boolean")),
+        }
+    }
     pub fn retention(&self) -> Arc<File> {
         self.hold.clone()
     }
