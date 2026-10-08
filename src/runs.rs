@@ -962,6 +962,13 @@ impl Runs {
         let Some(gpu) = self.service.gpu() else {
             return;
         };
+        let family = match crate::gpu_reservation::family(parent, |id| self.service.engine.get(id)) {
+            Ok(family) => family,
+            Err(error) => {
+                eprintln!("prefetch of {entrypoint}: {error}");
+                return;
+            }
+        };
         let actor = parent.submission.as_ref().map(|s| s.actor.clone()).unwrap_or_default();
         let (runs, parent, entrypoint) = (self.clone(), parent.id.clone(), entrypoint.to_string());
         let application = application.to_string();
@@ -981,7 +988,7 @@ impl Runs {
                 Ok((installation, Some(plan))) => {
                     match runs.service.catalog.resolve(&installation.generation)
                         .and_then(|held| held.application(&application)) {
-                        Ok(held) => gpu.prefetch(&runs.service.engine, held, plan),
+                        Ok(held) => gpu.prefetch(&runs.service.engine, held, plan, family.clone()),
                         Err(error) => eprintln!("prefetch of {entrypoint}: {error}"),
                     }
                 }

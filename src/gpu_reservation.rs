@@ -156,6 +156,20 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
+    fn managed_prefetch_borrows_its_parent_family_but_serializes_with_calls() {
+        let slot = Arc::new(Slot::default());
+        let parent = slot.take(Some("accelerator-parent"), false).unwrap();
+        let prefetch = slot.take(Some("accelerator-parent"), true).unwrap();
+        assert!(slot.take(None, true).is_none());
+        assert!(slot.take(Some("another-parent"), true).is_none());
+        assert!(slot.take(Some("accelerator-parent"), true).is_none());
+        drop(prefetch);
+        assert!(slot.take(Some("accelerator-parent"), true).is_some());
+        assert!(slot.take(None, true).is_none());
+        drop(parent);
+        assert!(slot.take(None, true).is_some());
+    }
+    #[test]
     fn ordinary_calls_and_warm_work_remain_exclusive() {
         let slot = Arc::new(Slot::default());
         let call = slot.take(None, true).unwrap();
