@@ -440,12 +440,7 @@ impl Jobs {
             .filter_map(|row| Some((row["output_id"].as_str()?.to_string(), row["max_bytes"].as_u64()?)))
             .collect();
         let actor = record.submission.as_ref().map(|s| s.actor.clone()).unwrap_or_default();
-        let (journal, run) = (engine.clone(), record.id.clone());
-        let current = Arc::new(move || {
-            journal
-                .get(&run)
-                .is_ok_and(|r| r.state == State::Running && r.cancel_actor.is_none() && r.pause_actor.is_none())
-        });
+        let current = weights_current(engine.clone(), record);
         let grant = crate::weights::Grant::new(&actor, &record.id, spool, sources, outputs, destination, current);
         Ok((grant, models))
     }
@@ -1661,9 +1656,52 @@ fn record_call(
     }
 }
 
+/// An execution can return to Running after a pause; its former storage grants cannot.
+fn weights_current(engine: Arc<Engine>, record: &Execution) -> Arc<dyn Fn() -> bool + Send + Sync> {
+    let (run, attempt) = (record.id.clone(), record.attempt);
+    Arc::new(move || {
+        engine.get(&run).is_ok_and(|r| {
+            r.attempt == attempt && r.state == State::Running
+                && r.cancel_actor.is_none() && r.pause_actor.is_none()
+        })
+    })
+}
+
 #[cfg(test)]
 mod exact_tests {
     use super::*;
+
+    #[test]
+    fn resumed_execution_does_not_reactivate_the_old_attempts_storage_grant() {
+        use crate::journal::{Journal, Outcome};
+        use std::process::{Command, Stdio};
+        let root = std::env::temp_dir().join(format!("cm-weights-attempt-{}", uuid::Uuid::new_v4()));
+        let engine = Engine::open(&root).unwrap();
+        let mut journal = Journal::open(&root).unwrap();
+        let id = journal.accept("weights-attempt", crate::journal::Invocation::default()).unwrap().id;
+        let mut child = Command::new("/bin/cat").stdin(Stdio::piped()).stdout(Stdio::null()).spawn().unwrap();
+        let mut previous = None;
+        for ordinal in 1..=2 {
+            assert!(journal.claim(&id).unwrap());
+            journal.register_process(&id, crate::execution::process_birth(child.id()).unwrap()).unwrap();
+            let running = journal.running(&id, None).unwrap();
+            assert_eq!(running.attempt, ordinal);
+            if let Some(old) = previous.as_ref() {
+                let old: &Arc<dyn Fn() -> bool + Send + Sync> = old;
+                assert!(!old(), "old attempt regained source/output authority");
+            }
+            let current = weights_current(engine.clone(), &running);
+            assert!(current());
+            journal.pause(&id, "owner", false).unwrap();
+            assert!(!current());
+            journal.finish(&id, Outcome::Paused).unwrap();
+            journal.resume(&id).unwrap();
+            previous = Some(current);
+        }
+        child.kill().unwrap(); child.wait().unwrap();
+        drop(journal); drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     /// A callee's memoized function is keyed by its package and the identity this machine read
     /// from its installed source: a new release that leaves it unchanged keeps its memos, one
