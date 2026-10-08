@@ -1,13 +1,17 @@
 # Cozy machine
 
-The Rust machine: API, execution journal, scheduler, memory policy, the linked TensorFS store
-(sole writer) and executor supervision. Python cozy-runtime executors run package code. It is
-meant to replace the Go agent and Python worker; it is not yet a complete replacement and is not
-installed as anyone's machine.
+TensorD (`cozy-machine`) is the Rust daemon that owns the machine API, execution journal,
+scheduling, memory policy and executor supervision. It uses embedded TensorFS to make stored
+model bytes available to Runtime and to fill, retain and release shared CPU weight buffers.
+Python cozy-runtime executors run package code, construct models and use their own TensorFS
+weight plane for GPU transfers and mappings. TensorFS is a library on both sides, with no
+separate daemon.
 
 - Architecture and module owners: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - Links TensorFS by git revision (`Cargo.toml`); a release pins a TensorFS tag.
-- Linux 6.5+ (`SO_PEERPIDFD`). The machine process never loads CUDA or NVML.
+- Linux 6.5+ (`SO_PEERPIDFD`). TensorD has no CUDA context. It can retain GPU allocation
+  handles exported by executors; Runtime performs the device operations. The CPU service
+  does not load NVML; a configured GPU pool samples it on its GPU sampler threads.
 
 ## Build and test
 
