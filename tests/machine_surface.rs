@@ -952,6 +952,153 @@ mod v1_api {
         (origin, held)
     }
 
+    /// Actual installed CPU jobs retain paused work and relinquish only explicitly canceled
+    /// unfinished or unadopted output custody, including across a daemon restart.
+    #[tokio::test]
+    async fn explicit_cancel_releases_unowned_native_outputs_and_preserves_adopted_custody() {
+        use tensorfs_core::{derived, meta::Meta, store::Store};
+        for phase in ["checkpoint", "commit", "adopt"] {
+            let (mut machine, tools) = installing_machine().await;
+            let mut peer = client(&machine).await;
+            let all = cap(Grant {
+                action: MACHINE.into(),
+                ..Default::default()
+            });
+            let manifest = write_package(
+                &mut peer,
+                &all,
+                "cpu_weights",
+                "local/cozy-machine-cpu-weights",
+            )
+            .await;
+            let mut stream = peer
+                .run(authorized(
+                    v1::RunRequest {
+                        id: "native-cancel".into(),
+                        after: 0,
+                        spec: Some(v1::RunSpec {
+                            kind: v1::RunKind::Job as i32,
+                            source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
+                            entrypoint: "table".into(),
+                            payload: serde_json::to_vec(
+                                &serde_json::json!({"size":64,"hold":phase}),
+                            )
+                            .unwrap(),
+                            owner: "alice".into(),
+                            ..Default::default()
+                        }),
+                    },
+                    &all,
+                ))
+                .await
+                .unwrap()
+                .into_inner();
+            loop {
+                let event = stream
+                    .message()
+                    .await
+                    .unwrap()
+                    .expect("job ended before native phase");
+                if matches!(event.event,Some(v1::run_event::Event::Progress(ref p)) if p.stage==format!("native {phase}"))
+                {
+                    break;
+                }
+                if let Some(v1::run_event::Event::Outcome(done)) = event.event {
+                    panic!("job ended before native {phase}: {done:?}");
+                }
+            }
+            let journal_root = machine.root.join("state/execution");
+            let mut journal = Journal::open(&journal_root).unwrap();
+            let record = journal.get_public(&actor(), "native-cancel").unwrap();
+            let bindings = journal.derived_outputs(&record.id).unwrap();
+            assert_eq!(bindings.len(), 1);
+            let transaction = bindings[0].transaction.clone();
+            let control = |action: v1::Action| {
+                authorized(
+                    v1::ControlRequest {
+                        id: "native-cancel".into(),
+                        action: action as i32,
+                    },
+                    &all,
+                )
+            };
+            if phase == "checkpoint" {
+                // Pause and observer disconnect preserve progress. The explicit cancel is
+                // durable while the daemon is down; startup must finish its native cleanup.
+                peer.control(control(v1::Action::Pause)).await.unwrap();
+                until(&mut peer, &all, "native-cancel", "paused").await;
+                drop(stream);
+                machine.stop();
+                let store = Store::open(&machine.store()).unwrap();
+                let meta = Meta::open(&store).unwrap();
+                assert!(matches!(
+                    derived::lookup(&store, &meta, &transaction).unwrap(),
+                    derived::Lookup::Open { .. }
+                ));
+                assert!(journal.canceled_derived_outputs().unwrap().is_empty());
+                journal.cancel(&record.id, &actor()).unwrap();
+                drop(meta);
+                drop(store);
+                drop(journal);
+                let (child, address) = launch(&machine.root, &installing_args(&tools));
+                machine.child = child;
+                machine.address = address;
+                peer = client(&machine).await;
+                until(&mut peer, &all, "native-cancel", "canceled").await;
+            } else {
+                peer.control(control(v1::Action::Cancel)).await.unwrap();
+                let ended = collect(stream).await.unwrap();
+                assert_eq!(outcome(&ended).status, "canceled", "{ended:?}");
+                drop(journal);
+            }
+            machine.stop();
+            let journal = Journal::open(&journal_root).unwrap();
+            assert!(journal.derived_outputs(&record.id).unwrap().is_empty());
+            let store = Store::open(&machine.store()).unwrap();
+            let meta = Meta::open(&store).unwrap();
+            let observed = derived::lookup(&store, &meta, &transaction).unwrap();
+            match (&observed, phase) {
+                (derived::Lookup::Abandoned, "checkpoint") => (),
+                (derived::Lookup::Committed(result), kind) => {
+                    let facts = result.disposition_value();
+                    let mut fields =
+                        tensorfs_core::canon::Fields::new("disposition", &facts).unwrap();
+                    assert_eq!(
+                        fields.req_str("kind").unwrap(),
+                        if kind == "adopt" {
+                            "adopted"
+                        } else {
+                            "released"
+                        }
+                    );
+                }
+                _ => panic!("{phase}: {observed:?}"),
+            }
+            tensorfs_core::gc::collect(store.root(), false).unwrap();
+            if let derived::Lookup::Committed(result) = observed {
+                assert_eq!(
+                    store.read_manifest(&result.receipt().manifest).is_ok(),
+                    phase == "adopt"
+                );
+                assert_eq!(
+                    derived::inspect_source(
+                        &store,
+                        &meta,
+                        result.receipt().manifest.clone(),
+                        vec!["model".into()],
+                        vec![]
+                    )
+                    .is_ok(),
+                    phase == "adopt"
+                );
+            }
+            drop(meta);
+            drop(store);
+            drop(journal);
+            drop(machine);
+            fs::remove_dir_all(tools).unwrap();
+        }
+    }
     /// `cozy model quantize`'s shape on CPU: a job writes its declared weights output through
     /// the machine's native writer channel and adopts it; the output is a product of its log
     /// (the manifest). A warm run keeps that held checkpoint under a local alias, and another

@@ -179,6 +179,9 @@ impl Jobs {
         });
         // The startup sweep ran before jobs were configured: ended runs' scratch goes now.
         jobs.sweep_scratch(&service.engine);
+        if let Err(error) = jobs.sweep_canceled_outputs(&service.engine) {
+            eprintln!("startup canceled native outputs: {error}");
+        }
         let (watching, engine) = (Arc::downgrade(&jobs), service.engine.clone());
         std::thread::Builder::new()
             .name("job-nudges".into())
@@ -441,7 +444,12 @@ impl Jobs {
             .collect();
         let actor = record.submission.as_ref().map(|s| s.actor.clone()).unwrap_or_default();
         let current = weights_current(engine.clone(), record);
-        let grant = crate::weights::Grant::new(&actor, &record.id, spool, sources, outputs, destination, current);
+        let (journal, run, attempt) = (engine.clone(), record.id.clone(), record.attempt);
+        let bind_output = Arc::new(move |transaction: &str, slot: &str| {
+            journal.with_journal(|journal| journal.bind_derived_output(&run, attempt, transaction, slot))
+        });
+        let grant = crate::weights::Grant::new(&actor, &record.id, spool, sources, outputs, destination,
+            crate::weights::GrantAuthority { current, bind_output });
         Ok((grant, models))
     }
 
@@ -583,6 +591,32 @@ impl Jobs {
         }
     }
 
+    /// Retry native cancellation cleanup from the existing durable execution associations.
+    pub fn sweep_canceled_outputs(&self, engine: &Engine) -> io::Result<usize> {
+        let bindings = engine.with_journal(|journal| journal.canceled_derived_outputs())?;
+        let mut released = 0;
+        let mut failure = None;
+        for binding in bindings {
+            let result = self
+                .weights
+                .cancel_output(&binding.transaction)
+                .and_then(|()| {
+                    engine.with_journal(|journal| journal.release_derived_output_binding(&binding))
+                });
+            match result {
+                Ok(()) => released += 1,
+                Err(error) => {
+                    failure.get_or_insert_with(|| {
+                        io::Error::other(format!(
+                            "run {} output {}: {error}",
+                            binding.execution, binding.slot
+                        ))
+                    });
+                }
+            }
+        }
+        failure.map_or(Ok(released), Err)
+    }
     /// Scratch of runs that have ended (or are unknown); a paused run keeps its own.
     pub fn sweep_scratch(&self, engine: &Engine) -> usize {
         let Ok(entries) = fs::read_dir(self.root.join("scratch")) else {
@@ -653,6 +687,9 @@ impl Jobs {
             return;
         };
         let record = service.engine.get(id).ok();
+        if let Err(error) = self.sweep_canceled_outputs(&service.engine) {
+            eprintln!("canceled native outputs: {error}");
+        }
         if record.as_ref().is_some_and(|r| r.state == State::Queued) {
             return;
         }
@@ -696,8 +733,13 @@ impl Jobs {
 
     /// A cancel reached a job with no root running (paused or queued): its children end too.
     pub fn canceled(&self, record: &Execution) {
-        if record.invocation.job && record.state.terminal() {
-            self.ended(&record.id);
+        if record.invocation.job && record.cancel_actor.is_some() {
+            if let Some(service) = self.service.upgrade() {
+                if let Err(error) = self.sweep_canceled_outputs(&service.engine) {
+                    eprintln!("canceled native outputs: {error}");
+                }
+            }
+            if record.state.terminal() { self.ended(&record.id); }
         }
     }
 
@@ -1675,15 +1717,25 @@ mod exact_tests {
     fn resumed_execution_does_not_reactivate_the_old_attempts_storage_grant() {
         use crate::journal::{Journal, Outcome};
         use std::process::{Command, Stdio};
-        let root = std::env::temp_dir().join(format!("cm-weights-attempt-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("cm-weights-attempt-{}", uuid::Uuid::new_v4()));
         let engine = Engine::open(&root).unwrap();
         let mut journal = Journal::open(&root).unwrap();
-        let id = journal.accept("weights-attempt", crate::journal::Invocation::default()).unwrap().id;
-        let mut child = Command::new("/bin/cat").stdin(Stdio::piped()).stdout(Stdio::null()).spawn().unwrap();
+        let id = journal
+            .accept("weights-attempt", crate::journal::Invocation::default())
+            .unwrap()
+            .id;
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
         let mut previous = None;
         for ordinal in 1..=2 {
             assert!(journal.claim(&id).unwrap());
-            journal.register_process(&id, crate::execution::process_birth(child.id()).unwrap()).unwrap();
+            journal
+                .register_process(&id, crate::execution::process_birth(child.id()).unwrap())
+                .unwrap();
             let running = journal.running(&id, None).unwrap();
             assert_eq!(running.attempt, ordinal);
             if let Some(old) = previous.as_ref() {
@@ -1698,11 +1750,12 @@ mod exact_tests {
             journal.resume(&id).unwrap();
             previous = Some(current);
         }
-        child.kill().unwrap(); child.wait().unwrap();
-        drop(journal); drop(engine);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        drop(journal);
+        drop(engine);
         std::fs::remove_dir_all(root).unwrap();
     }
-
     /// A callee's memoized function is keyed by its package and the identity this machine read
     /// from its installed source: a new release that leaves it unchanged keeps its memos, one
     /// that changes it does not. Without an identity, and always for the root's own functions

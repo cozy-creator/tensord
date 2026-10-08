@@ -142,6 +142,20 @@ native facts; additional peer observations do not change authority. Independent 
 retain their own roots, so releasing one consumer cannot make another's data collectible.
 See [tracker #341](https://github.com/cozy-creator/tracker/issues/341).
 
+Before native begin, the existing execution journal records only the run, output slot and
+transaction association, atomically with current-attempt admission. Explicit cancellation
+uses that association to fence and abandon unfinished work, or dispose a committed result
+that still has only pending custody. Acknowledged native adoption and independent consumer
+roots survive. Cleanup is idempotent and retried at startup/reclamation; pause, observer
+disconnect and ordinary failure do not authorize abandonment. Older unbound transactions
+are never guessed to belong to a canceled run.
+
+TensorFS allocates writer epochs from its durable transaction fence through
+`channel::Writer::begin_next`. Reopening after a restart or an old clock-derived high epoch
+creates a new writer attempt of the same transaction; stale channel closure cannot fence
+its replacement. Payload writes and publication remain concurrent; only local custody
+metadata transitions are coordinated with cancellation.
+
 - [Durable execution](DURABLE-EXECUTION.md): journal states, acceptance, cancellation, custody.
 - [Recovery](RECOVERY.md): executor and daemon lifetimes, update publication and rollback.
 - [Front door](FRONT-DOOR.md): the listener, TLS identity, install.

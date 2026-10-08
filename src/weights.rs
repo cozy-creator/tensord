@@ -30,6 +30,14 @@ pub const MANIFEST_MEDIA: &str = "application/vnd.cozy.model-manifest";
 /// Executor-written exchange files stay this small (TensorFS bounds its own documents).
 const EXCHANGE_MAX: u64 = 64 << 20;
 
+type BindOutput = Arc<dyn Fn(&str, &str) -> io::Result<()> + Send + Sync>;
+
+/// Execution-owner hooks: current attempt authority and durable output association.
+pub struct GrantAuthority {
+    pub current: Arc<dyn Fn() -> bool + Send + Sync>,
+    pub bind_output: BindOutput,
+}
+
 /// Where a job's outputs are published: the repository, its Hub and the run's
 /// machine-publication authorization.
 #[derive(Clone)]
@@ -51,6 +59,8 @@ pub struct Grant {
     pub destination: Option<Destination>,
     /// Refuses once the attempt is no longer current (canceled, paused, ended).
     pub current: Arc<dyn Fn() -> bool + Send + Sync>,
+    /// Persist the run/output association before any native transaction can begin.
+    bind_output: BindOutput,
     opened: Mutex<BTreeMap<String, String>>,
     /// Publications attempted and not yet in the run's log.
     uploads: Mutex<Vec<Upload>>,
@@ -74,8 +84,12 @@ impl Grant {
         sources: BTreeMap<String, u64>,
         outputs: BTreeMap<String, u64>,
         destination: Option<Destination>,
-        current: Arc<dyn Fn() -> bool + Send + Sync>,
+        authority: GrantAuthority,
     ) -> Self {
+        let GrantAuthority {
+            current,
+            bind_output,
+        } = authority;
         Self {
             actor: actor.into(),
             run: run.into(),
@@ -84,6 +98,7 @@ impl Grant {
             outputs,
             destination,
             current,
+            bind_output,
             opened: Mutex::new(BTreeMap::new()),
             uploads: Mutex::new(Vec::new()),
         }
@@ -104,6 +119,8 @@ pub struct Adopted {
 pub struct Weights {
     store: Arc<Store>,
     meta: Arc<Meta>,
+    /// Local custody transitions only. Native payload IO and publication never hold this.
+    custody: Mutex<()>,
 }
 
 type Refusal = (&'static str, String);
@@ -114,6 +131,7 @@ impl Weights {
         Ok(Self {
             store,
             meta: Arc::new(meta),
+            custody: Mutex::new(()),
         })
     }
 
@@ -194,6 +212,7 @@ impl Weights {
         let identity = format!("{}\0{}\0{slot}\0{work}", grant.actor, grant.run);
         let transaction = format!("sha256:{}", sha256::hex_digest(identity.as_bytes()));
         declaration.work_fingerprint = Some(format!("sha256:{work}"));
+        (grant.bind_output)(&transaction, slot).map_err(io_refusal)?;
         grant
             .opened
             .lock()
@@ -210,15 +229,8 @@ impl Weights {
         let writer = match committed {
             Some(_) => None,
             None => Some(
-                channel::Writer::begin(
-                    &store,
-                    meta.clone(),
-                    &transaction,
-                    session(),
-                    declaration,
-                    None,
-                )
-                .map_err(tfs)?,
+                channel::Writer::begin_next(&store, meta.clone(), &transaction, declaration, None)
+                    .map_err(tfs)?,
             ),
         };
         std::thread::Builder::new()
@@ -263,9 +275,10 @@ impl Weights {
             ));
         }
         let relayed = exchange(&grant.spool, slot, "native-receipt", frame.length)?;
+        let custody = self.custody.lock().unwrap();
         let receipt =
             match derived::lookup(&self.store, &self.meta, &frame.transaction).map_err(tfs)? {
-            derived::Lookup::Committed(result) => self.retained_receipt(&result)?,
+                derived::Lookup::Committed(result) => self.retained_receipt(&result)?,
                 _ => {
                     return Err((
                         "weights_receipt_mismatch",
@@ -286,7 +299,7 @@ impl Weights {
             "output-{}",
             &sha256::hex_digest(format!("{}\0{}\0{slot}", grant.actor, grant.run).as_bytes())[..40]
         );
-        let repo = RepositoryName::new("local", name).map_err(tfs)?;
+        let repo = RepositoryName::new("local", &name).map_err(tfs)?;
         let current = std::fs::read(self.store.repository_path(&repo)).ok();
         let mutation = Mutation::ReplaceLocal {
             repo,
@@ -297,6 +310,22 @@ impl Weights {
         self.store
             .apply_repository(current.as_deref(), &mutation, &Fault::default())
             .map_err(tfs)?;
+        // This local repository is durable result custody even if its acknowledgment or
+        // subsequent publication is lost. Do not replace another consumer's private root.
+        if let derived::Lookup::Committed(result) =
+            derived::lookup(&self.store, &self.meta, &frame.transaction).map_err(tfs)?
+        {
+            let disposition = result.disposition_value();
+            if Fields::new("derived disposition", &disposition)
+                .map_err(tfs)?
+                .req_str("kind")
+                .map_err(tfs)?
+                == "pending"
+            {
+                derived::adopt(&self.store, &self.meta, &frame.transaction, &name).map_err(tfs)?;
+            }
+        }
+        drop(custody);
         if let Some(destination) = &grant.destination {
             current_or_refuse(&*grant.current).map_err(tfs)?;
             let called_ms = crate::machine::lifecycle::now_ms();
@@ -312,6 +341,7 @@ impl Weights {
             published?;
         }
         let mut answer = Answer::ok(frame.seq);
+        current_or_refuse(&*grant.current).map_err(tfs)?;
         answer.request_id = grant.run.clone();
         answer.manifest = receipt.manifest.id();
         answer.manifest_length = receipt.manifest.length;
@@ -323,6 +353,44 @@ impl Weights {
                 manifest: receipt.manifest,
             },
         ))
+    }
+
+    /// Explicit run cancellation relinquishes only its unfinished/pending native claim.
+    /// A committed adopted result and independent consumer roots survive.
+    pub fn cancel_output(&self, transaction: &str) -> io::Result<()> {
+        let _custody = self.custody.lock().unwrap();
+        if let derived::Lookup::Open {
+            writer_session: Some(session),
+        } = derived::lookup(&self.store, &self.meta, transaction).map_err(io::Error::other)?
+        {
+            derived::fence(&self.meta, transaction, session).map_err(io::Error::other)?;
+        }
+        let committed =
+            derived::abandon(&self.store, &self.meta, transaction).map_err(io::Error::other)?;
+        if committed.is_some() {
+            if let derived::Lookup::Committed(result) =
+                derived::lookup(&self.store, &self.meta, transaction).map_err(io::Error::other)?
+            {
+                let disposition = result.disposition_value();
+                let kind = Fields::new("derived disposition", &disposition)
+                    .and_then(|mut fields| fields.req_str("kind"))
+                    .map_err(io::Error::other)?;
+                match kind {
+                    "pending" => {
+                        derived::dispose(&self.store, &self.meta, transaction)
+                            .map_err(io::Error::other)?;
+                    }
+                    "adopted" | "released" => (),
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "unknown derived result disposition",
+                        ))
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Receipt metadata outlives its payload custody. Replay and adoption require both.
@@ -463,13 +531,6 @@ fn reference(id: &str, length: u64) -> Result<ObjectRef, Refusal> {
         sha256: sha.into(),
         length,
     })
-}
-
-/// A writer session: positive, increasing across a restart's reopen of the same transaction.
-fn session() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(1, |since| since.as_millis() as u64)
 }
 
 fn current_or_refuse(current: &(dyn Fn() -> bool + Send + Sync)) -> tensorfs_core::err::Result<()> {

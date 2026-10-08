@@ -33,7 +33,10 @@ impl Fixture {
             BTreeMap::new(),
             [("model".into(), 8)].into(),
             None,
-            Arc::new(move || state.load(Ordering::SeqCst)),
+            GrantAuthority {
+                current: Arc::new(move || state.load(Ordering::SeqCst)),
+                bind_output: Arc::new(|_, _| Ok(())),
+            },
         );
         let plain = tensorfs_core::registry::seeds()
             .into_iter()
@@ -369,4 +372,122 @@ fn owner_process_death_preserves_the_native_transaction() {
     drop(writer);
     assert_eq!(facts["transaction_id"], transaction);
     assert!(f.adopt(&transaction, &facts).is_ok());
+}
+
+#[test]
+fn durable_writer_epoch_survives_clock_rollback_and_a_stale_channel_close() {
+    let f = Fixture::new();
+    let raw = std::fs::read(f.root.join("weights-model-derivation.canonical")).unwrap();
+    let mut declaration = channel::declaration_from_arguments(&raw).unwrap();
+    let work = sha256::hex_digest(&raw);
+    let identity = format!("{}\0{}\0model\0{work}", f.grant.actor, f.grant.run);
+    let transaction = format!("sha256:{}", sha256::hex_digest(identity.as_bytes()));
+    declaration.work_fingerprint = Some(format!("sha256:{work}"));
+    // A valid durable epoch above the current wall clock, as after clock rollback.
+    let previous_epoch = (1u64 << 52) + 17;
+    let begun = derived::begin(
+        &f.owner.store,
+        &f.owner.meta,
+        &transaction,
+        previous_epoch,
+        declaration,
+        None,
+    )
+    .unwrap();
+    derived::add_part(
+        &f.owner.store,
+        &f.owner.meta,
+        &transaction,
+        previous_epoch,
+        ("model", "weight", "value"),
+        &mut &[1u8; 8][..],
+    )
+    .unwrap();
+    derived::fence(&f.owner.meta, &transaction, previous_epoch).unwrap();
+    begun.writer_hold.release(&f.owner.meta).unwrap();
+    assert!(begun.source_leases.is_empty());
+    let (first, mut stale) = f.open();
+    assert_eq!(first, transaction);
+    let (second, mut replacement) = f.open();
+    assert_eq!(second, transaction);
+    stale.send(json!({"op":"completed_parts"}));
+    assert_eq!(stale.read()["error"], "WRITER_FENCED");
+    drop(stale);
+    assert_eq!(
+        replacement.ask(json!({"op":"completed_parts"})),
+        json!([["model", "weight", "value"]])
+    );
+    let facts = replacement.ask(json!({"op":"commit"}));
+    drop(replacement);
+    assert_eq!(facts["transaction_id"], transaction);
+}
+
+#[test]
+fn cancel_between_durable_binding_and_native_begin_cannot_resurrect_the_transaction() {
+    use crate::{
+        execution::{process_birth, Engine},
+        journal::{Invocation, Journal},
+    };
+    use std::process::{Command, Stdio};
+    let mut f = Fixture::new();
+    let journal_root = f.root.join("execution");
+    let engine = Engine::open(&journal_root).unwrap();
+    let record = engine
+        .submit(
+            "before-begin",
+            Invocation {
+                job: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut child = Command::new("/bin/cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let running = engine
+        .with_journal(|journal| {
+            assert!(journal.claim(&record.id)?);
+            journal.register_process(&record.id, process_birth(child.id())?)?;
+            journal.running(&record.id, None)
+        })
+        .unwrap();
+    let (journal, run, attempt) = (engine.clone(), running.id.clone(), running.attempt);
+    let cleanup = Weights::new(f.owner.store.clone()).unwrap();
+    f.grant.bind_output = Arc::new(move |transaction, slot| {
+        journal.with_journal(|j| j.bind_derived_output(&run, attempt, transaction, slot))?;
+        // Schedule the explicit cancellation at the crash window before native begin.
+        journal.cancel(&run, "owner")?;
+        cleanup.cancel_output(transaction)?;
+        Ok(())
+    });
+    let refused = f.owner.output(&f.grant, &f.output).unwrap_err();
+    assert!(refused.1.contains("TRANSACTION_CLOSED"), "{refused:?}");
+    let bindings = engine
+        .with_journal(|j| j.canceled_derived_outputs())
+        .unwrap();
+    assert_eq!(bindings.len(), 1);
+    assert!(matches!(
+        derived::lookup(&f.owner.store, &f.owner.meta, &bindings[0].transaction).unwrap(),
+        derived::Lookup::Abandoned
+    ));
+    assert!(engine
+        .with_journal(|j| j.bind_derived_output(
+            &running.id,
+            running.attempt,
+            &bindings[0].transaction,
+            "model"
+        ))
+        .is_err());
+    // Crash after native cleanup but before acknowledgment: the original journal mapping
+    // survives reopening and permits an idempotent cleanup retry, not a new workflow.
+    let journal = Journal::open(&journal_root).unwrap();
+    let replay = journal.canceled_derived_outputs().unwrap();
+    assert_eq!(replay[0].transaction, bindings[0].transaction);
+    f.owner.cancel_output(&replay[0].transaction).unwrap();
+    journal.release_derived_output_binding(&replay[0]).unwrap();
+    assert!(journal.canceled_derived_outputs().unwrap().is_empty());
+    child.kill().unwrap();
+    child.wait().unwrap();
 }

@@ -255,6 +255,14 @@ pub struct StoredProduct {
     pub product: Vec<u8>,
 }
 
+/// Ownership association only; TensorFS remains the transaction/progress/custody journal.
+#[derive(Clone, Debug)]
+pub struct DerivedOutputBinding {
+    pub execution: String,
+    pub transaction: String,
+    pub slot: String,
+}
+
 /// Coalesced observation; persisted only as part of an authoritative transition.
 #[derive(Clone, Debug)]
 pub struct ProgressSnapshot {
@@ -376,6 +384,8 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS held_memo_objects(actor TEXT NOT NULL,computation TEXT NOT NULL,sha256 TEXT NOT NULL,PRIMARY KEY(actor,computation,sha256));
             CREATE INDEX IF NOT EXISTS held_memo_objects_digest ON held_memo_objects(sha256);
             CREATE TABLE IF NOT EXISTS checkpoints(execution INTEGER NOT NULL REFERENCES executions(id),operation_key TEXT NOT NULL,logical_key TEXT NOT NULL,content_digest TEXT NOT NULL,length INTEGER NOT NULL,attempt INTEGER NOT NULL,receipt TEXT NOT NULL,at_ms INTEGER NOT NULL,PRIMARY KEY(execution,operation_key,logical_key));
+            CREATE TABLE IF NOT EXISTS derived_output_bindings(transaction_id TEXT PRIMARY KEY,execution INTEGER NOT NULL REFERENCES executions(id),slot TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS derived_output_execution ON derived_output_bindings(execution);
             CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_request ON executions(actor,request_id) WHERE actor IS NOT NULL;
             CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_submission ON executions(actor,submission_id) WHERE actor IS NOT NULL;
             CREATE INDEX IF NOT EXISTS executions_actor_order ON executions(actor,id) WHERE actor IS NOT NULL; COMMIT;").map_err(db_error)?;
@@ -1601,6 +1611,83 @@ impl Journal {
             .map(readable)
     }
 
+    /// Record ownership before native begin, serialized with cancellation/attempt changes.
+    pub fn bind_derived_output(
+        &mut self,
+        execution: &str,
+        attempt: u32,
+        transaction: &str,
+        slot: &str,
+    ) -> io::Result<()> {
+        tensorfs_core::ids::prefixed("derived transaction", transaction).map_err(db_error)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        let raw: String = tx
+            .query_row(
+                "SELECT record FROM executions WHERE id=?1",
+                [execution],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        let record: Execution = serde_json::from_str(&raw).map_err(db_error)?;
+        if record.state != State::Running
+            || record.attempt != attempt
+            || record.cancel_actor.is_some()
+            || record.pause_actor.is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "native output attempt is no longer current",
+            ));
+        }
+        let previous:Option<(String,String)> = tx.query_row("SELECT CAST(execution AS TEXT),slot FROM derived_output_bindings WHERE transaction_id=?1",[transaction],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(db_error)?;
+        if previous
+            .as_ref()
+            .is_some_and(|(run, output)| run != execution || output != slot)
+        {
+            return Err(db_error(
+                "native output belongs to another execution or slot",
+            ));
+        }
+        tx.execute("INSERT OR IGNORE INTO derived_output_bindings(transaction_id,execution,slot) VALUES(?1,?2,?3)",params![transaction,execution,slot]).map_err(db_error)?;
+        tx.commit().map_err(db_error)
+    }
+
+    /// Explicitly canceled runs retain bindings until native cleanup has completed.
+    pub fn canceled_derived_outputs(&self) -> io::Result<Vec<DerivedOutputBinding>> {
+        let mut statement = self.connection.prepare("SELECT CAST(b.execution AS TEXT),b.transaction_id,b.slot FROM derived_output_bindings b JOIN executions e ON e.id=b.execution WHERE json_extract(e.record,'$.cancel_actor') IS NOT NULL ORDER BY b.execution,b.transaction_id").map_err(db_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(DerivedOutputBinding {
+                    execution: row.get(0)?,
+                    transaction: row.get(1)?,
+                    slot: row.get(2)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.map(|row| row.map_err(db_error)).collect()
+    }
+
+    pub fn derived_outputs(&self, execution: &str) -> io::Result<Vec<DerivedOutputBinding>> {
+        let mut statement=self.connection.prepare("SELECT CAST(execution AS TEXT),transaction_id,slot FROM derived_output_bindings WHERE execution=?1 ORDER BY transaction_id").map_err(db_error)?;
+        let rows = statement
+            .query_map([execution], |row| {
+                Ok(DerivedOutputBinding {
+                    execution: row.get(0)?,
+                    transaction: row.get(1)?,
+                    slot: row.get(2)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.map(|row| row.map_err(db_error)).collect()
+    }
+
+    pub fn release_derived_output_binding(&self, binding: &DerivedOutputBinding) -> io::Result<()> {
+        self.connection.execute("DELETE FROM derived_output_bindings WHERE execution=?1 AND transaction_id=?2 AND slot=?3",params![binding.execution,binding.transaction,binding.slot]).map_err(db_error)?;
+        Ok(())
+    }
     /// Every run not completed, failed or canceled: paused and unknown states too. A row
     /// that does not decode is an error here, where a missed run is a model evicted.
     pub fn unfinished(&self) -> io::Result<Vec<Execution>> {
