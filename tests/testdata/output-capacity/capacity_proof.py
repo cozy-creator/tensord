@@ -17,6 +17,10 @@ class Result(msgspec.Struct):
     trace: Annotated[Tree, AssetBound(max_bytes=CAPACITY)]
 
 
+class NestedResult(msgspec.Struct):
+    artifact: Result
+
+
 def retained(ctx: Context, out: Outputs) -> Result:
     if ctx.device.kind != "cpu":
         raise RuntimeError("this fixture must run on CPU")
@@ -43,5 +47,5 @@ def job(ctx: Context, out: Outputs) -> Result:
 
 
 @app.entrypoint
-def serve(ctx: Context, out: Outputs) -> Result:
-    return retained(ctx, out)
+def serve(ctx: Context, out: Outputs) -> NestedResult:
+    return NestedResult(retained(ctx, out))
