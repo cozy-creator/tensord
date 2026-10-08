@@ -138,6 +138,7 @@ fn invoke(
     executor
         .command(
             &DeviceCommand::Invoke {
+                max_output_bytes: cozy_machine::output_capacity::DEFAULT_BYTES,
                 request_id: id.into(),
                 construction: "classifier".into(),
                 entrypoint: "classify".into(),
@@ -280,6 +281,7 @@ fn stock_executor_deferred_webp_reuses_sdk_encoder_and_exact_asset_binding() {
     let reply = executor
         .command(
             &DeviceCommand::Invoke {
+                max_output_bytes: cozy_machine::output_capacity::DEFAULT_BYTES,
                 request_id: "image".into(),
                 construction: "classifier".into(),
                 entrypoint: "render".into(),

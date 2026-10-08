@@ -1494,6 +1494,7 @@ print(json.dumps({"identity": generation.identity}))
                     let spool = engine.staging(&id)?;
                     let reply = executor.command(
                         &DeviceCommand::Invoke {
+                            max_output_bytes: crate::output_capacity::DEFAULT_BYTES,
                             request_id: id.clone(),
                             construction: "fixture".into(),
                             entrypoint: entrypoint.into(),

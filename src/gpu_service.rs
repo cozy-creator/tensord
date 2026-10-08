@@ -2690,6 +2690,9 @@ impl GpuPool {
         session.invoked = true;
         let reply = session.executor.command_with(
             &DeviceCommand::Invoke {
+                max_output_bytes: crate::output_capacity::for_callable(
+                    held.record.app(&record.invocation.module).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "installed output App is absent"))?.2,
+                    "entrypoints", &plan.entrypoint)?,
                 request_id: id.into(),
                 construction: plan.id.clone(),
                 entrypoint: plan.entrypoint,

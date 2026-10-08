@@ -160,6 +160,7 @@ fn a_forked_executor_is_sealed_serves_and_is_reaped_with_its_status() {
         let reply = child
             .command(
                 &DeviceCommand::Invoke {
+                    max_output_bytes: cozy_machine::output_capacity::DEFAULT_BYTES,
                     request_id: "forked".into(),
                     construction: "lifecycle".into(),
                     entrypoint: "steps".into(),
