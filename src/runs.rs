@@ -47,7 +47,7 @@ pub struct Spec {
     pub warm: bool,
     /// A warm run's whole warm set for its caller, replacing the previous one.
     pub set: Option<Vec<SetItem>>,
-    /// `kind: job`: `entrypoint` names an `@app.job`, run in a deviceless executor.
+    /// `kind: job`: `entrypoint` names an `@app.job`; its installed declaration selects its device.
     pub job: bool,
     /// A child run's parent execution (a job's call through its seam).
     pub parent: String,

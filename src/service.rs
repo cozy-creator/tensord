@@ -281,6 +281,10 @@ impl Service {
         invocation.attention_kernel = call.attention_kernel;
         invocation.inputs = call.inputs;
         invocation.job = call.job;
+        invocation.accelerator = call.job && held.accelerator_job(&invocation.module, &invocation.entrypoint)?;
+        if invocation.accelerator && self.gpu().is_none() {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "accelerator_job_unavailable: this job requires a configured GPU"));
+        }
         invocation.parent = call.parent;
         let record = self.engine.bind_prepared(id, invocation, preparation)?;
         self.retain(&record, held.retention());
@@ -419,7 +423,7 @@ impl Service {
         // pretend they are free merely because it has no local supervisor.
         let active = self.engine.active(usize::MAX)?;
         let is_gpu = |record: &Execution| {
-            record
+            record.invocation.accelerator || record
                 .submission
                 .as_ref()
                 .is_some_and(|s| !s.preparation_id.is_empty())
@@ -474,7 +478,12 @@ impl Service {
                         continue;
                     };
                     if record.invocation.job {
-                        jobs.dispatch(&self.engine, &record, held)?;
+                        if record.invocation.accelerator && gpu_active && !self.gpu().is_some_and(|gpu| gpu.joins_family(&self.engine, &record).unwrap_or(false)) {
+                            continue;
+                        }
+                        if jobs.dispatch(&self.engine, &record, held)? && record.invocation.accelerator {
+                            gpu_active = true;
+                        }
                     } else if room > 0 && jobs.dispatch(&self.engine, &record, held)? {
                         room -= 1;
                     }
@@ -483,7 +492,7 @@ impl Service {
                     .as_ref()
                     .filter(|s| !s.preparation_id.is_empty())
                 {
-                    if gpu_active {
+                    if gpu_active && !self.gpu().is_some_and(|gpu| gpu.joins_family(&self.engine, &record).unwrap_or(false)) {
                         continue;
                     }
                     let Some(gpu) = self.gpu() else {

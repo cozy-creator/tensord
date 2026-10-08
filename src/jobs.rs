@@ -1,4 +1,5 @@
-//! Jobs and their child runs. A job (`@app.job`) runs in a deviceless executor (`run_job`).
+//! Jobs and their child runs. Explicit accelerator jobs hold a family GPU reservation;
+//! other jobs run deviceless (`run_job`).
 //! Each call it makes to one of its package's invocables arrives on the seam (`child_call`)
 //! and becomes a run of its own, `<parent>/<call_index>`, under the parent's signer: same
 //! records, dispatched like any run, canceled with the parent. A child's result and files
@@ -201,10 +202,16 @@ impl Jobs {
         record: &Execution,
         held: HeldGeneration,
     ) -> io::Result<bool> {
+        let allocation = if record.invocation.accelerator {
+            let pool = self.service.upgrade().and_then(|s| s.gpu())
+                .ok_or_else(|| io::Error::other("accelerator_job_unavailable: no configured GPU"))?;
+            let Some(allocation) = pool.job_allocation(engine, record)? else { return Ok(false); };
+            Some(allocation)
+        } else { None };
         let (jobs, job) = (self.clone(), record.invocation.job);
         engine.dispatch_managed(&record.id, move |engine, id| {
             let result = match job {
-                true => jobs.job(&engine, &id, held),
+                true => jobs.job(&engine, &id, held, allocation),
                 false => jobs.call(&engine, &id, held),
             };
             let settled = match &result {
@@ -224,7 +231,16 @@ impl Jobs {
         engine: &Arc<Engine>,
         id: &str,
         held: &HeldGeneration,
+        allocation: Option<crate::gpu_service::JobAllocation>,
     ) -> io::Result<Option<DeviceExecutor>> {
+        if let Some(gpu) = &allocation { gpu.prepare()?; }
+        // Reclamation may have waited for a serving descendant to finish.
+        // A stopped job never opens an accelerator after that wait.
+        let pending = engine.get(id)?;
+        if pending.cancel_actor.is_some() || pending.pause_actor.is_some() {
+            engine.finish_stopped(id)?;
+            return Ok(None);
+        }
         let root = self.root.join(uuid::Uuid::new_v4().simple().to_string());
         fs::create_dir(&root)?;
         let directory = File::open(&root)?;
@@ -246,7 +262,7 @@ impl Jobs {
                 self.identity,
                 &self.incarnation,
                 &held.record.identity,
-                "",
+                allocation.as_ref().map(|gpu| gpu.devices.as_str()).unwrap_or_default(),
             )?,
             generation_hold: Some(held.retention()),
             identity: self.identity,
@@ -275,6 +291,7 @@ impl Jobs {
             )
         })?;
         executor.retain_until_exit(directory);
+        if let Some(allocation) = allocation { executor.retain_until_exit(allocation); }
         executor.retain_until_exit(WakeOnExit(Arc::downgrade(engine)));
         let facts = ExecutorFacts {
             pid: executor.birth.pid,
@@ -323,9 +340,10 @@ impl Jobs {
         engine: &Arc<Engine>,
         id: &str,
         held: HeldGeneration,
+        allocation: Option<crate::gpu_service::JobAllocation>,
     ) -> io::Result<()> {
         let record = engine.get(id)?;
-        let Some(mut executor) = self.launch(engine, id, &held)? else {
+        let Some(mut executor) = self.launch(engine, id, &held, allocation)? else {
             return Ok(());
         };
         let (interface, application, document) =
@@ -396,6 +414,7 @@ impl Jobs {
             call_interfaces,
             models,
             weights: true,
+            budget: record.invocation.accelerator.then_some(device_executor::JobBudget { gpu_count: 1 }),
         };
         // A command over the control frame fails its run by name; the executor never sees it.
         if let Some(why) = oversized(&command) {
@@ -458,7 +477,7 @@ impl Jobs {
         held: HeldGeneration,
     ) -> io::Result<()> {
         let record = engine.get(id)?;
-        let Some(mut executor) = self.launch(engine, id, &held)? else {
+        let Some(mut executor) = self.launch(engine, id, &held, None)? else {
             return Ok(());
         };
         let (interface, application, _) =
@@ -1027,7 +1046,8 @@ impl Jobs {
                 }
                 Ok(Answer::ok(frame.seq))
             }
-            // A deviceless parent holds no GPU.
+            // A deviceless parent holds none; an inline GPU handler keeps its
+            // actual device reservation until exit, per Context.release_gpus.
             Kind::GpuRelease => Ok(Answer::ok(frame.seq)),
             Kind::Checkpoint => self.checkpoint(parent, frame),
             _ => return Ok((Answer::unavailable(frame.seq), None)),

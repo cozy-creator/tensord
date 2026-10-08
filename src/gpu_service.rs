@@ -27,7 +27,7 @@ use std::{
     os::fd::{AsRawFd, OwnedFd},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::Ordering,
         Arc, Condvar, Mutex, Weak,
     },
     time::Instant,
@@ -473,7 +473,7 @@ pub struct GpuPool {
     incarnation: String,
     config: GpuConfig,
     store: Arc<Store>,
-    reserved: AtomicBool,
+    reserved: Arc<crate::gpu_reservation::Slot>,
     /// One retained executor per plan; the memory policy decides which keep weights mapped.
     sessions: Mutex<BTreeMap<String, Session>>,
     /// Per generation, the import-only executor sessions fork from. Declared after
@@ -510,13 +510,34 @@ struct Device {
     memory: GpuMemory,
 }
 
-struct Permit {
+pub(crate) struct Permit {
     pool: Arc<GpuPool>,
     engine: Weak<Engine>,
+    token: Option<crate::gpu_reservation::Permit>,
+}
+pub(crate) struct JobAllocation {
+    permit: Permit,
+    pub devices: String,
+}
+impl JobAllocation {
+    pub fn prepare(&self) -> io::Result<()> {
+        // A raw transform has no model plan to drive eviction. End only idle
+        // serving sessions under their existing lock, then revoke held mappings.
+        let pool = &self.permit.pool;
+        let mut sessions = pool.sessions.lock().unwrap();
+        let plans: Vec<_> = sessions.keys().cloned().collect();
+        for plan in plans {
+            pool.carry_out(&Step::End(plan), &mut sessions)?;
+        }
+        for holding in pool.holdings() {
+            pool.carry_out(&Step::Revoke(holding.id), &mut sessions)?;
+        }
+        Ok(())
+    }
 }
 impl Drop for Permit {
     fn drop(&mut self) {
-        self.pool.reserved.store(false, Ordering::Release);
+        drop(self.token.take());
         if let Some(engine) = self.engine.upgrade() {
             engine.notify_activity();
         }
@@ -539,7 +560,7 @@ fn gpu_request_queued(engine: &Engine) -> bool {
             return false;
         };
         let queued = |record: &Execution| {
-            let gpu = record.submission.as_ref().is_some_and(|s| !s.preparation_id.is_empty());
+            let gpu = record.invocation.accelerator || record.submission.as_ref().is_some_and(|s| !s.preparation_id.is_empty());
             gpu && record.state == State::Queued && record.waiting_reason.is_none()
         };
         if page.iter().any(queued) {
@@ -610,7 +631,7 @@ impl GpuPool {
             incarnation,
             config,
             store,
-            reserved: AtomicBool::new(false),
+            reserved: Arc::new(crate::gpu_reservation::Slot::default()),
             sessions: Mutex::new(BTreeMap::new()),
             zygotes: Mutex::new(BTreeMap::new()),
             kernel_boots: Mutex::new(BTreeMap::new()),
@@ -855,15 +876,8 @@ impl GpuPool {
         if holds.is_some_and(|holds| holds >= level) {
             return "";
         }
-        let busy = self
-            .reserved
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire);
-        if busy.is_err() {
+        let Some(_permit) = self.permit(engine, None, true) else {
             return "a request holds the GPU; it loads when that ends";
-        }
-        let _permit = Permit {
-            pool: self.clone(),
-            engine: Arc::downgrade(engine),
         };
         // A request queued for the GPU goes first; the member comes back after it.
         if gpu_request_queued(engine) {
@@ -1325,6 +1339,19 @@ impl GpuPool {
         }
         Ok(plan)
     }
+    fn permit(self: &Arc<Self>, engine: &Arc<Engine>, family: Option<&str>, call: bool) -> Option<Permit> {
+        let token = self.reserved.take(family, call)?;
+        Some(Permit { pool: self.clone(), engine: Arc::downgrade(engine), token: Some(token) })
+    }
+    pub fn joins_family(&self, engine: &Engine, record: &Execution) -> io::Result<bool> {
+        Ok(crate::gpu_reservation::family(record, |id| engine.get(id))?
+            .is_some_and(|family| self.reserved.family(&family)))
+    }
+    pub(crate) fn job_allocation(self: &Arc<Self>, engine: &Arc<Engine>, record: &Execution) -> io::Result<Option<JobAllocation>> {
+        let family = crate::gpu_reservation::family(record, |id| engine.get(id))?;
+        let devices = self.lane_devices(1)?;
+        Ok(self.permit(engine, family.as_deref(), false).map(|permit| JobAllocation { permit, devices }))
+    }
     pub fn dispatch(
         self: &Arc<Self>,
         engine: &Arc<Engine>,
@@ -1332,16 +1359,9 @@ impl GpuPool {
         held: HeldGeneration,
         plan: GpuPlan,
     ) -> io::Result<bool> {
-        if self
-            .reserved
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+        let family = crate::gpu_reservation::family(record, |id| engine.get(id))?;
+        let Some(permit) = self.permit(engine, family.as_deref(), true) else {
             return Ok(false);
-        }
-        let permit = Permit {
-            pool: self.clone(),
-            engine: Arc::downgrade(engine),
         };
         engine.dispatch_managed(&record.id, move |engine, id| {
             let pool = permit.pool.clone();
@@ -1429,16 +1449,9 @@ impl GpuPool {
                     }
                     zygote.wait_started();
                 }
-                while pool
-                    .reserved
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                    .is_err()
-                {
+                let _permit = loop {
+                    if let Some(permit) = pool.permit(&engine, None, true) { break permit; }
                     std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-                let _permit = Permit {
-                    pool: pool.clone(),
-                    engine: Arc::downgrade(&engine),
                 };
                 let key = plan.id.clone();
                 let waited = asked.elapsed();
