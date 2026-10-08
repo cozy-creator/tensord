@@ -261,3 +261,36 @@ impl HeldGeneration {
         }
     }
 }
+
+#[cfg(test)]
+mod accelerator_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn device_declaration_is_scoped_to_the_actual_installed_app() {
+        let path = std::env::temp_dir().join(format!("accelerator-interface-{}", uuid::Uuid::new_v4()));
+        let file = File::create(&path).unwrap();
+        let held = HeldGeneration {
+            hold: Arc::new(file),
+            record: Generation {
+                identity: "a".repeat(32), package: "local/root".into(), version: "1".into(),
+                application: "root:app".into(), python: "/usr/bin/python3".into(), dependencies: vec![],
+                cpu_bridge: String::new(), source_digest: String::new(), sdk_fallback: String::new(),
+                interface: json!({"jobs":[{"name":"work","accelerator":false},{"name":"legacy"}]}),
+                callees: vec![Callee {
+                    distribution: "child".into(), version: "1".into(), application: "child:app".into(),
+                    package: "local/child".into(), source_digest: String::new(),
+                    interface: json!({"jobs":[{"name":"work","accelerator":true},{"name":"broken","accelerator":"true"}]}),
+                }],
+            },
+        };
+        assert!(!held.accelerator_job("root:app", "work").unwrap());
+        assert!(!held.accelerator_job("", "legacy").unwrap());
+        assert!(held.accelerator_job("child:app", "work").unwrap());
+        assert!(held.accelerator_job("child:app", "broken").is_err());
+        assert!(held.accelerator_job("other:app", "work").is_err());
+        drop(held);
+        fs::remove_file(path).unwrap();
+    }
+}

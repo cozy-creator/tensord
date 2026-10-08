@@ -1902,7 +1902,7 @@ mod exact_tests {
             request_id: "job".into(), job: "root".into(), payload: json!({}), application: "root:app".into(),
             package_interface: "interface.json".into(), spool: "spool".into(), scratch: "scratch".into(),
             deadline_s: None, inputs: Default::default(), trees: Default::default(), call_interfaces,
-            models: Default::default(), weights: true,
+            models: Default::default(), weights: true, budget: None,
         };
         assert_eq!(oversized(&command(rows.clone())), None);
         let each_row: Vec<_> = rows.iter().cloned().map(|mut r| {
