@@ -322,7 +322,10 @@ impl Weights {
                 .map_err(tfs)?
                 == "pending"
             {
-                derived::adopt(&self.store, &self.meta, &frame.transaction, &name).map_err(tfs)?;
+                let retained =
+                    format!("output-{}", frame.transaction.trim_start_matches("sha256:"));
+                derived::adopt(&self.store, &self.meta, &frame.transaction, &retained)
+                    .map_err(tfs)?;
             }
         }
         drop(custody);
@@ -376,11 +379,11 @@ impl Weights {
                     .and_then(|mut fields| fields.req_str("kind"))
                     .map_err(io::Error::other)?;
                 match kind {
-                    "pending" => {
+                    "pending" | "released" => {
                         derived::dispose(&self.store, &self.meta, transaction)
                             .map_err(io::Error::other)?;
                     }
-                    "adopted" | "released" => (),
+                    "adopted" => (),
                     _ => {
                         return Err(io::Error::new(
                             io::ErrorKind::Unsupported,

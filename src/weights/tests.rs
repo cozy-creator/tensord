@@ -491,3 +491,136 @@ fn cancel_between_durable_binding_and_native_begin_cannot_resurrect_the_transact
     child.kill().unwrap();
     child.wait().unwrap();
 }
+
+#[test]
+fn changed_declaration_in_one_slot_keeps_both_acknowledged_results() {
+    let f = Fixture::new();
+    let (first, mut writer) = f.open();
+    writer.part();
+    let first_receipt = writer.ask(json!({"op":"commit"}));
+    drop(writer);
+    f.adopt(&first, &first_receipt).unwrap();
+    let path = f.root.join("weights-model-derivation.canonical");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, raw.replace("f32", "i32")).unwrap();
+    let (second, mut writer) = f.open();
+    writer.part();
+    let second_receipt = writer.ask(json!({"op":"commit"}));
+    drop(writer);
+    assert_ne!(first, second);
+    assert_ne!(first_receipt["manifest"], second_receipt["manifest"]);
+    f.adopt(&second, &second_receipt).unwrap();
+    tensorfs_core::gc::collect(f.owner.store.root(), false).unwrap();
+    for transaction in [first, second] {
+        let derived::Lookup::Committed(held) =
+            derived::lookup(&f.owner.store, &f.owner.meta, &transaction).unwrap()
+        else {
+            panic!("missing result")
+        };
+        f.owner
+            .store
+            .read_manifest(&held.receipt().manifest)
+            .unwrap();
+    }
+}
+
+#[test]
+fn cancellation_retries_released_root_cleanup_before_acknowledging_the_binding() {
+    use crate::{execution::process_birth, jobs::Jobs, journal::Invocation, service::Service};
+    use std::process::{Command, Stdio};
+    let mut f = Fixture::new();
+    let service = Service::open(&f.root.join("state"), &f.root.join("generations"), 1).unwrap();
+    let jobs = Jobs::configure(&service, f.owner.store.clone(), None).unwrap();
+    let engine = service.engine.clone();
+    let record = engine
+        .submit(
+            "cleanup-retry",
+            Invocation {
+                job: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut child = Command::new("/bin/cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let running = engine
+        .with_journal(|j| {
+            assert!(j.claim(&record.id)?);
+            j.register_process(&record.id, process_birth(child.id())?)?;
+            j.running(&record.id, None)
+        })
+        .unwrap();
+    let (owner, run, attempt) = (engine.clone(), running.id.clone(), running.attempt);
+    f.grant.run = run.clone();
+    f.grant.bind_output = Arc::new(move |transaction, slot| {
+        owner.with_journal(|j| j.bind_derived_output(&run, attempt, transaction, slot))
+    });
+    let (transaction, mut writer) = f.open();
+    writer.part();
+    writer.ask(json!({"op":"commit"}));
+    drop(writer);
+    let derived::Lookup::Committed(result) =
+        derived::lookup(&f.owner.store, &f.owner.meta, &transaction).unwrap()
+    else {
+        panic!("missing committed receipt")
+    };
+    let manifest = result.receipt().manifest.clone();
+    let repo = RepositoryName::new("local", "independent-consumer").unwrap();
+    f.owner
+        .store
+        .apply_repository(
+            None,
+            &Mutation::ReplaceLocal {
+                repo: repo.clone(),
+                manifest: manifest.clone(),
+                version: manifest.sha256.clone(),
+            },
+            &Fault::default(),
+        )
+        .unwrap();
+    let root = f.owner.store.root().join("roots/derived").join(format!(
+        "{}.json",
+        transaction.trim_start_matches("sha256:")
+    ));
+    let genuine_root = std::fs::read(&root).unwrap();
+    std::fs::remove_file(&root).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(
+        root.join("unlink-fault"),
+        b"cannot unlink a non-empty directory",
+    )
+    .unwrap();
+    // Real native dispose commits Released, then fails to unlink its original root path.
+    assert!(derived::dispose(&f.owner.store, &f.owner.meta, &transaction).is_err());
+    engine.cancel(&record.id, "owner").unwrap();
+    assert!(jobs.sweep_canceled_outputs(&engine).is_err());
+    assert_eq!(
+        engine
+            .with_journal(|j| j.canceled_derived_outputs())
+            .unwrap()
+            .len(),
+        1
+    );
+    std::fs::remove_dir_all(&root).unwrap();
+    std::fs::write(&root, genuine_root).unwrap();
+    assert_eq!(jobs.sweep_canceled_outputs(&engine).unwrap(), 1);
+    assert!(!root.exists());
+    assert!(engine
+        .with_journal(|j| j.canceled_derived_outputs())
+        .unwrap()
+        .is_empty());
+    tensorfs_core::gc::collect(f.owner.store.root(), false).unwrap();
+    f.owner.store.read_manifest(&manifest).unwrap();
+    assert!(f.owner.store.repository_path(&repo).exists());
+    child.kill().unwrap();
+    child.wait().unwrap();
+    engine
+        .finish(&record.id, crate::journal::Outcome::Canceled)
+        .unwrap();
+    drop(jobs);
+    drop(service);
+    engine.notify_activity();
+}
