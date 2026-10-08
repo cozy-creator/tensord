@@ -287,6 +287,7 @@ fn exec(
         let t = Instant::now();
         let reply = executor.command(
             &DeviceCommand::Invoke {
+                max_output_bytes: cozy_machine::output_capacity::DEFAULT_BYTES,
                 request_id: id.clone(),
                 construction: "pilot".into(),
                 entrypoint: config.entrypoint.clone(),

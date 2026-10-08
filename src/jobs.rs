@@ -424,6 +424,7 @@ impl Jobs {
             weights: Some((&self.weights, &grant)),
         };
         let command = DeviceCommand::RunJob {
+            max_output_bytes: crate::output_capacity::for_callable(&document, "jobs", &record.invocation.entrypoint)?,
             request_id: id.into(),
             job: record.invocation.entrypoint.clone(),
             payload: record.invocation.input.clone(),
@@ -503,7 +504,7 @@ impl Jobs {
         let Some(mut executor) = self.launch(engine, id, &held, None)? else {
             return Ok(());
         };
-        let (interface, application, _) =
+        let (interface, application, document) =
             self.interface(&executor, &held, &record.invocation.module)?;
         let spool = self.spool(&executor, id)?;
         let mut services = Seam {
@@ -587,6 +588,7 @@ impl Jobs {
         let inputs = stage_inputs(&self.store, self.identity, &spool, &invocation.inputs)?;
         let reply = executor.command(
             &DeviceCommand::Invoke {
+                max_output_bytes: crate::output_capacity::for_callable(&document, "entrypoints", &invocation.entrypoint)?,
                 request_id: id.into(),
                 construction: WEIGHTLESS.into(),
                 entrypoint: invocation.entrypoint.clone(),
@@ -1899,6 +1901,7 @@ mod exact_tests {
             assert_eq!(document["application"], "eval:app");
         }
         let command = |call_interfaces| DeviceCommand::RunJob {
+            max_output_bytes: crate::output_capacity::DEFAULT_BYTES,
             request_id: "job".into(), job: "root".into(), payload: json!({}), application: "root:app".into(),
             package_interface: "interface.json".into(), spool: "spool".into(), scratch: "scratch".into(),
             deadline_s: None, inputs: Default::default(), trees: Default::default(), call_interfaces,
