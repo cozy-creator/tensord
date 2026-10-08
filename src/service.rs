@@ -360,6 +360,9 @@ impl Service {
         *self.swept.lock().unwrap() = std::time::Instant::now();
         // Released Write roots first, so the store's GC can collect their bytes.
         if let Some(jobs) = self.jobs() {
+            if let Err(error) = jobs.sweep_canceled_outputs(&self.engine) {
+                eprintln!("reclaim canceled native outputs: {error}");
+            }
             if let Err(error) = jobs.sweep_objects() {
                 eprintln!("reclaim object roots: {error}");
             }

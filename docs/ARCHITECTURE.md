@@ -129,6 +129,33 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 
 ## Contracts
 
+Native storage grants belong to one durable run attempt. Pausing and resuming a run
+creates a fresh grant; an earlier attempt cannot regain authority when the run becomes
+active again. Closing a source/output channel fences that writer attempt but does not
+abandon its transaction or release committed custody. TensorFS persists resumable parts
+and committed receipts independently of channel acknowledgments.
+
+Replaying or adopting a derived result requires retained native custody and a verified
+model closure. Receipt metadata alone cannot recreate a disposed result. Adoption compares
+the transaction, declaration and immutable manifest identity, then records the owner's
+native facts; additional peer observations do not change authority. Independent consumers
+retain their own roots, so releasing one consumer cannot make another's data collectible.
+See [tracker #341](https://github.com/cozy-creator/tracker/issues/341).
+
+Before native begin, the existing execution journal records only the run, output slot and
+transaction association, atomically with current-attempt admission. Explicit cancellation
+uses that association to fence and abandon unfinished work, or dispose a committed result
+that still has only pending custody. Acknowledged native adoption and independent consumer
+roots survive. Cleanup is idempotent and retried at startup/reclamation; pause, observer
+disconnect and ordinary failure do not authorize abandonment. Older unbound transactions
+are never guessed to belong to a canceled run.
+
+TensorFS allocates writer epochs from its durable transaction fence through
+`channel::Writer::begin_next`. Reopening after a restart or an old clock-derived high epoch
+creates a new writer attempt of the same transaction; stale channel closure cannot fence
+its replacement. Payload writes and publication remain concurrent; only local custody
+metadata transitions are coordinated with cancellation.
+
 - [Durable execution](DURABLE-EXECUTION.md): journal states, acceptance, cancellation, custody.
 - [Recovery](RECOVERY.md): executor and daemon lifetimes, update publication and rollback.
 - [Front door](FRONT-DOOR.md): the listener, TLS identity, install.
