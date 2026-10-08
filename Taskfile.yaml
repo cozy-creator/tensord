@@ -13,7 +13,7 @@ tasks:
         set -eu; test -z "$(git status --porcelain)" || { echo "commit first: the build is stamped with HEAD" >&2; exit 1; }
         home=${CARGO_HOME:-$HOME/.cargo}; target=${CARGO_TARGET_DIR:-$PWD/target}/manylinux; mkdir -p "{{.OUT}}" "$target"
         cargo fetch --locked  # the host reads the private TensorFS; the container builds offline
-        docker run --rm --runtime=runc --user "$(id -u):$(id -g)" -e HOME=/tmp -e RUSTUP_HOME=/target/rustup -e COZY_MACHINE_COMMIT="$(git rev-parse HEAD)" \
+        docker run --rm --runtime=runc -e CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" --user "$(id -u):$(id -g)" -e HOME=/tmp -e RUSTUP_HOME=/target/rustup -e COZY_MACHINE_COMMIT="$(git rev-parse HEAD)" \
           -v "$home/registry:/cargo/registry" -v "$home/git:/cargo/git" -v "$PWD:/src:ro" -v "$target:/target" -w /src quay.io/pypa/manylinux_2_28_x86_64:2026.10.03-1 \
           sh -c 'curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal --default-toolchain 1.91.1 >&2 && PATH=/tmp/.cargo/bin:$PATH CARGO_HOME=/cargo cargo build --release --locked --offline --target-dir /target --bin cozy-machine'
         install -m 0755 "$target/release/cozy-machine" "{{.OUT}}/cozy-machine-linux-x86_64" && "{{.OUT}}/cozy-machine-linux-x86_64" version --json
