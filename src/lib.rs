@@ -6,6 +6,7 @@ pub mod catalog;
 pub mod child_launcher;
 pub mod device_executor;
 pub mod execution;
+mod gpu_reservation;
 pub mod gpu_service;
 pub mod held_models;
 pub mod host_memory;

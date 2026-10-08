@@ -1,0 +1,16 @@
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13"]
+build-backend = "uv_build"
+
+[project]
+name = "cozy-accelerator-job-proof"
+version = "0.0.1"
+requires-python = ">=3.12,<3.13"
+dependencies = ["cozy-runtime>=0.19,<0.20", "torch==2.14.0", "triton==3.8.0", "msgspec>=0.19"]
+
+[project.entry-points."cozy.application"]
+default = "accelerator_job:app"
+
+[tool.uv.build-backend]
+module-name = "accelerator_job"
+module-root = ""

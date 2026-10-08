@@ -47,7 +47,7 @@ pub struct Spec {
     pub warm: bool,
     /// A warm run's whole warm set for its caller, replacing the previous one.
     pub set: Option<Vec<SetItem>>,
-    /// `kind: job`: `entrypoint` names an `@app.job`, run in a deviceless executor.
+    /// `kind: job`: `entrypoint` names an `@app.job`; its installed declaration selects its device.
     pub job: bool,
     /// A child run's parent execution (a job's call through its seam).
     pub parent: String,
@@ -337,6 +337,7 @@ impl Runs {
             attention_kernel: spec.attention_kernel.clone(),
             inputs: spec.inputs.clone(),
             job: spec.job,
+            accelerator: false, // known only after the actual installation is prepared
             parent: spec.parent.clone(),
         };
         let (record, new) = self
@@ -973,6 +974,7 @@ impl Runs {
         let Some(gpu) = self.service.gpu() else {
             return Ok(());
         };
+        let family = crate::gpu_reservation::family(parent, |id| self.service.engine.get(id))?;
         let (runs, entrypoint) = (self.clone(), entrypoint.to_string());
         let application = application.to_string();
         let started = std::thread::Builder::new().name("child-prefetch".into()).spawn(move || {
@@ -989,7 +991,7 @@ impl Runs {
                 Ok((installation, Some(plan))) => {
                     match runs.service.catalog.resolve(&installation.generation)
                         .and_then(|held| held.application(&application)) {
-                        Ok(held) => gpu.prefetch(&runs.service.engine, held, plan),
+                        Ok(held) => gpu.prefetch(&runs.service.engine, held, plan, family.clone()),
                         Err(error) => eprintln!("prefetch of {entrypoint}: {error}"),
                     }
                 }
