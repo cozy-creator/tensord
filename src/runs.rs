@@ -328,6 +328,7 @@ impl Runs {
             attention_kernel: spec.attention_kernel.clone(),
             inputs: spec.inputs.clone(),
             job: spec.job,
+            accelerator: false, // known only after the actual installation is prepared
             parent: spec.parent.clone(),
         };
         let (record, new) = self
