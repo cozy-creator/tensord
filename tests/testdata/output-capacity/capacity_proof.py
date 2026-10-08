@@ -9,7 +9,7 @@ import msgspec
 from cozy_runtime.author import App, AssetBound, Context, Outputs, Tree
 
 app = App()
-CAPACITY = 2 << 30
+CAPACITY = 64 << 30
 LENGTH = (1 << 30) + (1 << 20)
 
 
@@ -22,7 +22,7 @@ class NestedResult(msgspec.Struct):
 
 
 def retained(ctx: Context, out: Outputs) -> Result:
-    if ctx.device.kind != "cpu":
+    if ctx.device.type != "cpu":
         raise RuntimeError("this fixture must run on CPU")
     if out._attempt.max_output_bytes != CAPACITY:
         raise RuntimeError(f"expected declared {CAPACITY}-byte grant, got {out._attempt.max_output_bytes}")
@@ -36,7 +36,7 @@ def retained(ctx: Context, out: Outputs) -> Result:
             digest.update(block)
     (directory / "receipt.json").write_text(json.dumps({
         "length": LENGTH, "sha256": digest.hexdigest(),
-        "capacity": out._attempt.max_output_bytes, "device": ctx.device.kind,
+        "capacity": out._attempt.max_output_bytes, "device": ctx.device.type,
     }))
     return Result(out.save_tree(directory))
 
