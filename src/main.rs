@@ -306,7 +306,11 @@ fn image_sdk(
     root: &std::path::Path,
     uv: PathBuf,
 ) -> cozy_machine::published::PackageSdk {
-    let mut pair: Vec<String> = std::fs::read_dir(wheels)
+    // An activation replaces sdk/current, not the immutable candidate directory.
+    // Freeze that selection once: both cache identity and the helper's actual wheel
+    // inputs must name the same build even when filenames/version labels repeat.
+    let wheels = wheels.canonicalize().unwrap_or_else(|_| wheels.to_path_buf());
+    let mut pair: Vec<String> = std::fs::read_dir(&wheels)
         .into_iter()
         .flatten()
         .flatten()
@@ -321,12 +325,15 @@ fn image_sdk(
     cozy_machine::published::PackageSdk {
         uv,
         python: "3.12".into(),
-        find_links: complete.then(|| wheels.to_path_buf()),
+        find_links: complete.then_some(wheels),
         requirements: if complete { pair } else { vec![] },
         client_wheel: None,
         seed_cache: seed.is_dir().then_some(seed),
     }
 }
+
+#[cfg(test)]
+mod sdk_selection_tests;
 
 #[allow(clippy::too_many_arguments)]
 fn start_api(

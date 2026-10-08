@@ -21,11 +21,13 @@ pub fn uv(root: &Path) -> PathBuf {
     }
 }
 
-/// Writes the embedded wheel under `engine/client` when this build's differs, and answers it.
+/// Publish the embedded wheel under its content identity. A new build with the same
+/// distribution version must not overwrite an earlier installer's selected input.
 pub fn wheel(engine: &Path) -> io::Result<PathBuf> {
-    let path = engine.join("client").join(WHEEL_NAME);
+    let digest = format!("{:x}", Sha256::digest(WHEEL));
+    let path = engine.join("client").join(digest).join(WHEEL_NAME);
     if fs::read(&path).ok().as_deref() != Some(WHEEL) {
-        fs::create_dir_all(engine.join("client"))?;
+        fs::create_dir_all(path.parent().expect("embedded wheel directory"))?;
         super::identity::write_atomic(&path, WHEEL, 0o644)?;
     }
     Ok(path)
@@ -61,4 +63,45 @@ pub fn helper(engine: &Path, uv: &Path, wheel: &Path) -> io::Result<PathBuf> {
         .arg(format!("{}[installer]", wheel.display())))?;
     fs::write(&marker, digest)?;
     Ok(python)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn embedded_client_selection_preserves_older_same_version_bytes() {
+        let engine = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/client-selection")
+            .join(uuid::Uuid::new_v4().to_string());
+        let old = engine.join("client").join(WHEEL_NAME);
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        fs::write(&old, b"previous embedded client build").unwrap();
+        let selected = wheel(&engine).unwrap();
+        assert!(
+            fs::read(&old).unwrap() == b"previous embedded client build",
+            "selecting a new build overwrote a prior selected wheel"
+        );
+        assert_ne!(selected, old);
+        assert!(fs::read(&selected).unwrap() == WHEEL);
+        assert_eq!(
+            selected
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            format!("{:x}", Sha256::digest(WHEEL))
+        );
+        let before = fs::metadata(&selected).unwrap();
+        assert_eq!(wheel(&engine).unwrap(), selected);
+        let after = fs::metadata(&selected).unwrap();
+        assert_eq!(
+            (before.ino(), before.mtime(), before.mtime_nsec()),
+            (after.ino(), after.mtime(), after.mtime_nsec())
+        );
+        fs::remove_dir_all(engine).unwrap();
+    }
 }
