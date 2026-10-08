@@ -13,6 +13,10 @@ CAPACITY = 64 << 30
 LENGTH = (1 << 30) + (1 << 20)
 
 
+class Request(msgspec.Struct):
+    pass
+
+
 class Result(msgspec.Struct):
     trace: Annotated[Tree, AssetBound(max_bytes=CAPACITY)]
 
@@ -42,10 +46,10 @@ def retained(ctx: Context, out: Outputs) -> Result:
 
 
 @app.job
-def job(ctx: Context, out: Outputs) -> Result:
+def job(payload: Request, ctx: Context, out: Outputs) -> Result:
     return retained(ctx, out)
 
 
 @app.entrypoint
-def serve(ctx: Context, out: Outputs) -> NestedResult:
+def serve(payload: Request, ctx: Context, out: Outputs) -> NestedResult:
     return NestedResult(retained(ctx, out))
