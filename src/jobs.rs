@@ -1048,7 +1048,8 @@ impl Jobs {
                     Some(File::from(std::os::fd::OwnedFd::from(theirs))),
                 ));
             }
-            // The job will call it next: its models prepare and load now.
+            // A hint about a future call: TensorD may prepare its weights and ask Runtime
+            // to build the construction. This answer does not promise completed loading.
             Kind::ModelPrefetch => {
                 let callable = (frame.module.clone(), frame.export.clone());
                 if let (Some(Some((application, entrypoint))), Some(runs), Some(service)) = (

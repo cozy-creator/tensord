@@ -36,6 +36,15 @@ PYTHON -I -m cozy_runtime.internal.trampoline --expect-parent <pid> --oom-adj 10
   ship together).
 - Start imports authored code, so journal authorization must come before `Start`.
 
+## Weight loading
+
+TensorD's `Load` command asks Runtime to construct the model in this executor. TensorD supplies
+the selected stored metadata/assets and CPU weight buffers or object descriptors; Runtime uses
+its own TensorFS library to parse and plan reads, then its weight plane/device APIs to perform
+GPU allocation, transfer, mapping and unmapping. Budget and eviction decisions remain with
+TensorD. Its retained exported GPU handles can let a replacement executor attach existing
+allocations, but that executor still needs its own model objects and CUDA context.
+
 ## Wire
 
 - 4-byte big-endian length + JSON, max 64 KiB (`MAX_DEVICE_FRAME`). Bulk data goes through the spool.
@@ -139,6 +148,5 @@ longer than eight times the longest pause it has shown, and at least six samples
   `cgroup.procs`, or (token) exec with a scrubbed environment and escape its ancestry. A fork's
   fork-only descendants carry its import-only parent's token, so they end with that parent. It
   can also reopen store paths.
-- Descriptor sources still use native TensorFS plane, header and read-plan code inside the executor.
-- Degree > 1 reads the store or the sealed tier (rank 0 shares it with followers); descriptor
-  sources are world-one.
+- For degree > 1, Runtime rank 0 coordinates its followers' weight delivery. Sharing exported
+  GPU allocations through TensorD's Degree 2 custody remains world-one.

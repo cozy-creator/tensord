@@ -1,6 +1,8 @@
-//! A session's selected models: each manifest's verified header and the selected components'
-//! encoded size. Selection grants authority; the weights come from the sealed host tier, and
-//! the header and model assets from here (`ModelSource`): the executor reads no store.
+//! Stored metadata and assets for a session's selected models. TensorD supplies each verified
+//! header, declared asset and selected component's encoded byte count through TensorFS.
+//! `ModelSource` returns sealed read-only descriptors; HostTier supplies CPU weight buffers
+//! and object descriptors. Runtime parses the metadata, constructs models and performs GPU
+//! transfers/mappings with its own TensorFS plane. Selection remains the access boundary.
 use crate::device_executor::{Answer, Frame};
 use crate::os;
 use serde::{Deserialize, Serialize};
@@ -136,8 +138,8 @@ impl ModelSources {
         Ok(Self { store, selected })
     }
 
-    /// Selected encoded source size, not GPU-resident/allocator memory. The SDK
-    /// measures its real device footprint; callers cannot infer a fit from this.
+    /// Selected encoded source size, separate from prepared CPU-buffer and GPU residency.
+    /// Runtime measures its real device footprint; callers cannot infer a fit from this.
     pub fn selected_facts(&self, manifest: &str) -> io::Result<(Vec<String>, u64, u64)> {
         let selected = self.selected.get(digest(manifest)?).ok_or_else(|| {
             io::Error::new(

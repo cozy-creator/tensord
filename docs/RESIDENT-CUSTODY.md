@@ -17,7 +17,7 @@ Rental proof that a CUDA-free holder keeps and frees the bytes:
 - A holding is one weight-set layout/variant on one GPU: `HoldingKey {device (GPU UUID), layout
   (plane digest), variant (empty or the baked LoRA delta identity)}`, a generation, regions
   (chunk sizes), one fd per chunk, readers, phase `Ready` or
-  `Revoking`. Every executor on the pod whose layout matches shares it, whoever submitted the
+  `Revoking`. Every executor on the pod whose layout and variant match shares it, whoever submitted the
   request and whichever package it runs.
 - A reader is a **lease**: one end of a socket pair the executor keeps while it maps the holding
   (sent after the chunk fds, `lease: true`). Its close ends the lease with no message: the executor

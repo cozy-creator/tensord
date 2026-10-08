@@ -1,8 +1,10 @@
 # GPU service
 
-`gpu_service.rs` (`GpuPool`) runs published, cached GPU callables through one retained device
-executor per plan; `memory::GpuMemory` decides every device byte. Acceptance, journal, progress and output custody stay in `Engine`. Scheduling stays in
-`service.rs`.
+`gpu_service.rs` (`GpuPool`) coordinates published, cached GPU callables through retained
+Runtime executors. TensorD supplies model data and shared CPU buffers and uses
+`memory::GpuMemory` to decide device budgets and eviction. Runtime constructs models and
+performs GPU operations through its TensorFS plane in the executor's CUDA context.
+Acceptance, journal, progress and output custody stay in `Engine`; scheduling stays in `service.rs`.
 
 ## Configuration
 
@@ -12,7 +14,6 @@ executor per plan; `memory::GpuMemory` decides every device byte. Acceptance, jo
 - `models: [ModelGrant { package, slot, repository, release, lane, manifest, components }]`: the only
   authority over cached model bytes.
 - `packages: [{ package, release, distribution, generation }]`: published-package mapping.
-- `source_mode`: `auto` (descriptors if offered), `legacy`, or `descriptors` (fails if not offered).
 - `pinned_budget_bytes`; `authorized_device_limit_bytes` (Load's limit only where NVML cannot read
   the device total).
 - `memory`: `{ floor_bytes, sample_log }`: raise the free floor; log each 1 s NVML reading.
@@ -88,7 +89,8 @@ Executor requests:
 - `device_room`: idle tenants give room (unmap, then end); the answer's `cap_bytes` raises the
   caller's cap into it. `stage_enter`/`stage_exit` (never asked for) keep the budget.
 - `sealed_tier` goes to `HostTier` (`HOST-TIER.md`); `Load.pinned_bytes` carries the pinned budget.
-- `model_source_read` goes to `ModelSources`.
+- `model_source` goes to `ModelSources` for selected headers/assets in sealed descriptors;
+  payload buffers and granted object files are supplied by `HostTier`.
 - `publish` (`Outputs.publish`) goes to `products.rs`: the spool file is retained as a native
   one-file tree bound to the run's actor, then journaled as a `product` (list outputs APPEND,
   single outputs SET; re-publishing identical SET bytes is a no-op). Answers `Published`.
@@ -114,7 +116,6 @@ thread.
 - Groups always take the first K envelope GPUs; one GPU call runs at a time machine-wide. No adapters.
 - Per-rank caps and cells need an executor with `rank_cells/1` and `process_cap/1`; otherwise every
   rank takes the smallest cap and only rank 0's GPU has a floor watchdog cell.
-- No host ledger (pinned tier, RSS/PSS, cgroup headroom) in the policy yet.
 - Executors before `process_cap/1` get only a plane budget: their context and activations are
   estimated, not capped.
 - One Python post helper per request.

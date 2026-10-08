@@ -1,7 +1,8 @@
-//! Degree 2 custody: GPU weight regions an executor filled, exported and offered stay alive
-//! here as the driver's own fds. This process never loads CUDA: an exported fd is the
-//! allocation's reference, closing the last reference anywhere frees it. Other executors on
-//! the GPU attach duplicates read-only. Each reader holds a lease: one end of a socket pair whose
+//! Degree 2 custody: TensorD retains handles to GPU weight allocations that Runtime created,
+//! filled and exported through TensorFS's plane in the executor's CUDA context. TensorD does
+//! no GPU copy or mapping: an exported driver fd is an allocation reference, and closing the
+//! last reference anywhere frees it. Other Runtime executors map duplicated handles read-only
+//! through their own plane. Each reader holds a lease: one end of a socket pair whose
 //! close (release, or the kernel at process death) ends it. Bytes are counted once per GPU, until
 //! every lease ended and the fds here are closed.
 use crate::execution::process_ended;
@@ -17,8 +18,8 @@ use std::time::Instant;
 /// Region spans are multiples of the VMM granularity every supported GPU divides.
 const GRANULE: u64 = 2 << 20;
 
-/// One holding: one weight-set layout on one GPU, shared by every executor of the pod whose
-/// layout matches, whoever submitted and whichever package it runs. A pod-level isolation
+/// One holding: one weight-set layout/variant on one GPU, shared by every executor whose
+/// layout and variant match, whoever submitted and whichever package it runs. A pod-level isolation
 /// policy (per publisher) would add its domain as a field here.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct HoldingKey {
@@ -71,7 +72,7 @@ pub enum Offered {
     Kept {
         generation: u64,
     },
-    /// Another executor's offer of the same layout is held; the offered fds were closed.
+    /// Another executor's offer of the same layout/variant is held; the offered fds were closed.
     Duplicate,
 }
 

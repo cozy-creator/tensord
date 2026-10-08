@@ -48,7 +48,7 @@ adopting a layout staged in part that cannot grow, it reads through a window of 
   `memory.high`/`memory.max` v2 or `limit_in_bytes` v1, minus non-reclaimable usage, and
   `MemAvailable`). `TierLimit` decides the most the tier may charge. `GpuPool` supplies
   `memory::host::TierPolicy`, whose shared host ledger accounts for the tier and executors'
-  private pinned buffers. `HalfOfHeadroom` is the standalone default policy.
+  private pinned buffers. `HalfOfHeadroom` remains a simple policy for standalone callers/pilots.
 - To make room, unheld, complete layouts are released oldest first; such layouts past `ttl` go
   anyway. A layout is held while any executor it was granted to is alive (pidfd). Held or filling
   layouts never go.

@@ -1,8 +1,8 @@
 # Cozy machine
 
 TensorD (`cozy-machine`) is the Rust daemon that owns the machine API, execution journal,
-scheduling, memory policy and executor supervision. It uses embedded TensorFS to make stored
-model bytes available to Runtime and to fill, retain and release shared CPU weight buffers.
+scheduling, memory policy and executor supervision. It uses embedded TensorFS to make selected
+model weights and metadata available to Runtime and to fill, retain and release shared CPU weight buffers.
 Python cozy-runtime executors run package code, construct models and use their own TensorFS
 weight plane for GPU transfers and mappings. TensorFS is a library on both sides, with no
 separate daemon.

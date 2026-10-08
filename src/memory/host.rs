@@ -1,6 +1,6 @@
 //! The host ledger: one rule for every host byte that holds weights. What the host has is read
 //! live at every decision (`host_memory`: the tightest cgroup on the path and `MemAvailable`);
-//! weights in RAM, the machine's sealed tier and executors' own pinned tiers together, may hold
+//! CPU weight buffers, TensorD's sealed tier and Runtime's own pinned tiers together, may hold
 //! half of it plus what they hold now (Runtime `weight_policy.pinned_total`). The other half
 //! stays for processes and the page cache, the tier's own fallback.
 use crate::{host_memory::HostMemory, host_tier::TierLimit};
@@ -9,8 +9,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-/// Pinned host bytes executors hold outside the machine's tier (their own memfds when they
-/// read the store); an executor adopting sealed layouts page-locks the tier's pages instead.
+/// Pinned CPU bytes Runtime holds outside TensorD's tier (its own staging buffers or an older
+/// peer's store-reading path). Adopting a sealed layout page-locks the shared pages instead.
 #[derive(Default)]
 pub struct HostLedger {
     private: Mutex<BTreeMap<String, u64>>,
@@ -37,7 +37,7 @@ pub struct TierPolicy(pub Arc<HostLedger>);
 impl TierLimit for TierPolicy {
     fn limit(&self, host: &HostMemory, charged: u64) -> u64 {
         if host.available < 0 {
-            return 0; // unreadable: nothing is admitted, executors read the store
+            return 0; // unreadable: no retained tier capacity; use a supported streaming path
         }
         let private = self.0.private_total();
         ((host.available as u64 + charged + private) / 2).saturating_sub(private)

@@ -1,6 +1,6 @@
 # Model sources
 
-TensorD makes the selected model's stored data available to Runtime. A source identifies an
+TensorD makes selected model weights and metadata available to Runtime. A source identifies an
 exact manifest and selected components and supplies their metadata/bytes; it is not merely a
 model name. The selection is also an access boundary: presence in the store alone does not
 authorize a request.

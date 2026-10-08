@@ -17,7 +17,7 @@ Model loading spans storage, shared CPU buffers and executor GPU memory:
 
 Runtime reports each rank's needs and measured use. TensorD decides budgets and eviction
 across workloads; Runtime and its TensorFS weight plane perform the concrete device operations
-within those grants. A model source carries access to actual selected data and metadata, not
+within those grants. A model source carries access to selected weight bytes, metadata and assets, not
 just a repository name. A host-buffer fill does not construct a PyTorch model, and retaining a
 GPU handle does not create a CUDA context in TensorD.
 
