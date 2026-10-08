@@ -41,7 +41,7 @@ PYTHON -I -m cozy_runtime.internal.trampoline --expect-parent <pid> --oom-adj 10
 TensorD's `Load` command asks Runtime to construct the model in this executor. TensorD supplies
 the selected stored metadata/assets and CPU weight buffers or object descriptors; Runtime uses
 its own TensorFS library to parse and plan reads, then its weight plane/device APIs to perform
-GPU allocation, transfer, mapping and unmapping. Budget and eviction decisions remain with
+GPU allocation, transfer, mapping and unmapping. Machine-wide budget and eviction decisions remain with
 TensorD. Its retained exported GPU handles can let a replacement executor attach existing
 allocations, but that executor still needs its own model objects and CUDA context.
 
