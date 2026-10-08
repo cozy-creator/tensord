@@ -1,6 +1,6 @@
 //! A run's local source: unpublished code the CLI uploaded with Write, named by the digest of
-//! its manifest object. It installs once per manifest and signer; a later run of the same code
-//! reopens that installation.
+//! its manifest object. It installs once per manifest, signer and selected SDK; a later run
+//! reopens that installation only while its environment inputs remain the same.
 use crate::{
     api::{
         install::{prepare_uploaded, InstallerConfig},
@@ -134,14 +134,15 @@ impl LocalSources {
         actor: &str,
         digest: &str,
     ) -> Result<Installation, Refused> {
-        let alias = format!(
-            "local-{}",
-            digest
-                .strip_prefix("sha256:")
-                .unwrap_or_default()
-                .get(..32)
-                .unwrap_or_default()
-        );
+        // Like published installations, local aliases include the selected SDK and
+        // client. The source digest alone cannot identify the environment after an update.
+        let key = serde_json::json!({
+            "manifest": digest,
+            "sdk": self.installer.sdk,
+            "client": self.installer.client_wheel,
+            "python": self.installer.python,
+        });
+        let alias = format!("local-{}", &tensorfs_core::sha256::hex_digest(key.to_string().as_bytes())[..32]);
         let _installing = self.installing.lock().unwrap();
         if let Some(held) = service.engine.installation(actor, &alias)? {
             if service.catalog.resolve(&held.generation).is_ok() {
@@ -234,7 +235,7 @@ mod tests {
 
     /// The real installer from objects the signer wrote; the same manifest reopens it.
     #[test]
-    fn a_written_local_package_installs_once_per_manifest() {
+    fn a_written_local_package_reuses_only_the_same_sdk_environment() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
         let root = std::env::temp_dir().join(format!("cm-local-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
@@ -340,18 +341,19 @@ mod tests {
             },
             store,
         );
-        let other = serde_json::json!({
-            "package": "local/cozy-machine-cpu-input",
-            "release": "0.1.0",
-            "python_version": "3.12",
-            "python_requires": ">=3.12",
-            "source": {"digest": source.digest, "length": source.length},
-        });
-        let other = write(&objects, "alice", other.to_string().as_bytes());
-        let installed = pinned.install(&service, "alice", &other.digest).unwrap();
+        // The source and manifest stay byte-identical across this SDK change. Reusing
+        // the first alias here would silently keep its original Runtime/TensorFS.
+        let updated = pinned.install(&service, "alice", &manifest.digest).unwrap();
+        assert_ne!(updated.alias, installed.alias);
+        assert_ne!(updated.generation, installed.generation);
+        let same_sdk = pinned.install(&service, "alice", &manifest.digest).unwrap();
+        assert_eq!(same_sdk.alias, updated.alias);
+        assert_eq!(same_sdk.generation, updated.generation);
+        // A prior generation remains valid for already accepted work.
+        assert!(service.catalog.resolve(&installed.generation).is_ok());
         let python = service
             .catalog
-            .resolve(&installed.generation)
+            .resolve(&updated.generation)
             .unwrap()
             .record
             .python
