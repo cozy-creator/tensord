@@ -1,5 +1,6 @@
-//! Trusted device execution on one GPU or a group of K (one executor sealed to all K; rank 0
-//! forms the followers); acceptance, scheduling and custody stay in Engine.
+//! TensorD coordinates device execution on one GPU or a group of K (rank 0 forms followers).
+//! It supplies weight sources/CPU buffers and budgets; Runtime constructs models and performs
+//! CUDA transfers/mappings through its TensorFS plane. Engine owns acceptance and run custody.
 use crate::{
     catalog::HeldGeneration,
     device_executor::{
@@ -2215,8 +2216,8 @@ impl GpuPool {
     }
 
     /// Launch an executor for `plan` (fork from its generation's import-only executor, else
-    /// spawn) and open its model sources and host-tier grants. Unsupported: an executor that
-    /// cannot take its weights from the sealed host tier.
+    /// spawn) and open its selected metadata sources and CPU-buffer grants. The advertised
+    /// capabilities select sealed-tier delivery or the supported legacy peer route.
     fn new_session(
         &self,
         engine: &Arc<Engine>,
@@ -2322,7 +2323,8 @@ impl GpuPool {
                 })
             })
             .collect::<io::Result<Vec<_>>>()?;
-        // Start on this model's layouts while the executor imports and constructs.
+        // TensorD starts filling CPU layouts through TensorFS while Runtime imports and
+        // constructs the model. GPU allocation/transfers still happen in the executor.
         if unsealed.is_none() {
             self.host.prepare(grants.clone(), staged);
         }
@@ -3860,7 +3862,8 @@ impl Services for Callbacks<'_> {
                 length: frame.length,
                 stage: frame.stage_regions.as_deref(),
             };
-            // A refusal is an answer: that weight set reads the store, the session goes on.
+            // A refusal belongs to this weight set; the executor determines whether another
+            // supported source remains. It does not grant permission to open the Store.
             match self.host.seal(self.peer, self.grants, request, plan) {
                 Ok(granted) => {
                     (answer.ok, answer.held) = (true, granted.is_some());

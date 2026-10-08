@@ -1,22 +1,34 @@
 # Model sources
 
-`model_sources.rs` (`ModelSources`) exports read-only model bytes from the machine's TensorFS store
-to a device executor. Only an explicit selection grants authority, never presence in the store.
-`model_source_driver.rs` answers executor `model_source_read` frames with it.
+TensorD makes selected model weights and metadata available to Runtime. A source identifies an
+exact manifest and selected components and supplies their metadata/bytes; it is not merely a
+model name. The selection is also an access boundary: presence in the store alone does not
+authorize a request.
+
+`model_sources.rs` (`ModelSources`) reads verified headers and header-declared assets through
+TensorFS. `GpuPool` answers executor `model_source` requests with those bytes in sealed
+read-only descriptors. Tensor payloads reach Runtime through the shared CPU layouts,
+streaming windows or granted object descriptors described in [Host tier](HOST-TIER.md).
+TensorFS runs as a library in TensorD and in Runtime; these requests do not address a
+separate TensorFS daemon.
 
 ## API
 
-`open_shared(store, &[SelectedManifest { manifest, components }])` reads the native header.
-The native read plan over the selected components defines the allowed objects.
+`open_shared(store, &[SelectedManifest { manifest, components }])` verifies the manifest/header
+and the requested components. TensorFS's read plan calculates their encoded source bytes.
+`selected_facts(manifest)` returns the component names, encoded byte count and manifest length;
+the byte count is neither prepared CPU-buffer residency nor a prediction of GPU memory use.
+`authorized_header(manifest)` supplies the header used to validate host-tier requests.
 
-`read(SourceRequest { manifest, role, name, length }) -> SourceGrant { sha256, length, file }`:
-- `header`: the verified header file;
-- `object`: must be in the selected plan, with an exact `length`;
-- `asset`: must be declared by the selected header. It is returned as a sealed read-only memfd;
-- other roles: `Unsupported`, failing only this request.
+`source(manifest, name)` returns the verified header when `name` is empty, or the named
+header-declared asset. Assets are read through a TensorFS lease over their own objects.
+`serve(frame)` places those bytes in a sealed memfd and returns `sha256`, `length` and a
+read-only descriptor; the control seam transfers it with `SCM_RIGHTS`.
 
-The answer carries `sha256`, `length` and one `SCM_RIGHTS` fd. It is used only after the executor
-offers `model_sources.descriptors/1`. Descriptors outlive the broker.
+Runtime parses the granted metadata using its local TensorFS library, constructs the model,
+and arranges weight reads/transfers with its weight plane. Keeping that work in the executor
+does not give it responsibility for TensorD's store lifetime, collection or machine-wide
+budgets. Descriptor and buffer lifetimes are separate from the request that supplied them.
 
 ## Closure transfer
 
@@ -26,5 +38,5 @@ offers `model_sources.descriptors/1`. Descriptors outlive the broker.
 ## Known gaps
 
 - Cooperative same-user contract, not a sandbox.
-- The lease keeps one fd per selected object and can hit the hard fd limit.
+- Host-tier object descriptors/read leases can reach the hard fd limit; see [Host tier](HOST-TIER.md).
 - Assets are buffered whole in memory.

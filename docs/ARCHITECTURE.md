@@ -1,15 +1,29 @@
 # Architecture
 
 TensorD (`cozy-machine`) is the persistent Rust daemon that owns the API, execution journal,
-node scheduling, memory budgets and executor supervision. TensorFS is an embedded library;
-ordinary processes can share its store for reads and writes. Package code runs in Python
-executors (cozy-runtime) inside each package environment. The machine never loads CUDA;
-executors own their device contexts. NVML is read only on each GPU's sampler thread (`memory`).
+node scheduling, memory budgets and executor supervision. Package code runs in Python
+executors (cozy-runtime) inside each package environment. TensorFS is a library embedded in
+TensorD and used inside Runtime; it is not a separate daemon. TensorD has no CUDA context:
+executors own device contexts and operations. NVML is read on each configured GPU's sampler
+thread (`memory`).
 
-TensorD makes allocation and eviction decisions across workloads. Runtime reports each rank's
-needs and measured use and acts on its grants; the TensorFS weight plane moves and accounts for
-bytes within those grants. TensorFS `Store::ensure_owned` retains the store claim through live
-handles and read leases, coordinates GC pins and excludes outside collectors. Its
+Model loading spans storage, shared CPU buffers and executor GPU memory:
+
+| Representation | TensorD's responsibility | Runtime's responsibility |
+| --- | --- | --- |
+| Stored weight bytes and metadata | Use TensorFS to acquire/retain manifests, headers, assets and tensor objects; bind available data to the selected model components | Request the selected header/assets, inspect tensor layouts, and construct Python/PyTorch models |
+| Shared CPU weight buffers | Fill and retain sealed layouts or streaming windows through TensorFS; coordinate host budgets and release unused buffers | Adopt granted layouts and descriptors through its TensorFS weight plane; read ready regions and manage its pinned staging within the host budget |
+| GPU-resident tensor storage | Coordinate device budgets and eviction; retain eligible executor-exported allocation handles and their leases | Allocate, transfer, map and unmap through TensorFS's plane/device APIs in the executor's CUDA context; attach those tensors to the model |
+
+Runtime reports each rank's needs and measured use. TensorD decides budgets and eviction
+across workloads; Runtime and its TensorFS weight plane perform the concrete device operations
+within those grants. A model source carries access to selected weight bytes, metadata and assets, not
+just a repository name. A host-buffer fill does not construct a PyTorch model, and retaining a
+GPU handle does not create a CUDA context in TensorD.
+
+TensorFS `Store::ensure_owned` retains the store claim through live handles and read leases,
+coordinates GC pins and excludes outside collectors. Cooperating ordinary processes can
+still share its store for reads and writes. Its
 [owned-store contract](https://github.com/cozy-creator/tensorfs/blob/master/docs/owned-store.md)
 describes collector compatibility. TensorD retains the node-specific sealed memfd cache, host
 tiers, GPU-region custody and peer/process leases. [Recovery](RECOVERY.md) distinguishes
@@ -100,8 +114,7 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 | `protocol.rs` | Private control-socket protocol (length-prefixed JSON + `SCM_RIGHTS`) | `Request`, `Command`, `Reply` | E |
 | `host_tier.rs` | Degree 1 host tier: machine-filled sealed layouts, adopted read-only, sized by live headroom | `HostTier`, `HostGrant`, `TierLimit`, `HostTierFacts` | B1 |
 | `host_memory.rs` | Live host headroom (cgroup v1/v2 path, `MemAvailable`) | `HostMemory` | B1 |
-| `model_sources.rs` | Selected model byte grants (read-only descriptors) | `ModelSources`, `SelectedManifest`, `SourceGrant` | B1 |
-| `model_source_driver.rs` | Answer one executor model-source request | `answer` | B1 |
+| `model_sources.rs` | Selected model headers/assets as verified bytes and sealed read-only descriptors; component byte facts for planning | `ModelSources`, `SelectedManifest` | B1 |
 | `resident_custody.rs` | Degree 2: executor-exported GPU regions kept as driver fds (no CUDA), leases, revocation | `ResidentCustody`, `HoldingKey`, `SharedRegion` | C |
 | `boundary_json.rs` | Strict JSON parse (no duplicate keys) for boundary records | — | D1 |
 

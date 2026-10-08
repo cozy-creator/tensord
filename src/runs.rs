@@ -951,8 +951,8 @@ impl Runs {
         })
     }
 
-    /// `model_prefetch`: the job will call `entrypoint` next, so its models prepare and load
-    /// now, beside whatever the GPU already holds.
+    /// `model_prefetch`: an acknowledged hint about a future child call. TensorD resolves
+    /// its models and asks the GPU pool to prewarm a Runtime construction when admitted.
     pub fn prefetch(self: &Arc<Self>, parent: &Execution, application: &str, entrypoint: &str) {
         let Some(gpu) = self.service.gpu() else {
             return;

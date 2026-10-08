@@ -204,8 +204,8 @@ pub enum DeviceCommand {
         sequence_parallel_degree: u32,
         binding: Box<Binding>,
         budgets: Budgets,
-        /// Several model slots in one construction (H3 turbo: base + LoRA); when set, the
-        /// executor loads these and ignores `binding`/`budgets`.
+        /// Several model slots in one construction (H3 turbo: base + LoRA); Runtime builds
+        /// these models and loads their granted weights, ignoring `binding`/`budgets`.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         models: Vec<ModelLoad>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -213,11 +213,11 @@ pub enum DeviceCommand {
         #[serde(skip_serializing_if = "String::is_empty")]
         attention_pin: String,
         stages: bool,
-        /// `host_tiers.sealed/1`: every weight set asks for the machine's sealed layout.
+        /// `host_tiers.sealed/1`: each weight set asks for TensorD's sealed CPU-buffer layout.
         #[serde(skip_serializing_if = "is_false")]
         sealed_tiers: bool,
-        /// The machine serves the header and model assets (`model_source`): with sealed
-        /// tiers the executor reads no store. Older executors ignore it.
+        /// TensorD supplies the selected header/assets (`model_source`) for Runtime to parse
+        /// and construct its model. With sealed tiers, no executor Store open is needed.
         #[serde(skip_serializing_if = "is_false")]
         model_sources: bool,
         /// This machine stages layouts in part and hands over object files
@@ -227,7 +227,7 @@ pub enum DeviceCommand {
         /// `load_pinned/1`: the pinned budget, applied before any weight set registers.
         #[serde(skip_serializing_if = "Option::is_none")]
         pinned_bytes: Option<i64>,
-        /// Attach GPU weights the machine keeps (`weights.attach/1`).
+        /// Runtime maps GPU allocation handles retained by TensorD (`weights.attach/1`).
         #[serde(skip_serializing_if = "is_false")]
         device_weights: bool,
         /// The process's device cap (`process_cap/1`).

@@ -1,17 +1,20 @@
 # Process replacement and recovery
 
-TensorD owns the persistent execution journal and the live node resource decisions. TensorFS is
-an embedded library. Replacing an executor, restarting the service, and replacing a rental have
-different recovery guarantees.
+TensorD owns the persistent execution journal and the live node resource decisions. TensorFS
+is a library in TensorD and in Runtime. TensorD can retain stored artifacts, shared CPU weight
+buffers and exported GPU allocation handles; Runtime must still construct the model and create
+its own CUDA mappings. Replacing an executor, restarting the service, and replacing a rental
+have different recovery guarantees.
 
 | Event | Retained state | State that must be reconstructed |
 | --- | --- | --- |
-| Executor replacement while the service lives | Verified TensorFS disk objects, machine-owned sealed host layouts, eligible resident GPU weight handles, journal and collected outputs | Executor CUDA context, streams, activations and interrupted computation |
+| Executor replacement while the service lives | Verified TensorFS disk objects/metadata, TensorD-owned sealed CPU buffers, eligible exported GPU allocation handles, journal and collected outputs | Runtime's Python/PyTorch model objects, CUDA context/mappings, streams, activations and interrupted computation |
 | Service or supervisor restart with the same machine root | Machine identity, journal, verified disk objects, package generations, collected outputs, job scratch and declared checkpoints | Host memory cache, GPU residency, leases, executor contexts and in-memory credentials |
 | Replacement rental without the same durable storage | Only artifacts and records acknowledged by external custody | Local journal, disk cache, model residency and unfinished computation |
 
-A cached model's presence does not mean its execution completed. A replacement executor can
-attach still-owned weights only through their ordinary validated descriptor and lease protocol.
+A cached artifact's presence does not mean a model is built or its execution completed. A
+replacement Runtime executor can reuse retained buffers/allocations only through their ordinary
+validated descriptor and lease protocol, constructing its own model and device mappings.
 No interrupted copy, kernel, or inference result is declared complete to make recovery possible.
 The control service remains CUDA-free. A service's stop flag is a shutdown request, not proof
 that dispatch threads, their store references, or executors have ended. Full process-restart

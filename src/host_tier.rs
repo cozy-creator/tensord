@@ -1,15 +1,14 @@
-//! Degree 1: the machine's host weights. Each weight set's layout is a memfd sealed at creation
-//! (nobody else can write, resize or punch it), filled once through TensorFS's verified read
-//! path by one background filler, in the order asked, and kept across executors and model
-//! switches. Executors adopt it read-only (`host_tiers.sealed/1`, `Plane.register_sealed`) the
-//! moment it exists and use each region once its Ready word is set (`host_tiers.filling/1`). The machine holds one descriptor per layout. The tier's
-//! size follows live host headroom (`host_memory`), read at every admission; unheld, complete
-//! layouts are released least recently used first, or after `ttl` unused. How much of the
-//! headroom the tier may take is `TierLimit`'s decision (the memory policy module's). No lock
-//! is held across a fill. A layout that does not fit even after releases is streamed instead
-//! (the disk rung): a sealed window of a few slots (`TierLimit::staging` sizes it; one region
-//! at least) that the machine refills from disk in order as the executor claims regions;
-//! nothing is refused for size, and the executor reads no store either way.
+//! Degree 1: shared CPU weight buffers filled and retained by TensorD through TensorFS.
+//! Each layout is a memfd sealed at creation (other processes cannot write, resize or punch
+//! it). TensorFS fills regions from verified stored bytes; Runtime adopts the layout read-only
+//! (`Plane.register_sealed`) and waits for Ready regions before using its own plane for pinned
+//! staging and GPU copies. Model construction and CUDA operations stay in the executor.
+//! TensorD holds one descriptor per layout across executor replacement and model switches.
+//! `TierLimit` bounds retained CPU buffers using live host headroom; unheld complete layouts
+//! are released least recently used first or after `ttl`. No lock is held across a fill.
+//! A layout can instead expose unstaged regions through granted object descriptors, or use
+//! a sealed streaming window that TensorD refills as Runtime claims regions. These are data
+//! paths for a granted weight set, not permission for the executor to open the managed Store.
 use crate::{host_memory::HostMemory, os};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -73,19 +72,19 @@ pub trait TierLimit: Send + Sync {
         self.limit(host, charged).saturating_sub(charged)
     }
 }
-/// Until the memory policy module decides: half of what the host has for the tier (free
-/// before its tightest limit, plus what the tier holds), Runtime's `pinned_total` rule.
+/// A simple standalone policy: half the live headroom plus the tier's retained bytes.
+/// GpuPool uses the shared host ledger's TierPolicy to include executor-private pinned bytes.
 pub struct HalfOfHeadroom;
 impl TierLimit for HalfOfHeadroom {
     fn limit(&self, host: &HostMemory, charged: u64) -> u64 {
         if host.available < 0 {
-            return 0; // unreadable: nothing is admitted, executors read the store
+            return 0; // unreadable: no retained tier capacity; use a supported streaming path
         }
         (host.available as u64 + charged) / 2
     }
 }
 
-/// What one executor may adopt: these components of this manifest (its selected model).
+/// CPU layouts one executor may adopt: these components of this exact model manifest.
 #[derive(Clone)]
 pub struct HostGrant {
     pub manifest: String,
