@@ -73,9 +73,9 @@ fn scopes() -> bool {
 /// runs until the test process ends; `given` counts (events, rungs).
 fn give_back(pressure: Pressure, held: Arc<Mutex<Vec<Child>>>, given: Arc<Mutex<(usize, usize)>>) {
     std::thread::spawn(move || {
-        let mut feedback = Feedback::new(pressure.stalled_us().unwrap(), Instant::now());
+        let mut feedback = Feedback::new(pressure.sample().unwrap().total(), Instant::now());
         while pressure.wait().is_ok() {
-            let give = feedback.give(pressure.stalled_us().unwrap(), Instant::now());
+            let Some(give) = feedback.observe(pressure.sample().unwrap(), Instant::now()) else { continue };
             let mut counts = given.lock().unwrap();
             counts.0 += 1;
             if give {

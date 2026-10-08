@@ -1,7 +1,9 @@
 //! The host asks for memory back (MEM/HOST-PRESSURE.md). A PSI trigger wakes one thread blocked
 //! in poll() with no timeout: in `shared` mode on the whole system's memory pressure (anyone
 //! stalled, the owner's apps included), in `dedicated` mode on this cgroup's (every task of it
-//! stalled). Each event gives one rung back while each rung lowers the stall; one that did not
+//! stalled). Cgroup v1 has no per-cgroup PSI: system `some` wakes the watcher, but only
+//! this cgroup's limit-hit counters may request reclaim, including limits on its parents.
+//! Each event gives one rung back while each rung lowers the pressure; one that did not
 //! stops it, since that stall is not ours to fix (page-cache refaults on a slow disk), until the
 //! stall rises above where it stopped (`Feedback`).
 use serde::Deserialize;
@@ -31,17 +33,54 @@ pub enum HostMode {
 /// "something stalled on memory in the last window".
 pub const WINDOW: Duration = Duration::from_secs(2);
 
-/// One armed PSI trigger, and in dedicated mode this cgroup's `memory.events` (its `high`
-/// and `max` counters: throttled or at the wall), which wakes poll() when they change.
+/// One armed PSI trigger. Dedicated v2 also watches memory.events; dedicated v1
+/// qualifies system wakeups with its finite cgroup limits' memory.failcnt counters.
 pub struct Pressure {
     trigger: File,
     path: PathBuf,
     kind: &'static str,
     events: Option<File>,
+    limit_hits: Vec<PathBuf>,
+}
+
+/// Different kernel counters, never synthetic stall microseconds. V1's memory.failcnt
+/// counts charges that reached a limit and triggered reclaim, not just failed allocations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sample {
+    StalledUs(u64),
+    LimitHits(u64),
+}
+
+impl Sample {
+    pub fn total(self) -> u64 {
+        match self {
+            Self::StalledUs(total) | Self::LimitHits(total) => total,
+        }
+    }
+    pub fn stalled_us(self) -> Option<u64> {
+        match self {
+            Self::StalledUs(total) => Some(total),
+            _ => None,
+        }
+    }
+    pub fn limit_hits(self) -> Option<u64> {
+        match self {
+            Self::LimitHits(total) => Some(total),
+            _ => None,
+        }
+    }
 }
 
 impl Pressure {
     pub fn arm(mode: HostMode) -> io::Result<Self> {
+        if mode == HostMode::Dedicated {
+            if let Some((groups, _, "memory.usage_in_bytes")) = crate::host_memory::cgroups() {
+                let limited = v1_limits(groups);
+                if !limited.is_empty() {
+                    return Self::arm_v1(limited, "/proc/pressure/memory".into());
+                }
+            }
+        }
         let cgroup = own_cgroup().filter(|cgroup| cgroup.join("memory.pressure").exists());
         match (mode, cgroup) {
             (HostMode::Dedicated, Some(cgroup)) => {
@@ -52,6 +91,25 @@ impl Pressure {
             (HostMode::Dedicated, None) => Self::arm_at("/proc/pressure/memory".into(), "full"),
             (HostMode::Shared, _) => Self::arm_at("/proc/pressure/memory".into(), "some"),
         }
+    }
+
+    fn arm_v1(groups: Vec<PathBuf>, system_pressure: PathBuf) -> io::Result<Self> {
+        // System `full` can stay quiet while one container stalls on a busy host.
+        // `some` is only the wakeup: unrelated host stalls cannot release this pod's
+        // holdings without a local limit hit. These counters also work on read-only
+        // cgroup mounts; no event_control registration or polling timer is needed.
+        let mut pressure = Self::arm_at(system_pressure, "some")?;
+        pressure.limit_hits = groups
+            .into_iter()
+            .map(|group| group.join("memory.failcnt"))
+            .collect();
+        if pressure.limit_hits.is_empty() {
+            return Err(io::Error::other(
+                "cgroup v1 memory limit counters are unavailable",
+            ));
+        }
+        pressure.sample()?;
+        Ok(pressure)
     }
 
     /// A trigger on one pressure file (`memory.pressure` of a cgroup, or the system's).
@@ -67,6 +125,7 @@ impl Pressure {
             path,
             kind,
             events: None,
+            limit_hits: Vec::new(),
         })
     }
 
@@ -103,10 +162,35 @@ impl Pressure {
         let text = fs::read_to_string(&self.path)?;
         text.lines()
             .find(|line| line.starts_with(self.kind))
-            .and_then(|line| line.split_whitespace().find_map(|f| f.strip_prefix("total=")))
+            .and_then(|line| {
+                line.split_whitespace()
+                    .find_map(|f| f.strip_prefix("total="))
+            })
             .and_then(|total| total.parse().ok())
             .ok_or_else(|| io::Error::other("no PSI total"))
     }
+
+    pub fn sample(&self) -> io::Result<Sample> {
+        if self.limit_hits.is_empty() {
+            return self.stalled_us().map(Sample::StalledUs);
+        }
+        let mut total = 0u64;
+        for path in &self.limit_hits {
+            let hits = fs::read_to_string(path)?
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| io::Error::other("invalid cgroup v1 memory limit counter"))?;
+            total = total.saturating_add(hits);
+        }
+        Ok(Sample::LimitHits(total))
+    }
+}
+
+fn v1_limits(groups: Vec<PathBuf>) -> Vec<PathBuf> {
+    groups
+        .into_iter()
+        .filter(|group| crate::host_memory::number(&group.join("memory.limit_in_bytes")).is_some())
+        .collect()
 }
 
 /// This process's cgroup v2 directory.
@@ -116,8 +200,8 @@ fn own_cgroup() -> Option<PathBuf> {
     Some(PathBuf::from("/sys/fs/cgroup").join(relative.trim_start_matches('/')))
 }
 
-/// Whether the next event gives a rung back. Each event brings the share of time stalled since
-/// the one before. After a rung, a share lower than the share before it by more than the noise
+/// Whether the next event gives a rung back. Each event brings the pressure counter's rate:
+/// stalled time for PSI, limit hits for v1. After a rung, a rate lower than before by more than the noise
 /// says the rung helped, and another may go; one that is not stops giving, and the noise is then
 /// measured: the largest change between consecutive shares while nothing is given. Giving
 /// resumes only once the share rises above where it stopped by more than that noise. So a stall
@@ -178,6 +262,22 @@ impl Feedback {
         true
     }
 
+    /// None is an unrelated host wakeup (or a reset v1 counter), not local pressure.
+    pub fn observe(&mut self, sample: Sample, at: Instant) -> Option<bool> {
+        if let Sample::LimitHits(total) = sample {
+            // A host PSI wakeup without another local limit hit is not this pod's
+            // pressure. Administrators may reset failcnt: start a fresh baseline.
+            if total < self.total {
+                *self = Self::new(total, at);
+                return None;
+            }
+            if total == self.total {
+                return None;
+            }
+        }
+        Some(self.give(sample.total(), at))
+    }
+
     /// Nothing was left to give: wait for more pressure than now.
     pub fn exhausted(&mut self) {
         self.stopped = self.rung.take();
@@ -221,6 +321,139 @@ pub fn others(host: &crate::host_memory::HostMemory, total: u64, ours: u64) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    struct V1Files(PathBuf);
+    impl V1Files {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("cozy-pressure-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(root.join("container")).unwrap();
+            fs::write(root.join("memory.failcnt"), "30\n").unwrap();
+            fs::write(root.join("container/memory.failcnt"), "10\n").unwrap();
+            fs::write(root.join("memory.limit_in_bytes"), "134217728\n").unwrap();
+            fs::write(root.join("container/memory.limit_in_bytes"), "67108864\n").unwrap();
+            fs::write(root.join("system-pressure"), "full avg10=0.00 total=0\n").unwrap();
+            Self(root)
+        }
+        fn arm(&self) -> Pressure {
+            Pressure::arm_v1(
+                vec![self.0.join("container"), self.0.clone()],
+                self.0.join("system-pressure"),
+            )
+            .unwrap()
+        }
+    }
+    impl Drop for V1Files {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn dedicated_v1_arms_some_and_reads_container_and_parent_limits_without_control_writes() {
+        let files = V1Files::new();
+        for path in [
+            files.0.join("memory.failcnt"),
+            files.0.join("container/memory.failcnt"),
+        ] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        // No cgroup.event_control or memory.pressure_level exists in this fixture.
+        let pressure = files.arm();
+        let trigger = fs::read(files.0.join("system-pressure")).unwrap();
+        assert!(trigger.starts_with(b"some 1 2000000\0"));
+        assert_eq!(pressure.sample().unwrap(), Sample::LimitHits(40));
+        assert_eq!(pressure.sample().unwrap().stalled_us(), None);
+    }
+
+    #[test]
+    fn unrelated_host_stalls_cannot_reclaim_v1_holdings_but_local_limit_hits_can() {
+        let files = V1Files::new();
+        let pressure = files.arm();
+        let start = Instant::now();
+        let mut feedback = Feedback::new(pressure.sample().unwrap().total(), start);
+        // Host `some` grows while `full` is quiet: another tenant alone cannot
+        // evict our caches or prevent their quiet bring-back.
+        fs::write(
+            files.0.join("system-pressure"),
+            "some total=9000000\nfull total=0\n",
+        )
+        .unwrap();
+        assert_eq!(
+            feedback.observe(pressure.sample().unwrap(), start + WINDOW),
+            None
+        );
+        // This container now reaches its limit. Parent-only pressure counts too.
+        fs::write(files.0.join("container/memory.failcnt"), "14\n").unwrap();
+        assert_eq!(
+            feedback.observe(pressure.sample().unwrap(), start + WINDOW * 2),
+            Some(true)
+        );
+        fs::write(files.0.join("memory.failcnt"), "31\n").unwrap();
+        assert_eq!(
+            feedback.observe(pressure.sample().unwrap(), start + WINDOW * 3),
+            Some(true)
+        );
+        assert_eq!(
+            feedback.observe(pressure.sample().unwrap(), start + WINDOW * 4),
+            None
+        );
+    }
+
+    #[test]
+    fn resetting_v1_counters_does_not_invent_pressure_or_disable_the_next_episode() {
+        let start = Instant::now();
+        let mut feedback = Feedback::new(40, start);
+        assert_eq!(
+            feedback.observe(Sample::LimitHits(44), start + WINDOW),
+            Some(true)
+        );
+        assert_eq!(
+            feedback.observe(Sample::LimitHits(0), start + WINDOW * 2),
+            None
+        );
+        assert_eq!(
+            feedback.observe(Sample::LimitHits(1), start + WINDOW * 3),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn unreadable_v1_counter_is_not_replaced_by_unrelated_host_psi() {
+        let files = V1Files::new();
+        let pressure = files.arm();
+        fs::write(files.0.join("container/memory.failcnt"), "unreadable\n").unwrap();
+        assert!(pressure.sample().is_err());
+    }
+
+    #[test]
+    fn a_missing_controlling_ancestor_counter_cannot_be_silently_omitted() {
+        let files = V1Files::new();
+        fs::remove_file(files.0.join("memory.failcnt")).unwrap();
+        assert!(Pressure::arm_v1(
+            vec![files.0.join("container"), files.0.clone()],
+            files.0.join("system-pressure"),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn an_unlimited_v1_host_keeps_system_pressure_instead_of_an_inert_limit_counter() {
+        let files = V1Files::new();
+        fs::write(
+            files.0.join("memory.limit_in_bytes"),
+            "9223372036854771712\n",
+        )
+        .unwrap();
+        let groups = vec![files.0.join("container"), files.0.clone()];
+        assert_eq!(v1_limits(groups.clone()), vec![files.0.join("container")]);
+        fs::write(
+            files.0.join("container/memory.limit_in_bytes"),
+            "9223372036854771712\n",
+        )
+        .unwrap();
+        assert!(v1_limits(groups).is_empty());
+    }
 
     /// Events every window with these stall shares; true where a rung went.
     fn run(shares: &[f64]) -> Vec<bool> {
@@ -262,8 +495,14 @@ mod tests {
         let start = Instant::now();
         let mut feedback = Feedback::new(0, start);
         assert!(feedback.give(600_000, start + WINDOW), "0.3: a rung");
-        assert!(!feedback.give(1_200_000, start + WINDOW * 2), "0.3 again: stopped");
-        assert!(!feedback.give(1_800_000, start + WINDOW * 3), "0.3: the noise is 0");
+        assert!(
+            !feedback.give(1_200_000, start + WINDOW * 2),
+            "0.3 again: stopped"
+        );
+        assert!(
+            !feedback.give(1_800_000, start + WINDOW * 3),
+            "0.3: the noise is 0"
+        );
         // No stall for three windows, then the same background burst: nothing.
         assert!(!feedback.give(2_400_000, start + WINDOW * 6));
         // A hog's stall well above it is answered, and falls rung by rung.
@@ -277,9 +516,18 @@ mod tests {
         let mut feedback = Feedback::new(0, start);
         assert!(feedback.give(400_000, start + WINDOW));
         feedback.exhausted();
-        assert!(!feedback.give(900_000, start + WINDOW * 2), "noise is measured first");
-        assert!(!feedback.give(1_380_000, start + WINDOW * 3), "within the noise");
-        assert!(feedback.give(2_580_000, start + WINDOW * 4), "well above it");
+        assert!(
+            !feedback.give(900_000, start + WINDOW * 2),
+            "noise is measured first"
+        );
+        assert!(
+            !feedback.give(1_380_000, start + WINDOW * 3),
+            "within the noise"
+        );
+        assert!(
+            feedback.give(2_580_000, start + WINDOW * 4),
+            "well above it"
+        );
     }
 
     #[test]
