@@ -102,7 +102,6 @@ impl Pressure {
         pressure.limit_hits = groups
             .into_iter()
             .map(|group| group.join("memory.failcnt"))
-            .filter(|path| path.is_file())
             .collect();
         if pressure.limit_hits.is_empty() {
             return Err(io::Error::other(
@@ -425,6 +424,17 @@ mod tests {
         let pressure = files.arm();
         fs::write(files.0.join("container/memory.failcnt"), "unreadable\n").unwrap();
         assert!(pressure.sample().is_err());
+    }
+
+    #[test]
+    fn a_missing_controlling_ancestor_counter_cannot_be_silently_omitted() {
+        let files = V1Files::new();
+        fs::remove_file(files.0.join("memory.failcnt")).unwrap();
+        assert!(Pressure::arm_v1(
+            vec![files.0.join("container"), files.0.clone()],
+            files.0.join("system-pressure"),
+        )
+        .is_err());
     }
 
     #[test]
