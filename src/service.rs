@@ -472,6 +472,9 @@ impl Service {
                     )?;
                     continue;
                 }
+                let joins_gpu_family = if gpu_active {
+                    self.gpu().map(|gpu| gpu.joins_family(&self.engine, &record)).transpose()?.unwrap_or(false)
+                } else { false };
                 if crate::jobs::Jobs::takes(&record) {
                     let Some(jobs) = &jobs else {
                         self.engine.wait_for_environment(
@@ -481,7 +484,7 @@ impl Service {
                         continue;
                     };
                     if record.invocation.job {
-                        if record.invocation.accelerator && gpu_active && !self.gpu().is_some_and(|gpu| gpu.joins_family(&self.engine, &record).unwrap_or(false)) {
+                        if record.invocation.accelerator && gpu_active && !joins_gpu_family {
                             continue;
                         }
                         if jobs.dispatch(&self.engine, &record, held)? && record.invocation.accelerator {
@@ -495,7 +498,7 @@ impl Service {
                     .as_ref()
                     .filter(|s| !s.preparation_id.is_empty())
                 {
-                    if gpu_active && !self.gpu().is_some_and(|gpu| gpu.joins_family(&self.engine, &record).unwrap_or(false)) {
+                    if gpu_active && !joins_gpu_family {
                         continue;
                     }
                     let Some(gpu) = self.gpu() else {
@@ -514,7 +517,7 @@ impl Service {
                                 "accepted GPU preparation is absent",
                             )
                         })?;
-                    gpu_active =
+                    gpu_active |=
                         gpu.dispatch(&self.engine, &record, held.application(&record.invocation.module)?, gpu.plan(&preparation)?)?;
                 }
                 if room == 0 && gpu_active && jobs.is_none() {

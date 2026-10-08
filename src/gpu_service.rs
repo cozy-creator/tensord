@@ -1441,7 +1441,7 @@ impl GpuPool {
     /// `prefetch(motion_segment)`): load it in the background where it fits beside the tenants
     /// already there (it never makes room), without waiting for the parent's own run to end.
     /// It takes the GPU's call slot like any call, so a child call in flight finishes first.
-    pub fn prefetch(self: &Arc<Self>, engine: &Arc<Engine>, held: HeldGeneration, plan: GpuPlan) {
+    pub fn prefetch(self: &Arc<Self>, engine: &Arc<Engine>, held: HeldGeneration, plan: GpuPlan, family: Option<String>) {
         let (pool, engine) = (self.clone(), engine.clone());
         let started = std::thread::Builder::new()
             .name("executor-prefetch".into())
@@ -1454,7 +1454,7 @@ impl GpuPool {
                     zygote.wait_started();
                 }
                 let _permit = loop {
-                    if let Some(permit) = pool.permit(&engine, None, true) { break permit; }
+                    if let Some(permit) = pool.permit(&engine, family.as_deref(), true) { break permit; }
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 };
                 let key = plan.id.clone();
