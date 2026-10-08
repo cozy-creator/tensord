@@ -80,6 +80,26 @@ struct Parent {
 }
 
 impl Parent {
+    fn callable(&self, frame: &Frame) -> Result<&(String, String), (&'static str, String)> {
+        self.callables
+            .get(&(frame.module.clone(), frame.export.clone()))
+            .ok_or((
+                "child_undeclared",
+                format!(
+                    "{}.{} is not an invocable of this package or its environment's",
+                    frame.module, frame.export
+                ),
+            ))?
+            .as_ref()
+            .ok_or((
+                "child_ambiguous",
+                format!(
+                    "{}.{} is registered by more than one App in this environment",
+                    frame.module, frame.export
+                ),
+            ))
+    }
+
     /// A call of this job has not ended: its executor is watched, and the root waits on it.
     fn unfinished(&self, engine: &Engine) -> bool {
         let calls = self.calls.lock().unwrap();
@@ -755,19 +775,7 @@ impl Jobs {
             .service
             .upgrade()
             .ok_or(("child_call_refused", "machine is stopping".into()))?;
-        let (application, entrypoint) = parent
-            .callables
-            .get(&(frame.module.clone(), frame.export.clone()))
-            .ok_or((
-                "child_undeclared",
-                format!(
-                    "{}.{} is not an invocable of this package or its environment's",
-                    frame.module, frame.export
-                ),
-            ))?
-            .as_ref().ok_or(("child_ambiguous", format!(
-                "{}.{} is registered by more than one App in this environment", frame.module, frame.export,
-            )))?;
+        let (application, entrypoint) = parent.callable(frame)?;
         let callable = (frame.module.clone(), frame.export.clone());
         if parent.pure && !parent.pure_callables.contains(&callable) {
             return Err((
@@ -1050,19 +1058,7 @@ impl Jobs {
             }
             // A hint about a future call: TensorD may prepare its weights and ask Runtime
             // to build the construction. This answer does not promise completed loading.
-            Kind::ModelPrefetch => {
-                let callable = (frame.module.clone(), frame.export.clone());
-                if let (Some(Some((application, entrypoint))), Some(runs), Some(service)) = (
-                    parent.callables.get(&callable),
-                    self.runs.upgrade(),
-                    self.service.upgrade(),
-                ) {
-                    if let Ok(job) = service.engine.get(&parent.id) {
-                        runs.prefetch(&job, application, entrypoint);
-                    }
-                }
-                Ok(Answer::ok(frame.seq))
-            }
+            Kind::ModelPrefetch => self.model_prefetch(parent, frame),
             // A deviceless parent holds no GPU.
             Kind::GpuRelease => Ok(Answer::ok(frame.seq)),
             Kind::Checkpoint => self.checkpoint(parent, frame),
@@ -1072,6 +1068,27 @@ impl Jobs {
             answered.unwrap_or_else(|(code, detail)| Answer::refused(frame.seq, code, detail)),
             None,
         ))
+    }
+
+    fn model_prefetch(&self, parent: &Parent, frame: &Frame) -> Result<Answer, (&'static str, String)> {
+        let (application, entrypoint) = parent.callable(frame)?;
+        // Older callers sent no choices. Explicit choices use the ordinary child-call
+        // decoder and selection path; a hint cannot turn a model name into byte authority.
+        let raw = if frame.payload.is_empty() { "{}" } else { &frame.payload };
+        let models = crate::boundary_json::parse(raw.as_bytes())
+            .map_err(|error| ("child_call_refused", format!("prefetch choices are not JSON: {error}")))?;
+        let choices = model_choices(&models, entrypoint)?;
+        let runs = self.runs.upgrade().ok_or((
+            "model_prefetch_unsupported", "machine does not prepare child models".into(),
+        ))?;
+        let service = self.service.upgrade().ok_or((
+            "model_prefetch_unsupported", "machine is stopping".into(),
+        ))?;
+        let job = service.engine.get(&parent.id)
+            .map_err(|error| ("child_call_refused", error.to_string()))?;
+        runs.prefetch(&job, application, entrypoint, choices)
+            .map_err(|error| (error.code, error.message))?;
+        Ok(Answer::ok(frame.seq))
     }
 }
 
@@ -1374,8 +1391,19 @@ fn serving_call(
 ) -> Result<(Value, Vec<crate::api::domain::ModelChoice>), (&'static str, String)> {
     let refuse = |why: &str| ("child_call_refused", format!("serving call {why}"));
     let request = call.get("payload").filter(|p| p.is_object()).ok_or_else(|| refuse("has no request object"))?;
+    Ok((request.clone(), model_choices(&call["models"], entrypoint)?))
+}
+
+fn model_choices(
+    models: &Value,
+    entrypoint: &str,
+) -> Result<Vec<crate::api::domain::ModelChoice>, (&'static str, String)> {
+    let refuse = |why: &str| ("child_call_refused", format!("model choices {why}"));
+    if !models.is_null() && !models.is_object() {
+        return Err(refuse("must be an object"));
+    }
     let mut choices = vec![];
-    for (name, artifact) in call["models"].as_object().into_iter().flatten() {
+    for (name, artifact) in models.as_object().into_iter().flatten() {
         if artifact.is_null() {
             continue;
         }
@@ -1383,16 +1411,18 @@ fn serving_call(
             .filter(|d| d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit()))
             .ok_or_else(|| refuse(&format!("passes {name} without an exact checkpoint")))?;
         let digest = (0..64).step_by(2).map(|i| u8::from_str_radix(&digest[i..i + 2], 16).unwrap()).collect();
+        let length = artifact["manifest"]["length"].as_u64().filter(|length| *length > 0)
+            .ok_or_else(|| refuse(&format!("passes {name} without a positive checkpoint length")))?;
         choices.push(crate::api::domain::ModelChoice {
             parameter: format!("{entrypoint}.models.{name}"),
             manifest: Some(crate::api::domain::Ref {
                 digest,
-                length: artifact["manifest"]["length"].as_u64().unwrap_or_default(),
+                length,
             }),
             ..Default::default()
         });
     }
-    Ok((request.clone(), choices))
+    Ok(choices)
 }
 
 /// The child's file inputs: every string of its request naming a file the parent holds (its

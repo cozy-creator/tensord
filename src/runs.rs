@@ -853,11 +853,8 @@ impl Runs {
             return Ok(existing);
         }
         let mut spec =
-            self.child_spec(&actor, &parent.id, application, entrypoint, input, inputs, intent)?;
+            self.child_spec(&actor, &parent.id, application, entrypoint, input, inputs, intent, &passed)?;
         spec.held = held;
-        // A model the caller passed by value is that slot's choice, over any other for it.
-        spec.models.retain(|choice| !passed.iter().any(|p| p.parameter == choice.parameter));
-        spec.models.extend(passed);
         self.submit(&actor, request, spec)
     }
 
@@ -892,6 +889,7 @@ impl Runs {
         input: Value,
         inputs: Vec<InputFile>,
         digest: &str,
+        passed: &[domain::ModelChoice],
     ) -> Result<Spec, Refused> {
         let held = self.jobs.lock().unwrap().get(parent).cloned();
         let context = match held {
@@ -916,7 +914,7 @@ impl Runs {
         let callee_interface: Value = serde_json::from_slice(&installed.interface)
             .map_err(|_| refused("package_interface_invalid", "held interface is corrupt"))?;
         let prefix = format!("{entrypoint}.");
-        Ok(Spec {
+        let mut spec = Spec {
             warm: false,
             set: None,
             job,
@@ -948,22 +946,37 @@ impl Runs {
             held: None,
             application: application.into(),
             digest: digest.into(),
-        })
+        };
+        // Both demand and prefetch overlay explicit artifacts on the same inherited
+        // choices. Declaration and data-access validation stay in the existing resolver.
+        for choice in passed {
+            let path = addressed(&choice.parameter, &installed.package, &callee_interface)
+                .filter(|path| path.starts_with(&prefix))
+                .ok_or_else(|| refused("invalid_request", "model choice does not name a declared callee slot"))?;
+            let mut choice = choice.clone();
+            choice.parameter = path;
+            spec.models.retain(|prior| prior.parameter != choice.parameter);
+            spec.models.push(choice);
+        }
+        Ok(spec)
     }
 
     /// `model_prefetch`: an acknowledged hint about a future child call. TensorD resolves
     /// its models and asks the GPU pool to prewarm a Runtime construction when admitted.
-    pub fn prefetch(self: &Arc<Self>, parent: &Execution, application: &str, entrypoint: &str) {
-        let Some(gpu) = self.service.gpu() else {
-            return;
-        };
+    pub fn prefetch(
+        self: &Arc<Self>, parent: &Execution, application: &str, entrypoint: &str,
+        passed: Vec<domain::ModelChoice>,
+    ) -> Result<(), Refused> {
         let actor = parent.submission.as_ref().map(|s| s.actor.clone()).unwrap_or_default();
-        let (runs, parent, entrypoint) = (self.clone(), parent.id.clone(), entrypoint.to_string());
+        let spec = self.child_spec(&actor, &parent.id, application, entrypoint,
+            json!({}), vec![], "", &passed)?;
+        let Some(gpu) = self.service.gpu() else {
+            return Ok(());
+        };
+        let (runs, entrypoint) = (self.clone(), entrypoint.to_string());
         let application = application.to_string();
         let started = std::thread::Builder::new().name("child-prefetch".into()).spawn(move || {
-            let prepared = runs
-                .child_spec(&actor, &parent, &application, &entrypoint, json!({}), vec![], "")
-                .and_then(|spec| {
+            let prepared = (|| {
                     let Source::Installation(alias) = &spec.source else { unreachable!() };
                     let held = match runs.service.engine.installation(&actor, alias)? {
                         Some(installed) => Some(runs.callee_view(installed, &spec.application)?),
@@ -971,7 +984,7 @@ impl Runs {
                     };
                     let (hub, models) = (spec.hub.clone(), spec.models.clone());
                     runs.resolve(&actor, held, None, hub, &spec, &spec.entrypoint, &models, Box::new(|_, _, _| ()))
-                });
+                })();
             match prepared {
                 Ok((installation, Some(plan))) => {
                     match runs.service.catalog.resolve(&installation.generation)
@@ -989,6 +1002,7 @@ impl Runs {
         if let Err(error) = started {
             eprintln!("prefetch of a child: {error}");
         }
+        Ok(())
     }
 
     /// A job ended: its children prepare no more.
@@ -1578,7 +1592,7 @@ mod tests {
             ],
             inputs:Default::default(),weights_destination:String::new(),publication:String::new(),
         });
-        let child = runs.child_spec("alice","7","callee:app","render",json!({}),vec![],"child").unwrap();
+        let child = runs.child_spec("alice","7","callee:app","render",json!({}),vec![],"child",&[]).unwrap();
         let chosen: Vec<_> = child.models.iter().map(|c| (c.parameter.as_str(), c.repository.as_str())).collect();
         assert_eq!(chosen, [("render.models.network", "second/chosen")],
             "a choice addressed to the callee's package reaches its declared slot, by that slot's path");
@@ -1607,7 +1621,7 @@ mod tests {
             binding_revision: String::new(), attention_kernel: String::new(), models: vec![],
             inputs: Default::default(), weights_destination: String::new(), publication: String::new(),
         });
-        let child = |name: &str| runs.child_spec("alice", "7", "", name, json!({}), vec![], "d");
+        let child = |name: &str| runs.child_spec("alice", "7", "", name, json!({}), vec![], "d", &[]);
         assert!(child("leaf-job").unwrap().job);
         assert!(!child("leaf-call").unwrap().job);
         assert_eq!(child("missing").err().unwrap().code, "invalid_entrypoint");
