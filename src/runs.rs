@@ -207,12 +207,25 @@ fn addressed(parameter: &str, package: &str, interface: &Value) -> Option<String
         .then(|| path.to_string())
 }
 
-/// Whether `installation` declares the entrypoint `name`.
+/// Whether `installation` declares a public entrypoint `name` for a warm set.
 fn declares(installation: &Installation, name: &str) -> Result<bool, Refused> {
     let interface: Value = serde_json::from_slice(&installation.interface)
         .map_err(|_| refused("package_interface_invalid", "held interface is corrupt"))?;
-    let rows = interface["entrypoints"].as_array();
-    Ok(rows.is_some_and(|rows| rows.iter().any(|row| row["name"] == name)))
+    let entry = interface["entrypoints"].as_array()
+        .and_then(|rows| rows.iter().find(|row| row["name"] == name));
+    if let Some(entry) = entry {
+        public_root(entry)?;
+    }
+    Ok(entry.is_some())
+}
+fn public_root(entry: &Value) -> Result<(), Refused> {
+    if entry["internal"].as_bool() == Some(true) {
+        return Err(refused(
+            "callable_internal",
+            format!("{} is an internal package function", entry["name"].as_str().unwrap_or_default()),
+        ));
+    }
+    Ok(())
 }
 fn refused(code: &'static str, message: impl Into<String>) -> Refused {
     Refused {
@@ -605,12 +618,17 @@ impl Runs {
         };
         let declared = interface[rows]
             .as_array()
-            .is_some_and(|rows| rows.iter().any(|row| row["name"] == spec.entrypoint.as_str()));
-        if !declared && !install_only {
+            .and_then(|rows| rows.iter().find(|row| row["name"] == spec.entrypoint.as_str()));
+        if declared.is_none() && !install_only {
             return Err(refused(
                 "invalid_entrypoint",
                 format!("{} declares no {noun} {:?}", installation.package, spec.entrypoint),
             ));
+        }
+        if spec.parent.is_empty() {
+            if let Some(entry) = declared {
+                public_root(entry)?;
+            }
         }
         if spec.job {
             // A bare parameter, or `<job>.models.<parameter>`, is the job's own model input.
@@ -1246,6 +1264,54 @@ mod tests {
             application: String::new(),
             digest: digest.into(),
         }
+    }
+
+    #[test]
+    fn resolved_internal_callables_refuse_roots_but_allow_managed_children() {
+        let root = std::env::temp_dir().join(format!("cm-private-call-{}", uuid::Uuid::new_v4()));
+        let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
+        let generation = "a".repeat(32);
+        let directory = service.catalog.root().join(&generation);
+        fs::create_dir_all(directory.join("env/bin")).unwrap();
+        std::os::unix::fs::symlink("/usr/bin/python3", directory.join("env/bin/python")).unwrap();
+        fs::write(directory.join(".hold"), "").unwrap();
+        let interface = json!({
+            "application":"fixture:app",
+            "entrypoints":[{"name":"steps","internal":true}],
+            "jobs":[{"name":"steps","internal":true}]
+        });
+        fs::write(directory.join("generation.json"), json!({
+            "identity":generation,"package":"fixture","version":"2.0.0",
+            "application":"fixture:app","python":directory.join("env/bin/python"),
+            "interface":interface
+        }).to_string()).unwrap();
+        service.engine.bind_installation(Installation {
+            actor:"alice".into(),alias:"installed".into(),generation,
+            package:"alice/fixture".into(),release:"2.0.0".into(),
+            interface:serde_json::to_vec(&interface).unwrap(),
+        }).unwrap();
+        let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
+        let objects = Arc::new(Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap());
+        let runs = Runs { service: service.clone(), objects, publisher: None, local: None,
+            own_hub: None, jobs: Default::default() };
+        for job in [false, true] {
+            let mut root_call = spec(Source::Installation("installed".into()), true, "root");
+            root_call.job = job;
+            let refused = runs.prepare("alice", "root", root_call).err().unwrap();
+            assert_eq!(refused.code, "callable_internal");
+            let mut child = spec(Source::Installation("installed".into()), true, "child");
+            child.job = job;
+            child.parent = "managed-parent".into();
+            let prepared = runs.prepare("alice", "child", child).unwrap().unwrap();
+            assert_eq!(prepared.value["release"], "2.0.0");
+        }
+        let mut warm = spec(Source::Models, true, "set");
+        warm.set = Some(vec![SetItem {
+            source: Source::Installation("installed".into()), entrypoint: "steps".into(),
+            models: vec![], level: Level::Host, sent: vec![],
+        }]);
+        assert_eq!(runs.prepare("alice", "set", warm).err().unwrap().code, "callable_internal");
+        let _ = fs::remove_dir_all(root);
     }
 
     /// Unpublished code written with Write runs through a run that prepares inside itself,
