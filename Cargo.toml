@@ -1,6 +1,6 @@
 [package]
 name = "cozy-machine"
-version = "0.1.0+dev.gpujobs.sdkcache.80a723c"
+version = "0.1.0+dev.outputcapacity.0599a77"
 edition = "2021"
 publish = false
 
