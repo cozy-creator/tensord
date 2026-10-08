@@ -40,7 +40,7 @@ fn meminfo(field: &str) -> i64 {
     -1
 }
 
-fn number(path: &Path) -> Option<u64> {
+pub(crate) fn number(path: &Path) -> Option<u64> {
     let text = fs::read_to_string(path).ok()?;
     let text = text.trim();
     // cgroup v2 spells "unlimited" `max`; v1 a page-rounded value near LONG_MAX
@@ -68,7 +68,7 @@ fn stat(cgroup: &Path) -> Option<(u64, u64)> {
 
 /// This process's memory cgroup and every parent up to the controller root, innermost first,
 /// with the limit files and the usage file of its version.
-fn cgroups() -> Option<(Vec<PathBuf>, &'static [&'static str], &'static str)> {
+pub(crate) fn cgroups() -> Option<(Vec<PathBuf>, &'static [&'static str], &'static str)> {
     let root = Path::new("/sys/fs/cgroup");
     let memberships = fs::read_to_string("/proc/self/cgroup").ok()?;
     let (leaf, top, limits, usage): (PathBuf, PathBuf, &[&str], &str) =

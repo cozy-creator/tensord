@@ -646,21 +646,22 @@ impl GpuPool {
             .name("host-pressure".into())
             .spawn(move || {
                 let mut feedback = crate::host_pressure::Feedback::new(
-                    pressure.stalled_us().unwrap_or(0),
+                    pressure.sample().map(|sample| sample.total()).unwrap_or(0),
                     std::time::Instant::now(),
                 );
                 while pressure.wait().is_ok() {
                     let Some(pool) = pool.upgrade() else { break };
+                    let Ok(sample) = pressure.sample() else { break };
+                    let Some(give) = feedback.observe(sample, std::time::Instant::now()) else { continue };
                     pool.stalls.fetch_add(1, Ordering::AcqRel);
                     pool.host_room_now();
-                    let Ok(total) = pressure.stalled_us() else { break };
-                    let give = feedback.give(total, std::time::Instant::now());
                     let gave = give && pool.give_back_one();
                     if give && !gave {
                         feedback.exhausted();
                     }
                     crate::memory::note(serde_json::json!({"event": "host_pressure",
-                        "mode": format!("{mode:?}"), "stalled_us": total, "gave": gave,
+                        "mode": format!("{mode:?}"), "stalled_us": sample.stalled_us(),
+                        "limit_hits": sample.limit_hits(), "gave": gave,
                         "stopped_at": feedback.stopped_at()}));
                 }
             });
