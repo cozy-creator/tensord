@@ -452,6 +452,7 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
         let start = Instant::now();
         let reply = executor.command(
             &DeviceCommand::Invoke {
+                max_output_bytes: cozy_machine::output_capacity::DEFAULT_BYTES,
                 request_id: id.clone(),
                 construction: "pilot-model".into(),
                 entrypoint: "generate".into(),

@@ -250,6 +250,8 @@ pub enum DeviceCommand {
         input_metadata: BTreeMap<String, Value>,
     },
     Invoke {
+        /// Retained asset capacity derived from the actual installed result schema.
+        max_output_bytes: u64,
         request_id: String,
         construction: String,
         entrypoint: String,
@@ -322,6 +324,8 @@ pub enum DeviceCommand {
     },
     /// One `@app.job` to completion; its child calls come back as `child_*` requests.
     RunJob {
+        /// Retained asset capacity derived from the actual installed result schema.
+        max_output_bytes: u64,
         request_id: String,
         job: String,
         payload: Value,

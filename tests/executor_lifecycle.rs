@@ -134,6 +134,7 @@ fn invoke(
     assert!(prepared.ok, "{prepared:?}");
     executor.command(
         &DeviceCommand::Invoke {
+            max_output_bytes: cozy_machine::output_capacity::DEFAULT_BYTES,
             request_id: id.into(),
             construction: "lifecycle".into(),
             entrypoint: entrypoint.into(),
@@ -537,6 +538,7 @@ fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
     let reply = executor
         .command(
             &DeviceCommand::Invoke {
+                max_output_bytes: cozy_machine::output_capacity::DEFAULT_BYTES,
                 request_id: "probe".into(),
                 construction: "lifecycle".into(),
                 entrypoint: "probe".into(),
