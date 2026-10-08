@@ -1741,6 +1741,9 @@ fn weights_current(engine: Arc<Engine>, record: &Execution) -> Arc<dyn Fn() -> b
 }
 
 #[cfg(test)]
+mod prefetch_tests;
+
+#[cfg(test)]
 mod exact_tests {
     use super::*;
 

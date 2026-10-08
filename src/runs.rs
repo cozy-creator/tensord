@@ -1597,6 +1597,24 @@ mod tests {
         assert_eq!(chosen, [("render.models.network", "second/chosen")],
             "a choice addressed to the callee's package reaches its declared slot, by that slot's path");
         assert_eq!(child.binding_revision, "caller-binding", "a callee sees the owner's rebindings");
+        // Prefetch and demand call this same selector: an explicit B replaces inherited A,
+        // without mutating the parent's choices. Omitted choices leave A and its defaults.
+        let chosen = domain::ModelChoice {
+            parameter: "render.models.network".into(),
+            manifest: Some(domain::Ref { digest: vec![0xbb; 32], length: 321 }),
+            ..Default::default()
+        };
+        let hinted = runs.child_spec("alice", "7", "callee:app", "render", json!({}), vec![], "", std::slice::from_ref(&chosen)).unwrap();
+        let demanded = runs.child_spec("alice", "7", "callee:app", "render", json!({"prompt":"later"}), vec![], "call", std::slice::from_ref(&chosen)).unwrap();
+        assert_eq!(hinted.models, vec![chosen]);
+        assert_eq!(hinted.models, demanded.models);
+        assert!(hinted.models[0].repository.is_empty(), "B must not remain constrained to A's repository");
+        assert_eq!(runs.child_spec("alice", "7", "callee:app", "render", json!({}), vec![], "", &[]).unwrap().models[0].repository, "second/chosen");
+        let bad = domain::ModelChoice { parameter: "render.models.absent".into(), ..Default::default() };
+        assert_eq!(runs.child_spec("alice", "7", "callee:app", "render", json!({}), vec![], "", &[bad]).err().unwrap().code, "invalid_request");
+        runs.jobs.lock().unwrap().get_mut("7").unwrap().models.clear();
+        assert!(runs.child_spec("alice", "7", "callee:app", "render", json!({}), vec![], "", &[]).unwrap().models.is_empty(),
+            "without inherited/explicit choices the normal resolver owns captured defaults");
         fs::remove_dir_all(root).unwrap();
     }
 
