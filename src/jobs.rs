@@ -146,9 +146,9 @@ struct Received {
 }
 
 impl Jobs {
-    /// The machine's CPU execution, configured on `service`: jobs and model-less calls in
-    /// deviceless executors, with the GPU executors' environment and identity when a GPU is
-    /// configured, else a minimal one. `runs` prepares a job's children (none: no children).
+    /// Jobs and model-less calls, with the configured executor environment and identity.
+    /// CPU jobs remain deviceless; explicitly declared GPU jobs borrow the native pool.
+    /// `runs` prepares a job's children (none: no children).
     pub fn configure(
         service: &Arc<Service>,
         store: Arc<Store>,
@@ -248,7 +248,7 @@ impl Jobs {
         })
     }
 
-    /// A deviceless executor for `id`, authorized to run; None when the run was canceled first.
+    /// An executor sealed to its admitted allocation (otherwise deviceless). None if stopped.
     fn launch(
         self: &Arc<Self>,
         engine: &Arc<Engine>,

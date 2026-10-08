@@ -98,7 +98,7 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 | `native_inputs.rs` | Native input custody into TensorFS + journal | `SourceIntake`, `IntakeJournal` | D1 |
 | `catalog.rs` | Immutable package environment generations and their holds | `Catalog`, `Generation`, `HeldGeneration` | D1 |
 | `service.rs` | Sole dispatch policy (CPU parallelism, one GPU slot, startup GPU fences) | `Service` | B2 |
-| `jobs.rs` | Jobs in deviceless executors, their child runs, pause/resume (root replay over finished children), scratch, checkpoint declarations | `Jobs` | G, L (pause/resume) |
+| `jobs.rs` | Jobs in CPU or explicitly allocated GPU executors, their child runs, pause/resume (root replay over finished children), scratch, checkpoint declarations | `Jobs` | G, L (pause/resume) |
 | `execution.rs` | Acceptance, runner supervision, cancellation, progress coalescing, output custody, reconcile | `Engine`, `RunnerConfig` | E |
 | `journal.rs` | SQLite journal: executions, installations, preparations, receipts, process births | `Journal`, `Execution`, `State`, `ProcessBirth` | E |
 | `gpu_service.rs` | GPU pool: published package/model mapping, executor retention, request callbacks; GPU groups (a degree-K plan on the first K GPUs, one memory decision per GPU) and multi-slot plans | `GpuPool`, `GpuConfig`, `GpuPlan`, `PlanSlot`, `ModelGrant` | B2 (admission, grants), E (spawn/fencing), D1 (published mapping), I (groups, slots) |
