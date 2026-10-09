@@ -58,14 +58,14 @@ pub struct Spec {
     pub models: Vec<domain::ModelChoice>,
     pub binding_revision: String,
     pub attention_kernel: String,
-    /// The run's Hub access, held in memory for this preparation only.
+    /// The run's Hub access; its grant is held in memory only.
     pub hub: Option<hub::Source>,
     /// Provider tokens for source models, held the same way.
     pub providers: Providers,
     /// `org/name`: a model-only warm run puts the source model it made there.
     pub weights_destination: String,
-    /// The machine-publication authorization the weights destination is written under.
-    pub publication: String,
+    /// The machine-publication grant the weights destination is written under.
+    pub publication: Option<Arc<hub::Grant>>,
     pub owner: String,
     /// A child's memoized result this machine holds: its answer.
     pub held: Option<ResultRecord>,
@@ -82,6 +82,8 @@ pub struct Runs {
     pub local: Option<Arc<LocalSources>>,
     /// On a rental: its own Hub, read with the pod's worker capability.
     pub own_hub: Option<hub::Source>,
+    /// Signers' execution grants, and the key that redeems and proves them.
+    pub grants: hub::Grants,
     /// Unfinished jobs' preparation: their children prepare with it. The tokens live only
     /// here; the rest is journaled too (`Durable`), for a paused job resumed after a restart.
     pub jobs: Mutex<HashMap<String, JobContext>>,
@@ -102,7 +104,7 @@ pub struct JobContext {
     /// The job's own model inputs, made present: parameter -> (class, manifest).
     inputs: BTreeMap<String, (String, ObjectRef)>,
     weights_destination: String,
-    publication: String,
+    publication: Option<Arc<hub::Grant>>,
 }
 
 /// What a job's weights grant reads of its context (`jobs.rs`).
@@ -125,8 +127,6 @@ struct Durable {
     inputs: BTreeMap<String, (String, String, u64)>,
     #[serde(default)]
     weights_destination: String,
-    #[serde(default)]
-    publication: String,
 }
 impl Durable {
     fn of(context: &JobContext) -> Self {
@@ -143,7 +143,6 @@ impl Durable {
                 .map(|(p, (class, m))| (p.clone(), (class.clone(), m.sha256.clone(), m.length)))
                 .collect(),
             weights_destination: context.weights_destination.clone(),
-            publication: context.publication.clone(),
         }
     }
     /// Without the run's tokens: its children prepare with the machine's own Hub, if any.
@@ -168,7 +167,7 @@ impl Durable {
                 .map(|(p, (class, sha256, length))| (p, (class, ObjectRef { sha256, length })))
                 .collect(),
             weights_destination: self.weights_destination,
-            publication: self.publication,
+            publication: None,
         })
     }
 }
@@ -396,7 +395,7 @@ impl Runs {
     /// Hub checkpoint downloaded, a provider source or a written file (`object://`) made, a
     /// checkpoint this machine holds (a run's weights output, a `local/` alias) found. With a
     /// weights destination the one choice is put there: a `local/` alias held by name, or a
-    /// Hub repository under the run's machine-publication authorization.
+    /// Hub repository under the run's machine-publication grant.
     fn warm_models(
         &self,
         actor: &str,
@@ -475,13 +474,13 @@ impl Runs {
                     .map_err(|e| refused("local_alias_refused", e.to_string()))?;
                 row["published"] = json!({"destination": destination, "checkpoint": manifest.id(), "converged": false});
             } else if !destination.is_empty() {
-                if spec.publication.is_empty() {
+                let Some(publication) = &spec.publication else {
                     return Err(refused(
                         "publication_unauthorized",
-                        "a weights destination needs the run's publication authorization",
+                        "a weights destination needs the run's publication grant",
                     ));
-                }
-                let publishing = hub::Publishing::new(hub_access()?, &spec.publication)
+                };
+                let publishing = hub::Publishing::new(hub_access()?, publication, self.own_hub.as_ref())
                     .map_err(|e| refused("publication_unauthorized", e.0))?;
                 let operation = format!(
                     "upload-{}",
@@ -942,7 +941,7 @@ impl Runs {
             hub: context.hub,
             providers: context.providers,
             weights_destination: String::new(),
-            publication: String::new(),
+            publication: None,
             owner: context.owner,
             held: None,
             application: application.into(),
@@ -1026,6 +1025,7 @@ impl Runs {
                 repository: context.weights_destination.clone(),
                 hub,
                 publication: context.publication.clone(),
+                rental: self.own_hub.clone(),
             }),
             (false, None) => {
                 return Err(io::Error::other(
@@ -1204,7 +1204,6 @@ mod tests {
             models: vec![],
             inputs: BTreeMap::from([("model".into(), ("Model".into(), model.repeat(64), 1))]),
             weights_destination: String::new(),
-            publication: String::new(),
         };
         let bind = |id: &str, context: &[u8]| {
             let bound = service.engine.with_journal(|journal| journal.bind_job_context(id, context));
@@ -1274,7 +1273,7 @@ mod tests {
             hub: None,
             providers: Default::default(),
             weights_destination: String::new(),
-            publication: String::new(),
+            publication: None,
             owner: "alice".into(),
             held: None,
             application: String::new(),
@@ -1309,7 +1308,7 @@ mod tests {
         let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
         let objects = Arc::new(Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap());
         let runs = Runs { service: service.clone(), objects, publisher: None, local: None,
-            own_hub: None, jobs: Default::default() };
+            own_hub: None, grants: Default::default(), jobs: Default::default() };
         for job in [false, true] {
             let mut root_call = spec(Source::Installation("installed".into()), true, "root");
             root_call.job = job;
@@ -1378,6 +1377,7 @@ mod tests {
             publisher: None,
             local: Some(Arc::new(local)),
             own_hub: None,
+            grants: Default::default(),
             jobs: Default::default(),
         });
         crate::jobs::Jobs::configure(&service, store.clone(), Some(&runs)).unwrap();
@@ -1480,7 +1480,7 @@ mod tests {
         let publisher = Publisher::new(&root.join("published"), Default::default(), store.clone()).unwrap();
         let objects = Arc::new(Objects::new(&root.join("writes"), store.clone(), service.engine.clone()).unwrap());
         let runs = Runs { service: service.clone(), objects, publisher: Some(publisher), local: None,
-            own_hub: None, jobs: Default::default() };
+            own_hub: None, grants: Default::default(), jobs: Default::default() };
         let held = "ab".repeat(32);
         let path = store.manifest_path(&held);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1527,7 +1527,7 @@ mod tests {
         let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
         let objects = Arc::new(Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap());
         let runs = Runs { service: service.clone(), objects, publisher: None, local: None,
-            own_hub: None, jobs: Default::default() };
+            own_hub: None, grants: Default::default(), jobs: Default::default() };
         let installed = service.engine.bind_installation(Installation {
             actor:"alice".into(),alias:"caller".into(),generation:generation.clone(),
             package:"first/caller".into(),release:"1.0.0".into(),interface:serde_json::to_vec(&caller).unwrap(),
@@ -1562,8 +1562,7 @@ mod tests {
         assert!(!legacy.record.owns("callee:app","other/callee-lib-name"));
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let source = hub::Source { origin:format!("http://{}", listener.local_addr().unwrap()),
-            credential:"bearer callee-test".into(),ca_der:None,object_hosts:vec![] };
+        let source = hub::Source::pod(&format!("http://{}", listener.local_addr().unwrap()), "wrk", "callee-test", None, vec![]);
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut bytes = Vec::new();
@@ -1574,7 +1573,7 @@ mod tests {
             }
             let request = String::from_utf8(bytes).unwrap();
             assert!(request.starts_with("GET /v1/packages/second/callee/bindings "), "{request}");
-            assert!(request.to_ascii_lowercase().contains("authorization: bearer callee-test"));
+            assert!(request.to_ascii_lowercase().contains("x-cozy-worker-token: callee-test"));
             let body = json!({"bindings":[{"slot":"render.models.network","model":"second/weights",
                 "release":"3.0.0","ladder":[{"gpu":"*","lane":"bf16","gpus":1}]}]}).to_string();
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
@@ -1592,7 +1591,7 @@ mod tests {
                 domain::ModelChoice { parameter:"second/callee/render.models.network".into(),repository:"second/chosen".into(),..Default::default() },
                 domain::ModelChoice { parameter:"render.models.absent".into(),repository:"second/nowhere".into(),..Default::default() },
             ],
-            inputs:Default::default(),weights_destination:String::new(),publication:String::new(),
+            inputs:Default::default(),weights_destination:String::new(),publication:None,
         });
         let child = runs.child_spec("alice","7","callee:app","render",json!({}),vec![],"child",&[]).unwrap();
         let chosen: Vec<_> = child.models.iter().map(|c| (c.parameter.as_str(), c.repository.as_str())).collect();
@@ -1626,7 +1625,7 @@ mod tests {
         let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
         let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
         let objects = Arc::new(Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap());
-        let runs = Runs { service: service.clone(), objects, publisher: None, local: None, own_hub: None, jobs: Default::default() };
+        let runs = Runs { service: service.clone(), objects, publisher: None, local: None, own_hub: None, grants: Default::default(), jobs: Default::default() };
         let interface = json!({
             "jobs": [{"name": "pipeline"}, {"name": "leaf-job"}, {"name": "both"}],
             "entrypoints": [{"name": "leaf-call"}, {"name": "both"}],
@@ -1639,7 +1638,7 @@ mod tests {
             installation: "pkg".into(), hub: None, providers: Default::default(), owner: "alice".into(),
             application: String::new(),
             binding_revision: String::new(), attention_kernel: String::new(), models: vec![],
-            inputs: Default::default(), weights_destination: String::new(), publication: String::new(),
+            inputs: Default::default(), weights_destination: String::new(), publication: None,
         });
         let child = |name: &str| runs.child_spec("alice", "7", "", name, json!({}), vec![], "d", &[]);
         assert!(child("leaf-job").unwrap().job);

@@ -1375,7 +1375,7 @@ fn ensure(
         store,
         catalog.origin(),
         &refspec,
-        &credential,
+        credential,
         catalog.policy(),
     );
     request.keep = &keep;
@@ -2099,7 +2099,7 @@ mod tests {
             }
             seen
         });
-        let source = hub::Source { origin, credential: "bearer t".into(), ca_der: None, object_hosts: vec![] };
+        let source = hub::Source::pod(&origin, "wrk", "t", None, vec![]);
         let catalog = Catalog::new(&source).unwrap();
         let installation = Installation {
             actor: "alice".into(),

@@ -73,13 +73,13 @@ message RunSpec {
   reserved 11;  // known results: memos are the machine's own
   string attention_kernel = 12;
   string weights_destination = 13;  // org/name: a job's weights outputs, or a warm run's source model
-  HubAccess hub = 14;               // held in memory for this run's preparation only
+  HubAccess hub = 14;               // tokens are held in memory only
   string owner = 15;                // the account that org-relative references of local code name
   ProviderAccess providers = 16;    // provider tokens for source models, memory only like hub
-  // A machine-publication authorization (POST /v1/machine-authorizations) for this machine's
-  // leaf: the run writes its weights destination under it. The machine renews the bearer with
-  // its sender proof, the run's Hub token or a rental's own worker capability.
-  string publication = 17;
+  reserved 17;  // publication authorization id: grants are OAuth codes now
+  // A fresh `tensorhub_machine_publication` code for this machine's leaf: the machine redeems
+  // it at submission and writes the run's weights destination under that grant.
+  HubAuthorization publication = 19;
   // RUN_KIND_WARM (`warm/2`): the caller's whole warm set, replacing its previous one; no items
   // clears it. The run installs and downloads every member, and its result lists each one's
   // `level` and `held_back`. Absent: the set is left as it is.
@@ -138,10 +138,20 @@ message Adapter {
 }
 message HubAccess {
   string origin = 1;
-  string token = 2;
-  int64 expires_at = 3;  // unix seconds
+  reserved 2, 3;         // bearer token and expiry: access is an OAuth grant now
   bytes ca_der = 4;      // an origin's private CA, when it has one
   repeated string object_hosts = 5;  // the Hub's object-storage hosts downloads may follow
+  // A fresh `tensorhub_execution` code: the machine redeems it at submission and holds the
+  // grant in memory for its signer at this origin. Absent: the grant it already holds.
+  HubAuthorization authorization = 6;
+}
+// An authorization code for client `cozy-machine`, bound to this machine's leaf (`dpop_jkt`).
+message HubAuthorization {
+  string issuer = 1;         // the token endpoint is issuer + "/oauth2/token"
+  string code = 2;
+  string code_verifier = 3;  // PKCE
+  string redirect_uri = 4;
+  string resource = 5;       // the resource the code was requested for
 }
 
 message RunEvent {

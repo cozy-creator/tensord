@@ -89,7 +89,6 @@ impl Pod {
             capture_digest: digest(&json!({"n": n, "salt": self.salt})),
             invocation_digest: digest(&json!({"preparation": prepared.id})),
             payload_digest: digest(&input),
-            publication_authorization_id: String::new(),
             preparation_id: prepared.id.clone(),
         };
         let call = Call {
