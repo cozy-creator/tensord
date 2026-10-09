@@ -226,13 +226,17 @@ impl Lifecycle {
     }
 }
 
-/// Keeps the Hub's authorized keys: asked again at half the lease it names, and each second
-/// while the Hub is unreachable or not yet ready, when the keys stay as they were.
+/// Keeps the Hub's authorized keys: asked again at half the lease it names. While the Hub is
+/// unreachable or not yet ready the keys stay as they were, and it is asked again after 1 s,
+/// doubling to 5 s (the Hub reads a pod's readiness every 5 s).
 pub async fn keep_authority(hub: Arc<Hub>, keys: Keys) {
+    const UNANSWERED: (Duration, Duration) = (Duration::from_secs(1), Duration::from_secs(5));
+    let mut unanswered = UNANSWERED.0;
     loop {
         let delay = match hub.authorized_keys().await {
-            Ok((current, lease, bindings)) => {
-                keys.renew(current, bindings);
+            Ok((current, lease)) => {
+                keys.renew(current);
+                unanswered = UNANSWERED.0;
                 lease / 2
             }
             Err(Refusal::Denied) => {
@@ -242,7 +246,11 @@ pub async fn keep_authority(hub: Arc<Hub>, keys: Keys) {
                 keys.revoke();
                 Duration::from_secs(1)
             }
-            Err(Refusal::Transport(_)) => Duration::from_secs(1),
+            Err(Refusal::Transport(_)) => {
+                let delay = unanswered;
+                unanswered = (unanswered * 2).min(UNANSWERED.1);
+                delay
+            }
         };
         tokio::time::sleep(delay).await;
     }
@@ -473,7 +481,6 @@ mod hub_tests {
         let hub = Arc::new(
             Hub::new(HubGrant {
                 origin: format!("https://localhost:{port}"),
-                public_origin: None,
                 worker_id: "ra-1".into(),
                 worker_token: token.clone(),
                 ca_der: Some(ca),

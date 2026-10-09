@@ -373,6 +373,7 @@ dependencies = [
  "prost",
  "protoc-bin-vendored",
  "rcgen",
+ "ring",
  "rusqlite",
  "rustls",
  "rustls-pemfile",

@@ -69,17 +69,14 @@ message RunSpec {
   bytes payload = 7;              // canonical JSON object of the function's parameters
   repeated InputFile inputs = 8;  // objects uploaded with Write, bound to payload fields
   repeated ModelChoice models = 9;
-  string binding_revision = 10;   // the owner's binding revision the caller knows
+  reserved 10;  // binding revision: every Hub model choice is exact (th-241)
   reserved 11;  // known results: memos are the machine's own
   string attention_kernel = 12;
   string weights_destination = 13;  // org/name: a job's weights outputs, or a warm run's source model
-  HubAccess hub = 14;               // tokens are held in memory only
+  HubAccess hub = 14;               // where the run reads, and its capability there
   string owner = 15;                // the account that org-relative references of local code name
   ProviderAccess providers = 16;    // provider tokens for source models, memory only like hub
-  reserved 17;  // publication authorization id: grants are OAuth codes now
-  // A fresh `tensorhub_machine_publication` code for this machine's leaf: the machine redeems
-  // it at submission and writes the run's weights destination under that grant.
-  HubAuthorization publication = 19;
+  reserved 17, 19;  // publication authorizations: the capability names a publication
   // RUN_KIND_WARM (`warm/2`): the caller's whole warm set, replacing its previous one; no items
   // clears it. The run installs and downloads every member, and its result lists each one's
   // `level` and `held_back`. Absent: the set is left as it is.
@@ -95,6 +92,13 @@ message ProviderAccess {
 message Release {
   string package = 1;  // org/name
   string release = 2;
+  // The release as its Hub publishes it, so the machine installs it reading no Hub (th-241):
+  // its package interface (canonical JSON), its Python version, and its locked requirements
+  // as an object the caller wrote with Write (sha256:<hex>). Needed only when the signer
+  // holds no installation of the release yet.
+  bytes package_interface = 3;
+  string python_version = 4;
+  string locked_requirements = 5;
 }
 // The manifest is a JSON object written with Write: {package: "local/<dist>", release,
 // python_requires, python_version, source: {digest, length} (a tar of the project),
@@ -110,19 +114,33 @@ message InputFile {
   string media_type = 4;
   uint32 order = 5;
 }
+// One model slot's choice. A Hub model is exact (th-241: the machine resolves nothing at a
+// Hub): `manifest` pins one checkpoint, or `rungs` are the slot's binding with every rung's
+// checkpoint resolved, of which the machine takes the widest its GPUs fit. The caller sends
+// one for every model slot the run may load, a callee's included (`<package>/<path>`).
 message ModelChoice {
   string parameter = 1;  // a root slot parameter or full slot path
   string repository = 2;
   string release = 3;
   string lane = 4;
-  string manifest = 5;   // sha256:<hex>, optional exact checkpoint
+  string manifest = 5;   // sha256:<hex>, an exact checkpoint
   uint64 manifest_length = 6;
-  repeated Adapter adapters = 7;
+  repeated Adapter adapters = 7;  // each exact: a manifest, or a provider source
   // A provider source (hf://<org>/<repo>@<rev>[/member], civitai://<version>[/file]) the
   // machine makes the slot's model from, under these reviewed profiles (none: the one its
   // headers select); never with repository or manifest.
   string source = 8;
   repeated string profiles = 9;
+  repeated ModelRung rungs = 10;
+}
+// One rung of a binding: on GPUs matching `gpu`, `gpus` of them run the slot's `lane`, whose
+// checkpoint is `manifest`.
+message ModelRung {
+  string gpu = 1;       // "*", or the tokens a GPU name contains, in order ("h100", "rtx 5090")
+  uint32 gpus = 2;
+  string lane = 3;
+  string manifest = 4;  // sha256:<hex>
+  uint64 manifest_length = 5;
 }
 message Adapter {
   string component = 1;
@@ -136,22 +154,19 @@ message Adapter {
   string source = 7;
   repeated string profiles = 8;
 }
+// A Hub a run reads. Public content is read anonymously.
 message HubAccess {
   string origin = 1;
-  reserved 2, 3;         // bearer token and expiry: access is an OAuth grant now
+  reserved 2, 3, 6;      // bearer token, expiry, authorization code
   bytes ca_der = 4;      // an origin's private CA, when it has one
   repeated string object_hosts = 5;  // the Hub's object-storage hosts downloads may follow
-  // A fresh `tensorhub_execution` code: the machine redeems it at submission and holds the
-  // grant in memory for its signer at this origin. Absent: the grant it already holds.
-  HubAuthorization authorization = 6;
-}
-// An authorization code for client `cozy-machine`, bound to this machine's leaf (`dpop_jkt`).
-message HubAuthorization {
-  string issuer = 1;         // the token endpoint is issuer + "/oauth2/token"
-  string code = 2;
-  string code_verifier = 3;  // PKCE
-  string redirect_uri = 4;
-  string resource = 5;       // the resource the code was requested for
+  // The owner's capability for this run's private operations (th-241): a compact JWS its
+  // device key signed for this machine's leaf (`cnf.jkt`) and the Hub's resource (`aud`),
+  // naming each operation in `authorization_details`. The machine trades it once, at the
+  // run's first private operation, at `token_endpoint` (AuthKit's JWT-bearer grant). Empty:
+  // a public-only run.
+  string capability = 7;
+  string token_endpoint = 8;  // the Hub's authorization server's, as its metadata names it
 }
 
 message RunEvent {

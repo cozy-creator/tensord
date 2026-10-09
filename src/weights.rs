@@ -38,14 +38,12 @@ pub struct GrantAuthority {
     pub bind_output: BindOutput,
 }
 
-/// Where a job's outputs are published: the repository, its Hub, the run's
-/// machine-publication grant and, on a rental, the pod's own Hub access.
+/// Where a job's outputs are published: the repository and its Hub, written under the run's
+/// capability there.
 #[derive(Clone)]
 pub struct Destination {
     pub repository: String,
     pub hub: hub::Source,
-    pub publication: Option<std::sync::Arc<hub::Grant>>,
-    pub rental: Option<hub::Source>,
 }
 
 /// One job attempt's weights grant.
@@ -446,7 +444,7 @@ impl Weights {
         Ok(receipt.clone())
     }
 
-    /// One adopted output into its destination, under the run's publication grant.
+    /// One adopted output into its destination, under the run's capability.
     fn publish(
         &self,
         grant: &Grant,
@@ -454,12 +452,11 @@ impl Weights {
         slot: &str,
         manifest: &ObjectRef,
     ) -> Result<(), Refusal> {
-        let publication = destination.publication.as_ref().ok_or((
-            "publication_unauthorized",
-            "a weights destination needs the run's publication grant".to_string(),
-        ))?;
-        let publishing = hub::Publishing::new(&destination.hub, publication, destination.rental.as_ref())
-            .map_err(|e| ("publication_unauthorized", e.0))?;
+        let repository = destination.repository.trim_start_matches("model://");
+        let publishing = hub::Catalog::for_op(
+            &destination.hub,
+            hub::Op::Publish { model: repository },
+        )?;
         let operation = format!(
             "output-{}",
             &sha256::hex_digest(format!("{}\0{}\0{slot}", grant.actor, grant.run).as_bytes())[..40]
@@ -467,10 +464,10 @@ impl Weights {
         tensorfs_core::transport::publish(&tensorfs_core::transport::Publication {
             store: &self.store,
             hub: publishing.origin(),
-            destination: destination.repository.trim_start_matches("model://"),
+            destination: repository,
             manifest,
             operation: &operation,
-            credential: &publishing,
+            credential: publishing.credential(),
             policy: publishing.policy(),
             progress: &|_, _| (),
             streams: 8,
@@ -482,7 +479,7 @@ impl Weights {
             } else {
                 format!("publication failed before its commit: {e}")
             };
-            ("weights_publication_failed", message)
+            publishing.reason("weights_publication_failed", message)
         })
     }
 }

@@ -24,14 +24,12 @@ const NAMES: &[&str] = &[
     "COZY_WEBRTC_PUBLIC_ADDRESS",
     "COZY_RECORD_OWNER_AUTH_JSON",
     "COZY_AUTHORIZED_KEYS",
-    "COZY_REPO_CACHE_ROOT",
     "COZY_SSH_PUBLIC_KEY",
     super::provider::API_ORIGIN,
     RECEIPT_KEY,
     RECEIPT_KEY_FILE,
     "TENSORHUB_ORIGIN",
     "TENSORHUB_CA_DER_B64URL",
-    "TENSORHUB_PUBLIC_ORIGIN",
     "TENSORHUB_OBJECT_STORAGE_HOSTS",
 ];
 pub const RECEIPT_KEY: &str = "COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL";
@@ -49,7 +47,6 @@ pub enum Lifetime {
 #[derive(Clone, Debug)]
 pub struct HubGrant {
     pub origin: String,
-    pub public_origin: Option<String>,
     pub worker_id: String,
     pub worker_token: String,
     pub ca_der: Option<Vec<u8>>,
@@ -66,7 +63,6 @@ pub struct Grant {
     /// Where browsers reach the WebRTC listener ([`super::player::reach`]).
     pub webrtc_reach: super::player::Reach,
     pub hub: Option<HubGrant>,
-    pub repo_cache_root: Option<PathBuf>,
     pub authorized: Vec<VerifyingKey>,
     /// The one-shot readiness key; taken by the receipt and never kept elsewhere.
     pub receipt_key: Option<Vec<u8>>,
@@ -176,10 +172,6 @@ impl Grant {
                 Some(HubGrant {
                     origin: origin(get("TENSORHUB_ORIGIN"), "TENSORHUB_ORIGIN")?
                         .ok_or_else(|| invalid("TENSORHUB_ORIGIN is required for a rental"))?,
-                    public_origin: origin(
-                        get("TENSORHUB_PUBLIC_ORIGIN"),
-                        "TENSORHUB_PUBLIC_ORIGIN",
-                    )?,
                     worker_id: worker_id.clone(),
                     worker_token: token.into(),
                     ca_der,
@@ -246,7 +238,6 @@ impl Grant {
             webrtc_port,
             webrtc_reach: super::player::reach(webrtc_port, env),
             hub,
-            repo_cache_root: get("COZY_REPO_CACHE_ROOT").map(PathBuf::from),
             authorized,
             receipt_key,
             developer_key,

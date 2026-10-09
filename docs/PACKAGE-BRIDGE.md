@@ -43,8 +43,8 @@ unknown and foreign origins stay local. Older records without a package identity
 `local/<normalized-distribution>`. Description
 reads metadata and AST inside the environment without importing package code.
 
-Model slots, owner bindings and resolution-cache entries belong to the callee package. The
-caller’s model choices and binding revision do not override another package's slots. GPU
+Model slots and resolution-cache entries belong to the callee package. The caller's model
+choices do not override another package's slots; a choice addressed to a callee slot names it. GPU
 execution uses the callee's interface; import-only parents are keyed by generation and App.
 These are additive generation and manifest fields; `cozy.machine.v1` is unchanged.
 An export registered by distinct Apps is refused only when that ambiguous call is made;

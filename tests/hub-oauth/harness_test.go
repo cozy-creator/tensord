@@ -1,7 +1,9 @@
 // Package harness serves a real AuthKit authorization server and a DPoP resource server in
-// front of a test Hub, for tests/hub_oauth.rs: the machine redeems and presents real grants
-// and AuthKit verifies every proof it makes. It plays the CLI too: a device-key sign-in that
-// approves each authorization request (th-238's flow).
+// front of a test Hub, for tests/hub_oauth.rs and tests/machine_surface.rs (th-241). It signs
+// run capabilities with an owner's enrolled device key, as the CLI does; the machine trades
+// them through AuthKit's JWT-bearer grant, and AuthKit verifies every signature and proof. It
+// plays the Hub: the grant decision (which may narrow), and on every token-bearing request
+// the device key still live and the route among the token's operations.
 package harness
 
 import (
@@ -11,13 +13,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"flag"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -25,6 +28,7 @@ import (
 
 	"github.com/open-rails/authkit"
 	"github.com/open-rails/authkit/authtest"
+	"github.com/open-rails/authkit/devicekey"
 	"github.com/open-rails/authkit/iam"
 	"github.com/open-rails/authkit/verify"
 )
@@ -35,26 +39,91 @@ var (
 )
 
 const (
-	client      = "cozy-machine"
-	redirect    = "http://127.0.0.1/cozy-machine/callback"
-	resource    = "https://hub.example.test"
-	execution   = "tensorhub_execution"
-	publication = "tensorhub_machine_publication"
-	accessTTL   = 4 * time.Second
+	client   = "tensord"
+	resource = "https://hub.example.test"
+	// narrowed is the model whose operations the Hub's decision always drops.
+	narrowed = "acme/narrowed"
 )
 
-// seen is one request the resource server verified.
+// seen is one token-bearing request the resource server verified.
 type seen struct {
 	Method string `json:"method"`
 	Path   string `json:"path"`
-	Type   string `json:"type"`
+	Owner  string `json:"owner"`
+	Actor  string `json:"actor"`
 	Token  string `json:"token"` // a digest, never the token
+}
+
+// op is one capability operation (th-241's vocabulary).
+type op struct {
+	Type     string `json:"type"`
+	Model    string `json:"model"`
+	Manifest string `json:"manifest,omitempty"`
+}
+
+type hub struct {
+	mu        sync.Mutex
+	verified  []seen
+	exchanges int
+	lastToken string
+}
+
+// decide is the Hub's JWT-bearer decision: the capability's operations, less any on the
+// narrowed model; none left is a refusal.
+func (h *hub) decide(_ context.Context, r iam.OAuthGrantRequest) (iam.OAuthGrantDecision, error) {
+	if r.Kind != iam.OAuthGrantJWTBearer || r.Capability == nil {
+		return iam.OAuthGrantDecision{}, iam.ErrOAuthGrantRefused
+	}
+	var asked, kept []json.RawMessage
+	if json.Unmarshal(r.AuthorizationDetails, &asked) != nil {
+		return iam.OAuthGrantDecision{}, iam.ErrOAuthGrantRefused
+	}
+	for _, raw := range asked {
+		var o op
+		if json.Unmarshal(raw, &o) == nil && o.Model != narrowed {
+			kept = append(kept, raw)
+		}
+	}
+	if len(kept) == 0 {
+		return iam.OAuthGrantDecision{}, iam.ErrOAuthGrantRefused
+	}
+	details, _ := json.Marshal(kept)
+	h.mu.Lock()
+	h.exchanges++
+	h.mu.Unlock()
+	return iam.OAuthGrantDecision{AuthorizationDetails: details}, nil
+}
+
+// permits answers whether ops name the operation a request to path is: a publication (or
+// its checkpoint probe) to a model, or a read of one of its checkpoints.
+func permits(ops []op, method, path string) bool {
+	rest, ok := strings.CutPrefix(path, "/v1/models/")
+	if !ok {
+		return false
+	}
+	model, checkpoint, read := strings.Cut(rest, "/checkpoints/")
+	if !read {
+		model, _, ok = strings.Cut(rest, "/publications/")
+		if !ok {
+			return false
+		}
+	}
+	return slices.ContainsFunc(ops, func(o op) bool {
+		switch o.Type {
+		case "tensorhub_model_publish":
+			return o.Model == model
+		case "tensorhub_model_read":
+			return read && o.Model == model && method == http.MethodGet && strings.SplitN(checkpoint, "/", 2)[0] == o.Manifest
+		}
+		return false
+	})
 }
 
 func TestHarness(t *testing.T) {
 	if *control == "" {
 		t.Skip("run by tests/hub_oauth.rs")
 	}
+	h := &hub{}
 	issuerServer := httptest.NewUnstartedServer(nil)
 	issuer := "http://" + issuerServer.Listener.Addr().String()
 	auth, outbox := authtest.New(t, authtest.WithConfig(func(c *authkit.Config) {
@@ -64,91 +133,102 @@ func TestHarness(t *testing.T) {
 		c.AuthorizationServer = authkit.AuthorizationServerConfig{
 			Resources: []authkit.ResourceServerConfig{{ID: resource}},
 			Clients: []authkit.OAuthClientConfig{{
-				ID: client, Name: "Cozy machine", RedirectURIs: []string{redirect}, Resources: []string{resource},
-				GrantTypes:                []authkit.OAuthGrantType{authkit.GrantAuthorizationCode, authkit.GrantRefreshToken},
-				AuthorizationDetailsTypes: []string{execution, publication}, Offline: true, KeyBound: true,
-				AccessTokenTTL: accessTTL, RefreshTokenTTL: 7 * 24 * time.Hour,
+				ID: client, Name: "TensorD", Resources: []string{resource},
+				GrantTypes:                []authkit.OAuthGrantType{authkit.GrantJWTBearer},
+				AuthorizationDetailsTypes: []string{"tensorhub_model_read", "tensorhub_model_publish"},
 			}},
 		}
-	}), authtest.WithDeps(func(d *authkit.Deps) { d.OAuthGrants = (&authtest.GrantAuthorizer{}).Authorize }))
+	}), authtest.WithDeps(func(d *authkit.Deps) { d.OAuthGrants = h.decide }))
 	issuerServer.Config.Handler = auth.Handler()
 	issuerServer.Start()
 	t.Cleanup(issuerServer.Close)
-
-	// The CLI's sign-in: a device key, as `cozy auth login` holds one.
 	owner := authtest.NewUser(t, auth)
-	signIn := authtest.EnrollDeviceKey(t, auth, outbox, owner)
-	signedIn := signIn.AccessToken
+	device := authtest.EnrollDeviceKey(t, auth, outbox, owner)
 
+	// The Hub's verifier: this deployment's own tokens, DPoP proofs spent once, nonces asked.
 	nonceKey := make([]byte, 32)
 	_, _ = rand.Read(nonceKey)
-	v := verify.NewVerifier(verify.WithHTTPClient(http.DefaultClient), verify.WithDPoP(memoryReplay()),
-		verify.WithDPoPNonce(nonceKey), verify.WithPublicURL(resource))
-	if err := v.AddIssuer(issuer, []string{resource}, verify.IssuerOptions{JWKSURI: issuer + iam.JWKSPath}); err != nil {
+	v, err := auth.NewVerifier([]string{resource}, verify.WithDPoPNonce(nonceKey), verify.WithPublicURL(resource))
+	if err != nil {
 		t.Fatal(err)
 	}
 	target, err := url.Parse(*upstream)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var mu sync.Mutex
-	var verified []seen
 	forward := httputil.NewSingleHostReverseProxy(target)
-	resourceServer := httptest.NewServer(verify.Required(v)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	refuse := func(w http.ResponseWriter, status int, code string) {
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, `{"error":{"code":"`+code+`","message":"refused"}}`)
+	}
+	authorized := verify.Required(v)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cl, _ := verify.ClaimsFromContext(r.Context())
-		var details []struct {
-			Type string `json:"type"`
-		}
-		_ = json.Unmarshal(cl.AuthorizationDetails, &details)
-		kind := ""
-		if len(details) == 1 {
-			kind = details[0].Type
-		}
-		// The Hub's rule: publication routes take a publication grant, every other read the
-		// owner's execution grant.
-		want := execution
-		if strings.Contains(r.URL.Path, "/publications/") || strings.Contains(r.URL.Path, "/checkpoints/") {
-			want = publication
-		}
 		token, _ := strings.CutPrefix(r.Header.Get("Authorization"), "DPoP ")
 		sum := sha256.Sum256([]byte(token))
-		mu.Lock()
-		verified = append(verified, seen{r.Method, r.URL.Path, kind, base64.RawURLEncoding.EncodeToString(sum[:8])})
-		mu.Unlock()
-		if kind != want {
-			w.WriteHeader(http.StatusForbidden)
-			_, _ = io.WriteString(w, `{"error":{"code":"auth.forbidden","message":"wrong grant"}}`)
+		h.mu.Lock()
+		h.verified = append(h.verified, seen{r.Method, r.URL.Path, cl.Subject, cl.Invoker, base64.RawURLEncoding.EncodeToString(sum[:8])})
+		h.lastToken = token
+		h.mu.Unlock()
+		// The Hub's per-request checks: the signing device key still live, then the route
+		// among the token's operations.
+		if auth.CheckSession(r.Context(), cl) != nil {
+			refuse(w, http.StatusUnauthorized, "capability.revoked")
+			return
+		}
+		var ops []op
+		if json.Unmarshal(cl.AuthorizationDetails, &ops) != nil || !permits(ops, r.Method, r.URL.Path) {
+			refuse(w, http.StatusForbidden, "capability.operation_forbidden")
 			return
 		}
 		r.Header.Del("Authorization")
 		r.Header.Del("DPoP")
-		r.Header.Set("X-Verified-Type", kind)
+		r.Header.Set("X-Verified-Owner", cl.Subject)
 		forward.ServeHTTP(w, r)
-	})))
+	}))
+	resourceServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Header.Get("Authorization") != "" || r.Header.Get("DPoP") != "":
+			authorized.ServeHTTP(w, r)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/packages/"):
+			// Packages are public: read anonymously.
+			r.Header.Set("X-Verified-Owner", "anonymous")
+			forward.ServeHTTP(w, r)
+		default:
+			// A private object without a token answers as absent.
+			refuse(w, http.StatusNotFound, "model.checkpoint_not_found")
+		}
+	}))
 	t.Cleanup(resourceServer.Close)
 
+	var mu sync.Mutex
 	controlServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
 		switch r.URL.Path {
-		case "/authorize":
-			answer, err := authorize(issuer, auth.APIBase(), signedIn, r.FormValue("kind"), r.FormValue("jkt"))
+		case "/capability": // the CLI signing a run's capability, offline
+			seconds, _ := strconv.Atoi(r.FormValue("seconds"))
+			signed, err := devicekey.SignCapability(device.Key, device.ID, devicekey.Capability{
+				UserID: device.UserID, Audience: resource, WorkloadThumbprint: r.FormValue("jkt"),
+				AuthorizationDetails: json.RawMessage(r.FormValue("ops")),
+				ExpiresAt:            time.Now().Add(time.Duration(seconds) * time.Second),
+				Claims:               map[string]any{"run": "run-" + random(6)},
+			})
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadGateway)
+				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			_ = json.NewEncoder(w).Encode(answer)
-		case "/logout":
-			req, _ := http.NewRequest(http.MethodDelete, issuer+auth.APIBase()+"/logout", nil)
-			req.Header.Set("Authorization", "Bearer "+signedIn)
-			res, err := http.DefaultClient.Do(req)
-			if err != nil || res.StatusCode != http.StatusNoContent {
-				http.Error(w, fmt.Sprintf("logout: %v %v", err, res), http.StatusBadGateway)
-				return
-			}
+			_, _ = io.WriteString(w, signed)
+		case "/revoke-device-key": // the owner signing out of that device
+			authtest.RevokeDeviceKey(t, auth, device)
+			w.WriteHeader(http.StatusNoContent)
+		case "/enroll-device-key": // the owner signing in on a new device
+			device = authtest.EnrollDeviceKey(t, auth, outbox, owner)
 			w.WriteHeader(http.StatusNoContent)
 		case "/seen":
-			mu.Lock()
-			defer mu.Unlock()
-			_ = json.NewEncoder(w).Encode(verified)
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"verified": h.verified, "exchanges": h.exchanges,
+				"owner": owner.ID, "last_token": h.lastToken})
 		default:
 			http.NotFound(w, r)
 		}
@@ -157,6 +237,7 @@ func TestHarness(t *testing.T) {
 
 	ready, _ := json.Marshal(map[string]string{
 		"issuer": issuer, "resource": resource, "hub": resourceServer.URL, "control": controlServer.URL,
+		"token_endpoint": issuer + "/oauth2/token",
 	})
 	if err := os.WriteFile(*control+".tmp", ready, 0o600); err != nil {
 		t.Fatal(err)
@@ -168,77 +249,8 @@ func TestHarness(t *testing.T) {
 	_, _ = io.Copy(io.Discard, os.Stdin)
 }
 
-// authorize runs the CLI's half of th-238's flow for a machine key: the authorization request
-// (PKCE, resource, dpop_jkt, authorization_details), read without following its redirect,
-// then the approval with the CLI's sign-in. It answers the HubAuthorization the CLI hands over.
-func authorize(issuer, api, signedIn, kind, jkt string) (map[string]string, error) {
-	verifier := random(32)
-	challenge := sha256.Sum256([]byte(verifier))
-	state := random(12)
-	q := url.Values{
-		"response_type": {"code"}, "client_id": {client}, "redirect_uri": {redirect}, "state": {state},
-		"code_challenge": {base64.RawURLEncoding.EncodeToString(challenge[:])}, "code_challenge_method": {"S256"},
-		"resource": {resource}, "dpop_jkt": {jkt},
-	}
-	switch kind {
-	case "execution":
-		q.Set("authorization_details", `[{"type":"`+execution+`"}]`)
-	case "publication":
-		q.Set("authorization_details", `[{"type":"`+publication+`","machine_id":"","repositories":[{"org":"acme","name":"tiny"}],"permissions":["checkpoint"]}]`)
-		q.Set("scope", "offline_access")
-	default:
-		return nil, fmt.Errorf("no grant kind %q", kind)
-	}
-	noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	res, err := noRedirect.Get(issuer + iam.OAuthAuthorizePath + "?" + q.Encode())
-	if err != nil {
-		return nil, err
-	}
-	res.Body.Close()
-	location, _ := url.Parse(res.Header.Get("Location"))
-	if res.StatusCode != http.StatusSeeOther || location == nil || location.Query().Get("authorization") == "" {
-		return nil, fmt.Errorf("authorize: %d %s", res.StatusCode, res.Header.Get("Location"))
-	}
-	req, _ := http.NewRequest(http.MethodPost, issuer+api+"/oauth2/authorizations/"+url.PathEscape(location.Query().Get("authorization"))+"/approve", nil)
-	req.Header.Set("Authorization", "Bearer "+signedIn)
-	res, err = http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer res.Body.Close()
-	var out struct {
-		RedirectTo string `json:"redirect_to"`
-	}
-	body, _ := io.ReadAll(res.Body)
-	if res.StatusCode != http.StatusOK || json.Unmarshal(body, &out) != nil {
-		return nil, fmt.Errorf("approve: %d %s", res.StatusCode, body)
-	}
-	callback, err := url.Parse(out.RedirectTo)
-	if err != nil || callback.Query().Get("state") != state || callback.Query().Get("iss") != issuer || callback.Query().Get("code") == "" {
-		return nil, fmt.Errorf("approve: redirect %q does not answer the request", out.RedirectTo)
-	}
-	return map[string]string{
-		"issuer": issuer, "code": callback.Query().Get("code"), "code_verifier": verifier,
-		"redirect_uri": redirect, "resource": resource,
-	}, nil
-}
-
 func random(n int) string {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
 	return base64.RawURLEncoding.EncodeToString(b)
-}
-
-func memoryReplay() func(context.Context, string, time.Duration) (bool, error) {
-	var mu sync.Mutex
-	claimed := map[string]bool{}
-	return func(_ context.Context, key string, _ time.Duration) (bool, error) {
-		mu.Lock()
-		defer mu.Unlock()
-		if claimed[key] {
-			return false, nil
-		}
-		claimed[key] = true
-		return true, nil
-	}
 }

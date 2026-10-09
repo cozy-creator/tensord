@@ -31,8 +31,6 @@ pub struct NativeBackend {
     pub store: Arc<Store>,
     pub installer: Option<crate::api::install::InstallerConfig>,
     pub publisher: Option<Arc<crate::published::Publisher>>,
-    /// On a rental: its own Hub, read with the pod's worker capability.
-    pub own_hub: Option<crate::hub::Source>,
     /// `cozy.machine.v1` Run sources and Write.
     pub runs: Option<Arc<crate::runs::Runs>>,
     // Serialize native projection, not inference or observation. Only one result
@@ -51,7 +49,6 @@ impl NativeBackend {
             store,
             installer: None,
             publisher: None,
-            own_hub: None,
             runs: None,
             projection: Mutex::new(()),
         }
