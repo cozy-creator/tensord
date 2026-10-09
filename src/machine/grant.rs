@@ -30,7 +30,6 @@ const NAMES: &[&str] = &[
     RECEIPT_KEY_FILE,
     "TENSORHUB_ORIGIN",
     "TENSORHUB_CA_DER_B64URL",
-    "TENSORHUB_OBJECT_ORIGIN",
     "TENSORHUB_OBJECT_STORAGE_HOSTS",
 ];
 pub const RECEIPT_KEY: &str = "COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL";
@@ -52,8 +51,6 @@ pub struct HubGrant {
     pub worker_token: String,
     pub ca_der: Option<Vec<u8>>,
     pub object_hosts: Vec<String>,
-    /// TENSORHUB_OBJECT_ORIGIN: where this Hub serves public checkpoints (th-243).
-    pub object_origin: String,
 }
 
 pub struct Grant {
@@ -181,7 +178,6 @@ impl Grant {
                     object_hosts: get("TENSORHUB_OBJECT_STORAGE_HOSTS")
                         .map(|h| h.split(',').map(str::to_owned).collect())
                         .unwrap_or_default(),
-                    object_origin: get("TENSORHUB_OBJECT_ORIGIN").unwrap_or_default().to_string(),
                 })
             }
         };
@@ -356,7 +352,6 @@ mod tests {
             ("COZY_AUTHORIZED_KEYS", KEY),
             (RECEIPT_KEY, TOKEN),
             ("TENSORHUB_ORIGIN", "https://hub.example"),
-            ("TENSORHUB_OBJECT_ORIGIN", "https://objects.example"),
             ("COZY_FUTURE_SETTING", "x"),
             ("WORKER_MODE", "development"),
             ("PUBLIC_KEY", "ssh-ed25519 AAAA"),
@@ -366,8 +361,7 @@ mod tests {
         assert_eq!(grant.layout.state, Path::new("/var/lib/cozy/machine"));
         assert_eq!((grant.worker_port, grant.webrtc_port), (8443, Some(8445)));
         assert_eq!(grant.receipt_key.as_deref(), Some(&[0u8; 32][..]));
-        let hub = grant.hub.unwrap();
-        assert_eq!((hub.origin.as_str(), hub.object_origin.as_str()), ("https://hub.example", "https://objects.example"));
+        assert_eq!(grant.hub.unwrap().origin, "https://hub.example");
         assert_eq!(grant.ignored, ["COZY_FUTURE_SETTING"]);
         assert_eq!(grant.developer_key.as_deref(), Some("ssh-ed25519 AAAA"));
     }
