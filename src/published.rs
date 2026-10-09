@@ -1138,17 +1138,14 @@ impl Publisher {
         }
         let _fetching = self.fetch(grants.iter().map(|g| g.manifest.clone()).collect());
         let keep = self.protected(service).map_err(io_failure)?;
+        // One download per checkpoint (a source model is already here), all at once: a LoRA
+        // never waits behind its 100 GB base.
         let mut fetched = std::collections::BTreeSet::new();
-        for grant in &grants {
-            if !fetched.insert(grant.manifest.clone()) || grant.repository.is_empty() || grant.repository.starts_with("local/") {
-                continue; // one download per checkpoint; a source model is already here
-            }
-            job.stage(format!(
-                "downloading {}@{} {}",
-                grant.repository, grant.release, grant.lane
-            ));
-            ensure(&self.store, catalog, &grant.repository, &grant.manifest, &keep, &|d, t| job.bytes(d, t))?;
-        }
+        let downloads: Vec<&ModelGrant> = grants
+            .iter()
+            .filter(|g| fetched.insert(g.manifest.clone()) && !g.repository.is_empty() && !g.repository.starts_with("local/"))
+            .collect();
+        download_all(&self.store, catalog, &downloads, &keep, job)?;
         for grant in &mut grants {
             let parameter = grant
                 .slot
@@ -1383,6 +1380,50 @@ fn ensure(
     tensorfs_core::ensure::ensure(&request)
         .map(drop)
         .map_err(|e| refused("model_download_failed", e))
+}
+
+/// Every checkpoint a preparation needs, downloaded at once under one stage whose bytes are
+/// their sum. The first refusal is the answer, once every download has ended.
+fn download_all(
+    store: &Store,
+    catalog: &Catalog,
+    grants: &[&ModelGrant],
+    keep: &[String],
+    job: &Job,
+) -> Result<(), Failure> {
+    if grants.is_empty() {
+        return Ok(());
+    }
+    let names: Vec<String> = grants
+        .iter()
+        .map(|g| format!("{}@{} {}", g.repository, g.release, g.lane))
+        .collect();
+    job.stage(format!("downloading {}", names.join(" and ")));
+    let moved = Mutex::new(vec![(0u64, 0u64); grants.len()]);
+    let results: Vec<Result<(), Failure>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = grants
+            .iter()
+            .enumerate()
+            .map(|(at, grant)| {
+                let moved = &moved;
+                scope.spawn(move || {
+                    ensure(store, catalog, &grant.repository, &grant.manifest, keep, &|done, total| {
+                        let (done, total) = {
+                            let mut moved = moved.lock().unwrap();
+                            moved[at] = (done, total);
+                            moved.iter().fold((0, 0), |(d, t), (dd, tt)| (d + dd, t + tt))
+                        };
+                        job.bytes(done, total);
+                    })
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|_| Err(("model_download_failed", "a download thread panicked".to_string()))))
+            .collect()
+    });
+    results.into_iter().collect()
 }
 
 /// A TensorFS refusal as a run's reason; a download the disk cannot fit is its own.
