@@ -21,6 +21,7 @@ pub struct AuthKit {
     /// The Hub origin a machine reaches: AuthKit's resource server, forwarding to the test Hub.
     pub hub: String,
     control: String,
+    dir: PathBuf,
 }
 
 fn harness() -> &'static PathBuf {
@@ -86,6 +87,7 @@ impl AuthKit {
             resource: field("resource"),
             hub: field("hub"),
             control: field("control"),
+            dir,
         }
     }
 
@@ -136,6 +138,7 @@ impl Drop for AuthKit {
         // Closing its stdin ends the harness, which drops its scratch schema.
         drop(self.stdin.take());
         let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
