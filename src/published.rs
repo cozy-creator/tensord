@@ -2295,7 +2295,7 @@ mod tests {
         assert_eq!(named.refspec(), format!("o/m@1.0.0@{manifest}"));
         let private = Named { release: String::new(), ..named };
         assert_eq!(private.refspec(), format!("o/m@{manifest}"));
-        assert_eq!(release_order("2.0.0") > release_order("10.0.0rc1"), true);
+        assert!(release_order("2.0.0") > release_order("10.0.0rc1"));
         assert!(release_order("10.0.0") > release_order("9.1.0"));
     }
 

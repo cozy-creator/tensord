@@ -1052,7 +1052,7 @@ mod tests {
             parameter: parameter.into(), repository: repository.into(), release: "1".into(), ..Default::default()
         };
         v1::RunSpec {
-            source: Some(v1::run_spec::Source::Release(v1::Release { package: "org/package".into(), release: "1.0.0".into(), ..Default::default() })),
+            source: Some(v1::run_spec::Source::Release(v1::Release { package: "org/package".into(), release: "1.0.0".into() })),
             entrypoint: "render".into(),
             payload: br#" { "seed":9007199254740993, "nested":{"b":2,"a":1} } "#.to_vec(),
             inputs: vec![input("reference", "a", 0), input("reference", "b", 1)],
