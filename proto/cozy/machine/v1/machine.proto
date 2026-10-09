@@ -69,7 +69,10 @@ message RunSpec {
   bytes payload = 7;              // canonical JSON object of the function's parameters
   repeated InputFile inputs = 8;  // objects uploaded with Write, bound to payload fields
   repeated ModelChoice models = 9;
-  reserved 10;  // binding revision: every Hub model choice is exact (th-241)
+  // The catalog revision the caller made its choices under (th-245): a held resolution is reused
+  // only under the same one, so a publish, yank, bind or retarget the caller knows of resolves
+  // once more at the Hub.
+  string catalog_revision = 10;
   reserved 11;  // known results: memos are the machine's own
   string attention_kernel = 12;
   string weights_destination = 13;  // org/name: a job's weights outputs, or a warm run's source model
@@ -89,16 +92,12 @@ message ProviderAccess {
   string civitai = 2;
 }
 
+// A published release by name (th-245): a machine that holds no installation of it reads its
+// card and locked requirements at the Hub by name.
 message Release {
   string package = 1;  // org/name
-  string release = 2;
-  // The release as its Hub publishes it, so the machine installs it reading no Hub (th-241):
-  // its package interface (canonical JSON), its Python version, and its locked requirements
-  // as an object the caller wrote with Write (sha256:<hex>). Needed only when the signer
-  // holds no installation of the release yet.
-  bytes package_interface = 3;
-  string python_version = 4;
-  string locked_requirements = 5;
+  string release = 2;  // empty: the Hub's newest
+  reserved 3, 4, 5;    // the card and lock the caller once carried
 }
 // The manifest is a JSON object written with Write: {package: "local/<dist>", release,
 // python_requires, python_version, source: {digest, length} (a tar of the project),
@@ -114,18 +113,20 @@ message InputFile {
   string media_type = 4;
   uint32 order = 5;
 }
-// One model slot's choice. A Hub model is exact (th-241: the machine resolves nothing at a
-// Hub): `manifest` pins one checkpoint, or `rungs` are the slot's binding with every rung's
-// checkpoint resolved, of which the machine takes the widest its GPUs fit. The caller sends
-// one for every model slot the run may load, a callee's included (`<package>/<path>`).
+// One model slot's choice, by name (th-245: the machine resolves it at the Hub). A Hub model is
+// `repository` at `release` (empty: the newest) in `lane`, else the widest rung of `rungs` its GPUs
+// fit, else the release's only lane. `manifest` names a checkpoint by hash only: the owner's
+// private one at the Hub (with `repository`; the run's capability names it) or one this machine
+// holds (without). The caller sends one for every model slot the run may load, a callee's
+// included (`<package>/<path>`).
 message ModelChoice {
   string parameter = 1;  // a root slot parameter or full slot path
   string repository = 2;
   string release = 3;
   string lane = 4;
-  string manifest = 5;   // sha256:<hex>, an exact checkpoint
+  string manifest = 5;   // sha256:<hex>
   uint64 manifest_length = 6;
-  repeated Adapter adapters = 7;  // each exact: a manifest, or a provider source
+  repeated Adapter adapters = 7;  // each by name, a hash of the owner's, or a provider source
   // A provider source (hf://<org>/<repo>@<rev>[/member], civitai://<version>[/file]) the
   // machine makes the slot's model from, under these reviewed profiles (none: the one its
   // headers select); never with repository or manifest.
@@ -133,21 +134,19 @@ message ModelChoice {
   repeated string profiles = 9;
   repeated ModelRung rungs = 10;
 }
-// One rung of a binding: on GPUs matching `gpu`, `gpus` of them run the slot's `lane`, whose
-// checkpoint is `manifest`.
+// One rung of a binding: on GPUs matching `gpu`, `gpus` of them run the slot's `lane`.
 message ModelRung {
   string gpu = 1;       // "*", or the tokens a GPU name contains, in order ("h100", "rtx 5090")
   uint32 gpus = 2;
   string lane = 3;
-  string manifest = 4;  // sha256:<hex>
-  uint64 manifest_length = 5;
+  reserved 4, 5;        // the rung's checkpoint: the machine resolves the lane by name
 }
 message Adapter {
   string component = 1;
   string model = 2;
   string release = 3;
   string lane = 4;
-  string manifest = 5;
+  string manifest = 5;  // sha256:<hex>, the owner's checkpoint by hash; else model at release, lane
   string scale = 6;  // canonical decimal; empty means 1
   // A provider source (civitai://<version>, hf://…) made here and normalized at ingest,
   // under these reviewed profiles (none: the one its headers select); never with model.
