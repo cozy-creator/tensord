@@ -1259,7 +1259,17 @@ impl GpuPool {
             }
             let grant = grants[0];
             let mut wanted = std::collections::BTreeSet::new();
-            if let Some(use_map) = model
+            // The components this callable declares it uses, else every one its methods use.
+            if let Some(declared) = model.get("components").and_then(serde_json::Value::as_array) {
+                for component in declared {
+                    wanted.insert(
+                        component
+                            .as_str()
+                            .ok_or_else(|| invalid("declared component is not a name"))?
+                            .to_string(),
+                    );
+                }
+            } else if let Some(use_map) = model
                 .get("component_use")
                 .and_then(serde_json::Value::as_object)
             {

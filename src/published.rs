@@ -149,7 +149,22 @@ pub struct Publisher {
     jobs: Mutex<HashMap<String, Arc<Job>>>,
     /// Manifests preparations are fetching, counted per preparation (`Fetching`).
     fetching: Mutex<HashMap<String, usize>>,
+    /// Checkpoints a run started on part of: the rest downloads behind it (`complete_behind`).
+    remainders: Mutex<HashMap<String, Remainder>>,
 }
+
+/// The rest of a checkpoint whose declared components a run downloaded first.
+struct Remainder {
+    repository: String,
+    source: hub::Source,
+    /// What the parts landed, held from GC until the whole checkpoint is recorded.
+    holds: Vec<tensorfs_core::ensure::PartHold>,
+    started: bool,
+}
+
+/// Streams a remainder downloads with while no preparation waits on it: well under a
+/// foreground pull's, so the running request keeps the link and the disk.
+const BEHIND_STREAMS: usize = 64;
 
 /// One preparation's manifests in `Publisher::fetching`, released when it ends.
 struct Fetching<'a> {
@@ -179,6 +194,7 @@ impl Publisher {
             store,
             jobs: Mutex::new(HashMap::new()),
             fetching: Mutex::new(HashMap::new()),
+            remainders: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -404,6 +420,97 @@ impl Publisher {
             .map_err(|(code, message)| Refused { code, message })
     }
 
+    /// Downloads the rest of every checkpoint `run`'s preparation took part of, once the run
+    /// is on its GPU. A remainder yields while a preparation fetches another checkpoint, and
+    /// speeds up for one waiting on it; its parts stay held from GC until it is recorded.
+    pub fn complete_behind(self: &Arc<Self>, service: &Arc<Service>, run: &str) {
+        let pending: Vec<String> = {
+            let mut remainders = self.remainders.lock().unwrap();
+            remainders
+                .iter_mut()
+                .filter(|(_, remainder)| !remainder.started)
+                .map(|(manifest, remainder)| {
+                    remainder.started = true;
+                    manifest.clone()
+                })
+                .collect()
+        };
+        for manifest in pending {
+            let (this, service, run) = (self.clone(), service.clone(), run.to_string());
+            let spawned = std::thread::Builder::new()
+                .name("remainder".into())
+                .spawn(move || this.remainder(&service, &run, &manifest));
+            if let Err(error) = spawned {
+                eprintln!("checkpoint remainder: {error}");
+            }
+        }
+    }
+
+    fn remainder(&self, service: &Service, run: &str, manifest: &str) {
+        let tick = std::time::Duration::from_secs(1);
+        while matches!(
+            service.engine.get(run).map(|record| record.state),
+            Ok(crate::journal::State::Queued | crate::journal::State::Starting)
+        ) {
+            std::thread::sleep(tick);
+        }
+        let Some((repository, source)) = self
+            .remainders
+            .lock()
+            .unwrap()
+            .get(manifest)
+            .map(|r| (r.repository.clone(), r.source.clone()))
+        else {
+            return;
+        };
+        let others = || self.fetching.lock().unwrap().keys().any(|m| m != manifest);
+        let waited_on = || self.fetching.lock().unwrap().contains_key(manifest);
+        let outcome = loop {
+            while others() {
+                std::thread::sleep(tick);
+            }
+            let catalog = match Catalog::new(&source) {
+                Ok(catalog) => catalog,
+                Err(e) => break Err(("catalog_read_failed", e.0)),
+            };
+            let keep = match self.protected(service) {
+                Ok(keep) => keep,
+                Err(e) => break Err(io_failure(e)),
+            };
+            let urgent = waited_on();
+            let cancellation = tensorfs_core::transport::PullCancellation::default();
+            let pull = Pull {
+                components: Vec::new(),
+                streams: (!urgent).then_some(BEHIND_STREAMS),
+                cancellation: Some(cancellation.clone()),
+            };
+            let done = std::sync::atomic::AtomicBool::new(false);
+            let result = std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    while !done.load(std::sync::atomic::Ordering::Acquire) {
+                        std::thread::park_timeout(tick);
+                        if others() || (!urgent && waited_on()) {
+                            cancellation.cancel();
+                            return;
+                        }
+                    }
+                });
+                let result = ensure_with(&self.store, &catalog, &repository, manifest, &keep, &pull, &|_, _| ());
+                done.store(true, std::sync::atomic::Ordering::Release);
+                result
+            });
+            match result {
+                Ok(_) => break Ok(()),
+                Err(_) if cancellation.is_cancelled() => continue,
+                Err(failure) => break Err(failure),
+            }
+        };
+        if let Err((code, detail)) = outcome {
+            eprintln!("checkpoint {manifest}: the rest did not download ({code}: {detail})");
+        }
+        self.remainders.lock().unwrap().remove(manifest);
+    }
+
     fn fetch(&self, manifests: Vec<String>) -> Fetching<'_> {
         let mut fetching = self.fetching.lock().unwrap();
         for manifest in &manifests {
@@ -432,6 +539,7 @@ impl Publisher {
         let gpu = service.gpu();
         let mut keep = gpu.as_ref().map(|gpu| gpu.serving()).unwrap_or_default();
         keep.extend(self.fetching.lock().unwrap().keys().cloned());
+        keep.extend(self.remainders.lock().unwrap().keys().cloned());
         for record in service.engine.with_journal(|journal| journal.unfinished())? {
             if record.invocation.job {
                 let context = service.engine.with_journal(|journal| journal.job_context(&record.id))?;
@@ -1140,12 +1248,56 @@ impl Publisher {
         let keep = self.protected(service).map_err(io_failure)?;
         // One download per checkpoint (a source model is already here), all at once: a LoRA
         // never waits behind its 100 GB base.
+        // A slot that declares the components its callable uses has those downloaded first;
+        // the rest of its checkpoint follows once the run is on its GPU (`complete_behind`).
+        let declared: HashMap<&str, Vec<&str>> = slots
+            .iter()
+            .filter_map(|slot| {
+                let path = slot.get("path")?.as_str()?;
+                let components = slot.get("components")?.as_array()?;
+                Some((path, components.iter().filter_map(Value::as_str).collect()))
+            })
+            .collect();
+        let mut parts: HashMap<&str, Option<Vec<String>>> = HashMap::new();
+        for grant in &grants {
+            let part: Option<Vec<String>> = declared.get(grant.slot.as_str()).map(|names| {
+                grant.components.iter().filter(|c| names.contains(&c.as_str())).cloned().collect()
+            });
+            let part = part.filter(|part| !part.is_empty() && part.len() < grant.components.len());
+            // A checkpoint two slots share downloads whole if either needs all of it.
+            let merged = match (parts.remove(grant.manifest.as_str()), part) {
+                (Some(Some(mut a)), Some(b)) => {
+                    a.extend(b);
+                    a.sort();
+                    a.dedup();
+                    Some(a)
+                }
+                (None, part) => part,
+                _ => None,
+            };
+            parts.insert(grant.manifest.as_str(), merged);
+        }
         let mut fetched = std::collections::BTreeSet::new();
-        let downloads: Vec<&ModelGrant> = grants
+        let downloads: Vec<(&ModelGrant, Vec<String>)> = grants
             .iter()
             .filter(|g| fetched.insert(g.manifest.clone()) && !g.repository.is_empty() && !g.repository.starts_with("local/"))
+            .map(|g| (g, parts.get(g.manifest.as_str()).cloned().flatten().unwrap_or_default()))
             .collect();
-        download_all(&self.store, catalog, &downloads, &keep, job)?;
+        let landed = download_all(&self.store, catalog, &downloads, &keep, job)?;
+        let mut remainders = self.remainders.lock().unwrap();
+        for (grant, hold) in landed {
+            remainders
+                .entry(grant.manifest.clone())
+                .or_insert_with(|| Remainder {
+                    repository: grant.repository.clone(),
+                    source: request.source.clone(),
+                    holds: Vec::new(),
+                    started: false,
+                })
+                .holds
+                .push(hold);
+        }
+        drop(remainders);
         for grant in &mut grants {
             let parameter = grant
                 .slot
@@ -1363,6 +1515,26 @@ fn ensure(
     keep: &[String],
     bytes: &(dyn Fn(u64, u64) + Sync),
 ) -> Result<(), Failure> {
+    ensure_with(store, catalog, repository, manifest, keep, &Pull::default(), bytes).map(drop)
+}
+
+/// How one ensure pulls: some components only (held until dropped), its streams, its stop.
+#[derive(Default)]
+struct Pull {
+    components: Vec<String>,
+    streams: Option<usize>,
+    cancellation: Option<tensorfs_core::transport::PullCancellation>,
+}
+
+fn ensure_with(
+    store: &Store,
+    catalog: &Catalog,
+    repository: &str,
+    manifest: &str,
+    keep: &[String],
+    pull: &Pull,
+    bytes: &(dyn Fn(u64, u64) + Sync),
+) -> Result<Option<tensorfs_core::ensure::PartHold>, Failure> {
     let credential = catalog.credential();
     let refspec = format!("{repository}@{manifest}");
     let mut keep = keep.to_vec();
@@ -1377,37 +1549,52 @@ fn ensure(
     );
     request.keep = &keep;
     request.on_event = Some(&on_event);
-    tensorfs_core::ensure::ensure(&request)
-        .map(drop)
+    request.components = &pull.components;
+    request.cancellation = pull.cancellation.clone();
+    if let Some(streams) = pull.streams {
+        request.streams = streams;
+    }
+    if pull.components.is_empty() {
+        return tensorfs_core::ensure::ensure(&request)
+            .map(|_| None)
+            .map_err(|e| refused("model_download_failed", e));
+    }
+    tensorfs_core::ensure::ensure_part(&request)
+        .map(|(_, hold)| Some(hold))
         .map_err(|e| refused("model_download_failed", e))
 }
 
 /// Every checkpoint a preparation needs, downloaded at once under one stage whose bytes are
-/// their sum. The first refusal is the answer, once every download has ended.
-fn download_all(
+/// their sum; a checkpoint with a part named downloads that part only, and answers its hold.
+/// The first refusal is the answer, once every download has ended.
+fn download_all<'g>(
     store: &Store,
     catalog: &Catalog,
-    grants: &[&ModelGrant],
+    grants: &[(&'g ModelGrant, Vec<String>)],
     keep: &[String],
     job: &Job,
-) -> Result<(), Failure> {
+) -> Result<Vec<(&'g ModelGrant, tensorfs_core::ensure::PartHold)>, Failure> {
     if grants.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let names: Vec<String> = grants
         .iter()
-        .map(|g| format!("{}@{} {}", g.repository, g.release, g.lane))
+        .map(|(g, part)| match part.is_empty() {
+            true => format!("{}@{} {}", g.repository, g.release, g.lane),
+            false => format!("{}@{} {} ({})", g.repository, g.release, g.lane, part.join(", ")),
+        })
         .collect();
     job.stage(format!("downloading {}", names.join(" and ")));
     let moved = Mutex::new(vec![(0u64, 0u64); grants.len()]);
-    let results: Vec<Result<(), Failure>> = std::thread::scope(|scope| {
+    let results: Vec<Result<Option<tensorfs_core::ensure::PartHold>, Failure>> = std::thread::scope(|scope| {
         let handles: Vec<_> = grants
             .iter()
             .enumerate()
-            .map(|(at, grant)| {
+            .map(|(at, (grant, part))| {
                 let moved = &moved;
                 scope.spawn(move || {
-                    ensure(store, catalog, &grant.repository, &grant.manifest, keep, &|done, total| {
+                    let pull = Pull { components: part.clone(), ..Pull::default() };
+                    ensure_with(store, catalog, &grant.repository, &grant.manifest, keep, &pull, &|done, total| {
                         let (done, total) = {
                             let mut moved = moved.lock().unwrap();
                             moved[at] = (done, total);
@@ -1423,7 +1610,13 @@ fn download_all(
             .map(|h| h.join().unwrap_or_else(|_| Err(("model_download_failed", "a download thread panicked".to_string()))))
             .collect()
     });
-    results.into_iter().collect()
+    let mut held = Vec::new();
+    for ((grant, _), result) in grants.iter().zip(results) {
+        if let Some(hold) = result? {
+            held.push((*grant, hold));
+        }
+    }
+    Ok(held)
 }
 
 /// A TensorFS refusal as a run's reason; a download the disk cannot fit is its own.

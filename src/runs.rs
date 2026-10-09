@@ -356,7 +356,12 @@ impl Runs {
                 .spawn(move || {
                     let outcome = this.prepare(&actor, &run, spec);
                     let ended = match outcome {
-                        Ok(None) => Ok(()),
+                        Ok(None) => {
+                            if let Some(publisher) = &this.publisher {
+                                publisher.complete_behind(&this.service, &run);
+                            }
+                            Ok(())
+                        }
                         Ok(Some(result)) => this
                             .service
                             .engine
