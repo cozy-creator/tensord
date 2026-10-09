@@ -1265,8 +1265,16 @@ mod v1_api {
         }
         assert!(cold.iter().all(|heard| !heard.ends_with("+credential")), "{cold:?}");
 
-        // Warm: the release's installation and the name's resolution are held.
+        // Warm: the release's installation and the name's resolution are held, across a
+        // restart too.
         let done = settle(&mut client, &all, "names-2", spec(Some("1.0.0"), named.clone(), "r1")).await;
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        assert_eq!(take(), Vec::<String>::new());
+        let mut machine = machine;
+        machine.stop();
+        (machine.child, machine.address) = launch(&machine.root, &[]);
+        let mut client = self::client(&machine).await;
+        let done = settle(&mut client, &all, "names-2b", spec(Some("1.0.0"), named.clone(), "r1")).await;
         assert_eq!(done.status, "succeeded", "{done:?}");
         assert_eq!(take(), Vec::<String>::new());
 

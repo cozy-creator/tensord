@@ -203,8 +203,6 @@ pub struct Publisher {
     fetching: Mutex<HashMap<String, usize>>,
     /// Checkpoints a run started on part of: the rest downloads behind it (`complete_behind`).
     remainders: Mutex<HashMap<String, Remainder>>,
-    /// What the Hub named each name under a caller's catalog revision (`resolve`).
-    names: Mutex<HashMap<String, Named>>,
 }
 
 /// The rest of a checkpoint whose declared components a run downloaded first.
@@ -249,7 +247,6 @@ impl Publisher {
             jobs: Mutex::new(HashMap::new()),
             fetching: Mutex::new(HashMap::new()),
             remainders: Mutex::new(HashMap::new()),
-            names: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -444,18 +441,21 @@ impl Publisher {
     }
 
     /// The checkpoint `named` is: a hash as given, a name as the Hub answers it (one closure
-    /// call), kept per catalog revision so a warm run asks the Hub nothing (th-245).
-    pub(crate) fn resolve(&self, source: &hub::Source, named: Named, revision: &str) -> Result<Named, Failure> {
+    /// call), journaled per catalog revision so a warm run, across restarts too, asks the Hub
+    /// nothing (th-245).
+    pub(crate) fn resolve(&self, service: &Service, source: &hub::Source, named: Named, revision: &str) -> Result<Named, Failure> {
         if !named.manifest.is_empty() {
             return Ok(named);
         }
         let origin = hub::origin_key(&source.origin).unwrap_or_default();
-        let key = json!([origin, named.repository, named.release, named.lane, revision]).to_string();
-        if let Some(held) = self.names.lock().unwrap().get(&key) {
-            return Ok(held.clone());
+        let name = json!([origin, named.repository, named.release, named.lane]).to_string();
+        let held = service.engine.with_journal(|j| j.named(&name, revision)).map_err(io_failure)?;
+        if let Some([release, lane, manifest]) = held.and_then(|held| serde_json::from_str::<[String; 3]>(&held).ok()) {
+            return Ok(Named { release, lane, manifest, ..named });
         }
         let resolved = named.at_hub(source)?;
-        self.names.lock().unwrap().insert(key, resolved.clone());
+        let answer = json!([resolved.release, resolved.lane, resolved.manifest]).to_string();
+        service.engine.with_journal(|j| j.bind_named(&name, revision, &answer)).map_err(io_failure)?;
         Ok(resolved)
     }
 
@@ -470,7 +470,7 @@ impl Publisher {
         bytes: &(dyn Fn(u64, u64) + Sync),
     ) -> Result<Named, Refused> {
         let failed = |(code, message)| Refused { code, message };
-        let named = self.resolve(source, named, revision).map_err(failed)?;
+        let named = self.resolve(service, source, named, revision).map_err(failed)?;
         // A checkpoint this store already holds whole, in that repository, moves nothing.
         let sha256 = named.manifest.trim_start_matches("sha256:");
         if let Ok(meta) = std::fs::metadata(self.store.manifest_path(sha256)) {
@@ -1247,7 +1247,7 @@ impl Publisher {
                 continue;
             }
             let (named, gpus) = choose(choice, &path, (&gpu_model, width))?;
-            let named = self.resolve(&request.source, named, &request.catalog_revision)?;
+            let named = self.resolve(service, &request.source, named, &request.catalog_revision)?;
             degree = degree.max(gpus);
             grants.push(ModelGrant {
                 package: installation.package.clone(),
@@ -1329,7 +1329,7 @@ impl Publisher {
                 .iter()
                 .find(|c| c.parameter == grant.slot || c.parameter == parameter)
             {
-                let resolve = |named| self.resolve(&request.source, named, &request.catalog_revision);
+                let resolve = |named| self.resolve(service, &request.source, named, &request.catalog_revision);
                 apply_adapters(&self.store, &request.source, &resolve, choice, grant, &keep, &request.providers, job)?;
             }
         }
