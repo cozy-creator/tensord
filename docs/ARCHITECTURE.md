@@ -87,7 +87,7 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 | `machine_api.rs` | `MachineBackend` implementation: submit, events, collect, list, inventory | `NativeBackend` | D1 |
 | `products.rs` | Run output log: `Outputs.publish` custody and `product` events (SET/APPEND, composite parts) | `publish`, `retain`, `document` | G |
 | `triage.rs` | One bounded triage bundle per failed attempt, named by its outcome | `TriageRef`, `Facts` | G |
-| `hub.rs` | Hub access (th-241): anonymous public reads; a run's capability traded once for a DPoP-bound token (JWT-bearer, leaf-signed assertion) and presented only on the private operations it names | `Leaf`, `Capability`, `Source`, `Catalog`, `Op` | D1 |
+| `hub.rs` | Hub access (th-241, th-245): anonymous reads by name (catalog, closure); a run's capability traded once for a DPoP-bound token (JWT-bearer, leaf-signed assertion) and presented only on the private operations it names | `Leaf`, `Capability`, `Source`, `Catalog`, `Op` | D1 |
 | `published.rs` | Package and model preparation: releases and models from the Hub, provider-source models via TensorFS `source_model`, held per release and resolution; downloads keep the serving set out of GC | `Publisher`, `Request`, `Prepared` | D1 |
 | `adapter_views.rs` | Caller LoRA adapters as a zero-copy TensorFS derivation | — | D1 |
 | `runs.rs` | Run sources and preparation inside a run: accepted at once, install/download as its progress, the Hub capability in memory only. A warm run with no entrypoint installs and fetches its choices; one with no code makes provider sources and uploads to its weights destination | `Runs`, `Spec`, `Source` | D1 |

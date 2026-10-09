@@ -18,7 +18,7 @@ the same reasons a run's outcome carries. Unknown fields are ignored with a warn
 | Call | Shape | Real callers | Why it cannot fold into another |
 |---|---|---|---|
 | **Status** | server stream `{keepalive?}`. The first frame describes the machine: worker and boot id, versions, capabilities, phase, GPUs, Hubs, the caller's live runs, held environments, disk, idle deadline, and the player endpoint: the `cozy/1` listener's port, the addresses to dial and its DTLS certificate's SHA-256. Each later frame is the whole picture again, sent when it changes. Holding the stream is **not** activity. `keepalive: true` resets the idle deadline once, and the first frame carries the new deadline. Without a cap it answers one frame: identity and the sealed readiness receipt. | CLI `machine show`, `rental show`, endpoint check; `rental keepalive` (one reset); Hub readiness (no cap) | It describes the machine, not a run. A unary describe is just its first frame. |
-| **Run** | server stream. `{id, after, spec?}`. With a spec and a new id it submits (idempotent on `id`). Every call then streams the run's log from `after`: `state`, `progress`, `product` (output, rev, length, label, media type; stable output names), `log`, `outcome` (status, typed reason, result, output list, triage). The spec holds `source` (a published release with its card, private placement, or an uploaded local package manifest), `kind` (`call`, `job`, `warm` or `update`), entrypoint, payload, input object digests, exact model choices, attention kernel, weights destination, and the Hub to read with the run's capability there. | CLI `cozy run` (attached or `--detach`), `run watch/show`, `machine model download` and prewarm (`kind: warm`), `rental update` (`kind: update`); Hub public serving; seam child runs | Submit without watch is the first frame then close. Watch is Run without a spec. Prepare is a run that only prepares (`warm`), and an ordinary run prepares inside itself (its `progress` shows install and download). |
+| **Run** | server stream. `{id, after, spec?}`. With a spec and a new id it submits (idempotent on `id`). Every call then streams the run's log from `after`: `state`, `progress`, `product` (output, rev, length, label, media type; stable output names), `log`, `outcome` (status, typed reason, result, output list, triage). The spec holds `source` (a published release by name, private placement, or an uploaded local package manifest), `kind` (`call`, `job`, `warm` or `update`), entrypoint, payload, input object digests, model choices by name, the caller's catalog revision, attention kernel, weights destination, and the Hub to read with the run's capability there. | CLI `cozy run` (attached or `--detach`), `run watch/show`, `machine model download` and prewarm (`kind: warm`), `rental update` (`kind: update`); Hub public serving; seam child runs | Submit without watch is the first frame then close. Watch is Run without a spec. Prepare is a run that only prepares (`warm`), and an ordinary run prepares inside itself (its `progress` shows install and download). |
 | **Control** | unary `{run, cancel \| pause \| resume}` | CLI `run cancel`, `job cancel`, `run pause/resume`; Hub public cancel; seam child cancel | Closing a Run stream must never cancel accepted work, so cancel needs its own call. |
 | **Read** | server stream `{target, offset, if_rev}`; target is a run output (`output[/i]`), `triage`, or a machine log (with tail). Frames carry rev, total length, the sha256 once final, then the bytes. | CLI downloads (`cozy run --out`, `cp`), triage quote on failure, `machine logs`, `rental logs` | Bytes do not belong in Run's event stream: a 50 GB output, resume at an offset, and many parallel readers. |
 | **Write** | client stream: one content-addressed object (sha256, length), resumable from the length already held | CLI `cozy run` file inputs and local package sources, Hub public inputs | Content addressing dedups across runs and resumes big uploads; inline bytes in Run would be re-sent on every attach. |
@@ -34,8 +34,8 @@ with a self-signed leaf; the CLI does not use it. Caller: the `cozy run play` li
 - **Submit, Watch, Get, Collect and Close** fold into Run.
 - **Acknowledge** is deleted. A Read that reaches the final length of an output's final revision
   marks it delivered, and delivered bytes are evicted first.
-- **Hub access** (th-241): public content is read anonymously. A run's private operations
-  (reading the owner's unpublished checkpoints, publishing to the owner's repositories) are named
+- **Hub access** (th-241): released content is read anonymously. A run's private operations
+  (reading the owner's checkpoint by hash, publishing to the owner's repositories) are named
   by `hub.capability`, which the owner's CLI signs offline with its device key for this machine's
   leaf. At the run's first private operation the machine trades it, once, at `hub.token_endpoint`
   (AuthKit's JWT-bearer grant: an assertion its leaf signs carries the capability, with a DPoP
@@ -45,11 +45,14 @@ with a self-signed leaf; the CLI does not use it. Caller: the `cozy run play` li
   an operation the Hub narrowed away `capability_exceeded`. Tokens live in memory only. If the
   machine restarts before preparation completes, the run ends FAILED with a typed reason; started
   work is never re-run.
-- **Hub lookups** are the caller's: a release arrives with its card (interface, Python version,
-  locked requirements written as an object), and every Hub model slot as an exact choice (a
-  pinned checkpoint, or its binding's rungs each resolved to a checkpoint, of which the machine
-  takes the widest its GPUs fit). The machine reads no release card, binding, model card or
-  resolution at a Hub, and there is no binding revision, TTL guess or forget verb.
+- **Names** (th-245): the machine resolves them at the run's Hub. A release (`org/name`, its
+  release or none for the newest) installs from the card and locked requirements it reads there
+  by name. A model slot is `repository` at `release` (none: the newest) in its `lane`, else the
+  widest rung of its binding its GPUs fit, else the release's only lane: one anonymous closure
+  call names its manifest, then the pull is pinned to that lane's checkpoint. `manifest` names a
+  checkpoint by hash only: the owner's (under the capability) or one the machine holds. Name
+  resolutions and held preparations are kept per `catalog_revision`, so a warm run reads nothing
+  at a Hub and a revision the caller moved resolves once more; there is no TTL guess or forget verb.
 - **List** is deleted. Status shows live runs; history is the CLI's own records plus Run by id.
 - **Update** is `Run kind: update` (D2). It stages and verifies a software cohort, activates it at
   measured idle and keeps the known-good install for rollback. The rental keeps its downloaded
