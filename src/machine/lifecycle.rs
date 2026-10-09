@@ -226,13 +226,13 @@ impl Lifecycle {
     }
 }
 
-/// Keeps the Hub lease of authorized keys: renewed at half its length, retried each second
-/// while the Hub is unreachable or not yet ready.
+/// Keeps the Hub's authorized keys: asked again at half the lease it names, and each second
+/// while the Hub is unreachable or not yet ready, when the keys stay as they were.
 pub async fn keep_authority(hub: Arc<Hub>, keys: Keys) {
     loop {
         let delay = match hub.authorized_keys().await {
             Ok((current, lease, bindings)) => {
-                keys.renew(current, lease, bindings);
+                keys.renew(current, bindings);
                 lease / 2
             }
             Err(Refusal::Denied) => {

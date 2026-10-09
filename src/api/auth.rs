@@ -8,7 +8,7 @@ use std::{
         Arc, RwLock,
     },
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio_stream::Stream;
 use tonic::Status;
@@ -20,88 +20,52 @@ pub struct Authority {
     pub keys: Keys,
 }
 
-/// The signing keys this machine admits, shared by every clone of its Authority. A
-/// rental's set is a Hub lease: its granted boot value holds until the Hub first answers,
-/// then each lease holds until it expires; a transport failure neither revokes nor extends
-/// it, a denial revokes it at once. Losing authority never cancels accepted work.
+/// The signing keys this machine admits, shared by every clone of its Authority. A rental's
+/// set is the Hub's: the granted boot keys hold until the Hub answers, and each answer holds
+/// until the next. Only the Hub's answer changes it: a Hub this machine cannot reach is weather
+/// and changes nothing, a denial revokes at once. Losing authority never cancels accepted work.
 #[derive(Clone)]
 pub struct Keys {
-    state: Arc<RwLock<KeyState>>,
+    keys: Arc<RwLock<Vec<VerifyingKey>>>,
     changes: Arc<tokio::sync::watch::Sender<u64>>,
-    /// The owner's bindings revision at the Hub, carried on the same lease answer; 0 for none.
+    /// The owner's bindings revision at the Hub, carried on the same answer; 0 for none.
     bindings: Arc<AtomicI64>,
-}
-struct KeyState {
-    keys: Vec<VerifyingKey>,
-    until: Option<Instant>,
-    leased: bool,
 }
 impl Keys {
     pub fn fixed(keys: Vec<VerifyingKey>) -> Self {
-        let state = KeyState {
-            keys,
-            until: None,
-            leased: false,
-        };
         Self {
-            state: Arc::new(RwLock::new(state)),
+            keys: Arc::new(RwLock::new(keys)),
             changes: Arc::new(tokio::sync::watch::channel(0).0),
             bindings: Arc::new(AtomicI64::new(0)),
         }
     }
-    fn replace(&self, state: KeyState) {
-        *self.state.write().unwrap() = state;
+    fn replace(&self, keys: Vec<VerifyingKey>) {
+        *self.keys.write().unwrap() = keys;
         self.changes.send_modify(|generation| *generation += 1);
     }
-    pub fn renew(&self, keys: Vec<VerifyingKey>, lease: Duration, bindings: i64) {
+    /// The Hub's current answer: these keys, and the owner's bindings revision.
+    pub fn renew(&self, keys: Vec<VerifyingKey>, bindings: i64) {
         self.bindings.store(bindings, Ordering::Release);
-        self.replace(KeyState {
-            keys,
-            until: Some(Instant::now() + lease),
-            leased: true,
-        });
+        self.replace(keys);
     }
     /// The owner's bindings revision as the Hub last stated it.
     pub fn bindings_revision(&self) -> i64 {
         self.bindings.load(Ordering::Acquire)
     }
     pub fn revoke(&self) {
-        self.replace(KeyState {
-            keys: vec![],
-            until: None,
-            leased: true,
-        });
+        self.replace(vec![]);
     }
-    /// The keys that may authorize a new control now: none without a current lease.
+    /// The keys that may authorize a new control now.
     pub fn admitted(&self) -> Vec<VerifyingKey> {
-        match self.current() {
-            (keys, true) => keys,
-            (_, false) => vec![],
-        }
+        self.keys.read().unwrap().clone()
     }
-    fn current(&self) -> (Vec<VerifyingKey>, bool) {
-        let state = self.state.read().unwrap();
-        let live = !state.leased || state.until.is_some_and(|until| Instant::now() < until);
-        (state.keys.clone(), live)
-    }
-    /// Resolves once `key` no longer authorizes: it left the set, or the lease that admits
-    /// it expired. Ends only that key's open transports; accepted work is never cancelled.
+    /// Resolves once `key` left the set. Ends only that key's open transports; accepted work
+    /// is never cancelled.
     pub async fn revoked(&self, key: [u8; 32]) {
         let mut changes = self.changes.subscribe();
-        loop {
-            if !self.admitted().iter().any(|k| k.to_bytes() == key) {
-                return;
-            }
-            let until = self.state.read().unwrap().until;
-            let expiry = async {
-                match until {
-                    Some(until) => tokio::time::sleep_until(until.into()).await,
-                    None => std::future::pending().await,
-                }
-            };
-            tokio::select! {
-                _ = changes.changed() => (),
-                _ = expiry => (),
+        while self.admitted().iter().any(|k| k.to_bytes() == key) {
+            if changes.changed().await.is_err() {
+                return std::future::pending().await;
             }
         }
     }
@@ -115,7 +79,7 @@ impl From<Vec<VerifyingKey>> for Keys {
 /// Why an open transport lost its authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Lapse {
-    /// The key that opened it left the admitted set, or the lease admitting it ran out.
+    /// The key that opened it left the admitted set.
     Revoked,
     /// The expiry its signer chose passed (a play link's `--expires`).
     Expired,

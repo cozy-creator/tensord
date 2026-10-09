@@ -181,7 +181,7 @@ impl MachineIdentity {
 
 impl MachineIdentity {
     /// The pod or computer machine: its lifetime files under the machine root, keys from its
-    /// grant (a rental's Hub lease replaces them) and this boot's readiness receipt.
+    /// grant (a rental's Hub answer replaces them) and this boot's readiness receipt.
     pub fn machine(
         worker_id: String,
         keys: super::auth::Keys,
