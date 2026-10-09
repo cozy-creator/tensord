@@ -176,8 +176,9 @@ impl Service {
         }
         *current = Some(gpu.clone());
         drop(current);
-        // Kernels compile at boot. An executor starts for a request or an install: nothing
-        // here prepares a package nobody asked for.
+        // Kernels compile at boot, before any install. An executor starts for a request or an
+        // install: nothing here prepares a package nobody asked for.
+        gpu.image_kernel_boot();
         for held in self.catalog.installed() {
             gpu.kernel_boot(held);
         }
