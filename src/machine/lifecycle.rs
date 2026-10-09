@@ -485,6 +485,7 @@ mod hub_tests {
                 worker_token: token.clone(),
                 ca_der: Some(ca),
                 object_hosts: vec![],
+                object_origin: String::new(),
             })
             .unwrap(),
         );

@@ -167,6 +167,9 @@ message HubAccess {
   // a public-only run.
   string capability = 7;
   string token_endpoint = 8;  // the Hub's authorization server's, as its metadata names it
+  // The Hub's anonymous content-addressed object origin (th-243): every public checkpoint is
+  // read there at <object_origin>/sha256/<hex>, never at the Hub. Https, or http on loopback.
+  string object_origin = 9;
 }
 
 message RunEvent {

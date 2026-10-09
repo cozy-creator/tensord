@@ -878,7 +878,11 @@ fn accept(runs: &Arc<crate::runs::Runs>, actor: &str, id: &str, mut spec: crate:
             (false, None) => return Err(refused("hub_access_invalid", "this machine holds no key to trade a capability with")),
         };
         let ca = Some(hub.ca_der).filter(|der| !der.is_empty());
-        spec.hub = Some(crate::hub::Source::new(&hub.origin, ca, hub.object_hosts, capability).map_err(invalid)?);
+        spec.hub = Some(
+            crate::hub::Source::new(&hub.origin, ca, hub.object_hosts, capability)
+                .and_then(|source| source.with_object_origin(&hub.object_origin))
+                .map_err(invalid)?,
+        );
     }
     runs.submit(actor, id, spec).map(drop).map_err(refusal)
 }
@@ -1075,6 +1079,7 @@ mod tests {
                 origin: "https://hub.example.test/".into(), capability: "e30.e30.c2ln".into(),
                 token_endpoint: "https://hub.example.test/v1/auth/oauth2/token".into(),
                 ca_der: vec![1], object_hosts: vec!["objects-1.example.test".into()],
+                object_origin: "https://objects-1.example.test".into(),
             }),
             providers: Some(v1::ProviderAccess { huggingface: "h1".into(), civitai: "c1".into() }),
             ..Default::default()
@@ -1092,6 +1097,7 @@ mod tests {
         resent.hub = Some(v1::HubAccess {
             origin: "https://hub.example.test".into(), capability: String::new(), token_endpoint: String::new(),
             ca_der: vec![2], object_hosts: vec!["objects-2.example.test".into()],
+            object_origin: "https://objects-2.example.test".into(),
         });
         resent.providers = None;
         assert_eq!(spec_of(resent).unwrap().0.digest, digest);
