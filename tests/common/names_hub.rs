@@ -23,13 +23,17 @@ pub struct Model {
     pub manifest: ObjectRef,
 }
 
-/// One published package release: its interface and its one wheel.
+/// One published package release: its interface, its wheel and the wheels of the other
+/// packages its lock pins at this Hub (`(wheel, bytes)`, published by the same org).
 pub struct Package {
     pub name: String,
     pub release: String,
     pub interface: Value,
     pub wheel: String,
     pub bytes: Vec<u8>,
+    pub callees: Vec<(String, Vec<u8>)>,
+    /// The lock's other rows (PyPI's), verbatim.
+    pub pypi: String,
 }
 
 struct Served {
@@ -134,14 +138,26 @@ async fn answer(State(served): State<Arc<Served>>, method: Method, uri: Uri, hea
                 "python_version": "3.12"}))
         }
         (Method::GET, p) if p == format!("{release_path}/locked-requirements") => {
+            // Rows at the Hub's file door, as it renders them: `/v1/index/<org>/files/<sha256>/<wheel>`.
             let package = package.unwrap();
-            let sha = tensorfs_core::sha256::hex_digest(&package.bytes);
-            let (_, distribution) = package.name.split_once('/').unwrap();
-            let lock = format!("{distribution} @ {}/v1/index/files/{sha}/{} --hash=sha256:{sha}\n", served.origin, package.wheel);
+            let (org, _) = package.name.split_once('/').unwrap();
+            let lock: String = std::iter::once((&package.wheel, &package.bytes))
+                .chain(package.callees.iter().map(|(wheel, bytes)| (wheel, bytes)))
+                .map(|(wheel, bytes)| {
+                    let sha = tensorfs_core::sha256::hex_digest(bytes);
+                    let distribution = wheel.split('-').next().unwrap().replace('_', "-");
+                    format!("{distribution} @ {}/v1/index/{org}/files/{sha}/{wheel} --hash=sha256:{sha}\n", served.origin)
+                })
+                .collect::<String>()
+                + &package.pypi;
             (StatusCode::OK, lock).into_response()
         }
         (Method::GET, p) if package.is_some_and(|package| p.ends_with(&format!("/{}", package.wheel))) => {
             ranged(&package.unwrap().bytes, &headers)
+        }
+        (Method::GET, p) if package.is_some_and(|package| package.callees.iter().any(|(wheel, _)| p.ends_with(&format!("/{wheel}")))) => {
+            let (_, bytes) = package.unwrap().callees.iter().find(|(wheel, _)| p.ends_with(&format!("/{wheel}"))).unwrap();
+            ranged(bytes, &headers)
         }
         (Method::POST, "/v1/tensorfs/closure") => {
             let refspec = asked["ref"].as_str().unwrap_or_default();

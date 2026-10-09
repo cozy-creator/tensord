@@ -1216,6 +1216,8 @@ mod v1_api {
             interface: serde_json::json!({"application": "pkg:app", "entrypoints": []}),
             wheel: "pkg-1.0.0-py3-none-any.whl".into(),
             bytes: wheel("pkg", "1.0.0"),
+            callees: vec![],
+            pypi: String::new(),
         };
         let (origin, heard) = names_hub::serve(&store, model, Some(package));
         let machine = Machine::start().await;
@@ -1963,6 +1965,94 @@ mod v1_api {
         let done = outcome(&events);
         assert_eq!(done.status, "succeeded", "{done:?}");
         assert_eq!(fs::read_to_string(&wheel_counter).unwrap(), "2");
+        let _ = fs::remove_dir_all(tools);
+    }
+
+    /// A published release calls another package its lock pins at the Hub (long_form calling
+    /// qwen-image-2's generate_image): the callee installs from the Hub's file door through
+    /// TensorFS and runs as a child under its own Hub name, `<org>/<name>`, so the run's model
+    /// choices addressed to it reach it. Named `local/<name>` (TensorD 0.4.1-0.5.0), a choice
+    /// for generate_image never arrived: model_choice_absent (runs 5141, 5142).
+    #[tokio::test]
+    async fn a_published_release_calls_its_hub_callee_under_the_callees_own_name() {
+        let (machine, tools) = installing_machine().await;
+        let mut client = client(&machine).await;
+        let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let built = tools.join("hub-wheels");
+        for fixture in ["cpu_caller", "cpu_memo"] {
+            assert!(Command::new("uv").args(["build", "--wheel", "--out-dir"]).arg(&built)
+                .arg(fixtures.join(fixture)).status().unwrap().success());
+        }
+        let wheel = |prefix: &str| {
+            let path = fs::read_dir(&built).unwrap().flatten().map(|e| e.path())
+                .find(|p| p.file_name().unwrap().to_str().unwrap().starts_with(prefix)).unwrap();
+            (path.file_name().unwrap().to_str().unwrap().to_string(), fs::read(&path).unwrap())
+        };
+        let ((root, root_bytes), callee) = (wheel("cozy_machine_cpu_caller-"), wheel("cozy_machine_cpu_memo-"));
+        let described = Command::new(installing_args(&tools)[1].clone())
+            .args(["-m", "cozy_machine_client.runtime_describe"])
+            .env("PYTHONPATH", Path::new(env!("CARGO_MANIFEST_DIR")).join("python"))
+            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
+            .spawn().and_then(|mut child| {
+                use std::io::Write as _;
+                let project = fixtures.join("cpu_caller");
+                child.stdin.take().unwrap().write_all(serde_json::json!({"kind": "describe", "project": project}).to_string().as_bytes())?;
+                child.wait_with_output()
+            }).unwrap();
+        let described: serde_json::Value = serde_json::from_slice(&described.stdout).unwrap();
+        let source = std::env::temp_dir().join(format!("cm-callee-{}", uuid::Uuid::new_v4()));
+        let store = tensorfs_core::store::Store::ensure(&source).unwrap();
+        let model = names_hub::Model {
+            repository: "acme/model".into(), release: "1.0.0".into(), lane: "bf16".into(),
+            manifest: hub_oauth::checkpoint(&store, &[5; 8192]),
+        };
+        // The rest of the lock is PyPI's, hash-pinned as the Hub's export pins it.
+        let pypi = Command::new("uv").args(["pip", "compile", "--generate-hashes", "--no-header", "--quiet",
+            "--python-version", "3.12", "-"])
+            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
+            .spawn().and_then(|mut child| {
+                use std::io::Write as _;
+                child.stdin.take().unwrap().write_all(b"cozy-runtime>=0.19,<0.20\nmsgspec>=0.19,<1\n")?;
+                child.wait_with_output()
+            }).unwrap();
+        assert!(pypi.status.success());
+        let package = names_hub::Package {
+            name: "acme/cozy-machine-cpu-caller".into(), release: "0.1.0".into(),
+            interface: described["interface"].clone(), wheel: root, bytes: root_bytes, callees: vec![callee],
+            pypi: String::from_utf8(pypi.stdout).unwrap(),
+        };
+        let (origin, _) = names_hub::serve(&store, model, Some(package));
+        let counter = machine.root.join("published-measured");
+        let events = collect(client.run(authorized(v1::RunRequest {
+            id: "published-relay".into(), after: 0, spec: Some(v1::RunSpec {
+                kind: v1::RunKind::Job as i32, entrypoint: "relay".into(), owner: "alice".into(),
+                source: Some(v1::run_spec::Source::Release(v1::Release {
+                    package: "acme/cozy-machine-cpu-caller".into(), release: "0.1.0".into() })),
+                payload: serde_json::to_vec(&serde_json::json!({"values": [3, 4], "counter": counter})).unwrap(),
+                hub: Some(v1::HubAccess { origin, object_hosts: vec!["localhost".into()], ..Default::default() }),
+                catalog_revision: "r1".into(),
+                ..Default::default()
+            }),
+        }, &all)).await.unwrap().into_inner()).await.unwrap();
+        let done = outcome(&events);
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        assert_eq!(result["squares"], serde_json::json!([9, 16]));
+        let calls: Vec<_> = events.iter().filter_map(|e| match &e.event {
+            Some(v1::run_event::Event::Call(call)) => Some(call.function.clone()),
+            _ => None,
+        }).collect();
+        assert_eq!(calls, ["measure", "measure", "greet"], "{events:?}");
+        let named: Vec<String> = fs::read_dir(machine.root.join("state/generations")).unwrap().flatten()
+            .filter_map(|g| fs::read(g.path().join("generation.json")).ok())
+            .filter_map(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
+            .flat_map(|record| record["callees"].as_array().cloned().unwrap_or_default())
+            .filter(|callee| callee["distribution"] == "cozy-machine-cpu-memo" || callee["distribution"] == "cozy_machine_cpu_memo")
+            .map(|callee| callee["package"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(named, ["acme/cozy-machine-cpu-memo"]);
+        let _ = fs::remove_dir_all(source);
         let _ = fs::remove_dir_all(tools);
     }
 
