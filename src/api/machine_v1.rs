@@ -234,9 +234,15 @@ fn member(mut item: v1::WarmItem) -> Result<crate::runs::SetItem, Status> {
     })
 }
 
-/// A Run spec as this machine's run sources (`runs`). Its digest (the token cleared) makes the
-/// id idempotent: the same id with another spec is refused.
-fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
+/// What a spec asks of the machine's Hub grants, resolved when the run is accepted.
+struct Access {
+    hub: Option<v1::HubAccess>,
+    publication: Option<v1::HubAuthorization>,
+}
+
+/// A Run spec as this machine's run sources (`runs`), and the Hub access it asks for. Its
+/// digest (access cleared) makes the id idempotent: the same id with another spec is refused.
+fn spec_of(mut spec: v1::RunSpec) -> Result<(crate::runs::Spec, Access), Status> {
     let (warm, job) = match v1::RunKind::try_from(spec.kind) {
         Ok(v1::RunKind::Call) => (false, false),
         Ok(v1::RunKind::Warm) => (true, false),
@@ -253,7 +259,8 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
         crate::boundary_json::parse(&spec.payload)
             .map_err(|_| Status::invalid_argument("the payload is not JSON"))?
     };
-    let hub = spec.hub.take().filter(|hub| !hub.token.is_empty());
+    let hub = spec.hub.take();
+    let publication = spec.publication.take();
     let providers = spec.providers.take();
     // What the run is, not how it reaches its sources: a spec re-sent with refreshed access,
     // binding hints or a reformatted payload names the same run.
@@ -265,26 +272,14 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
             ..Default::default()
         });
         identity.binding_revision.clear();
-        identity.publication.clear();
         format!(
             "sha256:{}",
             tensorfs_core::sha256::hex_digest(&prost::Message::encode_to_vec(&identity))
         )
     };
-    let hub = match hub {
-        None => None,
-        Some(hub) => {
-            if !crate::hub::valid_origin(&hub.origin) {
-                return Err(Status::invalid_argument("the run's Hub origin is invalid"));
-            }
-            Some(crate::hub::Source {
-                origin: hub.origin.trim_end_matches('/').to_string(),
-                credential: format!("bearer {}", hub.token),
-                ca_der: (!hub.ca_der.is_empty()).then_some(hub.ca_der),
-                object_hosts: hub.object_hosts,
-            })
-        }
-    };
+    if hub.as_ref().is_some_and(|hub| !crate::hub::valid_origin(&hub.origin)) {
+        return Err(Status::invalid_argument("the run's Hub origin is invalid"));
+    }
     let source = match spec.source {
         Some(v1::run_spec::Source::Release(release)) => crate::runs::Source::Release {
             package: release.package,
@@ -302,7 +297,7 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
         Some(set) => Some(set.items.into_iter().map(member).collect::<Result<_, _>>()?),
     };
     let models = choices(spec.models)?;
-    Ok(crate::runs::Spec {
+    Ok((crate::runs::Spec {
         warm,
         set,
         job,
@@ -324,7 +319,7 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
         models,
         binding_revision: spec.binding_revision,
         attention_kernel: spec.attention_kernel,
-        hub,
+        hub: None,
         providers: providers
             .map(|p| crate::published::Providers {
                 huggingface: p.huggingface,
@@ -332,12 +327,12 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
             })
             .unwrap_or_default(),
         weights_destination: spec.weights_destination,
-        publication: spec.publication,
+        publication: None,
         owner: spec.owner,
         held: None,
         application: String::new(),
         digest: identity_digest,
-    })
+    }, Access { hub, publication }))
 }
 
 /// A typed refusal: the status carries its code as `cozy-error-code`, its message as text.
@@ -870,23 +865,65 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
 }
 
 /// Accepts a run, or answers the one a re-sent spec already names whatever its access now
-/// says: expired Hub access refuses only a run not yet accepted.
-fn accept(runs: &Arc<crate::runs::Runs>, actor: &str, id: &str, spec: crate::runs::Spec, expired: bool) -> Result<(), Status> {
-    if expired && runs.existing(actor, id, &spec.digest).map_err(refusal)?.is_none() {
-        return Err(refused("hub_access_expired", "the run's Hub access has expired"));
+/// says: grants are redeemed and required only for a run not yet accepted.
+fn accept(runs: &Arc<crate::runs::Runs>, actor: &str, id: &str, mut spec: crate::runs::Spec, access: Access) -> Result<(), Status> {
+    if runs.existing(actor, id, &spec.digest).map_err(refusal)?.is_none() {
+        (spec.hub, spec.publication) = grants(runs, actor, access)?;
     }
     runs.submit(actor, id, spec).map(drop).map_err(refusal)
+}
+
+/// The run's Hub access and publication grant. A code is redeemed now (it lives a minute) and
+/// an execution grant held for the signer at that origin; without one, the held grant serves.
+fn grants(
+    runs: &crate::runs::Runs,
+    actor: &str,
+    access: Access,
+) -> Result<(Option<crate::hub::Source>, Option<Arc<crate::hub::Grant>>), Status> {
+    use crate::hub;
+    let code = |authorization: v1::HubAuthorization| hub::Authorization {
+        issuer: authorization.issuer,
+        code: authorization.code,
+        code_verifier: authorization.code_verifier,
+        redirect_uri: authorization.redirect_uri,
+        resource: authorization.resource,
+    };
+    let ca = access.hub.as_ref().map(|hub| hub.ca_der.clone()).filter(|der| !der.is_empty());
+    let source = match access.hub {
+        None => None,
+        Some(access) => {
+            let grant = match access.authorization {
+                Some(authorization) => {
+                    let grant = runs
+                        .grants
+                        .redeem(&code(authorization), hub::EXECUTION, ca.as_deref())
+                        .map_err(|e| refused("hub_authorization_refused", &e.0))?;
+                    runs.grants.hold(actor, &access.origin, grant.clone());
+                    grant
+                }
+                None => runs.grants.held(actor, &access.origin).ok_or_else(|| {
+                    refused("hub_access_required", "this machine holds no grant of yours at that Hub: authorize it again")
+                })?,
+            };
+            Some(hub::Source::granted(&access.origin, grant, ca.clone(), access.object_hosts))
+        }
+    };
+    let publication = match access.publication {
+        None => None,
+        Some(authorization) => Some(
+            runs.grants
+                .redeem(&code(authorization), hub::PUBLICATION, ca.as_deref())
+                .map_err(|e| refused("publication_unauthorized", &e.0))?,
+        ),
+    };
+    Ok((source, publication))
 }
 
 /// Accepts the run `spec` names under `id`.
 async fn submit<B: MachineBackend>(backend: &Arc<B>, actor: VerifiedActor, id: &str, spec: v1::RunSpec) -> Result<(), Status> {
     let runs = backend.runs().ok_or_else(|| Status::unimplemented("this machine takes no runs"))?;
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs() as i64);
-    let expired = spec.hub.as_ref().is_some_and(|hub| {
-        !hub.token.is_empty() && hub.expires_at != 0 && hub.expires_at <= now
-    });
-    let (id, spec, actor) = (id.to_string(), spec_of(spec)?, crate::machine_api::actor_id(actor));
-    tokio::task::spawn_blocking(move || accept(&runs, &actor, &id, spec, expired))
+    let (id, (spec, access), actor) = (id.to_string(), spec_of(spec)?, crate::machine_api::actor_id(actor));
+    tokio::task::spawn_blocking(move || accept(&runs, &actor, &id, spec, access))
         .await
         .map_err(|_| Status::internal("machine operation stopped"))?
 }
@@ -1057,6 +1094,13 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    fn code(code: &str) -> v1::HubAuthorization {
+        v1::HubAuthorization {
+            issuer: "https://hub.example.test/v1/auth".into(), code: code.into(), code_verifier: "v".into(),
+            redirect_uri: "http://127.0.0.1/cozy-machine/callback".into(), resource: "https://hub.example.test".into(),
+        }
+    }
+
     fn authored() -> v1::RunSpec {
         let input = |field: &str, hex: &str, order| v1::InputFile {
             field: field.into(), digest: format!("sha256:{}", hex.repeat(64)), length: 4, order, ..Default::default()
@@ -1071,9 +1115,9 @@ mod tests {
             inputs: vec![input("reference", "a", 0), input("reference", "b", 1)],
             models: vec![model("model", "org/first"), model("other", "org/second")],
             binding_revision: "7".into(),
-            publication: "p1".into(),
+            publication: Some(code("p1")),
             hub: Some(v1::HubAccess {
-                origin: "https://hub.example.test/".into(), token: "t1".into(), expires_at: i64::MAX,
+                origin: "https://hub.example.test/".into(), authorization: Some(code("e1")),
                 ca_der: vec![1], object_hosts: vec!["objects-1.example.test".into()],
             }),
             providers: Some(v1::ProviderAccess { huggingface: "h1".into(), civitai: "c1".into() }),
@@ -1081,20 +1125,20 @@ mod tests {
         }
     }
 
-    /// A spec re-sent after a daemon crash, with refreshed (even expired) access, new hints and
-    /// a reformatted payload, names the run it named; what the run is still tells runs apart.
+    /// A spec re-sent after a daemon crash, with other (even spent) codes, new hints and a
+    /// reformatted payload, names the run it named; what the run is still tells runs apart.
     #[test]
     fn a_resent_spec_names_the_run_it_named() {
         let original = authored();
-        let digest = spec_of(original.clone()).unwrap().digest;
+        let digest = spec_of(original.clone()).unwrap().0.digest;
         let mut resent = original.clone();
         resent.payload = br#"{"nested":{"a":1,"b":2},"seed":9007199254740993}"#.to_vec();
         resent.hub = Some(v1::HubAccess {
-            origin: "https://hub.example.test".into(), token: "t2".into(), expires_at: 1,
+            origin: "https://hub.example.test".into(), authorization: None,
             ca_der: vec![2], object_hosts: vec!["objects-2.example.test".into()],
         });
-        (resent.binding_revision, resent.publication, resent.providers) = ("8".into(), "p2".into(), None);
-        assert_eq!(spec_of(resent).unwrap().digest, digest);
+        (resent.binding_revision, resent.publication, resent.providers) = ("8".into(), Some(code("p2")), None);
+        assert_eq!(spec_of(resent).unwrap().0.digest, digest);
         let changes: [fn(&mut v1::RunSpec); 6] = [
             |s| s.payload = br#"{"seed":9007199254740992,"nested":{"a":1,"b":2}}"#.to_vec(),
             |s| s.payload = br#"{"seed":9007199254740993.0,"nested":{"a":1,"b":2}}"#.to_vec(),
@@ -1106,27 +1150,30 @@ mod tests {
         for change in changes {
             let mut changed = original.clone();
             change(&mut changed);
-            assert_ne!(spec_of(changed).unwrap().digest, digest);
+            assert_ne!(spec_of(changed).unwrap().0.digest, digest);
         }
     }
 
-    /// Expired access refuses a new run, never the accepted run a re-sent spec names.
+    /// Missing Hub access refuses a new run, never the accepted run a re-sent spec names.
     #[test]
-    fn expired_access_refuses_only_a_new_run() {
+    fn missing_access_refuses_only_a_new_run() {
         let root = std::env::temp_dir().join(format!("cm-accept-{}", uuid::Uuid::new_v4()));
         let service = crate::service::Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
         let store = Arc::new(tensorfs_core::store::Store::ensure(&root.join("store")).unwrap());
         let objects = Arc::new(crate::objects::Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap());
         let runs = Arc::new(crate::runs::Runs {
-            service: service.clone(), objects, publisher: None, local: None, own_hub: None, jobs: Default::default(),
+            service: service.clone(), objects, publisher: None, local: None, own_hub: None, grants: Default::default(), jobs: Default::default(),
         });
-        let spec = spec_of(authored()).unwrap();
+        let mut held = authored();
+        (held.hub.as_mut().unwrap().authorization, held.publication) = (None, None);
+        let (spec, access) = spec_of(held.clone()).unwrap();
         let invocation = crate::journal::Invocation { package: "org/package".into(), input: spec.input.clone(), ..Default::default() };
         let accepted = service.engine.accept_run("alice", "run-1", &spec.digest, invocation).unwrap().0;
-        accept(&runs, "alice", "run-1", spec_of(authored()).unwrap(), true).unwrap();
+        let (resent, again) = spec_of(held).unwrap();
+        accept(&runs, "alice", "run-1", resent, again).unwrap();
         assert_eq!(service.engine.get_public("alice", "run-1").unwrap().id, accepted.id);
-        let refusal = accept(&runs, "alice", "run-2", spec, true).unwrap_err();
-        assert_eq!(refusal.metadata().get("cozy-error-code").unwrap(), "hub_access_expired");
+        let refusal = accept(&runs, "alice", "run-2", spec, access).unwrap_err();
+        assert_eq!(refusal.metadata().get("cozy-error-code").unwrap(), "hub_access_required");
         let _ = std::fs::remove_dir_all(root);
     }
 

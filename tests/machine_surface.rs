@@ -3,7 +3,6 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use cozy_machine::journal::Journal;
 use ed25519_dalek::SigningKey;
 use std::{
-    collections::BTreeMap,
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -11,6 +10,9 @@ use std::{
     time::{Duration, Instant},
 };
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
+
+#[path = "common/hub_oauth.rs"]
+mod hub_oauth;
 
 struct Machine {
     child: Child,
@@ -827,129 +829,25 @@ mod v1_api {
         manifest_digest
     }
 
-    /// The Hub routes a machine publication uses, as Tensorhub answers them: a bearer renewed
-    /// for the sender's execution access, then the incremental publication of one checkpoint.
-    #[derive(Default)]
-    struct Publications {
-        renewals: usize,
-        refused: usize,
-        declared: Vec<String>,
-        uploaded: BTreeMap<String, Vec<u8>>,
-        finalized: Option<String>,
+    fn authorization(issued: serde_json::Value) -> v1::HubAuthorization {
+        let field = |name: &str| issued[name].as_str().unwrap().to_string();
+        v1::HubAuthorization {
+            issuer: field("issuer"),
+            code: field("code"),
+            code_verifier: field("code_verifier"),
+            redirect_uri: field("redirect_uri"),
+            resource: field("resource"),
+        }
     }
 
-    const EXECUTION_ACCESS: &str = "execution-access";
-
-    async fn publication_hub() -> (String, std::sync::Arc<std::sync::Mutex<Publications>>) {
-        use axum::{
-            body::Bytes,
-            extract::State,
-            http::{HeaderMap, Method, StatusCode, Uri},
-            response::IntoResponse,
-        };
-        type Held = std::sync::Arc<std::sync::Mutex<Publications>>;
-        let exp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+    /// The thumbprint of the leaf the machine's API presents: what the CLI pins and names as
+    /// every authorization request's `dpop_jkt`.
+    fn leaf_jkt(machine: &Machine) -> String {
+        let identity: serde_json::Value =
+            serde_json::from_slice(&fs::read(machine.root.join("config/identity/identity.json")).unwrap()).unwrap();
+        tensorfs_core::transport::DpopKey::from_pem(identity["private_key_pem"].as_str().unwrap())
             .unwrap()
-            .as_secs()
-            + 900;
-        let bearer = format!(
-            "e30.{}.sig",
-            URL_SAFE_NO_PAD.encode(serde_json::json!({ "exp": exp }).to_string())
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin = format!("http://{}", listener.local_addr().unwrap());
-        let held: Held = Default::default();
-        let base = origin.clone();
-        let answer = move |State(held): State<Held>,
-                           method: Method,
-                           uri: Uri,
-                           headers: HeaderMap,
-                           body: Bytes| {
-            let (bearer, base) = (bearer.clone(), base.clone());
-            async move {
-                let json = |value: serde_json::Value| {
-                    (StatusCode::OK, serde_json::to_vec(&value).unwrap()).into_response()
-                };
-                let header = |name: &str| {
-                    headers
-                        .get(name)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or_default()
-                        .to_string()
-                };
-                let ids = |field: &str| -> Vec<String> {
-                    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                    body[field]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .map(|row| row.get("object_id").unwrap_or(row).as_str().unwrap().to_string())
-                        .collect()
-                };
-                let mut held = held.lock().unwrap();
-                let path = uri.path().to_string();
-                if let Some(hex) = path.strip_prefix("/upload/") {
-                    let id = format!("sha256:{hex}");
-                    assert_eq!(id, format!("sha256:{}", tensorfs_core::sha256::hex_digest(&body)));
-                    held.uploaded.insert(id, body.to_vec());
-                    return StatusCode::OK.into_response();
-                }
-                if header("x-cozy-execution-access") != EXECUTION_ACCESS {
-                    held.refused += 1;
-                    return (StatusCode::UNAUTHORIZED, r#"{"error":{"code":"auth.refused","message":"no sender"}}"#).into_response();
-                }
-                if path.starts_with("/v1/worker/machine-authorizations/grant-1/token") {
-                    held.renewals += 1;
-                    return json(serde_json::json!({"token": bearer, "expires_at": "2099-01-01T00:00:00Z"}));
-                }
-                if header("authorization") != format!("Bearer {bearer}") {
-                    held.refused += 1;
-                    return (StatusCode::UNAUTHORIZED, r#"{"error":{"code":"auth.refused","message":"no bearer"}}"#).into_response();
-                }
-                let publication = "/v1/models/acme/tiny/publications/";
-                match (method, path.as_str()) {
-                    (Method::GET, p) if p.starts_with("/v1/models/acme/tiny/checkpoints/") => (
-                        StatusCode::NOT_FOUND,
-                        r#"{"error":{"code":"model.checkpoint_not_found","message":"absent"}}"#,
-                    )
-                        .into_response(),
-                    (Method::PUT, p) if p.starts_with(publication) => {
-                        held.declared = ids("objects");
-                        let rows: Vec<_> = held
-                            .declared
-                            .iter()
-                            .map(|id| serde_json::json!({"object_id": id, "state": "claimed"}))
-                            .collect();
-                        json(serde_json::json!({"publication": {"state": "open", "objects": rows}}))
-                    }
-                    (Method::POST, p) if p.starts_with(publication) && p.ends_with("/grants") => {
-                        let grants: Vec<_> = ids("object_ids")
-                            .into_iter()
-                            .map(|id| serde_json::json!({"object_id": id,
-                                "url": format!("{base}/upload/{}", &id[7..]), "required_headers": {}}))
-                            .collect();
-                        json(serde_json::json!({ "grants": grants }))
-                    }
-                    (Method::POST, p) if p.starts_with(publication) && p.ends_with("/verify") => {
-                        json(serde_json::json!({}))
-                    }
-                    (Method::POST, p) if p.starts_with(publication) && p.ends_with("/finalize") => {
-                        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                        held.finalized = body["manifest_id"].as_str().map(String::from);
-                        json(serde_json::json!({"state": "completed"}))
-                    }
-                    _ => (
-                        StatusCode::NOT_FOUND,
-                        r#"{"error":{"code":"route.absent","message":"no such route"}}"#,
-                    )
-                        .into_response(),
-                }
-            }
-        };
-        let router = axum::Router::new().fallback(answer).with_state(held.clone());
-        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        (origin, held)
+            .thumbprint()
     }
 
     /// Actual installed CPU jobs retain paused work and relinquish only explicitly canceled
@@ -1101,11 +999,9 @@ mod v1_api {
     }
     /// `cozy model quantize`'s shape on CPU: a job writes its declared weights output through
     /// the machine's native writer channel and adopts it; the output is a product of its log
-    /// (the manifest). A warm run keeps that held checkpoint under a local alias, and another
-    /// puts the alias's checkpoint in a Hub destination.
+    /// (the manifest). A warm run keeps that held checkpoint under a local alias.
     #[tokio::test]
-    async fn a_job_writes_a_weights_output_kept_under_a_local_alias_that_a_warm_run_publishes() {
-        let (origin, hub) = publication_hub().await;
+    async fn a_job_writes_a_weights_output_kept_under_a_local_alias() {
         let (machine, tools) = installing_machine().await;
         let mut client = client(&machine).await;
         let all = cap(Grant {
@@ -1187,8 +1083,40 @@ mod v1_api {
         };
         assert!(refused.message().contains("was not written to this machine"), "{refused:?}");
 
-        // `cozy model upload local/tiny acme/tiny`: the alias's checkpoint, published.
-        let upload = v1::RunSpec {
+        let _ = fs::remove_dir_all(tools);
+    }
+
+    /// `cozy model upload local/tiny acme/tiny` under th-238's grants: the CLI hands the machine
+    /// an execution code and a publication code, the machine redeems both with its leaf's key
+    /// at submission, and AuthKit verifies every proof it presents. A later run reads with the
+    /// held execution grant; a signer the machine holds none for is refused before acceptance.
+    #[tokio::test]
+    #[ignore = "real AuthKit: needs go and AUTHKIT_TEST_DATABASE_URL"]
+    async fn a_warm_run_publishes_a_local_alias_under_the_signers_grants() {
+        use tensorfs_core::repository::{Mutation, RepositoryName};
+        let (upstream, hub) = hub_oauth::test_hub();
+        let authkit = hub_oauth::AuthKit::start(&upstream);
+        let mut held = None;
+        let machine = Machine::start_with(|state, _| {
+            let store = tensorfs_core::store::Store::ensure(&state.join("tensorfs")).unwrap();
+            let manifest = hub_oauth::checkpoint(&store, &[7; 8192]);
+            let replace = Mutation::ReplaceLocal {
+                repo: RepositoryName::new("local", "tiny").unwrap(),
+                version: manifest.sha256.clone(),
+                manifest: manifest.clone(),
+            };
+            store.apply_repository(None, &replace, &Default::default()).unwrap();
+            held = Some(manifest.id());
+        })
+        .await;
+        let manifest = held.unwrap();
+        let jkt = leaf_jkt(&machine);
+        let mut client = client(&machine).await;
+        let all = cap(Grant {
+            action: MACHINE.into(),
+            ..Default::default()
+        });
+        let upload = |authorize: bool| v1::RunSpec {
             kind: v1::RunKind::Warm as i32,
             models: vec![v1::ModelChoice {
                 parameter: "model".into(),
@@ -1197,36 +1125,58 @@ mod v1_api {
             }],
             weights_destination: "acme/tiny".into(),
             hub: Some(v1::HubAccess {
-                origin,
-                token: EXECUTION_ACCESS.into(),
+                origin: authkit.hub.clone(),
+                authorization: authorize.then(|| authorization(authkit.authorize("execution", &jkt))),
+                object_hosts: vec!["localhost".into()],
                 ..Default::default()
             }),
-            publication: "grant-1".into(),
+            publication: Some(authorization(authkit.authorize("publication", &jkt))),
             owner: "alice".into(),
             ..Default::default()
         };
-        let events = collect(client.run(authorized(run("upload", upload), &all)).await.unwrap().into_inner())
-            .await
-            .unwrap();
-        let done = outcome(&events);
-        assert_eq!(done.status, "succeeded", "{done:?}");
-        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
-        assert_eq!(result["models"][0]["published"]["checkpoint"], written.digest, "{result}");
-        let held = hub.lock().unwrap();
-        assert_eq!(held.finalized.as_deref(), Some(written.digest.as_str()));
-        assert_eq!(held.refused, 0);
-        let _ = fs::remove_dir_all(tools);
+        let run = |id: &str, spec: v1::RunSpec| v1::RunRequest {
+            id: id.into(),
+            after: 0,
+            spec: Some(spec),
+        };
+        for (id, authorize) in [("upload-1", true), ("upload-2", false)] {
+            let events = collect(client.run(authorized(run(id, upload(authorize)), &all)).await.unwrap().into_inner())
+                .await
+                .unwrap();
+            let done = outcome(&events);
+            assert_eq!(done.status, "succeeded", "{id}: {done:?}");
+            let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+            assert_eq!(result["models"][0]["published"]["checkpoint"], manifest, "{result}");
+        }
+        {
+            let hub = hub.lock().unwrap();
+            assert_eq!(hub.finalized, [manifest.clone(), manifest.clone()]);
+            assert_eq!(hub.credentialed_uploads, 0);
+        }
+        let seen = authkit.seen();
+        assert!(!seen.is_empty() && seen.iter().all(|s| s["type"] == "tensorhub_machine_publication"), "{seen:?}");
+
+        let other = cap_by(&OTHER, Grant {
+            action: MACHINE.into(),
+            ..Default::default()
+        });
+        let refused = match client.run(authorized(run("upload-3", upload(false)), &other)).await {
+            Ok(stream) => collect(stream.into_inner()).await.unwrap_err(),
+            Err(status) => status,
+        };
+        assert_eq!(refused.metadata().get("cozy-error-code").unwrap(), "hub_access_required", "{refused:?}");
     }
 
     /// `cozy model upload` on the serve process: a warm run of one provider source makes it
     /// with TensorFS and puts its checkpoint in the destination under the run's
-    /// machine-publication authorization. The machine renews the bearer with the run's
-    /// execution access as sender proof; every object reaches the Hub, then finalization.
+    /// machine-publication grant; every object reaches the Hub, then finalization.
     #[tokio::test]
-    #[ignore = "real network: huggingface.co"]
+    #[ignore = "real network: huggingface.co; real AuthKit: go and AUTHKIT_TEST_DATABASE_URL"]
     async fn a_warm_run_uploads_its_source_model_to_its_destination() {
-        let (origin, hub) = publication_hub().await;
+        let (upstream, hub) = hub_oauth::test_hub();
+        let authkit = hub_oauth::AuthKit::start(&upstream);
         let machine = Machine::start().await;
+        let jkt = leaf_jkt(&machine);
         let mut client = client(&machine).await;
         let all = cap(Grant {
             action: MACHINE.into(),
@@ -1241,11 +1191,12 @@ mod v1_api {
             }],
             weights_destination: "acme/tiny".into(),
             hub: Some(v1::HubAccess {
-                origin,
-                token: EXECUTION_ACCESS.into(),
+                origin: authkit.hub.clone(),
+                authorization: Some(authorization(authkit.authorize("execution", &jkt))),
+                object_hosts: vec!["localhost".into()],
                 ..Default::default()
             }),
-            publication: "grant-1".into(),
+            publication: Some(authorization(authkit.authorize("publication", &jkt))),
             owner: "alice".into(),
             ..Default::default()
         };
@@ -1264,9 +1215,9 @@ mod v1_api {
         assert_eq!(model["published"]["destination"], "acme/tiny");
         assert_eq!(model["published"]["checkpoint"], model["manifest"]);
         let held = hub.lock().unwrap();
-        assert_eq!((held.renewals, held.refused), (1, 0));
-        assert_eq!(held.finalized.as_deref(), model["manifest"].as_str());
-        assert!(held.declared.contains(&held.finalized.clone().unwrap()));
+        assert_eq!(held.credentialed_uploads, 0);
+        assert_eq!(held.finalized, [model["manifest"].as_str().unwrap()]);
+        assert!(held.declared.contains(&held.finalized[0]));
         let mut uploaded: Vec<_> = held.uploaded.keys().cloned().collect();
         let mut declared = held.declared.clone();
         uploaded.sort();

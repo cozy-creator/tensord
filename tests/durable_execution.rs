@@ -319,7 +319,6 @@ fn public_context(
         capture_digest: "sha256:authored-capture".into(),
         invocation_digest: "sha256:consumed-invocation".into(),
         payload_digest: "sha256:payload".into(),
-        publication_authorization_id: "publication-authority-id".into(),
         preparation_id: String::new(),
     }
 }

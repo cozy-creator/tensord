@@ -89,6 +89,7 @@ fn open(root: &Path, tools: &Tools) -> Machine {
         publisher: None,
         local: Some(Arc::new(local)),
         own_hub: None,
+        grants: Default::default(),
         jobs: Default::default(),
     });
     Jobs::configure(&service, store.clone(), Some(&runs)).unwrap();
@@ -156,7 +157,7 @@ fn film(manifest: &str, reference: &(String, u64), segments: &[&str], hold_at: i
         hub: None,
         providers: Default::default(),
         weights_destination: String::new(),
-        publication: String::new(),
+        publication: None,
         owner: ACTOR.into(),
         held: None,
         application: String::new(),

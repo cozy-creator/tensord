@@ -397,6 +397,11 @@ fn start_api(
             ))
         }),
         own_hub: backend.own_hub.clone(),
+        // The leaf the CLI pins is the key every Hub grant is bound to (th-238).
+        grants: cozy_machine::hub::Grants::new(Arc::new(
+            tensorfs_core::transport::DpopKey::from_pem(&identity.key_pem)
+                .map_err(|e| io::Error::other(e.to_string()))?,
+        )),
         jobs: Default::default(),
     }));
     cozy_machine::jobs::Jobs::configure(service, store.clone(), backend.runs.as_ref())?;

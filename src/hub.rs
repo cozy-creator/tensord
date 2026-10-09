@@ -1,50 +1,28 @@
-//! Delegated Hub access (the Go agent's `POST`/`DELETE /v1/hubs/access`) and the catalog
-//! reads it authorizes. Access is the signed-in account's execution grant, bound to this
-//! machine's TLS leaf, handed over by an owner-signed capability. It is journaled per
-//! owner key and origin; nothing here infers authority from a cache or a URL.
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use ed25519_dalek::{Signature, VerifyingKey};
-use serde::{Deserialize, Serialize};
+//! Hub access (th-238). A signer's authority at a Hub arrives as an AuthKit authorization code
+//! for client `cozy-machine`, approved by the signer's CLI and bound to this machine's TLS leaf
+//! (`dpop_jkt`). The machine redeems it at once with a DPoP proof from that key and holds the
+//! grant in memory only: refresh tokens rotate and never touch disk, and every Hub request
+//! carries the access token beside a fresh proof. A rental also reads its own Hub with its
+//! worker capability, and presents it beside a publication grant.
+use base64::Engine as _;
+use serde::Deserialize;
 use serde_json::Value;
-use std::collections::BTreeMap;
-use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tensorfs_core::{
-    sha256,
-    transport::{self, Deadline, Ledger, ScopedHeaders, SourcePolicy},
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tensorfs_core::transport::{
+    self, AccessToken, Both, CredentialProvider, Deadline, DpopCredential, DpopKey, Ledger,
+    ScopedHeaders, SourcePolicy,
 };
 
-pub const ACTION: &str = "hub-access";
-
-/// The access document the CLI sends; unknown members are ignored.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-pub struct Access {
-    pub origin: String,
-    pub token: String,
-    pub expires_at: i64,
-    #[serde(default)]
-    pub environment: BTreeMap<String, String>,
-    #[serde(
-        default,
-        rename = "ca_der_b64url",
-        skip_serializing_if = "String::is_empty"
-    )]
-    pub ca: String,
-}
-
-/// One journaled grant: the access, whose account it is, and the leaf it was bound to.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub struct Grant {
-    pub access: Access,
-    pub principal: String,
-    pub leaf: String,
-}
-
-impl Grant {
-    pub fn expired(&self, now: i64) -> bool {
-        self.access.expires_at <= now
-    }
-}
+pub const CLIENT_ID: &str = "cozy-machine";
+/// `authorization_details` types: the owner's catalog reads, and writes to named repositories.
+pub const EXECUTION: &str = "tensorhub_execution";
+pub const PUBLICATION: &str = "tensorhub_machine_publication";
+/// A token endpoint that has not answered by then has not answered.
+const TOKEN_CALL_SECONDS: f64 = 30.0;
+/// After an unanswered refresh, the next ask waits this long before asking again.
+const REFRESH_RETRY: Duration = Duration::from_secs(15);
 
 /// `scheme://host:port`, lowercase, default port spelled: one key per origin.
 pub fn origin_key(origin: &str) -> Option<String> {
@@ -86,87 +64,12 @@ pub fn valid_origin(origin: &str) -> bool {
     }
 }
 
-/// The account a delegated token names (continuity, not authentication: Tensorhub
-/// verifies every request). An unfamiliar token may refresh only with identical bytes.
-pub fn principal(token: &str) -> String {
-    let opaque = || format!("opaque:{}", sha256::hex_digest(token.as_bytes()));
-    let parts: Vec<_> = token.split('.').collect();
-    if token.len() > 32 << 10 || parts.len() != 3 || parts[2].is_empty() {
-        return opaque();
-    }
-    #[derive(Deserialize)]
-    struct Header {
-        typ: String,
-    }
-    #[derive(Deserialize)]
-    struct Claims {
-        #[serde(default)]
-        iss: String,
-        #[serde(default)]
-        delegated_sub: String,
-        #[serde(default)]
-        sub: String,
-        #[serde(default)]
-        permissions: Vec<String>,
-    }
-    let decode = |part: &str| URL_SAFE_NO_PAD.decode(part.trim_end_matches('=')).ok();
-    let header: Option<Header> = decode(parts[0]).and_then(|raw| serde_json::from_slice(&raw).ok());
-    let claims: Option<Claims> = decode(parts[1]).and_then(|raw| serde_json::from_slice(&raw).ok());
-    match (header, claims) {
-        (Some(header), Some(claims))
-            if header
-                .typ
-                .trim()
-                .eq_ignore_ascii_case("delegated-access+jwt")
-                && !claims.iss.is_empty()
-                && claims.iss.len() <= 2048
-                && !claims.delegated_sub.is_empty()
-                && claims.delegated_sub.len() <= 256
-                && claims.sub.is_empty()
-                && claims.permissions == ["cozy.execution-access"] =>
-        {
-            format!(
-                "delegated:{}",
-                serde_json::to_string(&[claims.iss, claims.delegated_sub]).unwrap_or_default()
-            )
-        }
-        _ => opaque(),
-    }
-}
-
-pub fn validate(access: &Access, now: i64) -> Result<(), &'static str> {
-    if !valid_origin(&access.origin) {
-        return Err("Hub origin must be an HTTPS origin or loopback HTTP origin");
-    }
-    let token = &access.token;
-    if token.is_empty()
-        || token.len() > 32 << 10
-        || token.trim() != token
-        || token.contains(['\r', '\n'])
-    {
-        return Err("Hub access token is invalid");
-    }
-    if access.expires_at <= now {
-        return Err("Hub access grant has expired");
-    }
-    let declared = access
-        .environment
-        .get("TENSORHUB_ORIGIN")
-        .map(String::as_str)
-        .unwrap_or_default();
-    if declared.trim_end_matches('/') != access.origin.trim_end_matches('/') {
-        return Err("Hub access environment names another origin");
-    }
-    if !access.ca.is_empty() {
-        let der = URL_SAFE_NO_PAD
-            .decode(&access.ca)
-            .map_err(|_| "invalid Hub CA encoding")?;
-        let pem = pem(&der);
-        if rustls_pemfile::certs(&mut pem.as_bytes()).count() != 1 {
-            return Err("invalid Hub CA certificate");
-        }
-    }
-    Ok(())
+/// The origin of an absolute URL: everything before its path.
+fn origin_of(url: &str) -> &str {
+    let after = url.find("://").map_or(0, |at| at + 3);
+    url[after..]
+        .find(['/', '?', '#'])
+        .map_or(url, |end| &url[..after + end])
 }
 
 fn pem(der: &[u8]) -> String {
@@ -182,93 +85,366 @@ fn pem(der: &[u8]) -> String {
     )
 }
 
-/// A `Cozy-Cap` capability (`base64url(JSON).base64url(sig)`, domain `cozy-capability/1\0`).
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Capability {
-    m: String,
-    #[serde(default)]
-    r: String,
-    #[serde(default)]
-    a: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    p: Vec<String>,
-    e: i64,
-    k: String,
-    #[serde(default)]
-    x: String,
-}
-
-pub fn key_id(key: &VerifyingKey) -> String {
-    URL_SAFE_NO_PAD.encode(&sha256::digest(key.as_bytes())[..16])
-}
-
-/// The signer of a valid capability for `action` on `worker`, or None.
-pub fn verify_capability(
-    token: &str,
-    worker: &str,
-    keys: &[VerifyingKey],
-    now: i64,
-    action: &str,
-) -> Option<VerifyingKey> {
-    let (payload, signature) = token.split_once('.')?;
-    let payload = URL_SAFE_NO_PAD.decode(payload).ok()?;
-    let signature = Signature::from_slice(&URL_SAFE_NO_PAD.decode(signature).ok()?).ok()?;
-    let grant: Capability = serde_json::from_slice(&payload).ok()?;
-    if grant.m.is_empty() || grant.r.is_empty() == grant.a.is_empty() || grant.e == 0 {
-        return None;
-    }
-    let mut signed = b"cozy-capability/1\0".to_vec();
-    signed.extend_from_slice(&payload);
-    let key = keys
-        .iter()
-        .find(|key| key_id(key) == grant.k && key.verify_strict(&signed, &signature).is_ok())?;
-    (grant.m == worker
-        && grant.x.is_empty()
-        && now < grant.e
-        && grant.r.is_empty()
-        && grant.a == action)
-        .then_some(*key)
-}
-
-/// A catalog read refusal: the HTTP-level detail, never the token.
+/// A Hub refusal: the HTTP-level detail, never a token.
 #[derive(Debug, Clone)]
 pub struct Refusal(pub String);
 
-/// Where and as whom a machine reads a Hub: the owner's delegated access (a bearer), or on a
-/// rental the pod's own worker capability, which is what a run that names no Hub uses there
-/// (the Go agent and Python worker's default registration).
+/// An authorization code the signer's CLI handed over (`HubAuthorization`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Authorization {
+    pub issuer: String,
+    pub code: String,
+    pub code_verifier: String,
+    pub redirect_uri: String,
+    pub resource: String,
+}
+
+/// A redeemed grant: DPoP-bound tokens this machine holds, the access token renewed at half
+/// its life. Refresh tokens rotate, so only the newest is kept and none is ever sent twice.
+pub struct Grant {
+    key: Arc<DpopKey>,
+    issuer: String,
+    resource: String,
+    tokens: Mutex<Tokens>,
+}
+
+struct Tokens {
+    access: String,
+    renew: Instant,
+    expires: Instant,
+    refresh: Option<String>,
+    /// Why the grant ended: the issuer refused its refresh token.
+    ended: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Issued {
+    access_token: String,
+    token_type: String,
+    expires_in: u64,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    authorization_details: Option<Value>,
+}
+
+enum TokenRefusal {
+    /// The issuer's OAuth error (`invalid_grant`: the code or grant is no longer good).
+    Refused {
+        error: String,
+        description: String,
+    },
+    Unanswered(String),
+}
+
+impl TokenRefusal {
+    fn detail(&self) -> String {
+        match self {
+            Self::Refused { error, description } if description.is_empty() => error.clone(),
+            Self::Refused { error, description } => format!("{error}: {description:.256}"),
+            Self::Unanswered(why) => why.clone(),
+        }
+    }
+}
+
+impl Grant {
+    /// Redeems `authorization` with this machine's key, refusing a grant of another kind.
+    pub fn redeem(
+        authorization: &Authorization,
+        kind: &str,
+        key: Arc<DpopKey>,
+        ca_der: Option<&[u8]>,
+    ) -> Result<Arc<Grant>, Refusal> {
+        let Authorization {
+            issuer,
+            code,
+            code_verifier,
+            redirect_uri,
+            resource,
+        } = authorization;
+        let issuer = issuer.trim_end_matches('/');
+        if !valid_origin(origin_of(issuer)) || issuer.contains(['?', '#']) {
+            return Err(Refusal(
+                "the authorization's issuer is not an HTTPS URL".into(),
+            ));
+        }
+        if !valid_origin(origin_of(resource)) {
+            return Err(Refusal(
+                "the authorization's resource is not an HTTPS URL".into(),
+            ));
+        }
+        if [code, code_verifier, redirect_uri]
+            .iter()
+            .any(|v| v.is_empty() || v.len() > 4096)
+        {
+            return Err(Refusal("the authorization is incomplete".into()));
+        }
+        if let Some(der) = ca_der {
+            transport::trust_roots(pem(der).as_bytes()).map_err(|e| Refusal(e.to_string()))?;
+        }
+        let issued = token_call(
+            issuer,
+            &key,
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", code),
+                ("redirect_uri", redirect_uri),
+                ("code_verifier", code_verifier),
+                ("client_id", CLIENT_ID),
+                ("resource", resource),
+            ],
+        )
+        .map_err(|refusal| {
+            Refusal(format!(
+                "the authorization did not redeem: {}",
+                refusal.detail()
+            ))
+        })?;
+        let granted = issued
+            .authorization_details
+            .as_ref()
+            .and_then(|details| details[0]["type"].as_str());
+        if granted != Some(kind) {
+            return Err(Refusal(format!(
+                "the authorization grants {}, not {kind}",
+                granted.unwrap_or("nothing named")
+            )));
+        }
+        Ok(Arc::new(Grant {
+            key,
+            issuer: issuer.to_string(),
+            resource: resource.trim_end_matches('/').to_string(),
+            tokens: Mutex::new(Tokens::from(issued)),
+        }))
+    }
+
+    /// The resource the grant's tokens are for: proofs name its origin.
+    pub fn resource(&self) -> &str {
+        &self.resource
+    }
+
+    /// Why the grant ended, or None while it lives.
+    pub fn ended(&self) -> Option<String> {
+        let tokens = self.tokens.lock().unwrap();
+        match (&tokens.ended, &tokens.refresh) {
+            (Some(why), _) => Some(why.clone()),
+            (None, None) if Instant::now() >= tokens.expires => {
+                Some("its access token expired".into())
+            }
+            _ => None,
+        }
+    }
+
+    /// Presents this grant to `host` with a fresh proof per request.
+    pub fn presenter(self: &Arc<Self>, host: &str) -> DpopCredential<Arc<Grant>> {
+        DpopCredential::new(self.key.clone(), self.clone(), vec![host.to_string()])
+            .proving_origin(origin_of(&self.resource))
+    }
+
+    fn refresh(&self, tokens: &mut Tokens) {
+        let Some(refresh) = tokens.refresh.clone() else {
+            tokens.ended = Some("the grant has no refresh token".into());
+            return;
+        };
+        let answer = token_call(
+            &self.issuer,
+            &self.key,
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh),
+                ("client_id", CLIENT_ID),
+            ],
+        );
+        match answer {
+            // Rotated: the old refresh token is gone for good.
+            Ok(issued) => *tokens = Tokens::from(issued),
+            Err(TokenRefusal::Refused { error, description }) if error == "invalid_grant" => {
+                tokens.refresh = None;
+                tokens.ended = Some(format!("{error}: {description:.256}"));
+            }
+            // No answer is not a rotation: the same token is asked again shortly, and the
+            // access token serves meanwhile. Had the issuer rotated it, reuse ends the grant.
+            Err(refusal) => {
+                eprintln!("Hub grant refresh: {}", refusal.detail());
+                tokens.renew = Instant::now() + REFRESH_RETRY;
+            }
+        }
+    }
+}
+
+impl From<Issued> for Tokens {
+    fn from(issued: Issued) -> Self {
+        let now = Instant::now();
+        let life = Duration::from_secs(issued.expires_in);
+        Tokens {
+            access: issued.access_token,
+            renew: now + life / 2,
+            expires: now + life,
+            refresh: issued.refresh_token,
+            ended: None,
+        }
+    }
+}
+
+impl AccessToken for Grant {
+    fn current(&self) -> Option<String> {
+        let mut tokens = self.tokens.lock().unwrap();
+        if tokens.ended.is_none() && Instant::now() >= tokens.renew && tokens.refresh.is_some() {
+            self.refresh(&mut tokens);
+        }
+        (tokens.ended.is_none() && Instant::now() < tokens.expires).then(|| tokens.access.clone())
+    }
+
+    fn refused(&self, token: &str) {
+        let mut tokens = self.tokens.lock().unwrap();
+        if tokens.access != token || tokens.ended.is_some() {
+            return;
+        }
+        tokens.expires = Instant::now();
+        if tokens.refresh.is_some() {
+            self.refresh(&mut tokens);
+        }
+    }
+}
+
+impl std::fmt::Debug for Grant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Grant")
+            .field("issuer", &self.issuer)
+            .field("resource", &self.resource)
+            .finish()
+    }
+}
+
+/// The execution grants this machine holds, per signer and Hub origin, and the key that
+/// redeems and proves every grant (the leaf's). Memory only: a restart forgets them, and the
+/// signer's CLI grants again when a run is refused `hub_access_required`.
+#[derive(Default)]
+pub struct Grants {
+    key: Option<Arc<DpopKey>>,
+    held: Mutex<HashMap<(String, String), Arc<Grant>>>,
+}
+
+impl Grants {
+    pub fn new(key: Arc<DpopKey>) -> Self {
+        Self {
+            key: Some(key),
+            held: Mutex::default(),
+        }
+    }
+
+    pub fn redeem(
+        &self,
+        authorization: &Authorization,
+        kind: &str,
+        ca_der: Option<&[u8]>,
+    ) -> Result<Arc<Grant>, Refusal> {
+        let key = self
+            .key
+            .clone()
+            .ok_or_else(|| Refusal("this machine holds no key to prove a grant with".into()))?;
+        Grant::redeem(authorization, kind, key, ca_der)
+    }
+
+    /// `actor`'s execution grant at `origin` from now on.
+    pub fn hold(&self, actor: &str, origin: &str, grant: Arc<Grant>) {
+        let key = (actor.to_string(), origin_key(origin).unwrap_or_default());
+        self.held.lock().unwrap().insert(key, grant);
+    }
+
+    /// `actor`'s live execution grant at `origin`; an ended one is forgotten.
+    pub fn held(&self, actor: &str, origin: &str) -> Option<Arc<Grant>> {
+        let key = (actor.to_string(), origin_key(origin).unwrap_or_default());
+        let mut held = self.held.lock().unwrap();
+        let grant = held.get(&key)?.clone();
+        if grant.ended().is_some() {
+            held.remove(&key);
+            return None;
+        }
+        Some(grant)
+    }
+}
+
+/// One form POST to `issuer`'s token endpoint, proving `key`.
+fn token_call(
+    issuer: &str,
+    key: &Arc<DpopKey>,
+    form: &[(&str, &str)],
+) -> Result<Issued, TokenRefusal> {
+    let endpoint = format!("{issuer}/oauth2/token");
+    let unanswered = |why: String| TokenRefusal::Unanswered(format!("{endpoint}: {why}"));
+    let host = transport::base_host(&endpoint).map_err(|e| unanswered(e.detail))?;
+    let policy = SourcePolicy {
+        allowed_hosts: vec![host.clone()],
+        allow_local: origin_key(origin_of(issuer)).is_some_and(|key| loopback_host(&key)),
+        max_redirects: 0,
+        ..Default::default()
+    };
+    let proof = DpopCredential::new(key.clone(), (), vec![host]);
+    let (status, body) = transport::form_post(
+        &endpoint,
+        form,
+        &policy,
+        &proof,
+        64 << 10,
+        Deadline::after_seconds(Some(TOKEN_CALL_SECONDS)),
+    )
+    .map_err(|e| unanswered(e.detail))?;
+    if status == 200 {
+        let issued: Issued = serde_json::from_slice(&body)
+            .map_err(|_| unanswered("an unreadable token answer".into()))?;
+        if !issued.token_type.eq_ignore_ascii_case("DPoP") || issued.access_token.is_empty() {
+            return Err(unanswered(format!(
+                "a {} token, not a DPoP-bound one",
+                issued.token_type
+            )));
+        }
+        return Ok(issued);
+    }
+    #[derive(Deserialize)]
+    struct OAuthError {
+        error: String,
+        #[serde(default)]
+        error_description: String,
+    }
+    match serde_json::from_slice::<OAuthError>(&body) {
+        Ok(refused) if (400..500).contains(&status) => Err(TokenRefusal::Refused {
+            error: refused.error,
+            description: refused.error_description,
+        }),
+        _ => Err(unanswered(format!("HTTP {status}"))),
+    }
+}
+
+/// How a machine reads a Hub: as the signer's grant, or on a rental as the pod itself.
+#[derive(Clone, Debug)]
+pub enum Credential {
+    Grant(Arc<Grant>),
+    Worker { id: String, token: String },
+}
+
+/// Where and as whom a machine reads a Hub. On a rental, a run that names no Hub reads the
+/// rental's own with the pod's worker capability (the Go agent and Python worker's default).
 #[derive(Clone, Debug)]
 pub struct Source {
     pub origin: String,
-    /// TensorFS credential spelling: `bearer <token>` or `worker <id> <token>`.
-    pub credential: String,
+    pub credential: Credential,
     pub ca_der: Option<Vec<u8>>,
     pub object_hosts: Vec<String>,
 }
 
 impl Source {
-    pub fn delegated(access: &Access) -> Self {
+    pub fn granted(
+        origin: &str,
+        grant: Arc<Grant>,
+        ca_der: Option<Vec<u8>>,
+        object_hosts: Vec<String>,
+    ) -> Self {
         Self {
-            origin: access.origin.trim_end_matches('/').to_string(),
-            credential: format!("bearer {}", access.token),
-            ca_der: URL_SAFE_NO_PAD
-                .decode(&access.ca)
-                .ok()
-                .filter(|der| !der.is_empty()),
-            object_hosts: access
-                .environment
-                .get("TENSORHUB_OBJECT_STORAGE_HOSTS")
-                .map(|hosts| {
-                    hosts
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|h| !h.is_empty())
-                        .map(String::from)
-                        .collect()
-                })
-                .unwrap_or_default(),
+            origin: origin.trim_end_matches('/').to_string(),
+            credential: Credential::Grant(grant),
+            ca_der,
+            object_hosts,
         }
     }
     pub fn pod(
@@ -280,23 +456,50 @@ impl Source {
     ) -> Self {
         Self {
             origin: origin.trim_end_matches('/').to_string(),
-            credential: format!("worker {worker_id} {worker_token}"),
+            credential: Credential::Worker {
+                id: worker_id.into(),
+                token: worker_token.into(),
+            },
             ca_der,
             object_hosts,
         }
     }
+    fn worker(&self, host: &str) -> ScopedHeaders {
+        let headers = match &self.credential {
+            Credential::Worker { id, token } => vec![
+                ("x-cozy-worker-id".to_string(), id.clone()),
+                ("x-cozy-worker-token".to_string(), token.clone()),
+            ],
+            Credential::Grant(_) => vec![],
+        };
+        ScopedHeaders {
+            hosts: vec![host.to_string()],
+            headers,
+        }
+    }
 }
+
+type Presenter = Box<dyn CredentialProvider + Send + Sync>;
 
 /// Reads at a Hub with its credential, presented only to the Hub host.
 pub struct Catalog {
     origin: String,
     host: String,
-    credential: String,
+    credential: Presenter,
     policy: SourcePolicy,
 }
 
 impl Catalog {
     pub fn new(source: &Source) -> Result<Self, Refusal> {
+        Self::presenting(source, |host| match &source.credential {
+            Credential::Grant(grant) => Box::new(grant.presenter(host)),
+            Credential::Worker { .. } => Box::new(source.worker(host)),
+        })
+    }
+    fn presenting(
+        source: &Source,
+        credential: impl FnOnce(&str) -> Presenter,
+    ) -> Result<Self, Refusal> {
         let origin = source.origin.clone();
         let host = transport::base_host(&origin).map_err(|e| Refusal(e.to_string()))?;
         if let Some(der) = &source.ca_der {
@@ -311,21 +514,16 @@ impl Catalog {
         };
         Ok(Self {
             origin,
+            credential: credential(&host),
             host,
-            credential: source.credential.clone(),
             policy,
         })
     }
     pub fn origin(&self) -> &str {
         &self.origin
     }
-    pub fn credential(&self) -> ScopedHeaders {
-        transport::credential_from_spec(&self.credential, vec![self.host.clone()]).unwrap_or(
-            ScopedHeaders {
-                hosts: vec![],
-                headers: vec![],
-            },
-        )
+    pub fn credential(&self) -> &dyn CredentialProvider {
+        &*self.credential
     }
     pub fn policy(&self) -> &SourcePolicy {
         &self.policy
@@ -339,7 +537,7 @@ impl Catalog {
         transport::api_get(
             &url,
             &policy,
-            &self.credential(),
+            self.credential(),
             cap,
             Deadline::none(),
             &Ledger::new(),
@@ -353,40 +551,29 @@ impl Catalog {
     }
 }
 
-/// Hub writes under a machine-publication authorization: the Hub mints a short bearer for this
-/// machine's leaf, proven by its sender proof (the run's execution access, or a rental's own
-/// worker capability), and it is renewed at half its life. Both go to the Hub host only;
-/// presigned object hosts see neither.
+/// Hub writes under a machine-publication grant, presented to the Hub host only; presigned
+/// object hosts see nothing. On a rental the pod's worker capability rides beside it: the Hub
+/// checks that its leaf is the grant's key.
 pub struct Publishing {
     catalog: Catalog,
-    sender: Vec<(String, String)>,
-    authorization: String,
-    bearer: Mutex<Option<(String, Instant)>>,
 }
 
 impl Publishing {
-    pub fn new(source: &Source, authorization: &str) -> Result<Self, Refusal> {
-        let sender = match source.credential.split_whitespace().collect::<Vec<_>>()[..] {
-            ["bearer", token] => vec![("x-cozy-execution-access".into(), token.into())],
-            ["worker", id, token] => vec![
-                ("x-cozy-worker-id".into(), id.into()),
-                ("x-cozy-worker-token".into(), token.into()),
-            ],
-            _ => {
-                return Err(Refusal(
-                    "publication needs this machine's Hub access".into(),
-                ))
-            }
-        };
-        let publishing = Self {
-            catalog: Catalog::new(source)?,
-            sender,
-            authorization: authorization.to_string(),
-            bearer: Mutex::new(None),
-        };
-        // A refused authorization surfaces here, before any byte moves.
-        *publishing.bearer.lock().unwrap() = Some(publishing.renew()?);
-        Ok(publishing)
+    /// `source` is where the run reads; `rental` the pod's own Hub access, if this is a rental.
+    pub fn new(
+        source: &Source,
+        grant: &Arc<Grant>,
+        rental: Option<&Source>,
+    ) -> Result<Self, Refusal> {
+        if let Some(why) = grant.ended() {
+            return Err(Refusal(format!("the publication grant ended: {why}")));
+        }
+        let worker = rental.filter(|pod| origin_key(&pod.origin) == origin_key(&source.origin));
+        let catalog = Catalog::presenting(source, |host| {
+            let worker = worker.map_or_else(|| source.worker(host), |pod| pod.worker(host));
+            Box::new(Both(grant.presenter(host), worker))
+        })?;
+        Ok(Self { catalog })
     }
     pub fn origin(&self) -> &str {
         self.catalog.origin()
@@ -394,68 +581,15 @@ impl Publishing {
     pub fn policy(&self) -> &SourcePolicy {
         self.catalog.policy()
     }
-    fn renew(&self) -> Result<(String, Instant), Refusal> {
-        let path = format!(
-            "/v1/worker/machine-authorizations/{}/token",
-            escape(&self.authorization)
-        );
-        let sender = ScopedHeaders {
-            hosts: vec![self.catalog.host.clone()],
-            headers: self.sender.clone(),
-        };
-        let answer =
-            transport::hub_call("POST", self.origin(), &path, b"{}", &sender, self.policy())
-                .map_err(|e| Refusal(format!("publication authorization: {}", e.detail)))?;
-        let token = match &answer {
-            tensorfs_core::canon::Value::Obj(pairs) => pairs.iter().find_map(|(k, v)| match v {
-                tensorfs_core::canon::Value::Str(token) if k == "token" => Some(token.clone()),
-                _ => None,
-            }),
-            _ => None,
-        }
-        .ok_or_else(|| Refusal("the Hub minted no publication token".into()))?;
-        let renew_after = Duration::from_secs(remaining_life(&token) / 2);
-        Ok((token, Instant::now() + renew_after))
-    }
 }
 
-impl transport::CredentialProvider for Publishing {
-    fn headers(&self, host: &str) -> Vec<(String, String)> {
-        if !host.eq_ignore_ascii_case(&self.catalog.host) {
-            return vec![];
-        }
-        let mut held = self.bearer.lock().unwrap();
-        if held
-            .as_ref()
-            .is_none_or(|(_, renew)| Instant::now() >= *renew)
-        {
-            match self.renew() {
-                Ok(fresh) => *held = Some(fresh),
-                // The Hub refuses the stale bearer and the publication fails with its answer.
-                Err(Refusal(why)) => eprintln!("{why}"),
-            }
-        }
-        let mut headers = self.sender.clone();
-        if let Some((token, _)) = held.as_ref() {
-            headers.push(("authorization".into(), format!("Bearer {token}")));
-        }
-        headers
+impl CredentialProvider for Publishing {
+    fn headers(&self, ask: &transport::Ask) -> Vec<(String, String)> {
+        self.catalog.credential.headers(ask)
     }
-}
-
-/// Seconds until a JWT's `exp`, from its own claims; 0 when it names none.
-fn remaining_life(token: &str) -> u64 {
-    let exp = token
-        .split('.')
-        .nth(1)
-        .and_then(|claims| URL_SAFE_NO_PAD.decode(claims).ok())
-        .and_then(|claims| serde_json::from_slice::<Value>(&claims).ok())
-        .and_then(|claims| claims["exp"].as_u64())
-        .unwrap_or(0);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs());
-    exp.saturating_sub(now)
+    fn answered(&self, ask: &transport::Ask, answer: &transport::Answer) -> bool {
+        self.catalog.credential.answered(ask, answer)
+    }
 }
 
 /// Path segment escaping for catalog names and refs.
@@ -474,50 +608,9 @@ pub fn escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{Signer, SigningKey};
-
-    fn mint(key: &SigningKey, payload: &str) -> String {
-        let mut signed = b"cozy-capability/1\0".to_vec();
-        signed.extend_from_slice(payload.as_bytes());
-        format!(
-            "{}.{}",
-            URL_SAFE_NO_PAD.encode(payload),
-            URL_SAFE_NO_PAD.encode(key.sign(&signed).to_bytes())
-        )
-    }
 
     #[test]
-    fn capability_admits_only_its_signer_worker_action_and_lifetime() {
-        let key = SigningKey::from_bytes(&[7; 32]);
-        let other = SigningKey::from_bytes(&[8; 32]);
-        let keys = [key.verifying_key()];
-        let id = key_id(&key.verifying_key());
-        let good = mint(
-            &key,
-            &format!(r#"{{"m":"w1","a":"hub-access","e":200,"k":"{id}"}}"#),
-        );
-        assert!(verify_capability(&good, "w1", &keys, 100, ACTION).is_some());
-        assert!(verify_capability(&good, "w2", &keys, 100, ACTION).is_none());
-        assert!(verify_capability(&good, "w1", &keys, 200, ACTION).is_none());
-        assert!(verify_capability(&good, "w1", &keys, 100, "runtime-update").is_none());
-        assert!(verify_capability(&good, "w1", &[other.verifying_key()], 100, ACTION).is_none());
-        let forged = mint(
-            &other,
-            &format!(r#"{{"m":"w1","a":"hub-access","e":200,"k":"{id}"}}"#),
-        );
-        assert!(verify_capability(&forged, "w1", &keys, 100, ACTION).is_none());
-        let unknown = mint(
-            &key,
-            &format!(r#"{{"m":"w1","a":"hub-access","e":200,"k":"{id}","z":1}}"#),
-        );
-        assert!(verify_capability(&unknown, "w1", &keys, 100, ACTION).is_none());
-        let run = mint(&key, &format!(r#"{{"m":"w1","r":"7","e":200,"k":"{id}"}}"#));
-        assert!(verify_capability(&run, "w1", &keys, 100, ACTION).is_none());
-    }
-
-    #[test]
-    fn a_rental_reads_its_hub_as_the_pod_and_delegated_access_as_a_bearer() {
-        use tensorfs_core::transport::CredentialProvider;
+    fn a_rental_reads_its_hub_as_the_pod() {
         let pod = Catalog::new(&Source::pod(
             "https://hub.example/",
             "wrk-1",
@@ -527,37 +620,8 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(pod.origin(), "https://hub.example");
-        assert_eq!(
-            pod.credential().headers("hub.example"),
-            [
-                ("x-cozy-worker-id".to_string(), "wrk-1".to_string()),
-                ("x-cozy-worker-token".to_string(), "tok".to_string())
-            ]
-        );
-        assert!(
-            pod.credential().headers("objects.example").is_empty(),
-            "presigned hosts never see the credential"
-        );
+        assert_eq!(pod.host, "hub.example");
         assert!(pod.policy().allows_host("objects.example"));
-        let access = Access {
-            origin: "https://hub.example".into(),
-            token: "bearer-token".into(),
-            expires_at: 1,
-            environment: BTreeMap::from([(
-                "TENSORHUB_OBJECT_STORAGE_HOSTS".into(),
-                "objects.example".into(),
-            )]),
-            ca: String::new(),
-        };
-        let delegated = Catalog::new(&Source::delegated(&access)).unwrap();
-        assert_eq!(
-            delegated.credential().headers("hub.example"),
-            [(
-                "authorization".to_string(),
-                "Bearer bearer-token".to_string()
-            )]
-        );
-        assert!(delegated.policy().allows_host("objects.example"));
     }
 
     #[test]
@@ -574,22 +638,10 @@ mod tests {
         assert!(!valid_origin("http://hub.example"));
         assert!(!valid_origin("https://hub.example/path"));
         assert!(!valid_origin("https://user@hub.example"));
-    }
-
-    #[test]
-    fn principal_is_issuer_and_delegated_subject() {
-        let part = |v: &str| URL_SAFE_NO_PAD.encode(v);
-        let token = |sub: &str| {
-            format!(
-                "{}.{}.sig",
-                part(r#"{"typ":"delegated-access+jwt"}"#),
-                part(&format!(
-                    r#"{{"iss":"https://h","delegated_sub":"{sub}","permissions":["cozy.execution-access"],"n":1}}"#
-                ))
-            )
-        };
-        assert_eq!(principal(&token("a")), principal(&token("a")));
-        assert_ne!(principal(&token("a")), principal(&token("b")));
-        assert!(principal("opaque-token").starts_with("opaque:"));
+        assert_eq!(
+            origin_of("https://hub.example/v1/auth"),
+            "https://hub.example"
+        );
+        assert_eq!(origin_of("https://hub.example"), "https://hub.example");
     }
 }

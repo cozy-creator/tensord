@@ -18,7 +18,7 @@ the same reasons a run's outcome carries. Unknown fields are ignored with a warn
 | Call | Shape | Real callers | Why it cannot fold into another |
 |---|---|---|---|
 | **Status** | server stream `{keepalive?}`. The first frame describes the machine: worker and boot id, versions, capabilities, phase, GPUs, Hubs, the caller's live runs, held environments, disk, idle deadline (held models come with the binding revision), and the player endpoint: the `cozy/1` listener's port, the addresses to dial and its DTLS certificate's SHA-256. Each later frame is the whole picture again, sent when it changes. Holding the stream is **not** activity. `keepalive: true` resets the idle deadline once, and the first frame carries the new deadline. Without a cap it answers one frame: identity and the sealed readiness receipt. | CLI `machine show`, `rental show`, endpoint check; `rental keepalive` (one reset); Hub readiness (no cap) | It describes the machine, not a run. A unary describe is just its first frame. |
-| **Run** | server stream. `{id, after, spec?}`. With a spec and a new id it submits (idempotent on `id`). Every call then streams the run's log from `after`: `state`, `progress`, `product` (output, rev, length, label, media type; stable output names), `log`, `outcome` (status, typed reason, result, output list, triage). The spec holds `source` (published release, private placement, or an uploaded local package manifest), `kind` (`call`, `job`, `warm` or `update`), entrypoint, payload, input object digests, model choices, the binding revision the CLI knows, the known memo results, attention kernel, weights destination, and the Hub access token. | CLI `cozy run` (attached or `--detach`), `run watch/show`, `machine model download` and prewarm (`kind: warm`), `rental update` (`kind: update`); Hub public serving; seam child runs | Submit without watch is the first frame then close. Watch is Run without a spec. Prepare is a run that only prepares (`warm`), and an ordinary run prepares inside itself (its `progress` shows install and download). |
+| **Run** | server stream. `{id, after, spec?}`. With a spec and a new id it submits (idempotent on `id`). Every call then streams the run's log from `after`: `state`, `progress`, `product` (output, rev, length, label, media type; stable output names), `log`, `outcome` (status, typed reason, result, output list, triage). The spec holds `source` (published release, private placement, or an uploaded local package manifest), `kind` (`call`, `job`, `warm` or `update`), entrypoint, payload, input object digests, model choices, the binding revision the CLI knows, the known memo results, attention kernel, weights destination, and the Hub authorization codes. | CLI `cozy run` (attached or `--detach`), `run watch/show`, `machine model download` and prewarm (`kind: warm`), `rental update` (`kind: update`); Hub public serving; seam child runs | Submit without watch is the first frame then close. Watch is Run without a spec. Prepare is a run that only prepares (`warm`), and an ordinary run prepares inside itself (its `progress` shows install and download). |
 | **Control** | unary `{run, cancel \| pause \| resume}` | CLI `run cancel`, `job cancel`, `run pause/resume`; Hub public cancel; seam child cancel | Closing a Run stream must never cancel accepted work, so cancel needs its own call. |
 | **Read** | server stream `{target, offset, if_rev}`; target is a run output (`output[/i]`), `triage`, or a machine log (with tail). Frames carry rev, total length, the sha256 once final, then the bytes. | CLI downloads (`cozy run --out`, `cp`), triage quote on failure, `machine logs`, `rental logs` | Bytes do not belong in Run's event stream: a 50 GB output, resume at an offset, and many parallel readers. |
 | **Write** | client stream: one content-addressed object (sha256, length), resumable from the length already held | CLI `cozy run` file inputs and local package sources, Hub public inputs | Content addressing dedups across runs and resumes big uploads; inline bytes in Run would be re-sent on every attach. |
@@ -34,10 +34,15 @@ with a self-signed leaf; the CLI does not use it. Caller: the `cozy run play` li
 - **Submit, Watch, Get, Collect and Close** fold into Run.
 - **Acknowledge** is deleted. A Read that reaches the final length of an output's final revision
   marks it delivered, and delivered bytes are evicted first.
-- **HubAccess** is deleted. The token travels in the run spec. It is held in memory for that run's
-  preparation only, and never written to the journal or any durable record. All Hub reads happen
-  inside a run, and child runs inherit the token. If the machine restarts before preparation
-  completes, the run ends FAILED with a typed reason; started work is never re-run.
+- **Hub access** travels in the run spec as AuthKit authorization codes for client
+  `cozy-machine`, bound to this machine's leaf (th-238): `hub.authorization` for the signer's
+  execution grant, `publication` for a weights destination. The machine redeems each code at
+  submission with a DPoP proof from its leaf key and holds the grant in memory only: the execution
+  grant per signer and origin for later runs (a spec with no code uses it, or is refused
+  `hub_access_required`), the publication grant for that run. Tokens and refresh tokens are never
+  written to the journal or any durable record; child runs inherit the grants. If the machine
+  restarts before preparation completes, the run ends FAILED with a typed reason; started work is
+  never re-run.
 - **Binding freshness** is the spec's binding revision: the revision the CLI knows, since it ran
   `package bind`. The machine re-resolves a held model resolution only when the revision differs.
   There is no TTL guess and no forget verb.
@@ -77,7 +82,7 @@ forever.
 | 4 | KeepRentalAlive | `Status{keepalive: true}` |
 | 5 | receipt, health | Status without a cap |
 | 6 | runtime state, wheel, update | Status (versions); Run `kind: update` |
-| 7 | hubs/access set, forget | token in the Run spec |
+| 7 | hubs/access set, forget | authorization codes in the Run spec |
 | 8 | PreparePackageSet | Run (published, `warm` or inside a call) |
 | 9 | PreparePrivatePlacement | Run (private source) |
 | 10 | PrepareLocalPackage, LocalPackageUpload | Write + Run (local manifest) |

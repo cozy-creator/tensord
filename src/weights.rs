@@ -38,13 +38,14 @@ pub struct GrantAuthority {
     pub bind_output: BindOutput,
 }
 
-/// Where a job's outputs are published: the repository, its Hub and the run's
-/// machine-publication authorization.
+/// Where a job's outputs are published: the repository, its Hub, the run's
+/// machine-publication grant and, on a rental, the pod's own Hub access.
 #[derive(Clone)]
 pub struct Destination {
     pub repository: String,
     pub hub: hub::Source,
-    pub publication: String,
+    pub publication: Option<std::sync::Arc<hub::Grant>>,
+    pub rental: Option<hub::Source>,
 }
 
 /// One job attempt's weights grant.
@@ -445,7 +446,7 @@ impl Weights {
         Ok(receipt.clone())
     }
 
-    /// One adopted output into its destination, under the run's publication authorization.
+    /// One adopted output into its destination, under the run's publication grant.
     fn publish(
         &self,
         grant: &Grant,
@@ -453,7 +454,11 @@ impl Weights {
         slot: &str,
         manifest: &ObjectRef,
     ) -> Result<(), Refusal> {
-        let publishing = hub::Publishing::new(&destination.hub, &destination.publication)
+        let publication = destination.publication.as_ref().ok_or((
+            "publication_unauthorized",
+            "a weights destination needs the run's publication grant".to_string(),
+        ))?;
+        let publishing = hub::Publishing::new(&destination.hub, publication, destination.rental.as_ref())
             .map_err(|e| ("publication_unauthorized", e.0))?;
         let operation = format!(
             "output-{}",

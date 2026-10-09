@@ -56,7 +56,6 @@ pub struct SubmissionContext {
     pub capture_digest: String,
     pub invocation_digest: String,
     pub payload_digest: String,
-    pub publication_authorization_id: String,
     pub preparation_id: String,
 }
 
@@ -374,7 +373,6 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS run_calls(execution INTEGER NOT NULL REFERENCES executions(id),sequence INTEGER NOT NULL,at_ms INTEGER NOT NULL,call TEXT NOT NULL,record BLOB NOT NULL,PRIMARY KEY(execution,sequence),UNIQUE(execution,call));
             CREATE TABLE IF NOT EXISTS native_outputs(actor TEXT NOT NULL,owner TEXT NOT NULL,source BLOB NOT NULL,PRIMARY KEY(actor,owner));
             CREATE TABLE IF NOT EXISTS input_intakes(actor TEXT NOT NULL,retention TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,retention));
-            CREATE TABLE IF NOT EXISTS hub_access(actor TEXT NOT NULL,origin TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,origin));
             CREATE TABLE IF NOT EXISTS triage(execution INTEGER PRIMARY KEY REFERENCES executions(id),record TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS resolutions(actor TEXT NOT NULL,key TEXT NOT NULL,package TEXT NOT NULL,preparation TEXT NOT NULL,PRIMARY KEY(actor,key));
             CREATE TABLE IF NOT EXISTS job_inputs(actor TEXT NOT NULL,key TEXT NOT NULL,repository TEXT NOT NULL,manifest TEXT NOT NULL,PRIMARY KEY(actor,key));
@@ -667,48 +665,6 @@ impl Journal {
         Ok(record)
     }
 
-    pub fn hub_grant(&self, actor: &str, origin: &str) -> io::Result<Option<crate::hub::Grant>> {
-        self.connection
-            .query_row(
-                "SELECT record FROM hub_access WHERE actor=?1 AND origin=?2",
-                params![actor, origin],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(db_error)?
-            .map(|record| serde_json::from_str(&record).map_err(db_error))
-            .transpose()
-    }
-    /// Retains a grant unless this owner already holds another account at the origin.
-    pub fn put_hub_grant(
-        &mut self,
-        actor: &str,
-        origin: &str,
-        grant: &crate::hub::Grant,
-    ) -> io::Result<bool> {
-        if self
-            .hub_grant(actor, origin)?
-            .is_some_and(|prior| prior.principal != grant.principal)
-        {
-            return Ok(false);
-        }
-        self.connection
-            .execute(
-                "INSERT OR REPLACE INTO hub_access(actor,origin,record) VALUES(?1,?2,?3)",
-                params![actor, origin, encoded(grant)?],
-            )
-            .map_err(db_error)?;
-        Ok(true)
-    }
-    pub fn forget_hub_grant(&mut self, actor: &str, origin: &str) -> io::Result<()> {
-        self.connection
-            .execute(
-                "DELETE FROM hub_access WHERE actor=?1 AND origin=?2",
-                params![actor, origin],
-            )
-            .map_err(db_error)?;
-        Ok(())
-    }
     pub fn resolution(&self, actor: &str, key: &str) -> io::Result<Option<String>> {
         self.connection
             .query_row(
@@ -1265,7 +1221,6 @@ impl Journal {
             capture_digest: String::new(),
             invocation_digest: digest.into(),
             payload_digest: String::new(),
-            publication_authorization_id: String::new(),
             preparation_id: String::new(),
         };
         let execution = insert(&tx, &key, invocation, Some(context), "", Some(PREPARING))?;
