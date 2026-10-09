@@ -51,6 +51,8 @@ pub struct HubGrant {
     pub worker_token: String,
     pub ca_der: Option<Vec<u8>>,
     pub object_hosts: Vec<String>,
+    /// TENSORHUB_OBJECT_ORIGIN: where this Hub serves public checkpoints (th-243).
+    pub object_origin: String,
 }
 
 pub struct Grant {
@@ -178,6 +180,7 @@ impl Grant {
                     object_hosts: get("TENSORHUB_OBJECT_STORAGE_HOSTS")
                         .map(|h| h.split(',').map(str::to_owned).collect())
                         .unwrap_or_default(),
+                    object_origin: get("TENSORHUB_OBJECT_ORIGIN").unwrap_or_default().to_string(),
                 })
             }
         };

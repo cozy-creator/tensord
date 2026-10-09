@@ -413,7 +413,10 @@ fn start_api(
             ))
         }),
         own_hub: own_hub
-            .map(|hub| cozy_machine::hub::Source::new(&hub.origin, hub.ca_der, hub.object_hosts, None))
+            .map(|hub| {
+                cozy_machine::hub::Source::new(&hub.origin, hub.ca_der, hub.object_hosts, None)
+                    .and_then(|source| source.with_object_origin(&hub.object_origin))
+            })
             .transpose()
             .map_err(|e| io::Error::other(e.0))?,
         leaf: Some(Arc::new(leaf)),
