@@ -218,6 +218,7 @@ fn run_machine(
             "environment": {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": home, "COZY_HOME": home},
             // A rented pod is the machine's alone (its grant says so); anywhere else it is a guest.
             "host": {"mode": if rental { "dedicated" } else { "shared" }},
+            "image_kernels": image_kernels(&layout.root, &paths.sdk()),
         });
         // The operator's GPU settings, when the machine root has them, over these defaults.
         if let Ok(file) = std::fs::File::open(layout.state.join("gpu-config.json")) {
@@ -301,6 +302,19 @@ fn run_machine(
 
 /// Executors use the machine's own Runtime/TensorFS pair (the wheels its root ships), so they
 /// speak its protocol; without a pair, each release's locked SDK.
+/// The image's Runtime interpreter and the executors' Runtime wheel, when both are here: the
+/// machine compiles its kernels with them as it starts.
+fn image_kernels(root: &std::path::Path, sdk: &std::path::Path) -> Option<serde_json::Value> {
+    let python = root.join("opt/cozy/python/bin/python");
+    let wheel = std::fs::read_dir(sdk).ok()?.flatten().map(|entry| entry.path()).find(|path| {
+        path.file_name().is_some_and(|name| {
+            let name = name.to_string_lossy();
+            name.starts_with("cozy_runtime-") && name.ends_with(".whl")
+        })
+    })?;
+    python.is_file().then(|| serde_json::json!({"python": python, "runtime_wheel": wheel}))
+}
+
 fn image_sdk(
     wheels: &std::path::Path,
     root: &std::path::Path,

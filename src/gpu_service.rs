@@ -105,6 +105,15 @@ pub struct GpuConfig {
     /// host memory (no device memory); false spawns every executor, which imports again.
     #[serde(default = "yes")]
     pub prespawn: bool,
+    /// The image's Runtime interpreter and the executors' Runtime wheel: the machine compiles
+    /// its kernels with them at start, before any package is installed (`image_kernel_boot`).
+    #[serde(default)]
+    pub image_kernels: Option<ImageKernels>,
+}
+#[derive(Clone, Debug, Deserialize)]
+pub struct ImageKernels {
+    pub python: PathBuf,
+    pub runtime_wheel: PathBuf,
 }
 impl GpuConfig {
     pub fn load(path: &Path) -> io::Result<Self> {
@@ -1584,13 +1593,28 @@ impl GpuPool {
     /// (machine start, after an install, so beside the model download): the Runtime's
     /// `machine_kernels` under the generation's own seal, so each key is its executors' and
     /// a kernel already in the store is not built again. Once per generation and machine
-    /// run. It opens no device; its builds are niced and as wide as the host memory free
-    /// when each starts. An executor that needs a kernel still compiling waits for it.
+    /// run. It opens no device; its builds are niced and share the host. An executor that
+    /// needs a kernel still compiling waits for it.
     pub fn kernel_boot(self: &Arc<Self>, held: HeldGeneration) {
-        let generation = held.record.identity.clone();
-        if !binds_models(&held.record.interface) {
-            return;
+        if binds_models(&held.record.interface) {
+            self.boot_kernels(held.record.identity, held.record.python, None);
         }
+    }
+
+    /// The same compile at machine start, before any install: the image's Runtime
+    /// interpreter (its torch and toolkit, which package environments install from the same
+    /// seed) running the executors' Runtime, unpacked from its wheel, so its keys are theirs.
+    pub fn image_kernel_boot(self: &Arc<Self>) {
+        let Some(image) = self.config.image_kernels.clone() else {
+            return;
+        };
+        match unpack_runtime(&image.runtime_wheel, &self.root.join("kernel-runtime")) {
+            Ok(runtime) => self.boot_kernels("image".into(), image.python, Some(runtime)),
+            Err(error) => eprintln!("kernel boot: image Runtime: {error}"),
+        }
+    }
+
+    fn boot_kernels(self: &Arc<Self>, generation: String, python: PathBuf, runtime: Option<PathBuf>) {
         {
             let mut boots = self.kernel_boots.lock().unwrap();
             if boots.contains_key(&generation) {
@@ -1603,7 +1627,9 @@ impl GpuPool {
             .name("kernel-boot".into())
             .spawn(move || {
                 let began = Instant::now();
-                let Some(launched) = pool.upgrade().map(|pool| pool.launch_kernel_boot(&held))
+                let Some(launched) = pool
+                    .upgrade()
+                    .map(|pool| pool.launch_kernel_boot(&generation, &python, runtime.as_deref()))
                 else {
                     return;
                 };
@@ -1627,9 +1653,10 @@ impl GpuPool {
 
     fn launch_kernel_boot(
         &self,
-        held: &HeldGeneration,
+        generation: &str,
+        python: &Path,
+        runtime: Option<&Path>,
     ) -> io::Result<(std::process::Child, crate::process::Exact, PathBuf)> {
-        let generation = &held.record.identity;
         let devices: Vec<_> = self.devices.iter().map(|d| d.entry.as_str()).collect();
         let seal = Seal::prepare(
             &self.root,
@@ -1644,13 +1671,13 @@ impl GpuPool {
             self.root.parent().unwrap_or(&self.root),
         ))?);
         let launch = || {
-            let mut command = crate::launch_identity::trampoline(
-                &held.record.python,
-                self.config.identity,
-                Some(&scope),
-            )?;
+            let mut command =
+                crate::launch_identity::trampoline(python, self.config.identity, Some(&scope))?;
+            match runtime {
+                None => command.args(["-I", "-m", "cozy_runtime.internal.machine_kernels"]),
+                Some(runtime) => command.args(["-I", "-c", RUNTIME_FIRST]).arg(runtime),
+            };
             command
-                .args(["-I", "-m", "cozy_runtime.internal.machine_kernels"])
                 .env_clear()
                 .envs(seal.environment(&self.config.environment))
                 .envs(scope.environment())
@@ -1668,7 +1695,7 @@ impl GpuPool {
             Ok((child, boot)) => {
                 let boot = boot.with_scope(Some(scope));
                 let mut boots = self.kernel_boots.lock().unwrap();
-                boots.insert(generation.clone(), Some(boot.try_clone()?));
+                boots.insert(generation.to_string(), Some(boot.try_clone()?));
                 Ok((child, boot, log))
             }
             Err(error) => {
@@ -3250,6 +3277,42 @@ fn log_released(released: Vec<(HoldingKey, u64)>) {
 
 /// Degree 2 stays off on a GPU that drives a display until qualified there. Unknown is "yes".
 /// Whether any entrypoint of an installed interface binds a model: its executors are GPU ones.
+/// `machine_kernels` from the Runtime tree named by the first argument, ahead of the
+/// interpreter's own Runtime; its builders inherit that path.
+const RUNTIME_FIRST: &str = "import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); \
+    runpy.run_module('cozy_runtime.internal.machine_kernels', run_name='__main__')";
+
+/// A Runtime wheel's importable tree, unpacked once per wheel digest under `into`.
+fn unpack_runtime(wheel: &Path, into: &Path) -> io::Result<PathBuf> {
+    let bytes = fs::read(wheel)?;
+    let tree = into.join(&tensorfs_core::sha256::hex_digest(&bytes)[..32]);
+    if tree.is_dir() {
+        return Ok(tree);
+    }
+    let staging = into.join(format!(".{}", uuid::Uuid::new_v4().simple()));
+    let mut archive = zip::ZipArchive::new(io::Cursor::new(bytes)).map_err(io::Error::other)?;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(io::Error::other)?;
+        // Scripts and data (the bundled machine) are not imported.
+        let Some(name) = entry.enclosed_name().filter(|name| {
+            !name.iter().next().is_some_and(|top| top.to_string_lossy().ends_with(".data"))
+        }) else {
+            continue;
+        };
+        let path = staging.join(name);
+        if entry.is_dir() {
+            fs::create_dir_all(&path)?;
+            continue;
+        }
+        fs::create_dir_all(path.parent().unwrap_or(&staging))?;
+        io::copy(&mut entry, &mut File::create(&path)?)?;
+    }
+    match fs::rename(&staging, &tree) {
+        Err(_) if tree.is_dir() => fs::remove_dir_all(&staging).map(|()| tree),
+        renamed => renamed.map(|()| tree),
+    }
+}
+
 fn binds_models(interface: &serde_json::Value) -> bool {
     interface
         .get("entrypoints")
@@ -3989,6 +4052,35 @@ impl Services for Callbacks<'_> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_image_boot_runs_machine_kernels_from_the_executors_runtime_wheel() {
+        let dir = std::env::temp_dir().join(format!("kernel-runtime-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let wheel = dir.join("cozy_runtime-9.9.9-py3-none-any.whl");
+        let mut zip = zip::ZipWriter::new(File::create(&wheel).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        for (name, body) in [
+            ("cozy_runtime/__init__.py", ""),
+            ("cozy_runtime/internal/__init__.py", ""),
+            ("cozy_runtime/internal/machine_kernels.py", "import sys; print(__name__, sys.path[0])"),
+            ("cozy_runtime-9.9.9.data/scripts/cozy-machine", "not imported"),
+        ] {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(body.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+        let tree = unpack_runtime(&wheel, &dir.join("trees")).unwrap();
+        assert_eq!(unpack_runtime(&wheel, &dir.join("trees")).unwrap(), tree);
+        assert!(!tree.join("cozy_runtime-9.9.9.data").exists());
+        let ran = std::process::Command::new("python3")
+            .args(["-I", "-c", RUNTIME_FIRST])
+            .arg(&tree)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&ran.stdout).trim(), format!("__main__ {}", tree.display()));
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn every_rank_of_a_group_gets_its_own_gpus_cap() {
