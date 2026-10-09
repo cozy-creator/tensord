@@ -13,7 +13,7 @@ use crate::{
 use fs2::FileExt;
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
@@ -963,7 +963,7 @@ impl Publisher {
             ))?;
         File::create(dir.join(".hold")).map_err(io_failure)?;
         let (source_digest, callees) = match &self.sdk.client_wheel {
-            Some(_) => describe_environment(&py, &split.distribution, &source.origin)?,
+            Some(_) => describe_environment(&py, &split.distribution, &source.origin, &hub_packages(&split.exact, source))?,
             None => (String::new(), vec![]),
         };
         let record = json!({"identity":identity,"package":split.distribution,"version":release,"application":application,"python":interpreter,"dependencies":installed_sdk(&env),"interface":interface,"sdk":sdk_choice,"sdk_fallback":sdk_fallback,"source_digest":source_digest,"callees":callees});
@@ -1689,6 +1689,27 @@ fn stage_of(progress: &Progress) -> String {
     }
 }
 
+/// The package each lock row the run's Hub publishes installs, by distribution: the org its
+/// index names (`<origin>/v1/index/<org>/files/<sha256>/<wheel>`). Those rows install from
+/// local files (`hub_files`), so an installed callee's own provenance no longer names the
+/// Hub; without this the environment's describer called a Hub-published callee
+/// `local/<name>`, and the run's model choices addressed to `<org>/<name>/...` never reached
+/// it (long_form's generate_image: model_choice_absent).
+fn hub_packages(exact: &str, source: &hub::Source) -> BTreeMap<String, String> {
+    exact
+        .lines()
+        .filter_map(|line| {
+            let file = hub_file(line, source)?;
+            let path = file.url.split_once("://")?.1.split_once('/')?.1;
+            let ["v1", "index", org, "files", _, _] = path.split('/').collect::<Vec<_>>()[..] else {
+                return None;
+            };
+            let distribution = normalized(file.name.split('-').next()?);
+            (!org.is_empty()).then(|| (distribution.clone(), format!("{org}/{distribution}")))
+        })
+        .collect()
+}
+
 /// A lock row the run's Hub publishes: `name @ <url>/<file>.whl ... --hash=sha256:<hex>`.
 struct HubFile {
     url: String,
@@ -1816,7 +1837,12 @@ struct Lock {
 /// The environment's root digest and the other Apps it holds, described inside it by the
 /// machine's client without importing them (`runtime_describe`). A failed description fails
 /// this preparation; it never publishes an environment with silently missing callees.
-pub fn describe_environment(python: &str, root: &str, hub_origin: &str) -> Result<(String, Vec<crate::catalog::Callee>), Failure> {
+pub fn describe_environment(
+    python: &str,
+    root: &str,
+    hub_origin: &str,
+    packages: &BTreeMap<String, String>,
+) -> Result<(String, Vec<crate::catalog::Callee>), Failure> {
     #[derive(serde::Deserialize)]
     #[serde(tag = "kind", rename_all = "snake_case")]
     enum Reply {
@@ -1835,7 +1861,7 @@ pub fn describe_environment(python: &str, root: &str, hub_origin: &str) -> Resul
         .stderr(Stdio::inherit())
         .spawn()
         .and_then(|mut child| {
-            let request = json!({"kind": "describe_environment", "root": root, "hub_origin":hub_origin}).to_string();
+            let request = json!({"kind": "describe_environment", "root": root, "hub_origin": hub_origin, "packages": packages}).to_string();
             child.stdin.take().expect("piped").write_all(request.as_bytes())?;
             child.wait_with_output()
         });
@@ -2100,6 +2126,25 @@ mod tests {
         }
         let value = Command::new(&python).args(["-c", "import acme_pkg; print(acme_pkg.VALUE)"]).output().unwrap();
         assert_eq!(String::from_utf8_lossy(&value.stdout).trim(), "7");
+        // Installed from disk, the wheel names no Hub; the lock row still does. The machine's
+        // describer reads it inside the environment (msgspec is its one dependency).
+        assert!(Command::new("uv").args(["pip", "install", "-q", "--no-config", "--python", python.to_str().unwrap(), "msgspec"])
+            .env("UV_CACHE_DIR", root.join("uv-cache")).status().unwrap().success());
+        let packages = hub_packages(&exact, &source);
+        assert_eq!(packages, BTreeMap::from([("acme-pkg".to_string(), "acme/acme-pkg".to_string())]));
+        let named = |packages: &BTreeMap<String, String>| {
+            let script = format!(
+                "import importlib.metadata,json;from cozy_machine_client.distribution import package_name;\
+                 print(package_name(importlib.metadata.distribution('acme-pkg'),json.loads('{}'),'{origin}'))",
+                serde_json::to_string(packages).unwrap()
+            );
+            let out = Command::new(&python).args(["-c", &script])
+                .env("PYTHONPATH", Path::new(env!("CARGO_MANIFEST_DIR")).join("python")).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(named(&packages), "acme/acme-pkg");
+        assert_eq!(named(&BTreeMap::new()), "local/acme-pkg", "without the lock's identity");
 
         let tampered = format!("acme-pkg @ {origin}/v1/index/acme/files/{bad}/acme_pkg-1.0-py3-none-any.whl --hash=sha256:{bad}\n");
         let other = root.join("tampered");

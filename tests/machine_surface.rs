@@ -1929,6 +1929,7 @@ mod v1_api {
             python.to_str().unwrap(),
             "cozy-machine-cpu-caller",
             "",
+            &Default::default(),
         ).unwrap();
         assert!(digest.starts_with("sha256:"), "{digest}");
         assert_eq!(callees[0].application, "cpu_memo:app", "{callees:?}");
