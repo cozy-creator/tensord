@@ -297,6 +297,15 @@ fn run_machine(
             )
         }),
     )?;
+    // The Hub probes the endpoint the provider put in this pod's environment at once,
+    // instead of waiting for the provider to report it.
+    if let (Some(hub), true) = (grant.hub.clone(), rental) {
+        if let Some(endpoint) = cozy_machine::machine::endpoint::from_env(std::env::vars()) {
+            std::thread::Builder::new()
+                .name("endpoint-report".into())
+                .spawn(move || report_endpoint(hub, endpoint))?;
+        }
+    }
     serve(owner, service, control)
 }
 
@@ -812,4 +821,31 @@ fn client(
             protocol::send_fd(&stream, &fd)?;
         }
     }
+}
+
+/// Tells the Hub this machine's endpoint, trying again while the Hub cannot be reached. The
+/// report only saves the provider's lag: after a few misses the provider's view serves.
+fn report_endpoint(grant: cozy_machine::machine::grant::HubGrant, endpoint: cozy_machine::machine::endpoint::Endpoint) {
+    use cozy_machine::machine::hub::{Hub, Refusal};
+    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(error) => return eprintln!("cozy-machine: endpoint report: {error}"),
+    };
+    let hub = match Hub::new(grant) {
+        Ok(hub) => hub,
+        Err(error) => return eprintln!("cozy-machine: endpoint report: {error}"),
+    };
+    runtime.block_on(async {
+        for attempt in 0..5u32 {
+            match hub.report_endpoint(&endpoint).await {
+                Ok(true) => return eprintln!("cozy-machine: reported endpoint {}", endpoint.public_host),
+                Ok(false) => return eprintln!("cozy-machine: the Hub takes no endpoint reports"),
+                Err(Refusal::Denied) => return eprintln!("cozy-machine: the Hub refused the endpoint report"),
+                Err(Refusal::Transport(error)) => {
+                    eprintln!("cozy-machine: endpoint report: {error}");
+                    tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
+                }
+            }
+        }
+    });
 }

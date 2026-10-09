@@ -173,6 +173,20 @@ impl Hub {
         Ok((keys, Duration::from_secs(document.lease_seconds), document.bindings_revision))
     }
 
+    /// Tells the Hub where this booting machine listens. Ok(false): a Hub that takes no
+    /// reports and waits for the provider instead.
+    pub async fn report_endpoint(&self, endpoint: &super::endpoint::Endpoint) -> Result<bool, Refusal> {
+        let body = serde_json::to_vec(endpoint).expect("JSON");
+        let (status, _) = self
+            .call(Method::POST, "/v1/worker/rental/endpoint", Some(body))
+            .await?;
+        match status {
+            StatusCode::NO_CONTENT => Ok(true),
+            StatusCode::NOT_FOUND => Ok(false),
+            other => Err(Refusal::Transport(format!("the endpoint report answered HTTP {other}"))),
+        }
+    }
+
     /// Ends this rental's allocation; 204 is acceptance.
     pub async fn release(&self) -> Result<(), Refusal> {
         let body = serde_json::to_vec(&serde_json::json!({ "worker_id": self.grant.worker_id }))
