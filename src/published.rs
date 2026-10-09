@@ -1309,9 +1309,8 @@ fn make_source(
     .map_err(|e| refused("model_source_failed", e))
 }
 
-/// Download one exact checkpoint: through the Hub under the run's capability when it names it
-/// (an owner's unpublished checkpoint), else anonymously by digest from the Hub's object origin
-/// (th-243), which the Hub never sees. `keep` names what its GC must not evict (`protected`).
+/// Download one exact checkpoint, anonymously unless the run's capability names it (an
+/// owner's unpublished checkpoint); `keep` names what its GC must not evict (`protected`).
 fn ensure(
     store: &Store,
     source: &hub::Source,
@@ -1341,32 +1340,18 @@ fn ensure_with(
     bytes: &(dyn Fn(u64, u64) + Sync),
 ) -> Result<Option<tensorfs_core::ensure::PartHold>, Failure> {
     let catalog = Catalog::for_op(source, hub::Op::Read { model: repository, manifest })?;
+    let credential = catalog.credential();
     let refspec = format!("{repository}@{manifest}");
     let mut keep = keep.to_vec();
     keep.push(manifest.to_string());
     let on_event = |event: &tensorfs_core::ensure::Event| bytes(event.bytes_done, event.bytes_total);
-    let public = tensorfs_core::transport::SourcePolicy::default();
-    let mut request = match (catalog.private(), source.object_origin.as_deref()) {
-        (true, _) => tensorfs_core::ensure::Request::new(
-            store,
-            catalog.origin(),
-            &refspec,
-            catalog.credential(),
-            catalog.policy(),
-        ),
-        (false, Some(object_origin)) => {
-            tensorfs_core::ensure::Request::public(store, object_origin, &refspec, &public)
-        }
-        (false, None) => {
-            return Err((
-                "public_origin_unavailable",
-                format!(
-                    "{} names no object origin for its public content; update the CLI and the Hub",
-                    source.origin
-                ),
-            ))
-        }
-    };
+    let mut request = tensorfs_core::ensure::Request::new(
+        store,
+        catalog.origin(),
+        &refspec,
+        credential,
+        catalog.policy(),
+    );
     request.keep = &keep;
     request.on_event = Some(&on_event);
     request.cancellation = pull.cancellation.clone();

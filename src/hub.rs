@@ -452,8 +452,6 @@ pub struct Source {
     pub origin: String,
     pub ca_der: Option<Vec<u8>>,
     pub object_hosts: Vec<String>,
-    /// The Hub's anonymous object origin (th-243): public checkpoints are read there by digest.
-    pub object_origin: Option<String>,
     pub capability: Option<Arc<Capability>>,
 }
 
@@ -471,22 +469,8 @@ impl Source {
             origin: origin.trim_end_matches('/').to_string(),
             ca_der,
             object_hosts,
-            object_origin: None,
             capability: capability.map(Arc::new),
         })
-    }
-
-    /// The Hub's object origin, as its run spec or pod environment names it; empty names none.
-    pub fn with_object_origin(mut self, object_origin: &str) -> Result<Self, Refusal> {
-        let object_origin = object_origin.trim_end_matches('/');
-        if object_origin.is_empty() {
-            return Ok(self);
-        }
-        if !valid_url(object_origin) {
-            return Err(Refusal(format!("{object_origin} is not an HTTPS object origin")));
-        }
-        self.object_origin = Some(object_origin.to_string());
-        Ok(self)
     }
 }
 
@@ -613,10 +597,6 @@ impl Catalog {
     pub fn origin(&self) -> &str {
         &self.origin
     }
-    /// Built for an operation the run's capability names: the read is private.
-    pub fn private(&self) -> bool {
-        self.credential.is_some()
-    }
     pub fn credential(&self) -> &dyn CredentialProvider {
         match &self.credential {
             Some(presenter) => presenter,
@@ -692,26 +672,6 @@ mod tests {
         let other = signed(&self::leaf(), json!([{"type": "tensorhub_model_publish", "model": "alice/out"}]));
         assert!(Capability::new(&other, TOKENS, leaf.clone()).is_err(), "a capability for another machine key");
         assert!(Capability::new("not-a-jws", TOKENS, leaf).is_err());
-    }
-
-    /// The object origin is an https base (a path is a bucket on a path-style store), or http on
-    /// loopback; a read the capability names stays private, every other read is public.
-    #[test]
-    fn public_reads_go_to_the_object_origin() {
-        let source = |origin: &str| Source::new("https://hub.example", None, vec![], None).unwrap().with_object_origin(origin);
-        assert_eq!(source("https://objects.example/").unwrap().object_origin.as_deref(), Some("https://objects.example"));
-        assert_eq!(source("http://127.0.0.1:9000/public").unwrap().object_origin.as_deref(), Some("http://127.0.0.1:9000/public"));
-        assert!(source("").unwrap().object_origin.is_none());
-        for bad in ["http://objects.example", "https://objects.example/?x=1", "objects.example"] {
-            assert!(source(bad).is_err(), "{bad} admitted");
-        }
-        let leaf = leaf();
-        let manifest = format!("sha256:{}", "ab".repeat(32));
-        let jws = signed(&leaf, json!([{"type": "tensorhub_model_read", "model": "alice/private", "manifest": manifest}]));
-        let capability = Capability::new(&jws, "https://hub.example/v1/auth/oauth2/token", leaf).unwrap();
-        let source = Source::new("https://hub.example", None, vec![], Some(capability)).unwrap();
-        let read = |model| Catalog::for_op(&source, Op::Read { model, manifest: &manifest }).unwrap().private();
-        assert!(read("alice/private") && !read("bob/public"));
     }
 
     /// An assertion verifies under the leaf's public key, which it carries; its claims are

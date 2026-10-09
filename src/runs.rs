@@ -145,8 +145,6 @@ struct DurableHub {
     ca_der: Option<Vec<u8>>,
     #[serde(default)]
     object_hosts: Vec<String>,
-    #[serde(default)]
-    object_origin: Option<String>,
 }
 impl Durable {
     fn of(context: &JobContext) -> Self {
@@ -155,7 +153,6 @@ impl Durable {
                 origin: hub.origin.clone(),
                 ca_der: hub.ca_der.clone(),
                 object_hosts: hub.object_hosts.clone(),
-                object_origin: hub.object_origin.clone(),
             }),
             installation: context.installation.clone(),
             application: context.application.clone(),
@@ -173,10 +170,7 @@ impl Durable {
     fn context(self) -> io::Result<JobContext> {
         let hub = self
             .hub
-            .map(|hub| {
-                hub::Source::new(&hub.origin, hub.ca_der, hub.object_hosts, None)
-                    .and_then(|source| source.with_object_origin(hub.object_origin.as_deref().unwrap_or("")))
-            })
+            .map(|hub| hub::Source::new(&hub.origin, hub.ca_der, hub.object_hosts, None))
             .transpose()
             .map_err(|e| io::Error::other(e.0))?;
         Ok(JobContext {
