@@ -184,15 +184,8 @@ fn choices(sent: Vec<v1::ModelChoice>) -> Result<Vec<domain::ModelChoice>, Statu
                 rungs: choice
                     .rungs
                     .into_iter()
-                    .map(|rung| -> Result<domain::ModelRung, Status> {
-                        Ok(domain::ModelRung {
-                            gpu: rung.gpu,
-                            gpus: rung.gpus,
-                            lane: rung.lane,
-                            manifest: domain::Ref { digest: digest(&rung.manifest)?, length: rung.manifest_length },
-                        })
-                    })
-                    .collect::<Result<_, _>>()?,
+                    .map(|rung| domain::ModelRung { gpu: rung.gpu, gpus: rung.gpus, lane: rung.lane })
+                    .collect(),
                 adapters: choice
                     .adapters
                     .into_iter()
@@ -213,18 +206,9 @@ fn choices(sent: Vec<v1::ModelChoice>) -> Result<Vec<domain::ModelChoice>, Statu
         .collect()
 }
 
-/// A published release and the card it carries; none is a release the signer holds already.
-fn release_source(release: v1::Release) -> Result<crate::runs::Source, Status> {
-    let card = match release.package_interface.is_empty() {
-        true => None,
-        false => Some(crate::runs::Card {
-            interface: serde_json::from_slice(&release.package_interface)
-                .map_err(|_| Status::invalid_argument("the release's package interface is not JSON"))?,
-            python_version: release.python_version,
-            locked_requirements: release.locked_requirements,
-        }),
-    };
-    Ok(crate::runs::Source::Release { package: release.package, release: release.release, card })
+/// A published release by name (th-245): empty is the Hub's newest.
+fn release_source(release: v1::Release) -> crate::runs::Source {
+    crate::runs::Source::Release { package: release.package, release: release.release }
 }
 
 /// One warm set member. A level this machine does not know is its highest; none is
@@ -240,7 +224,7 @@ fn member(mut item: v1::WarmItem) -> Result<crate::runs::SetItem, Status> {
         Ok(v1::WarmLevel::Gpu) | Err(_) => Level::Gpu,
     };
     let source = match item.source {
-        Some(v1::warm_item::Source::Release(release)) => release_source(release)?,
+        Some(v1::warm_item::Source::Release(release)) => release_source(release),
         Some(v1::warm_item::Source::Installation(alias)) => crate::runs::Source::Installation(alias),
         None => {
             return Err(Status::invalid_argument(
@@ -279,9 +263,10 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<(crate::runs::Spec, Option<v1::HubAc
     let hub = spec.hub.take();
     let providers = spec.providers.take();
     // What the run is, not how it reaches its sources: a spec re-sent with other access,
-    // binding hints or a reformatted payload names the same run.
+    // another catalog revision or a reformatted payload names the same run.
     let identity_digest = {
         let mut identity = spec.clone();
+        identity.catalog_revision.clear();
         identity.payload = crate::boundary_json::exact(&input);
         identity.hub = hub.as_ref().map(|hub| v1::HubAccess {
             origin: hub.origin.trim_end_matches('/').into(),
@@ -296,7 +281,7 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<(crate::runs::Spec, Option<v1::HubAc
         return Err(Status::invalid_argument("the run's Hub origin is invalid"));
     }
     let source = match spec.source {
-        Some(v1::run_spec::Source::Release(release)) => release_source(release)?,
+        Some(v1::run_spec::Source::Release(release)) => release_source(release),
         Some(v1::run_spec::Source::Installation(alias)) => crate::runs::Source::Installation(alias),
         Some(v1::run_spec::Source::Local(local)) => crate::runs::Source::Local(local.manifest),
         // A warm run of model choices alone makes them (and uploads to its destination).
@@ -339,6 +324,7 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<(crate::runs::Spec, Option<v1::HubAc
             .unwrap_or_default(),
         weights_destination: spec.weights_destination,
         owner: spec.owner,
+        catalog_revision: spec.catalog_revision,
         held: None,
         application: String::new(),
         digest: identity_digest,
@@ -1066,7 +1052,7 @@ mod tests {
             parameter: parameter.into(), repository: repository.into(), release: "1".into(), ..Default::default()
         };
         v1::RunSpec {
-            source: Some(v1::run_spec::Source::Release(v1::Release { package: "org/package".into(), release: "1.0.0".into(), ..Default::default() })),
+            source: Some(v1::run_spec::Source::Release(v1::Release { package: "org/package".into(), release: "1.0.0".into() })),
             entrypoint: "render".into(),
             payload: br#" { "seed":9007199254740993, "nested":{"b":2,"a":1} } "#.to_vec(),
             inputs: vec![input("reference", "a", 0), input("reference", "b", 1)],

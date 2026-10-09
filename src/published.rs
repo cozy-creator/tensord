@@ -1,6 +1,5 @@
-//! Published packages and their models, prepared from a Hub under the owner's access and
-//! reused: a run whose installation and model resolution are held reads nothing from the
-//! Hub. Port of the Python worker's release-root preparation (package set from the
+//! Published packages and their models, prepared from a Hub by name (th-245) and reused: a
+//! run whose installation and model resolution are held reads nothing from the Hub. Port of the Python worker's release-root preparation (package set from the
 //! release's locked requirements with uv; model by owner binding ladder, then a TensorFS
 //! download) with its `release_root_preparing` progress answers.
 use crate::{
@@ -65,27 +64,64 @@ pub enum Progress {
 pub struct Request {
     pub source: hub::Source,
     pub package: String,
+    /// Empty: the Hub's newest.
     pub release: String,
-    /// The release's card as the run carries it; installing needs it.
-    pub card: Option<Card>,
     /// Unpublished code this machine already holds, in place of the release.
     pub installed: Option<Installation>,
     /// The account an unpublished package's org-relative model names belong to.
     pub owner: String,
+    /// The caller's catalog revision: a held resolution is reused only under the same one.
+    pub catalog_revision: String,
     /// Provider tokens for source models (memory only).
     pub providers: Providers,
     pub entrypoint: String,
     pub choices: Vec<domain::ModelChoice>,
 }
 
-/// A release as its Hub publishes it, carried by the run (th-241): the machine installs it
-/// reading no Hub.
-#[derive(Clone, Debug)]
-pub struct Card {
-    pub interface: Value,
-    pub python_version: String,
-    /// The locked requirements' text.
-    pub lock: String,
+/// A Hub checkpoint as a run names it (th-245): `repository` at `release` (empty: the newest) in
+/// `lane` (empty: the release's only one), or the owner's checkpoint by hash (`manifest` and no
+/// release). Resolved, it carries the release, lane and manifest the Hub named.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Named {
+    pub repository: String,
+    pub release: String,
+    pub lane: String,
+    /// `sha256:<hex>`; empty until resolved.
+    pub manifest: String,
+}
+
+impl Named {
+    /// The checkpoint the Hub names it: one anonymous closure call.
+    fn at_hub(mut self, source: &hub::Source) -> Result<Self, Failure> {
+        let refspec = match self.release.is_empty() {
+            true => self.repository.clone(),
+            false => format!("{}@{}", self.repository, self.release),
+        };
+        let closure = Catalog::new(source)
+            .map_err(|e| ("catalog_read_failed", e.0))?
+            .closure(&refspec, &self.lane)
+            .map_err(|e| refused("model_resolution_failed", e))?;
+        (self.release, self.lane, self.manifest) = (closure.release, closure.lane, closure.manifest.id());
+        Ok(self)
+    }
+
+    /// The ref a pull names: a release's lane pinned to its manifest, which the Hub checks is that
+    /// lane's, or the owner's checkpoint by hash.
+    fn refspec(&self) -> String {
+        match self.release.is_empty() {
+            true => format!("{}@{}", self.repository, self.manifest),
+            false => format!("{}@{}@{}", self.repository, self.release, self.manifest),
+        }
+    }
+
+    fn of(grant: &ModelGrant) -> Self {
+        Self {
+            repository: grant.repository.clone(),
+            release: grant.release.clone(),
+            lane: grant.lane.clone(),
+            manifest: grant.manifest.clone(),
+        }
+    }
 }
 
 /// The caller's provider tokens; empty reads public sources anonymously.
@@ -171,7 +207,7 @@ pub struct Publisher {
 
 /// The rest of a checkpoint whose declared components a run downloaded first.
 struct Remainder {
-    repository: String,
+    checkpoint: Named,
     source: hub::Source,
     /// What the parts landed, held from GC until the whole checkpoint is recorded.
     holds: Vec<tensorfs_core::ensure::PartHold>,
@@ -404,29 +440,49 @@ impl Publisher {
             .map_err(|(code, message)| Refused { code, message })
     }
 
-    /// A Hub checkpoint downloaded into the store (a warm run's model choice), held from
-    /// eviction while it downloads.
-    pub fn download(
+    /// The checkpoint `named` is: a hash as given, a name as the Hub answers it (one closure
+    /// call), journaled per catalog revision so a warm run, across restarts too, asks the Hub
+    /// nothing (th-245).
+    pub(crate) fn resolve(&self, service: &Service, source: &hub::Source, named: Named, revision: &str) -> Result<Named, Failure> {
+        if !named.manifest.is_empty() {
+            return Ok(named);
+        }
+        let origin = hub::origin_key(&source.origin).unwrap_or_default();
+        let name = json!([origin, named.repository, named.release, named.lane]).to_string();
+        let held = service.engine.with_journal(|j| j.named(&name, revision)).map_err(io_failure)?;
+        if let Some([release, lane, manifest]) = held.and_then(|held| serde_json::from_str::<[String; 3]>(&held).ok()) {
+            return Ok(Named { release, lane, manifest, ..named });
+        }
+        let resolved = named.at_hub(source)?;
+        let answer = json!([resolved.release, resolved.lane, resolved.manifest]).to_string();
+        service.engine.with_journal(|j| j.bind_named(&name, revision, &answer)).map_err(io_failure)?;
+        Ok(resolved)
+    }
+
+    /// A Hub checkpoint resolved and downloaded into the store (a warm run's or a job's model
+    /// choice), held from eviction while it downloads; answers what the Hub named.
+    pub(crate) fn download(
         &self,
         service: &Service,
         source: &hub::Source,
-        repository: &str,
-        manifest: &str,
+        named: Named,
+        revision: &str,
         bytes: &(dyn Fn(u64, u64) + Sync),
-    ) -> Result<(), Refused> {
-        // A checkpoint this store already holds whole, in that repository, asks the Hub nothing.
-        if let Some(sha256) = manifest.strip_prefix("sha256:") {
-            if let Ok(meta) = std::fs::metadata(self.store.manifest_path(sha256)) {
-                let held = tensorfs_core::ids::ObjectRef { sha256: sha256.to_string(), length: meta.len() };
-                if tensorfs_core::checkpoint_root::check_source(&self.store, repository, &held).is_ok() {
-                    return Ok(());
-                }
+    ) -> Result<Named, Refused> {
+        let failed = |(code, message)| Refused { code, message };
+        let named = self.resolve(service, source, named, revision).map_err(failed)?;
+        // A checkpoint this store already holds whole, in that repository, moves nothing.
+        let sha256 = named.manifest.trim_start_matches("sha256:");
+        if let Ok(meta) = std::fs::metadata(self.store.manifest_path(sha256)) {
+            let held = tensorfs_core::ids::ObjectRef { sha256: sha256.to_string(), length: meta.len() };
+            if tensorfs_core::checkpoint_root::check_source(&self.store, &named.repository, &held).is_ok() {
+                return Ok(named);
             }
         }
-        let _fetching = self.fetch(vec![manifest.to_string()]);
-        let keep = self.protected(service).map_err(io_failure).map_err(|(code, message)| Refused { code, message })?;
-        ensure(&self.store, source, repository, manifest, &keep, bytes)
-            .map_err(|(code, message)| Refused { code, message })
+        let _fetching = self.fetch(vec![named.manifest.clone()]);
+        let keep = self.protected(service).map_err(io_failure).map_err(failed)?;
+        ensure(&self.store, source, &named, &keep, bytes).map_err(failed)?;
+        Ok(named)
     }
 
     /// Downloads the rest of every checkpoint `run`'s preparation took part of, once the run
@@ -463,12 +519,12 @@ impl Publisher {
         ) {
             std::thread::sleep(tick);
         }
-        let Some((repository, source)) = self
+        let Some((checkpoint, source)) = self
             .remainders
             .lock()
             .unwrap()
             .get(manifest)
-            .map(|r| (r.repository.clone(), r.source.clone()))
+            .map(|r| (r.checkpoint.clone(), r.source.clone()))
         else {
             return;
         };
@@ -500,7 +556,7 @@ impl Publisher {
                         }
                     }
                 });
-                let result = ensure_with(&self.store, &source, &repository, manifest, &keep, &pull, &|_, _| ());
+                let result = ensure_with(&self.store, &source, &checkpoint, &keep, &pull, &|_, _| ());
                 done.store(true, std::sync::atomic::Ordering::Release);
                 result
             });
@@ -570,15 +626,20 @@ impl Publisher {
     }
 
     fn alias(&self, request: &Request) -> String {
-        if let Some(installed) = &request.installed {
-            return installed.alias.clone();
+        match &request.installed {
+            Some(installed) => installed.alias.clone(),
+            None => self.release_alias(request, &request.release),
         }
+    }
+
+    /// The installation of `release` of the request's package at its Hub, by this machine's SDK.
+    fn release_alias(&self, request: &Request, release: &str) -> String {
         let origin = hub::origin_key(&request.source.origin).unwrap_or_default();
         let sdk = format!(
             "{:?}{:?}{:?}",
             self.sdk.requirements, self.sdk.find_links, self.sdk.client_wheel
         );
-        let key = format!("{origin}\0{}\0{}\0{sdk}", request.package, request.release);
+        let key = format!("{origin}\0{}\0{release}\0{sdk}", request.package);
         format!("hub-{}", &sha256::hex_digest(key.as_bytes())[..32])
     }
 
@@ -597,6 +658,7 @@ impl Publisher {
                         .map(|m| (sha256::hex(&m.digest), m.length)),
                     c.source,
                     c.profiles,
+                    c.rungs.iter().map(|r| (&r.gpu, r.gpus, &r.lane)).collect::<Vec<_>>(),
                     // Adapter order and scale are part of what the slot runs.
                     c.adapters
                         .iter()
@@ -617,7 +679,7 @@ impl Publisher {
         let origin = hub::origin_key(&request.source.origin).unwrap_or_default();
         let package = request.installed.as_ref().map(|i| i.package.as_str()).unwrap_or(&request.package);
         let release = request.installed.as_ref().map(|i| i.release.as_str()).unwrap_or(&request.release);
-        let key = json!({"installation":alias,"package":package,"release":release,"hub":origin,"owner":request.owner,"entrypoint":request.entrypoint,"choices":choices,"gpu":gpu});
+        let key = json!({"installation":alias,"package":package,"release":release,"hub":origin,"owner":request.owner,"catalog":request.catalog_revision,"entrypoint":request.entrypoint,"choices":choices,"gpu":gpu});
         format!("hub-{}", sha256::hex_digest(key.to_string().as_bytes()))
     }
 
@@ -710,6 +772,9 @@ impl Publisher {
         })
     }
 
+    /// The request's release installed for this signer: its card and locked requirements read
+    /// at its Hub by name (th-245), the Hub's newest release when it names none. An installation
+    /// of that release this signer holds already is the answer.
     fn install(
         &self,
         service: &Service,
@@ -717,42 +782,45 @@ impl Publisher {
         request: &Request,
         job: &Job,
     ) -> Result<Installation, Failure> {
-        job.stage(format!(
-            "installing {}@{}",
-            request.package, request.release
-        ));
-        let (_, name) = request.package.split_once('/').ok_or((
+        let (org, name) = request.package.split_once('/').ok_or((
             "release_root_invalid",
             "package must be org/name".to_string(),
         ))?;
-        let card = request.card.as_ref().ok_or((
-            "release_card_absent",
-            format!("the run carries no card for {}@{}, which this signer has not installed", request.package, request.release),
-        ))?;
-        if !card.interface.is_object() {
-            return Err((
-                "package_prepare_interface_missing",
-                "the release card carries no package interface".to_string(),
-            ));
+        let catalog = Catalog::new(&request.source).map_err(|e| ("catalog_read_failed", e.0))?;
+        let release = match request.release.is_empty() {
+            true => newest_release(&catalog, org, name)?,
+            false => request.release.clone(),
+        };
+        let alias = self.release_alias(request, &release);
+        if let Some(held) = service.engine.installation(actor, &alias).map_err(io_failure)? {
+            if service.catalog.resolve(&held.generation).is_ok() {
+                return Ok(held);
+            }
         }
-        let interface = card.interface.clone();
-        let python = Some(card.python_version.as_str())
-            .filter(|v| !v.is_empty())
-            .unwrap_or(&self.sdk.python)
-            .to_string();
-        let lock = card.lock.clone();
-        let split = split_lock(
-            &lock,
-            name,
-            &request.release,
-            !self.sdk.requirements.is_empty(),
-        )?;
+        job.stage(format!("installing {}@{release}", request.package));
+        let base = format!("/v1/packages/{}/{}/releases/{}", hub::escape(org), hub::escape(name), hub::escape(&release));
+        let card = catalog.json(&base).map_err(|e| ("catalog_read_failed", e.0))?;
+        if card.pointer("/release/release").and_then(Value::as_str) != Some(release.as_str()) {
+            return Err(("catalog_read_failed", format!("{base} named another release")));
+        }
+        let interface = card.get("package_interface").filter(|v| v.is_object()).cloned().ok_or((
+            "package_prepare_interface_missing",
+            "the release carries no package interface".to_string(),
+        ))?;
+        let python = card["python_version"].as_str().filter(|v| !v.is_empty()).unwrap_or(&self.sdk.python).to_string();
+        let lock = catalog
+            .get(&format!("{base}/locked-requirements"), 16 << 20)
+            .map_err(|e| ("catalog_read_failed", e.0))?;
+        let lock = String::from_utf8(lock).map_err(|_| {
+            ("package_prepare_locked_requirements_invalid", "locked requirements are not UTF-8".to_string())
+        })?;
+        let split = split_lock(&lock, name, &release, !self.sdk.requirements.is_empty())?;
         let identity = sha256::hex_digest(json!({"lock":lock,"python":python,"hub":hub::origin_key(&request.source.origin),"sdk":self.sdk.requirements,"links":self.sdk.find_links,"client":self.sdk.client_wheel}).to_string().as_bytes())[..32].to_string();
         let wanted = Environment {
             split: &split,
             python: &python,
             interface: &interface,
-            release: &request.release,
+            release: &release,
             source: &request.source,
         };
         self.generation(service.catalog.root(), &identity, &wanted, job)?;
@@ -766,10 +834,10 @@ impl Publisher {
             .engine
             .bind_installation(Installation {
                 actor: actor.into(),
-                alias: self.alias(request),
+                alias,
                 generation: identity,
                 package: request.package.clone(),
-                release: request.release.clone(),
+                release,
                 interface: serde_json::to_vec(&held.record.interface)
                     .map_err(|e| io_failure(io::Error::other(e)))?,
             })
@@ -1178,15 +1246,16 @@ impl Publisher {
                 grants.push(self.held_grant(installation, &path, reference)?);
                 continue;
             }
-            let exact = exact(choice, &path, (&gpu_model, width))?;
-            degree = degree.max(exact.gpus);
+            let (named, gpus) = choose(choice, &path, (&gpu_model, width))?;
+            let named = self.resolve(service, &request.source, named, &request.catalog_revision)?;
+            degree = degree.max(gpus);
             grants.push(ModelGrant {
                 package: installation.package.clone(),
                 slot: path,
-                repository: exact.repository,
-                release: exact.release,
-                lane: exact.lane,
-                manifest: exact.manifest,
+                repository: named.repository,
+                release: named.release,
+                lane: named.lane,
+                manifest: named.manifest,
                 components: vec![],
             });
         }
@@ -1236,7 +1305,7 @@ impl Publisher {
             remainders
                 .entry(grant.manifest.clone())
                 .or_insert_with(|| Remainder {
-                    repository: grant.repository.clone(),
+                    checkpoint: Named::of(grant),
                     source: request.source.clone(),
                     holds: Vec::new(),
                     started: false,
@@ -1260,7 +1329,8 @@ impl Publisher {
                 .iter()
                 .find(|c| c.parameter == grant.slot || c.parameter == parameter)
             {
-                apply_adapters(&self.store, &request.source, choice, grant, &keep, &request.providers, job)?;
+                let resolve = |named| self.resolve(service, &request.source, named, &request.catalog_revision);
+                apply_adapters(&self.store, &request.source, &resolve, choice, grant, &keep, &request.providers, job)?;
             }
         }
         job.stage(format!("preparing {}", request.package));
@@ -1302,43 +1372,27 @@ pub(crate) fn machine_gpu(service: &Service) -> (String, usize) {
     })
 }
 
-/// A Hub model slot's exact checkpoint as its choice names it (th-241: the caller resolved
-/// it): the pinned manifest, or the widest rung of its binding this machine's GPUs fit.
-pub(crate) struct Exact {
-    pub repository: String,
-    pub release: String,
-    pub lane: String,
-    pub manifest: String,
-    /// The rung's GPU count; 0 for a pinned checkpoint.
-    pub gpus: u32,
-}
-
-pub(crate) fn exact(choice: &domain::ModelChoice, path: &str, (gpu, width): (&str, usize)) -> Result<Exact, Failure> {
+/// A Hub model slot's checkpoint as its choice names it (th-245): the owner's by hash, else
+/// `repository` at `release` in the choice's lane, else the widest rung of its binding this
+/// machine's GPUs fit, else the release's only lane; with the rung's GPU count (0 unstated).
+pub(crate) fn choose(choice: &domain::ModelChoice, path: &str, (gpu, width): (&str, usize)) -> Result<(Named, u32), Failure> {
     if choice.repository.is_empty() {
-        return Err(("model_choice_inexact", format!("{path}'s choice names no model repository")));
+        return Err(("model_choice_absent", format!("{path}'s choice names no model repository")));
     }
-    let (lane, manifest, gpus) = match &choice.manifest {
-        Some(reference) if reference.digest.len() == 32 => (choice.lane.clone(), &reference.digest, 0),
-        _ if choice.rungs.is_empty() => {
-            return Err(("model_choice_inexact", format!("{path}'s choice names no exact checkpoint")));
-        }
-        _ => {
+    let manifest = choice.manifest.as_ref().map(|m| format!("sha256:{}", sha256::hex(&m.digest))).unwrap_or_default();
+    let (lane, gpus) = match choice.lane.is_empty() && manifest.is_empty() && !choice.rungs.is_empty() {
+        true => {
             let rung = rung(&choice.rungs, gpu, width).ok_or((
                 "model_binding_absent",
                 format!("no rung of {path}'s binding fits {width}x {gpu:?}"),
             ))?;
-            (rung.lane.clone(), &rung.manifest.digest, rung.gpus)
+            (rung.lane.clone(), rung.gpus)
         }
+        false => (choice.lane.clone(), 0),
     };
-    Ok(Exact {
-        repository: choice.repository.clone(),
-        release: choice.release.clone(),
-        lane,
-        manifest: format!("sha256:{}", sha256::hex(manifest)),
-        gpus,
-    })
+    let named = Named { repository: choice.repository.clone(), release: choice.release.clone(), lane, manifest };
+    Ok((named, gpus))
 }
-
 
 fn make_source(
     store: &Store,
@@ -1381,17 +1435,16 @@ fn make_source(
     .map_err(|e| refused("model_source_failed", e))
 }
 
-/// Download one exact checkpoint, anonymously unless the run's capability names it (an
-/// owner's unpublished checkpoint); `keep` names what its GC must not evict (`protected`).
+/// Download one resolved checkpoint: a release's lane anonymously, the owner's checkpoint by
+/// hash under the run's capability; `keep` names what its GC must not evict (`protected`).
 fn ensure(
     store: &Store,
     source: &hub::Source,
-    repository: &str,
-    manifest: &str,
+    checkpoint: &Named,
     keep: &[String],
     bytes: &(dyn Fn(u64, u64) + Sync),
 ) -> Result<(), Failure> {
-    ensure_with(store, source, repository, manifest, keep, &Pull::default(), bytes).map(drop)
+    ensure_with(store, source, checkpoint, keep, &Pull::default(), bytes).map(drop)
 }
 
 /// How one ensure pulls: some components only (held until dropped), its streams, its stop.
@@ -1405,15 +1458,18 @@ struct Pull {
 fn ensure_with(
     store: &Store,
     source: &hub::Source,
-    repository: &str,
-    manifest: &str,
+    checkpoint: &Named,
     keep: &[String],
     pull: &Pull,
     bytes: &(dyn Fn(u64, u64) + Sync),
 ) -> Result<Option<tensorfs_core::ensure::PartHold>, Failure> {
-    let catalog = Catalog::for_op(source, hub::Op::Read { model: repository, manifest })?;
+    let (model, manifest) = (checkpoint.repository.as_str(), checkpoint.manifest.as_str());
+    let catalog = match checkpoint.release.is_empty() {
+        true => Catalog::for_op(source, hub::Op::Read { model, manifest })?,
+        false => Catalog::new(source).map_err(|e| ("catalog_read_failed", e.0))?,
+    };
     let credential = catalog.credential();
-    let refspec = format!("{repository}@{manifest}");
+    let refspec = checkpoint.refspec();
     let mut keep = keep.to_vec();
     keep.push(manifest.to_string());
     let on_event = |event: &tensorfs_core::ensure::Event| bytes(event.bytes_done, event.bytes_total);
@@ -1424,6 +1480,7 @@ fn ensure_with(
         credential,
         catalog.policy(),
     );
+    request.lane = &checkpoint.lane;
     request.keep = &keep;
     request.on_event = Some(&on_event);
     request.cancellation = pull.cancellation.clone();
@@ -1477,7 +1534,7 @@ fn download_all<'g>(
                 let moved = &moved;
                 scope.spawn(move || {
                     let pull = Pull { components: part.clone(), ..Pull::default() };
-                    ensure_with(store, source, &grant.repository, &grant.manifest, keep, &pull, &|done, total| {
+                    ensure_with(store, source, &Named::of(grant), keep, &pull, &|done, total| {
                         let (done, total) = {
                             let mut moved = moved.lock().unwrap();
                             moved[at] = (done, total);
@@ -1512,9 +1569,11 @@ fn refused(code: &'static str, refusal: tensorfs_core::err::Refusal) -> Failure 
 
 /// A slot's caller adapters applied to its resolved base: each adapter downloaded, then one
 /// adapter view composed (`adapter_views`); the grant then names the view.
+#[allow(clippy::too_many_arguments)]
 fn apply_adapters(
     store: &Store,
     source: &hub::Source,
+    resolve: &dyn Fn(Named) -> Result<Named, Failure>,
     choice: &domain::ModelChoice,
     grant: &mut ModelGrant,
     keep: &[String],
@@ -1545,15 +1604,18 @@ fn apply_adapters(
     let mut selections = vec![];
     for adapter in &choice.adapters {
         let manifest = if adapter.source.is_empty() {
-            // Exact as the caller resolved it (th-241): the machine reads no model card.
-            if adapter.model.is_empty() || !adapter.manifest.starts_with("sha256:") {
-                return Err((
-                    "adapter_inexact",
-                    format!("an adapter of {} names no exact checkpoint", grant.slot),
-                ));
+            // By name, resolved at the Hub, or the owner's by hash (th-245).
+            if adapter.model.is_empty() {
+                return Err(("adapter_absent", format!("an adapter of {} names no model", grant.slot)));
             }
-            ensure(store, source, &adapter.model, &adapter.manifest, &keep, &|d, t| job.bytes(d, t))?;
-            adapter.manifest.clone()
+            let named = resolve(Named {
+                repository: adapter.model.clone(),
+                release: adapter.release.clone(),
+                lane: adapter.lane.clone(),
+                manifest: adapter.manifest.clone(),
+            })?;
+            ensure(store, source, &named, &keep, &|d, t| job.bytes(d, t))?;
+            named.manifest
         } else {
             // A provider-source LoRA (civitai://, hf://) is made here, normalized at ingest.
             let made = make_source(store, &adapter.source, &adapter.profiles, providers, &|stage, moved, total| {
@@ -1588,6 +1650,36 @@ fn apply_adapters(
     grant.repository = composed.repository;
     grant.manifest = format!("sha256:{}", composed.manifest.sha256);
     Ok(())
+}
+
+/// The newest release of `org/name` at the Hub (a run naming none): the newest final release
+/// by version, else the newest pre-release; yanked ones never.
+fn newest_release(catalog: &Catalog, org: &str, name: &str) -> Result<String, Failure> {
+    let card = catalog
+        .json(&format!("/v1/packages/{}/{}", hub::escape(org), hub::escape(name)))
+        .map_err(|e| ("catalog_read_failed", e.0))?;
+    card["releases"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|row| row["yanked"].as_bool() != Some(true) && row["yanked_at"].as_str().is_none_or(str::is_empty))
+        .filter_map(|row| row["release"].as_str())
+        .max_by(|a, b| release_order(a).cmp(&release_order(b)))
+        .map(str::to_string)
+        .ok_or(("release_absent", format!("{org}/{name} has no release that is not yanked")))
+}
+
+/// Finals after pre-releases, then by the numbers of the version and of its tag.
+fn release_order(release: &str) -> (bool, Vec<u64>, Vec<u64>) {
+    let numbers = |text: &str| -> Vec<u64> {
+        text.split(|c: char| !c.is_ascii_digit())
+            .filter(|part| !part.is_empty())
+            .map(|part| part.parse().unwrap_or(u64::MAX))
+            .collect()
+    };
+    let split = release.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(release.len());
+    let (version, tag) = release.split_at(split);
+    (tag.is_empty(), numbers(version), numbers(tag))
 }
 
 fn stage_of(progress: &Progress) -> String {
@@ -2147,13 +2239,7 @@ mod tests {
     fn rungs(ladder: &[(&str, u32, &str)]) -> Vec<domain::ModelRung> {
         ladder
             .iter()
-            .enumerate()
-            .map(|(i, (gpu, gpus, lane))| domain::ModelRung {
-                gpu: gpu.to_string(),
-                gpus: *gpus,
-                lane: lane.to_string(),
-                manifest: domain::Ref { digest: vec![i as u8; 32], length: 1 },
-            })
+            .map(|(gpu, gpus, lane)| domain::ModelRung { gpu: gpu.to_string(), gpus: *gpus, lane: lane.to_string() })
             .collect()
     }
 
@@ -2171,33 +2257,46 @@ mod tests {
         assert_eq!(lane(&h3, "NVIDIA H100 80GB HBM3", 8), Some(("fp8-pruned".into(), 4)));
     }
 
-    /// A Hub slot's checkpoint is exact as its choice names it, a pinned manifest or the rung
-    /// this machine fits; anything else is refused, never resolved at a Hub.
+    /// A Hub slot's checkpoint is a name (its lane, else the rung this machine fits, else the
+    /// release's only one) or the owner's hash; a choice naming no repository is absent.
     #[test]
-    fn a_hub_choice_is_exact_or_refused() {
+    fn a_hub_choice_is_a_name_or_the_owners_hash() {
+        let choose = |choice: &domain::ModelChoice, gpu| self::choose(choice, "touch.models.source", gpu);
         let pinned = domain::ModelChoice {
             repository: "proof/probe".into(),
             lane: "bf16".into(),
             manifest: Some(domain::Ref { digest: vec![7; 32], length: 9 }),
             ..Default::default()
         };
-        let got = self::exact(&pinned, "touch.models.source", ("", 0)).unwrap();
-        assert_eq!((got.manifest, got.gpus), (format!("sha256:{}", "07".repeat(32)), 0));
+        let (got, gpus) = choose(&pinned, ("", 0)).unwrap();
+        assert_eq!((got.manifest, got.release, gpus), (format!("sha256:{}", "07".repeat(32)), String::new(), 0));
         let laddered = domain::ModelChoice {
             repository: "proof/probe".into(),
             release: "1.0.0".into(),
             rungs: rungs(&[("h100", 2, "fp8"), ("*", 0, "bf16")]),
             ..Default::default()
         };
-        let got = self::exact(&laddered, "touch.models.source", ("NVIDIA H100 80GB HBM3", 2)).unwrap();
-        assert_eq!((got.lane.as_str(), got.gpus, got.release.as_str()), ("fp8", 2, "1.0.0"));
-        assert_eq!(got.manifest, format!("sha256:{}", "00".repeat(32)));
-        let got = self::exact(&laddered, "touch.models.source", ("NVIDIA A40", 1)).unwrap();
-        assert_eq!(got.lane, "bf16");
-        let named = domain::ModelChoice { repository: "proof/probe".into(), release: "1.0.0".into(), ..Default::default() };
-        assert_eq!(self::exact(&named, "touch.models.source", ("", 0)).err().unwrap().0, "model_choice_inexact");
+        let (got, gpus) = choose(&laddered, ("NVIDIA H100 80GB HBM3", 2)).unwrap();
+        assert_eq!((got.lane.as_str(), gpus, got.release.as_str(), got.manifest.as_str()), ("fp8", 2, "1.0.0", ""));
+        assert_eq!(choose(&laddered, ("NVIDIA A40", 1)).unwrap().0.lane, "bf16");
+        let only = domain::ModelChoice { repository: "proof/probe".into(), rungs: rungs(&[("h100", 0, "fp8")]), ..Default::default() };
+        assert_eq!(choose(&only, ("NVIDIA A40", 1)).err().unwrap().0, "model_binding_absent");
+        let named = domain::ModelChoice { repository: "proof/probe".into(), ..Default::default() };
+        let (got, _) = choose(&named, ("", 0)).unwrap();
+        assert_eq!((got.release.as_str(), got.lane.as_str(), got.manifest.as_str()), ("", "", ""));
         let unnamed = domain::ModelChoice { manifest: pinned.manifest.clone(), ..Default::default() };
-        assert_eq!(self::exact(&unnamed, "touch.models.source", ("", 0)).err().unwrap().0, "model_choice_inexact");
+        assert_eq!(choose(&unnamed, ("", 0)).err().unwrap().0, "model_choice_absent");
+    }
+
+    #[test]
+    fn a_checkpoint_pulls_pinned_to_its_release_or_by_the_owners_hash() {
+        let manifest = format!("sha256:{}", "ab".repeat(32));
+        let named = Named { repository: "o/m".into(), release: "1.0.0".into(), lane: "fp8".into(), manifest: manifest.clone() };
+        assert_eq!(named.refspec(), format!("o/m@1.0.0@{manifest}"));
+        let private = Named { release: String::new(), ..named };
+        assert_eq!(private.refspec(), format!("o/m@{manifest}"));
+        assert!(release_order("2.0.0") > release_order("10.0.0rc1"));
+        assert!(release_order("10.0.0") > release_order("9.1.0"));
     }
 
     /// A source choice becomes the slot's grant through TensorFS `source_model`, as a local

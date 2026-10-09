@@ -23,7 +23,8 @@ use std::{
 };
 
 pub enum Source {
-    Release { package: String, release: String, card: Option<Card> },
+    /// A published release by name (th-245); empty: the Hub's newest.
+    Release { package: String, release: String },
     /// An installation this machine already holds for the signer.
     Installation(String),
     /// Unpublished code written with Write: its manifest's digest.
@@ -32,17 +33,8 @@ pub enum Source {
     Models,
 }
 
-/// A release's card as a run carries it (th-241): the machine installs from it, reading no Hub.
-#[derive(Clone, Debug)]
-pub struct Card {
-    pub interface: Value,
-    pub python_version: String,
-    /// The locked requirements: an object the signer wrote (`sha256:<hex>`).
-    pub locked_requirements: String,
-}
-
-/// A published release a run installs, with its card.
-type Published = (String, String, Option<Card>);
+/// A published release a run installs: its package and release.
+type Published = (String, String);
 
 /// One member of the warm set a warm run carries (`RunSpec.set`).
 pub struct SetItem {
@@ -76,6 +68,8 @@ pub struct Spec {
     /// `org/name`: a model-only warm run puts the source model it made there.
     pub weights_destination: String,
     pub owner: String,
+    /// The caller's catalog revision: held resolutions are reused only under it (th-245).
+    pub catalog_revision: String,
     /// A child's memoized result this machine holds: its answer.
     pub held: Option<ResultRecord>,
     /// A child run of a callee: the other package's App its parent's environment holds.
@@ -98,7 +92,7 @@ pub struct Runs {
     pub jobs: Mutex<HashMap<String, JobContext>>,
 }
 
-/// What a job's children prepare with: its installation, Hub access, owner, binding revision,
+/// What a job's children prepare with: its installation, Hub access, owner, catalog revision,
 /// attention pin and the model choices addressed to its callables (`<entrypoint>.models.<p>`).
 #[derive(Clone)]
 pub struct JobContext {
@@ -107,6 +101,7 @@ pub struct JobContext {
     hub: Option<hub::Source>,
     providers: Providers,
     owner: String,
+    catalog_revision: String,
     attention_kernel: String,
     models: Vec<domain::ModelChoice>,
     /// The job's own model inputs, made present: parameter -> (class, manifest).
@@ -131,6 +126,8 @@ struct Durable {
     #[serde(default)]
     application: String,
     owner: String,
+    #[serde(default)]
+    catalog_revision: String,
     attention_kernel: String,
     models: Vec<Vec<u8>>,
     #[serde(default)]
@@ -157,6 +154,7 @@ impl Durable {
             installation: context.installation.clone(),
             application: context.application.clone(),
             owner: context.owner.clone(),
+            catalog_revision: context.catalog_revision.clone(),
             attention_kernel: context.attention_kernel.clone(),
             models: context.models.iter().map(crate::archive::encode_model_choice).collect(),
             inputs: context
@@ -179,6 +177,7 @@ impl Durable {
             hub,
             providers: Providers::default(),
             owner: self.owner,
+            catalog_revision: self.catalog_revision,
             attention_kernel: self.attention_kernel,
             models: self
                 .models
@@ -464,28 +463,30 @@ impl Runs {
                 let row = json!({"parameter": choice.parameter,
                     "repository": choice.repository, "manifest": manifest.id()});
                 (manifest, row)
-            } else {
-                let digest = choice.manifest.as_ref().ok_or_else(|| {
-                    refused(
-                        "invalid_request",
-                        format!("model choice {:?} names no exact manifest or provider source", choice.parameter),
-                    )
+            } else if choice.repository.is_empty() {
+                // A checkpoint this machine already holds (a run's output).
+                let manifest = choice.manifest.as_ref().ok_or_else(|| {
+                    refused("invalid_request", format!("model choice {:?} names no model", choice.parameter))
                 })?;
-                let sha256 = tensorfs_core::sha256::hex(&digest.digest);
-                let manifest = format!("sha256:{sha256}");
-                if !choice.repository.is_empty() {
-                    let stage = format!("downloading {}", choice.repository);
-                    publisher.download(&self.service, hub_access()?, &choice.repository, &manifest, &|done, total| {
-                        observe(&stage, done, total)
-                    })?;
-                }
-                // No repository: a checkpoint this machine already holds (a run's output).
-                let length = std::fs::metadata(publisher.store().manifest_path(&sha256)).map_err(|_| {
-                    refused("checkpoint_absent", format!("this machine holds no checkpoint {manifest}"))
-                })?;
-                let row = json!({"parameter": choice.parameter,
-                    "repository": choice.repository, "manifest": manifest});
+                let sha256 = tensorfs_core::sha256::hex(&manifest.digest);
+                let length = std::fs::metadata(publisher.store().manifest_path(&sha256))
+                    .map_err(|_| refused("checkpoint_absent", format!("this machine holds no checkpoint sha256:{sha256}")))?;
+                let row = json!({"parameter": choice.parameter, "manifest": format!("sha256:{sha256}")});
                 (ObjectRef { sha256, length: length.len() }, row)
+            } else {
+                // A Hub checkpoint by name, or the owner's by hash.
+                let (gpu, width) = crate::published::machine_gpu(&self.service);
+                let (named, _) = crate::published::choose(choice, &choice.parameter, (&gpu, width))
+                    .map_err(|(code, message)| refused(code, message))?;
+                let stage = format!("downloading {}", choice.repository);
+                let named = publisher.download(&self.service, hub_access()?, named, &spec.catalog_revision, &|done, total| {
+                    observe(&stage, done, total)
+                })?;
+                let sha256 = named.manifest.trim_start_matches("sha256:").to_string();
+                let length = std::fs::metadata(publisher.store().manifest_path(&sha256))?.len();
+                let row = json!({"parameter": choice.parameter, "repository": named.repository,
+                    "release": named.release, "lane": named.lane, "manifest": named.manifest});
+                (ObjectRef { sha256, length }, row)
             };
             if let Some(name) = destination.strip_prefix("local/") {
                 // A local alias (`cozy model download … local/name`): the model, held by name.
@@ -602,10 +603,7 @@ impl Runs {
         };
         let hub = spec.hub.clone().or_else(|| self.own_hub.clone());
         let release = match &spec.source {
-            Source::Release { release, .. } if release.is_empty() => {
-                return Err(refused("invalid_request", "a release source names its release"));
-            }
-            Source::Release { package, release, card } => Some((package.clone(), release.clone(), card.clone())),
+            Source::Release { package, release } => Some((package.clone(), release.clone())),
             _ => None,
         };
         // A job's choices address its callables; its children resolve them.
@@ -690,6 +688,7 @@ impl Runs {
                 hub,
                 providers: spec.providers.clone(),
                 owner: spec.owner.clone(),
+                catalog_revision: spec.catalog_revision.clone(),
                 attention_kernel: spec.attention_kernel.clone(),
                 models: spec.models.clone(),
                 inputs,
@@ -737,10 +736,7 @@ impl Runs {
                     let absent = || refused("installation_absent", "this machine holds no such installation for this signer");
                     (Some(held.ok_or_else(absent)?), None)
                 }
-                Source::Release { release, .. } if release.is_empty() => {
-                    return Err(refused("invalid_request", "a warm set member's release names its release"));
-                }
-                Source::Release { package, release, card } => (None, Some((package.clone(), release.clone(), card.clone()))),
+                Source::Release { package, release } => (None, Some((package.clone(), release.clone()))),
                 _ => return Err(refused("invalid_request", "a warm set member names a release or an installation")),
             };
             // `installed` stops at the code: nothing of the function is resolved or downloaded.
@@ -821,16 +817,15 @@ impl Runs {
             .is_none_or(|installed| declares_models(installed, entrypoint));
         match (hub, &self.publisher) {
             (Some(source), Some(publisher)) if needs_hub => {
-                let (package, release, card) = release.unwrap_or_default();
-                let card = card.map(|card| self.card(actor, card)).transpose()?;
+                let (package, release) = release.unwrap_or_default();
                 let request = Request {
                     source,
                     package,
                     release,
-                    card,
                     installed: held,
                     owner: spec.owner.clone(),
-                        providers: spec.providers.clone(),
+                    catalog_revision: spec.catalog_revision.clone(),
+                    providers: spec.providers.clone(),
                     entrypoint: entrypoint.into(),
                     choices: choices.to_vec(),
                 };
@@ -850,23 +845,6 @@ impl Runs {
                 Ok((installed, plan))
             }
         }
-    }
-
-    /// A release card with its locked requirements read from the object the signer wrote.
-    fn card(&self, actor: &str, card: Card) -> Result<crate::published::Card, Refused> {
-        let absent = || {
-            refused(
-                "release_card_invalid",
-                format!("the release's locked requirements {} were not written to this machine", card.locked_requirements),
-            )
-        };
-        let (path, length) = self.objects.path(actor, &card.locked_requirements)?.ok_or_else(absent)?;
-        if length > 16 << 20 {
-            return Err(refused("release_card_invalid", "a release's locked requirements are at most 16 MiB"));
-        }
-        let lock = String::from_utf8(std::fs::read(path)?)
-            .map_err(|_| refused("release_card_invalid", "a release's locked requirements are UTF-8"))?;
-        Ok(crate::published::Card { interface: card.interface, python_version: card.python_version, lock })
     }
 
     /// A child call of a running job: a run `<request>` under the job's signer, idempotent on
@@ -979,6 +957,7 @@ impl Runs {
             providers: context.providers,
             weights_destination: String::new(),
             owner: context.owner,
+            catalog_revision: context.catalog_revision,
             held: None,
             application: application.into(),
             digest: digest.into(),
@@ -1119,21 +1098,21 @@ impl Runs {
                     .make_source(&choice.source, &choice.profiles, &spec.providers, observe)?
                     .manifest
             } else {
-                // A Hub checkpoint, exact as the caller resolved it (th-241).
+                // A Hub checkpoint by name, or the owner's by hash (th-245).
                 let choice = choice.ok_or_else(|| {
                     refused("model_choice_absent", format!("the run names no model for {path}"))
                 })?;
                 let (gpu, width) = crate::published::machine_gpu(&self.service);
-                let exact = crate::published::exact(choice, path, (&gpu, width))
+                let (named, _) = crate::published::choose(choice, path, (&gpu, width))
                     .map_err(|(code, message)| refused(code, message))?;
                 let hub = hub.ok_or_else(|| {
                     refused("hub_access_absent", "a Hub model downloads with the run's Hub access, and this run carries none")
                 })?;
-                let stage = format!("downloading {}", exact.repository);
-                publisher.download(&self.service, hub, &exact.repository, &exact.manifest, &|done, total| {
+                let stage = format!("downloading {}", named.repository);
+                let named = publisher.download(&self.service, hub, named, &spec.catalog_revision, &|done, total| {
                     observe(&stage, done, total)
                 })?;
-                let sha256 = exact.manifest.trim_start_matches("sha256:").to_string();
+                let sha256 = named.manifest.trim_start_matches("sha256:").to_string();
                 let length = std::fs::metadata(publisher.store().manifest_path(&sha256))?.len();
                 ObjectRef { sha256, length }
             };
@@ -1208,6 +1187,7 @@ mod tests {
             installation: String::new(),
             application: String::new(),
             owner: "alice".into(),
+            catalog_revision: String::new(),
             attention_kernel: String::new(),
             models: vec![],
             inputs: BTreeMap::from([("model".into(), ("Model".into(), model.repeat(64), 1))]),
@@ -1281,6 +1261,7 @@ mod tests {
             providers: Default::default(),
             weights_destination: String::new(),
             owner: "alice".into(),
+            catalog_revision: String::new(),
             held: None,
             application: String::new(),
             digest: digest.into(),
@@ -1567,7 +1548,7 @@ mod tests {
         let source = hub::Source::new("https://hub.example", None, vec![], None).unwrap();
         runs.jobs.lock().unwrap().insert("7".into(), JobContext {
             installation:"caller".into(),application:String::new(),hub:Some(source),providers:Default::default(),
-            owner:"alice".into(),attention_kernel:String::new(),
+            owner:"alice".into(),catalog_revision:String::new(),attention_kernel:String::new(),
             models:vec![
                 domain::ModelChoice { parameter:"second/callee/render.models.network".into(),repository:"second/chosen".into(),..Default::default() },
                 domain::ModelChoice { parameter:"render.models.absent".into(),repository:"second/nowhere".into(),..Default::default() },
@@ -1616,7 +1597,7 @@ mod tests {
         }).unwrap();
         runs.jobs.lock().unwrap().insert("7".into(), JobContext {
             installation: "pkg".into(), hub: None, providers: Default::default(), owner: "alice".into(),
-            application: String::new(),
+            catalog_revision: String::new(), application: String::new(),
             attention_kernel: String::new(), models: vec![],
             inputs: Default::default(), weights_destination: String::new(),
         });

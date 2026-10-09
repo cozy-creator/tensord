@@ -1,4 +1,4 @@
-//! Hub access (th-241). Public content is read anonymously. A run's private operations (reading
+//! Hub access (th-241, th-245). Released content is read anonymously, by name. A run's private operations (reading
 //! one of the owner's unpublished checkpoints, publishing to the owner's repositories) are
 //! named by a capability the owner's CLI signed with its device key for this machine's TLS leaf.
 //! At the run's first private operation the machine trades it, once, for a DPoP-bound token
@@ -12,8 +12,8 @@ use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tensorfs_core::transport::{
-    self, AccessToken, Anonymous, Ask, CredentialProvider, Deadline, DpopCredential, DpopKey,
-    SourcePolicy,
+    self, AccessToken, Anonymous, Ask, Client, Closure, CredentialProvider, Deadline, DpopCredential,
+    DpopKey, Ledger, SourcePolicy,
 };
 
 /// The AuthKit client every TensorD asserts as.
@@ -620,6 +620,25 @@ impl Catalog {
     pub fn policy(&self) -> &SourcePolicy {
         &self.policy
     }
+
+    /// One read of the Hub's API (`path` from the origin), at most `cap` bytes, from the Hub
+    /// host only.
+    pub fn get(&self, path: &str, cap: u64) -> Result<Vec<u8>, Refusal> {
+        let policy = SourcePolicy { allowed_hosts: vec![self.host.clone()], ..self.policy.clone() };
+        transport::api_get(&format!("{}{path}", self.origin), &policy, self.credential(), cap, Deadline::none(), &Ledger::new())
+            .map(|(body, _)| body)
+            .map_err(|e| Refusal(format!("{path}: {}", e.detail)))
+    }
+    pub fn json(&self, path: &str) -> Result<Value, Refusal> {
+        serde_json::from_slice(&self.get(path, 4 << 20)?).map_err(|_| Refusal(format!("{path}: invalid JSON")))
+    }
+
+    /// What `refspec` (`org/name[@release][@sha256:<hex>]`) and `lane` name at the Hub: the
+    /// first page of its closure, which carries the release, lane and manifest it resolved.
+    pub fn closure(&self, refspec: &str, lane: &str) -> Result<Closure, tensorfs_core::err::Refusal> {
+        transport::closure(&Client::new(), &self.origin, refspec, lane, "", self.credential(), &self.policy, Deadline::none(), &Ledger::new())
+    }
+
     /// A failed Hub call as a run's reason: the capability's typed refusal when it no longer
     /// serves or the Hub narrowed it, else `code`.
     pub fn reason(&self, code: &'static str, detail: impl std::fmt::Display) -> (&'static str, String) {
@@ -634,6 +653,17 @@ impl Catalog {
         }
         (code, detail.to_string())
     }
+}
+
+/// One path segment of a catalog name or release.
+pub fn escape(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -13,6 +13,8 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
 #[path = "common/hub_oauth.rs"]
 mod hub_oauth;
+#[path = "common/names_hub.rs"]
+mod names_hub;
 
 struct Machine {
     child: Child,
@@ -1157,6 +1159,213 @@ mod v1_api {
         assert_eq!(revoked.status, "failed", "{revoked:?}");
         assert_eq!(revoked.reason.unwrap().code, "capability_refused");
         assert_eq!(hub.lock().unwrap().finalized.len(), 2);
+    }
+
+    /// A wheel with one module and nothing else: `name` `version`.
+    fn wheel(name: &str, version: &str) -> Vec<u8> {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        let info = format!("{name}-{version}.dist-info");
+        let files = [
+            (format!("{name}/__init__.py"), "app = None\n".to_string()),
+            (format!("{info}/METADATA"), format!("Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n")),
+            (format!("{info}/WHEEL"), "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n".into()),
+        ];
+        let mut record = String::new();
+        for (path, body) in &files {
+            zip.start_file(path.as_str(), options).unwrap();
+            zip.write_all(body.as_bytes()).unwrap();
+            record.push_str(&format!("{path},,\n"));
+        }
+        zip.start_file(format!("{info}/RECORD"), options).unwrap();
+        zip.write_all(record.as_bytes()).unwrap();
+        zip.finish().unwrap().into_inner()
+    }
+
+    /// One warm run to its outcome.
+    async fn settle(
+        client: &mut v1::machine_client::MachineClient<Channel>,
+        cap: &str,
+        id: &str,
+        spec: v1::RunSpec,
+    ) -> v1::Outcome {
+        let request = v1::RunRequest { id: id.into(), after: 0, spec: Some(spec) };
+        outcome(&collect(client.run(authorized(request, cap)).await.unwrap().into_inner()).await.unwrap())
+    }
+
+    /// th-245: a run names its release and model and the machine resolves both at its Hub by
+    /// name, anonymously: the newest release's card and lock, the model's lane by one closure
+    /// call, then the checkpoint pulled pinned to that lane. Under the same catalog revision a
+    /// second run asks the Hub nothing; a moved revision resolves once more and moves no bytes;
+    /// a hash alone is the owner's, refused without the capability. Real uv, Python and TensorFS.
+    #[tokio::test]
+    async fn runs_name_their_release_and_model_and_a_warm_run_asks_the_hub_nothing() {
+        let source = std::env::temp_dir().join(format!("cm-names-{}", uuid::Uuid::new_v4()));
+        let store = tensorfs_core::store::Store::ensure(&source).unwrap();
+        let manifest = hub_oauth::checkpoint(&store, &[5; 8192]);
+        let model = names_hub::Model {
+            repository: "acme/model".into(),
+            release: "1.0.0".into(),
+            lane: "bf16".into(),
+            manifest: manifest.clone(),
+        };
+        let package = names_hub::Package {
+            name: "acme/pkg".into(),
+            release: "1.0.0".into(),
+            interface: serde_json::json!({"application": "pkg:app", "entrypoints": []}),
+            wheel: "pkg-1.0.0-py3-none-any.whl".into(),
+            bytes: wheel("pkg", "1.0.0"),
+        };
+        let (origin, heard) = names_hub::serve(&store, model, Some(package));
+        let machine = Machine::start().await;
+        let mut client = client(&machine).await;
+        let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
+        let spec = |release: Option<&str>, choice: v1::ModelChoice, revision: &str| v1::RunSpec {
+            kind: v1::RunKind::Warm as i32,
+            source: release.map(|release| {
+                v1::run_spec::Source::Release(v1::Release { package: "acme/pkg".into(), release: release.into() })
+            }),
+            models: vec![v1::ModelChoice { parameter: "model".into(), ..choice }],
+            hub: Some(v1::HubAccess {
+                origin: origin.clone(),
+                object_hosts: vec!["localhost".into()],
+                ..Default::default()
+            }),
+            catalog_revision: revision.into(),
+            owner: "alice".into(),
+            ..Default::default()
+        };
+        let named = v1::ModelChoice {
+            repository: "acme/model".into(),
+            release: "1.0.0".into(),
+            lane: "bf16".into(),
+            ..Default::default()
+        };
+        let take = || std::mem::take(&mut *heard.lock().unwrap());
+
+        // Cold: the newest release installs by name; the model resolves and downloads by name.
+        let done = settle(&mut client, &all, "names-1", spec(Some(""), named.clone(), "r1")).await;
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        let row = &result["models"][0];
+        assert_eq!(result["release"], "1.0.0");
+        assert_eq!((&row["release"], &row["lane"], &row["manifest"]), (&"1.0.0".into(), &"bf16".into(), &manifest.id().into()));
+        let cold = take();
+        let pinned = format!("POST /v1/tensorfs/closure acme/model@1.0.0@{} bf16", manifest.id());
+        for asked in [
+            "GET /v1/packages/acme/pkg",
+            "GET /v1/packages/acme/pkg/releases/1.0.0",
+            "GET /v1/packages/acme/pkg/releases/1.0.0/locked-requirements",
+            "POST /v1/tensorfs/closure acme/model@1.0.0 bf16",
+            &pinned,
+            "POST /v1/tensorfs/presign",
+        ] {
+            assert!(cold.iter().any(|heard| heard == asked), "{asked} not in {cold:?}");
+        }
+        assert!(cold.iter().all(|heard| !heard.ends_with("+credential")), "{cold:?}");
+
+        // Warm: the release's installation and the name's resolution are held, across a
+        // restart too.
+        let done = settle(&mut client, &all, "names-2", spec(Some("1.0.0"), named.clone(), "r1")).await;
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        assert_eq!(take(), Vec::<String>::new());
+        let mut machine = machine;
+        machine.stop();
+        (machine.child, machine.address) = launch(&machine.root, &[]);
+        let mut client = self::client(&machine).await;
+        let done = settle(&mut client, &all, "names-2b", spec(Some("1.0.0"), named.clone(), "r1")).await;
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        assert_eq!(take(), Vec::<String>::new());
+
+        // A name alone is the newest release's only lane: one closure, nothing to move.
+        let bare = v1::ModelChoice { repository: "acme/model".into(), ..Default::default() };
+        let done = settle(&mut client, &all, "names-3", spec(None, bare, "r1")).await;
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        assert_eq!((&result["models"][0]["release"], &result["models"][0]["lane"]), (&"1.0.0".into(), &"bf16".into()));
+        assert_eq!(take(), ["POST /v1/tensorfs/closure acme/model "]);
+
+        // A revision the caller moved resolves the name once more; the bytes are held.
+        let done = settle(&mut client, &all, "names-4", spec(Some("1.0.0"), named, "r2")).await;
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        assert_eq!(take(), ["POST /v1/tensorfs/closure acme/model@1.0.0 bf16"]);
+
+        // A hash alone is the owner's: absent without the run's capability.
+        let other = format!("sha256:{}", "ab".repeat(32));
+        let hashed = v1::ModelChoice { repository: "acme/model".into(), manifest: other.clone(), manifest_length: 9, ..Default::default() };
+        let done = settle(&mut client, &all, "names-5", spec(None, hashed, "r2")).await;
+        assert_eq!(done.status, "failed", "{done:?}");
+        assert_eq!(take(), [format!("POST /v1/tensorfs/closure acme/model@{other} ")]);
+        let _ = fs::remove_dir_all(source);
+    }
+
+    /// th-245 with th-241: the owner's checkpoint by hash reads only under a run capability that
+    /// names it. The machine trades it once through a real AuthKit and presents the token on the
+    /// closure and presign; a capability naming another checkpoint reads anonymously and finds it
+    /// absent, with no trade; one signed for another machine key is refused at submission.
+    #[tokio::test]
+    #[ignore = "real AuthKit: go and AUTHKIT_TEST_DATABASE_URL"]
+    async fn the_owners_checkpoint_by_hash_reads_under_the_runs_capability() {
+        let source = std::env::temp_dir().join(format!("cm-private-{}", uuid::Uuid::new_v4()));
+        let store = tensorfs_core::store::Store::ensure(&source).unwrap();
+        let manifest = hub_oauth::checkpoint(&store, &[9; 8192]);
+        let model = names_hub::Model {
+            repository: "acme/private".into(),
+            release: "1.0.0".into(),
+            lane: "bf16".into(),
+            manifest: manifest.clone(),
+        };
+        let (upstream, heard) = names_hub::serve(&store, model, None);
+        let authkit = hub_oauth::AuthKit::start(&upstream);
+        let machine = Machine::start().await;
+        let mut client = client(&machine).await;
+        let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
+        let spec = |capability: String| v1::RunSpec {
+            kind: v1::RunKind::Warm as i32,
+            models: vec![v1::ModelChoice {
+                parameter: "model".into(),
+                repository: "acme/private".into(),
+                manifest: manifest.id(),
+                manifest_length: manifest.length,
+                ..Default::default()
+            }],
+            hub: Some(v1::HubAccess {
+                origin: authkit.hub.clone(),
+                object_hosts: vec!["localhost".into()],
+                capability,
+                token_endpoint: authkit.token_endpoint.clone(),
+                ..Default::default()
+            }),
+            owner: "alice".into(),
+            ..Default::default()
+        };
+        let read = |manifest: &str| serde_json::json!([{"type": "tensorhub_model_read", "model": "acme/private", "manifest": manifest}]);
+        let jkt = leaf_jkt(&machine);
+
+        let other = authkit.capability(&jkt, &read(&format!("sha256:{}", "ab".repeat(32))), 600);
+        let done = settle(&mut client, &all, "private-1", spec(other)).await;
+        assert_eq!(done.status, "failed", "{done:?}");
+        assert_eq!(authkit.exchanges(), 0);
+
+        let named = authkit.capability(&jkt, &read(&manifest.id()), 600);
+        let done = settle(&mut client, &all, "private-2", spec(named)).await;
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        assert_eq!(authkit.exchanges(), 1);
+        let verified = authkit.verified();
+        assert!(verified.iter().any(|seen| seen["path"] == "/v1/tensorfs/closure"), "{verified:?}");
+        let closures: Vec<_> = heard.lock().unwrap().iter().filter(|h| h.contains("closure")).cloned().collect();
+        assert_eq!(closures.len(), 2, "{closures:?}");
+
+        let forged = authkit.capability(&tensorfs_core::transport::DpopKey::generate().unwrap().thumbprint(), &read(&manifest.id()), 600);
+        let request = v1::RunRequest { id: "private-3".into(), after: 0, spec: Some(spec(forged)) };
+        let refused = client.run(authorized(request, &all)).await;
+        let refused = match refused {
+            Err(status) => status,
+            Ok(stream) => collect(stream.into_inner()).await.unwrap_err(),
+        };
+        assert!(refused.message().contains("hub_access_invalid"), "{refused:?}");
+        let _ = fs::remove_dir_all(source);
     }
 
     /// `cozy model upload` on the serve process: a warm run of one provider source makes it

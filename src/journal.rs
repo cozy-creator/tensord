@@ -375,6 +375,7 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS input_intakes(actor TEXT NOT NULL,retention TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,retention));
             CREATE TABLE IF NOT EXISTS triage(execution INTEGER PRIMARY KEY REFERENCES executions(id),record TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS resolutions(actor TEXT NOT NULL,key TEXT NOT NULL,package TEXT NOT NULL,preparation TEXT NOT NULL,PRIMARY KEY(actor,key));
+            CREATE TABLE IF NOT EXISTS names(name TEXT PRIMARY KEY,revision TEXT NOT NULL,named TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS objects(actor TEXT NOT NULL,sha256 TEXT NOT NULL,length INTEGER NOT NULL,PRIMARY KEY(actor,sha256));
             CREATE TABLE IF NOT EXISTS object_uses(sha256 TEXT PRIMARY KEY,length INTEGER NOT NULL,used_ms INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS run_objects(execution INTEGER NOT NULL REFERENCES executions(id),sha256 TEXT NOT NULL,length INTEGER NOT NULL,PRIMARY KEY(execution,sha256));
@@ -686,9 +687,20 @@ impl Journal {
             .map_err(db_error)?;
         Ok(())
     }
-    /// A job model input this signer resolved at its Hub under `key` (its installation, slot,
-    /// choice, owner, binding revision and GPU): its repository and manifest, or None.
-    /// The length of an object this signer wrote (`objects`), or None.
+    /// What a Hub named `name` (its origin, a repository, release and lane) under the caller's
+    /// catalog `revision` (th-245), or None. One row per name: a moved revision replaces it.
+    pub fn named(&self, name: &str, revision: &str) -> io::Result<Option<String>> {
+        self.connection
+            .query_row("SELECT named FROM names WHERE name=?1 AND revision=?2", params![name, revision], |r| r.get(0))
+            .optional()
+            .map_err(db_error)
+    }
+    pub fn bind_named(&mut self, name: &str, revision: &str, named: &str) -> io::Result<()> {
+        self.connection
+            .execute("INSERT OR REPLACE INTO names(name,revision,named) VALUES(?1,?2,?3)", params![name, revision, named])
+            .map_err(db_error)?;
+        Ok(())
+    }
     /// A memoized call's result, reusable while this machine holds every file it names: the
     /// child's result record, keyed by its signer and computation. Each signer keeps its
     /// `MAX_HELD_MEMOS` most recently used.

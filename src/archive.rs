@@ -109,8 +109,6 @@ pub struct ModelRung {
     pub gpus: u32,
     #[prost(string, tag = "3")]
     pub lane: ::prost::alloc::string::String,
-    #[prost(message, optional, tag = "4")]
-    pub manifest: ::core::option::Option<Ref>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -322,7 +320,6 @@ impl From<domain::ModelChoice> for ModelChoice {
                     gpu: rung.gpu,
                     gpus: rung.gpus,
                     lane: rung.lane,
-                    manifest: Some(rung.manifest.into()),
                 })
                 .collect(),
         }
@@ -347,7 +344,6 @@ impl From<ModelChoice> for domain::ModelChoice {
                     gpu: rung.gpu,
                     gpus: rung.gpus,
                     lane: rung.lane,
-                    manifest: rung.manifest.map(Into::into).unwrap_or_default(),
                 })
                 .collect(),
         }
