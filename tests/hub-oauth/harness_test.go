@@ -95,8 +95,12 @@ func (h *hub) decide(_ context.Context, r iam.OAuthGrantRequest) (iam.OAuthGrant
 }
 
 // permits answers whether ops name the operation a request to path is: a publication (or
-// its checkpoint probe) to a model, or a read of one of its checkpoints.
+// its checkpoint probe) to a model, a read of one of its checkpoints, or a closure or presign
+// under a read (the test Hub checks the owner's checkpoint by hash).
 func permits(ops []op, method, path string) bool {
+	if path == "/v1/tensorfs/closure" || path == "/v1/tensorfs/presign" {
+		return slices.ContainsFunc(ops, func(o op) bool { return o.Type == "tensorhub_model_read" })
+	}
 	rest, ok := strings.CutPrefix(path, "/v1/models/")
 	if !ok {
 		return false
@@ -189,8 +193,9 @@ func TestHarness(t *testing.T) {
 		switch {
 		case r.Header.Get("Authorization") != "" || r.Header.Get("DPoP") != "":
 			authorized.ServeHTTP(w, r)
-		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/packages/"):
-			// Packages are public: read anonymously.
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/packages/"),
+			r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/tensorfs/"):
+			// Packages and released models are public: read anonymously (th-245).
 			r.Header.Set("X-Verified-Owner", "anonymous")
 			forward.ServeHTTP(w, r)
 		default:
