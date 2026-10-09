@@ -237,6 +237,17 @@ pub struct ModelChoice {
     pub source: String,
     pub profiles: Vec<String>,
     pub adapters: Vec<DownloadAdapterRef>,
+    /// The slot's binding, every rung exact: the machine takes the widest its GPUs fit.
+    pub rungs: Vec<ModelRung>,
+}
+
+/// One exact rung of a binding (`ModelRung`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ModelRung {
+    pub gpu: String,
+    pub gpus: u32,
+    pub lane: String,
+    pub manifest: Ref,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

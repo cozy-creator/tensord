@@ -40,6 +40,7 @@ image-webp = "0.2"
 tar = "0.4"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 rustls-pemfile = "2"
+ring = "0.17"
 time = "0.3"
 
 [dev-dependencies]

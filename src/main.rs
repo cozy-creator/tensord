@@ -286,16 +286,8 @@ fn run_machine(
         Some(wheel),
         "3.12".into(),
         image_sdk(&paths.sdk(), &layout.root, uv),
-        // A run naming no Hub reads this rental's own Hub as the pod (Go agent parity).
-        grant.hub.clone().filter(|_| rental).map(|hub| {
-            cozy_machine::hub::Source::pod(
-                &hub.origin,
-                &hub.worker_id,
-                &hub.worker_token,
-                hub.ca_der,
-                hub.object_hosts,
-            )
-        }),
+        // A run naming no Hub reads this rental's own Hub's public content.
+        grant.hub.clone().filter(|_| rental),
     )?;
     // The Hub probes the endpoint the provider put in this pod's environment at once,
     // instead of waiting for the provider to report it.
@@ -370,7 +362,7 @@ fn start_api(
     wheel: Option<PathBuf>,
     python: String,
     mut sdk: cozy_machine::published::PackageSdk,
-    own_hub: Option<cozy_machine::hub::Source>,
+    own_hub: Option<cozy_machine::machine::grant::HubGrant>,
 ) -> io::Result<()> {
     use cozy_machine::{api, machine_api::NativeBackend};
     sdk.client_wheel = wheel.clone();
@@ -380,7 +372,6 @@ fn start_api(
     );
     let store = owner.lock().unwrap().store();
     let mut backend = NativeBackend::new(service.clone(), identity.authority.clone(), store.clone());
-    backend.own_hub = own_hub;
     let publisher =
         cozy_machine::published::Publisher::new(&root.join("published"), sdk, store.clone())?;
     service.configure_publisher(publisher.clone());
@@ -408,6 +399,8 @@ fn start_api(
         store.clone(),
         service.engine.clone(),
     )?);
+    // The leaf the CLI pins is the key a run's capability names (th-241).
+    let leaf = cozy_machine::hub::Leaf::from_pem(&identity.key_pem).map_err(|e| io::Error::other(e.0))?;
     backend.runs = Some(Arc::new(cozy_machine::runs::Runs {
         service: service.clone(),
         objects: objects.clone(),
@@ -419,12 +412,11 @@ fn start_api(
                 store.clone(),
             ))
         }),
-        own_hub: backend.own_hub.clone(),
-        // The leaf the CLI pins is the key every Hub grant is bound to (th-238).
-        grants: cozy_machine::hub::Grants::new(Arc::new(
-            tensorfs_core::transport::DpopKey::from_pem(&identity.key_pem)
-                .map_err(|e| io::Error::other(e.to_string()))?,
-        )),
+        own_hub: own_hub
+            .map(|hub| cozy_machine::hub::Source::new(&hub.origin, hub.ca_der, hub.object_hosts, None))
+            .transpose()
+            .map_err(|e| io::Error::other(e.0))?,
+        leaf: Some(Arc::new(leaf)),
         jobs: Default::default(),
     }));
     cozy_machine::jobs::Jobs::configure(service, store.clone(), backend.runs.as_ref())?;

@@ -3,10 +3,7 @@ use ed25519_dalek::VerifyingKey;
 use std::{
     future::Future,
     pin::Pin,
-    sync::{
-        atomic::{AtomicI64, Ordering},
-        Arc, RwLock,
-    },
+    sync::{Arc, RwLock},
     task::{Context, Poll},
     time::Duration,
 };
@@ -28,29 +25,21 @@ pub struct Authority {
 pub struct Keys {
     keys: Arc<RwLock<Vec<VerifyingKey>>>,
     changes: Arc<tokio::sync::watch::Sender<u64>>,
-    /// The owner's bindings revision at the Hub, carried on the same answer; 0 for none.
-    bindings: Arc<AtomicI64>,
 }
 impl Keys {
     pub fn fixed(keys: Vec<VerifyingKey>) -> Self {
         Self {
             keys: Arc::new(RwLock::new(keys)),
             changes: Arc::new(tokio::sync::watch::channel(0).0),
-            bindings: Arc::new(AtomicI64::new(0)),
         }
     }
     fn replace(&self, keys: Vec<VerifyingKey>) {
         *self.keys.write().unwrap() = keys;
         self.changes.send_modify(|generation| *generation += 1);
     }
-    /// The Hub's current answer: these keys, and the owner's bindings revision.
-    pub fn renew(&self, keys: Vec<VerifyingKey>, bindings: i64) {
-        self.bindings.store(bindings, Ordering::Release);
+    /// The Hub's current answer: these keys.
+    pub fn renew(&self, keys: Vec<VerifyingKey>) {
         self.replace(keys);
-    }
-    /// The owner's bindings revision as the Hub last stated it.
-    pub fn bindings_revision(&self) -> i64 {
-        self.bindings.load(Ordering::Acquire)
     }
     pub fn revoke(&self) {
         self.replace(vec![]);

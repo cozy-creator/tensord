@@ -116,7 +116,7 @@ impl Server {
             publisher: None,
             local: None,
             own_hub: None,
-            grants: Default::default(),
+            leaf: None,
             jobs: Default::default(),
         }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

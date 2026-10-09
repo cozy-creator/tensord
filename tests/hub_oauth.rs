@@ -1,177 +1,168 @@
-//! The machine's Hub grants against a real AuthKit (th-238): codes redeemed with the machine's
-//! leaf key, DPoP-bound tokens presented and refreshed by the hub module over TensorFS, and
-//! every proof checked by AuthKit's resource verifier.
+//! A run's capability against a real AuthKit (th-241): public reads go anonymous; the first
+//! private operation trades the owner's device-key-signed capability, once, through the
+//! JWT-bearer grant (an assertion the leaf signs, DPoP from the same key); every proof is
+//! checked by AuthKit's resource verifier, and the Hub's narrowing, a revoked device key and
+//! the capability's expiry each end the run's private work with a typed reason.
 #[path = "common/hub_oauth.rs"]
 mod hub_oauth;
 
-use cozy_machine::hub::{self, Authorization, Catalog, Grants, Publishing, Source};
-use serde_json::Value;
+use cozy_machine::hub::{reason, Capability, Catalog, Leaf, Op, Source};
+use serde_json::json;
 use std::{sync::Arc, thread::sleep, time::Duration};
-use tensorfs_core::transport::{AccessToken, DpopKey, Publication};
-
-fn code(issued: Value) -> Authorization {
-    let field = |name: &str| issued[name].as_str().unwrap().to_string();
-    Authorization {
-        issuer: field("issuer"),
-        code: field("code"),
-        code_verifier: field("code_verifier"),
-        redirect_uri: field("redirect_uri"),
-        resource: field("resource"),
-    }
-}
+use tensorfs_core::transport::{AccessToken, DpopCredential, DpopKey, Publication};
 
 /// A key as the machine's identity holds it: a P-256 PKCS#8 PEM.
-fn leaf_key() -> Arc<DpopKey> {
+fn leaf() -> Arc<Leaf> {
     let pem = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .unwrap()
         .serialize_pem();
-    Arc::new(DpopKey::from_pem(&pem).unwrap())
+    Arc::new(Leaf::from_pem(&pem).unwrap())
 }
 
 fn publish(
-    publishing: &Publishing,
+    catalog: &Catalog,
     store: &tensorfs_core::store::Store,
     manifest: &tensorfs_core::ids::ObjectRef,
     operation: &str,
-) {
+) -> tensorfs_core::err::Result<()> {
     tensorfs_core::transport::publish(&Publication {
         store,
-        hub: publishing.origin(),
+        hub: catalog.origin(),
         destination: "acme/tiny",
         manifest,
         operation,
-        credential: publishing,
-        policy: publishing.policy(),
-        progress: &|_, _| (),
-        streams: 2,
-    })
-    .unwrap();
-}
-
-#[test]
-#[ignore = "real AuthKit: needs go and AUTHKIT_TEST_DATABASE_URL"]
-fn grants_redeem_present_refresh_and_end_as_authkit_decides() {
-    let (upstream, hub) = hub_oauth::test_hub();
-    let authkit = hub_oauth::AuthKit::start(&upstream);
-    let key = leaf_key();
-    let jkt = key.thumbprint();
-    let grants = Grants::new(key);
-
-    // Execution: the code redeems with the leaf's key, and a catalog read passes AuthKit's
-    // verifier (its first proof is challenged for a nonce and retried with it).
-    let execution = grants
-        .redeem(
-            &code(authkit.authorize("execution", &jkt)),
-            hub::EXECUTION,
-            None,
-        )
-        .unwrap();
-    let source = Source::granted(
-        &authkit.hub,
-        execution.clone(),
-        None,
-        vec!["localhost".into()],
-    );
-    let catalog = Catalog::new(&source).unwrap();
-    assert_eq!(
-        catalog.json("/v1/packages/acme/pkg").unwrap()["package"],
-        "acme/pkg"
-    );
-    assert_eq!(hub.lock().unwrap().reads, 1);
-    let seen = authkit.seen();
-    assert_eq!(seen.len(), 1, "{seen:?}");
-    assert_eq!(seen[0]["type"], hub::EXECUTION);
-
-    // A code redeems once, only with the key it names, and only as the grant it is.
-    let spent = code(authkit.authorize("execution", &jkt));
-    grants.redeem(&spent, hub::EXECUTION, None).unwrap();
-    let again = grants.redeem(&spent, hub::EXECUTION, None).unwrap_err();
-    assert!(again.0.contains("invalid_grant"), "{again:?}");
-    let stolen = Grants::new(leaf_key()).redeem(
-        &code(authkit.authorize("execution", &jkt)),
-        hub::EXECUTION,
-        None,
-    );
-    assert!(stolen.is_err(), "another key redeems nothing");
-    let mixed = grants
-        .redeem(
-            &code(authkit.authorize("execution", &jkt)),
-            hub::PUBLICATION,
-            None,
-        )
-        .unwrap_err();
-    assert!(
-        mixed.0.contains("not tensorhub_machine_publication"),
-        "{mixed:?}"
-    );
-
-    // Publication: an offline grant writes the destination; the object host sees no
-    // credential, and an execution grant is refused on publication routes.
-    let store_root = std::env::temp_dir().join(format!("cm-oauth-store-{}", uuid::Uuid::new_v4()));
-    let store = tensorfs_core::store::Store::ensure(&store_root).unwrap();
-    let manifest = hub_oauth::checkpoint(&store, &[7; 8192]);
-    let publication = grants
-        .redeem(
-            &code(authkit.authorize("publication", &jkt)),
-            hub::PUBLICATION,
-            None,
-        )
-        .unwrap();
-    publish(
-        &Publishing::new(&source, &publication, None).unwrap(),
-        &store,
-        &manifest,
-        "op-1",
-    );
-    {
-        let hub = hub.lock().unwrap();
-        assert_eq!(hub.finalized, [manifest.id()]);
-        assert_eq!(hub.credentialed_uploads, 0);
-        assert!(!hub.uploaded.is_empty());
-    }
-    let wrong = tensorfs_core::transport::publish(&Publication {
-        store: &store,
-        hub: &authkit.hub,
-        destination: "acme/tiny",
-        manifest: &manifest,
-        operation: "op-wrong",
         credential: catalog.credential(),
         policy: catalog.policy(),
         progress: &|_, _| (),
         streams: 2,
-    });
-    assert!(wrong.is_err(), "an execution grant publishes nothing");
+    })
+    .map(drop)
+}
 
-    // Access tokens live 4 s and renew at half life: a later read presents a fresh one.
-    let before = authkit
-        .seen()
-        .iter()
-        .rfind(|s| s["type"] == hub::EXECUTION)
-        .unwrap()["token"]
-        .clone();
-    sleep(Duration::from_millis(2500));
-    catalog.json("/v1/packages/acme/pkg").unwrap();
-    let after = authkit.seen().last().unwrap()["token"].clone();
-    assert_ne!(before, after, "the refreshed token is presented");
+const TINY: Op = Op::Publish { model: "acme/tiny" };
 
-    // Signing out ends the execution grant at its next refresh, and its reads with it; the
-    // offline publication grant outlives the sign-in.
-    authkit.logout();
-    sleep(Duration::from_millis(2500));
-    assert!(catalog.json("/v1/packages/acme/pkg").is_err());
-    let ended = execution.ended().expect("the execution grant ended");
-    assert!(ended.contains("invalid_grant"), "{ended}");
-    assert_eq!(hub.lock().unwrap().reads, 2);
-    assert!(
-        publication.current().is_some(),
-        "the publication grant refreshes after sign-out"
-    );
-    publish(
-        &Publishing::new(&source, &publication, None).unwrap(),
-        &store,
-        &manifest,
-        "op-2",
-    );
-    assert_eq!(hub.lock().unwrap().finalized.len(), 2);
+/// One JSON read at the catalog's Hub, presented as the catalog presents.
+fn get(catalog: &Catalog, path: &str) -> Result<serde_json::Value, String> {
+    let (body, _) = tensorfs_core::transport::api_get(
+        &format!("{}{path}", catalog.origin()),
+        catalog.policy(),
+        catalog.credential(),
+        1 << 20,
+        tensorfs_core::transport::Deadline::after_seconds(Some(30.0)),
+        &tensorfs_core::transport::Ledger::new(),
+    )
+    .map_err(|e| e.detail)?;
+    serde_json::from_slice(&body).map_err(|e| e.to_string())
+}
+
+#[test]
+#[ignore = "real AuthKit: needs go and AUTHKIT_TEST_DATABASE_URL"]
+fn a_run_capability_trades_once_for_exactly_what_it_names() {
+    let (upstream, hub) = hub_oauth::test_hub();
+    let authkit = hub_oauth::AuthKit::start(&upstream);
+    let leaf = leaf();
+    let jkt = leaf.thumbprint();
+    let hosts = vec!["localhost".to_string()];
+
+    // A public-only run: its reads carry nothing, and AuthKit hears of nothing.
+    let public = Source::new(&authkit.hub, None, hosts.clone(), None).unwrap();
+    let catalog = Catalog::new(&public).unwrap();
+    assert_eq!(get(&catalog, "/v1/packages/acme/pkg").unwrap()["package"], "acme/pkg");
+    assert_eq!(hub.lock().unwrap().reads, 1);
+    assert_eq!(authkit.exchanges(), 0);
+    assert!(authkit.verified().is_empty());
+
+    // A run that publishes: the capability names acme/tiny's checkpoints and one read the
+    // Hub narrows away. Nothing is traded until the first private operation.
+    let narrowed = format!("sha256:{}", "ab".repeat(32));
+    let ops = json!([
+        {"type": "tensorhub_model_publish", "model": "acme/tiny"},
+        {"type": "tensorhub_model_read", "model": "acme/narrowed", "manifest": narrowed},
+    ]);
+    let signed = authkit.capability(&jkt, &ops, 600);
+    let source = Source::new(&authkit.hub, None, hosts.clone(), Some(Capability::new(&signed, &authkit.token_endpoint, leaf.clone()).unwrap())).unwrap();
+    let store_root = std::env::temp_dir().join(format!("cm-oauth-store-{}", uuid::Uuid::new_v4()));
+    let store = tensorfs_core::store::Store::ensure(&store_root).unwrap();
+    let manifest = hub_oauth::checkpoint(&store, &[7; 8192]);
+    assert_eq!(authkit.exchanges(), 0);
+    let tiny = Catalog::for_op(&source, TINY).unwrap();
+    publish(&tiny, &store, &manifest, "op-1").unwrap();
+    publish(&Catalog::for_op(&source, TINY).unwrap(), &store, &manifest, "op-2").unwrap();
+    {
+        let hub = hub.lock().unwrap();
+        assert_eq!(hub.finalized, [manifest.id(), manifest.id()]);
+        assert_eq!(hub.credentialed_uploads, 0, "object hosts see no credential");
+    }
+    assert_eq!(authkit.exchanges(), 1, "one trade per run");
+    let verified = authkit.verified();
+    assert!(verified.iter().all(|s| s["owner"] == authkit.owner().as_str() && s["actor"] == jkt.as_str()), "{verified:?}");
+    // Public reads of the same run stay anonymous.
+    get(&Catalog::new(&source).unwrap(), "/v1/packages/acme/pkg").unwrap();
+    assert_eq!(authkit.verified().len(), verified.len());
+
+    // An operation the capability does not name never reaches the Hub; one the Hub narrowed
+    // away is refused there.
+    let other = Op::Publish { model: "acme/other" };
+    assert_eq!(Catalog::for_op(&source, other).err().unwrap().0, reason::REQUIRED);
+    let read = Catalog::for_op(&source, Op::Read { model: "acme/narrowed", manifest: &narrowed }).unwrap();
+    let refused = get(&read, &format!("/v1/models/acme/narrowed/checkpoints/{narrowed}")).unwrap_err();
+    assert_eq!(read.reason("catalog_read_failed", &refused).0, reason::EXCEEDED, "{refused:?}");
+
+    // The token is bound to the leaf: presented with another key's proof, it reads nothing.
+    struct Fixed(String);
+    impl AccessToken for Fixed {
+        fn current(&self) -> Option<String> {
+            Some(self.0.clone())
+        }
+    }
+    let thief = DpopCredential::new(
+        Arc::new(DpopKey::generate().unwrap()),
+        Fixed(authkit.last_token()),
+        vec!["127.0.0.1".into()],
+    )
+    .proving_origin(&authkit.resource);
+    let finalized = hub.lock().unwrap().finalized.len();
+    let stolen = publish_with(&thief, &authkit.hub, tiny.policy(), &store, &manifest);
+    assert!(stolen.is_err(), "a stolen token without the key is refused");
+    assert_eq!(hub.lock().unwrap().finalized.len(), finalized);
+
+    // Revoking the device key ends the run's private work at its next request, typed, with
+    // no second trade.
+    authkit.revoke_device_key();
+    let tiny = Catalog::for_op(&source, TINY).unwrap();
+    assert!(publish(&tiny, &store, &manifest, "op-3").is_err());
+    assert_eq!(tiny.reason("weights_publication_failed", "").0, reason::REFUSED);
+    assert_eq!(authkit.exchanges(), 1);
+
+    // A capability that expires ends typed too, before the Hub hears of it.
+    authkit.enroll_device_key();
+    let brief = authkit.capability(&jkt, &ops, 2);
+    let source = Source::new(&authkit.hub, None, hosts, Some(Capability::new(&brief, &authkit.token_endpoint, leaf).unwrap())).unwrap();
+    sleep(Duration::from_secs(3));
+    assert_eq!(Catalog::for_op(&source, TINY).err().unwrap().0, reason::EXPIRED);
+    assert_eq!(authkit.exchanges(), 1);
+    assert_eq!(hub.lock().unwrap().finalized.len(), finalized);
     let _ = std::fs::remove_dir_all(store_root);
+}
+
+/// One publication presented by `credential`, whatever it is.
+fn publish_with(
+    credential: &dyn tensorfs_core::transport::CredentialProvider,
+    hub: &str,
+    policy: &tensorfs_core::transport::SourcePolicy,
+    store: &tensorfs_core::store::Store,
+    manifest: &tensorfs_core::ids::ObjectRef,
+) -> tensorfs_core::err::Result<()> {
+    tensorfs_core::transport::publish(&Publication {
+        store,
+        hub,
+        destination: "acme/tiny",
+        manifest,
+        operation: "op-stolen",
+        credential,
+        policy,
+        progress: &|_, _| (),
+        streams: 2,
+    })
+    .map(drop)
 }

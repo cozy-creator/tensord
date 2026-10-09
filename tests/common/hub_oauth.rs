@@ -1,7 +1,9 @@
 //! A real AuthKit authorization server and DPoP resource server (`tests/hub-oauth`, Go) in
-//! front of a test Hub (th-238). The machine redeems real grants, and AuthKit verifies every
-//! proof it makes, nonce challenge included. Needs `go`, and AUTHKIT_TEST_DATABASE_URL naming
-//! a PostgreSQL the harness may create schemas in.
+//! front of a test Hub (th-241). The harness signs run capabilities with an owner's enrolled
+//! device key, as the CLI does; the machine trades them through AuthKit's JWT-bearer grant, and
+//! AuthKit verifies every proof. It plays the Hub: its grant decision (which may narrow) and
+//! its resource checks (the token's operations, the device key still live). Needs `go`, and
+//! AUTHKIT_TEST_DATABASE_URL naming a PostgreSQL the harness may create schemas in.
 #![allow(dead_code)]
 use serde_json::Value;
 use std::{
@@ -18,6 +20,8 @@ pub struct AuthKit {
     stdin: Option<ChildStdin>,
     pub issuer: String,
     pub resource: String,
+    /// Where a capability is traded, as the CLI hands it over beside it.
+    pub token_endpoint: String,
     /// The Hub origin a machine reaches: AuthKit's resource server, forwarding to the test Hub.
     pub hub: String,
     control: String,
@@ -85,6 +89,7 @@ impl AuthKit {
             child,
             issuer: field("issuer"),
             resource: field("resource"),
+            token_endpoint: field("token_endpoint"),
             hub: field("hub"),
             control: field("control"),
             dir,
@@ -103,21 +108,31 @@ impl AuthKit {
         .unwrap()
     }
 
-    /// The CLI's half of the flow for a machine key: a fresh code (`execution` or
-    /// `publication`), as the CLI hands it over.
-    pub fn authorize(&self, kind: &str, jkt: &str) -> Value {
-        let (status, body) = self.post("/authorize", &[("kind", kind), ("jkt", jkt)]);
+    /// A capability the owner's device key signs for the machine key `jkt`: `ops` are its
+    /// `authorization_details`, and it expires in `seconds`.
+    pub fn capability(&self, jkt: &str, ops: &Value, seconds: u64) -> String {
+        let (status, body) = self.post(
+            "/capability",
+            &[("jkt", jkt), ("ops", &ops.to_string()), ("seconds", &seconds.to_string())],
+        );
         assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
-        serde_json::from_slice(&body).unwrap()
+        String::from_utf8(body).unwrap()
     }
 
-    /// The CLI signs out: its device key is revoked.
-    pub fn logout(&self) {
-        assert_eq!(self.post("/logout", &[]).0, 204);
+    /// The owner signs out of that device: its key, and every capability it signed, end.
+    pub fn revoke_device_key(&self) {
+        assert_eq!(self.post("/revoke-device-key", &[]).0, 204);
     }
 
-    /// Every request AuthKit's resource server verified: method, path, grant type, token digest.
-    pub fn seen(&self) -> Vec<Value> {
+    /// The owner signs in on a new device: later capabilities are signed by its key.
+    pub fn enroll_device_key(&self) {
+        assert_eq!(self.post("/enroll-device-key", &[]).0, 204);
+    }
+
+    /// What the Hub saw: `verified` (each token-bearing request AuthKit's resource server
+    /// verified: method, path, owner, actor, token digest), `exchanges` (grant decisions),
+    /// `owner` (the owner's user id) and `last_token`.
+    pub fn seen(&self) -> Value {
         let (body, _) = transport::api_get(
             &format!("{}/seen", self.control),
             &local(),
@@ -127,9 +142,23 @@ impl AuthKit {
             &Ledger::new(),
         )
         .unwrap();
-        serde_json::from_slice::<Option<Vec<Value>>>(&body)
-            .unwrap()
-            .unwrap_or_default()
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    pub fn verified(&self) -> Vec<Value> {
+        self.seen()["verified"].as_array().cloned().unwrap_or_default()
+    }
+
+    pub fn exchanges(&self) -> u64 {
+        self.seen()["exchanges"].as_u64().unwrap()
+    }
+
+    pub fn owner(&self) -> String {
+        self.seen()["owner"].as_str().unwrap().to_string()
+    }
+
+    pub fn last_token(&self) -> String {
+        self.seen()["last_token"].as_str().unwrap().to_string()
     }
 }
 
@@ -207,10 +236,13 @@ pub fn test_hub() -> (String, Arc<Mutex<Hub>>) {
                 held.uploaded.insert(id, body.to_vec());
                 return StatusCode::OK.into_response();
             }
-            assert!(
-                headers.contains_key("x-verified-type"),
-                "{path} reached the Hub unverified"
-            );
+            // Package reads are public and anonymous; everything else came with a token.
+            let owner = headers.get("x-verified-owner").and_then(|v| v.to_str().ok());
+            if path.starts_with("/v1/packages/") {
+                assert_eq!(owner, Some("anonymous"), "{path} is a public read");
+            } else {
+                assert!(owner.is_some_and(|o| o != "anonymous"), "{path} reached the Hub unverified");
+            }
             let publication = "/v1/models/acme/tiny/publications/";
             match (method, path.as_str()) {
                 (Method::GET, "/v1/packages/acme/pkg") => {

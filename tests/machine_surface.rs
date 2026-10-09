@@ -829,19 +829,8 @@ mod v1_api {
         manifest_digest
     }
 
-    fn authorization(issued: serde_json::Value) -> v1::HubAuthorization {
-        let field = |name: &str| issued[name].as_str().unwrap().to_string();
-        v1::HubAuthorization {
-            issuer: field("issuer"),
-            code: field("code"),
-            code_verifier: field("code_verifier"),
-            redirect_uri: field("redirect_uri"),
-            resource: field("resource"),
-        }
-    }
-
-    /// The thumbprint of the leaf the machine's API presents: what the CLI pins and names as
-    /// every authorization request's `dpop_jkt`.
+    /// The thumbprint of the leaf the machine's API presents: what the CLI pins and names as a
+    /// capability's `cnf.jkt`.
     fn leaf_jkt(machine: &Machine) -> String {
         let identity: serde_json::Value =
             serde_json::from_slice(&fs::read(machine.root.join("config/identity/identity.json")).unwrap()).unwrap();
@@ -1086,13 +1075,13 @@ mod v1_api {
         let _ = fs::remove_dir_all(tools);
     }
 
-    /// `cozy model upload local/tiny acme/tiny` under th-238's grants: the CLI hands the machine
-    /// an execution code and a publication code, the machine redeems both with its leaf's key
-    /// at submission, and AuthKit verifies every proof it presents. A later run reads with the
-    /// held execution grant; a signer the machine holds none for is refused before acceptance.
+    /// `cozy model upload local/tiny acme/tiny` under the run's capability (th-241): the spec
+    /// names the Hub and carries the owner's device-key-signed capability for this machine's
+    /// leaf; the machine trades it once at the upload and AuthKit verifies every proof. With no
+    /// capability, or one signed by a revoked device key, the run ends typed.
     #[tokio::test]
     #[ignore = "real AuthKit: needs go and AUTHKIT_TEST_DATABASE_URL"]
-    async fn a_warm_run_publishes_a_local_alias_under_the_signers_grants() {
+    async fn a_warm_run_publishes_a_local_alias_under_its_capability() {
         use tensorfs_core::repository::{Mutation, RepositoryName};
         let (upstream, hub) = hub_oauth::test_hub();
         let authkit = hub_oauth::AuthKit::start(&upstream);
@@ -1116,34 +1105,38 @@ mod v1_api {
             action: MACHINE.into(),
             ..Default::default()
         });
-        let upload = |authorize: bool| v1::RunSpec {
-            kind: v1::RunKind::Warm as i32,
-            models: vec![v1::ModelChoice {
-                parameter: "model".into(),
-                repository: "local/tiny".into(),
-                ..Default::default()
-            }],
-            weights_destination: "acme/tiny".into(),
-            hub: Some(v1::HubAccess {
-                origin: authkit.hub.clone(),
-                authorization: authorize.then(|| authorization(authkit.authorize("execution", &jkt))),
-                object_hosts: vec!["localhost".into()],
-                ..Default::default()
-            }),
-            publication: Some(authorization(authkit.authorize("publication", &jkt))),
-            owner: "alice".into(),
-            ..Default::default()
-        };
-        let run = |id: &str, spec: v1::RunSpec| v1::RunRequest {
+        let ops = serde_json::json!([{"type": "tensorhub_model_publish", "model": "acme/tiny"}]);
+        let upload = |id: &str, capability: String| v1::RunRequest {
             id: id.into(),
             after: 0,
-            spec: Some(spec),
+            spec: Some(v1::RunSpec {
+                kind: v1::RunKind::Warm as i32,
+                models: vec![v1::ModelChoice {
+                    parameter: "model".into(),
+                    repository: "local/tiny".into(),
+                    ..Default::default()
+                }],
+                weights_destination: "acme/tiny".into(),
+                hub: Some(v1::HubAccess {
+                    origin: authkit.hub.clone(),
+                    object_hosts: vec!["localhost".into()],
+                    capability,
+                    token_endpoint: authkit.token_endpoint.clone(),
+                    ..Default::default()
+                }),
+                owner: "alice".into(),
+                ..Default::default()
+            }),
         };
-        for (id, authorize) in [("upload-1", true), ("upload-2", false)] {
-            let events = collect(client.run(authorized(run(id, upload(authorize)), &all)).await.unwrap().into_inner())
-                .await
-                .unwrap();
-            let done = outcome(&events);
+        let done = |events: Vec<v1::RunEvent>| outcome(&events);
+        let refused = done(collect(client.run(authorized(upload("upload-0", String::new()), &all)).await.unwrap().into_inner()).await.unwrap());
+        assert_eq!(refused.status, "failed", "{refused:?}");
+        assert_eq!(refused.reason.unwrap().code, "capability_required");
+        assert_eq!(authkit.exchanges(), 0);
+
+        for id in ["upload-1", "upload-2"] {
+            let signed = authkit.capability(&jkt, &ops, 600);
+            let done = done(collect(client.run(authorized(upload(id, signed), &all)).await.unwrap().into_inner()).await.unwrap());
             assert_eq!(done.status, "succeeded", "{id}: {done:?}");
             let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
             assert_eq!(result["models"][0]["published"]["checkpoint"], manifest, "{result}");
@@ -1153,30 +1146,30 @@ mod v1_api {
             assert_eq!(hub.finalized, [manifest.clone(), manifest.clone()]);
             assert_eq!(hub.credentialed_uploads, 0);
         }
-        let seen = authkit.seen();
-        assert!(!seen.is_empty() && seen.iter().all(|s| s["type"] == "tensorhub_machine_publication"), "{seen:?}");
+        assert_eq!(authkit.exchanges(), 2, "one trade per run");
+        let owner = authkit.owner();
+        let verified = authkit.verified();
+        assert!(!verified.is_empty() && verified.iter().all(|s| s["owner"] == owner.as_str()), "{verified:?}");
 
-        let other = cap_by(&OTHER, Grant {
-            action: MACHINE.into(),
-            ..Default::default()
-        });
-        let refused = match client.run(authorized(run("upload-3", upload(false)), &other)).await {
-            Ok(stream) => collect(stream.into_inner()).await.unwrap_err(),
-            Err(status) => status,
-        };
-        assert_eq!(refused.metadata().get("cozy-error-code").unwrap(), "hub_access_required", "{refused:?}");
+        let signed = authkit.capability(&jkt, &ops, 600);
+        authkit.revoke_device_key();
+        let revoked = done(collect(client.run(authorized(upload("upload-3", signed), &all)).await.unwrap().into_inner()).await.unwrap());
+        assert_eq!(revoked.status, "failed", "{revoked:?}");
+        assert_eq!(revoked.reason.unwrap().code, "capability_refused");
+        assert_eq!(hub.lock().unwrap().finalized.len(), 2);
     }
 
     /// `cozy model upload` on the serve process: a warm run of one provider source makes it
-    /// with TensorFS and puts its checkpoint in the destination under the run's
-    /// machine-publication grant; every object reaches the Hub, then finalization.
+    /// with TensorFS and puts its checkpoint in the destination under the machine's authority;
+    /// every object reaches the Hub, then finalization.
     #[tokio::test]
     #[ignore = "real network: huggingface.co; real AuthKit: go and AUTHKIT_TEST_DATABASE_URL"]
     async fn a_warm_run_uploads_its_source_model_to_its_destination() {
         let (upstream, hub) = hub_oauth::test_hub();
         let authkit = hub_oauth::AuthKit::start(&upstream);
         let machine = Machine::start().await;
-        let jkt = leaf_jkt(&machine);
+        let ops = serde_json::json!([{"type": "tensorhub_model_publish", "model": "acme/tiny"}]);
+        let capability = authkit.capability(&leaf_jkt(&machine), &ops, 600);
         let mut client = client(&machine).await;
         let all = cap(Grant {
             action: MACHINE.into(),
@@ -1192,11 +1185,11 @@ mod v1_api {
             weights_destination: "acme/tiny".into(),
             hub: Some(v1::HubAccess {
                 origin: authkit.hub.clone(),
-                authorization: Some(authorization(authkit.authorize("execution", &jkt))),
                 object_hosts: vec!["localhost".into()],
+                capability,
+                token_endpoint: authkit.token_endpoint.clone(),
                 ..Default::default()
             }),
-            publication: Some(authorization(authkit.authorize("publication", &jkt))),
             owner: "alice".into(),
             ..Default::default()
         };

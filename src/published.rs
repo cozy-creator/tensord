@@ -59,17 +59,26 @@ pub struct Request {
     pub source: hub::Source,
     pub package: String,
     pub release: String,
+    /// The release's card as the run carries it; installing needs it.
+    pub card: Option<Card>,
     /// Unpublished code this machine already holds, in place of the release.
     pub installed: Option<Installation>,
     /// The account an unpublished package's org-relative model names belong to.
     pub owner: String,
-    /// The owner's binding revision the caller knows: a held resolution made under another
-    /// revision resolves again.
-    pub binding_revision: String,
     /// Provider tokens for source models (memory only).
     pub providers: Providers,
     pub entrypoint: String,
     pub choices: Vec<domain::ModelChoice>,
+}
+
+/// A release as its Hub publishes it, carried by the run (th-241): the machine installs it
+/// reading no Hub.
+#[derive(Clone, Debug)]
+pub struct Card {
+    pub interface: Value,
+    pub python_version: String,
+    /// The locked requirements' text.
+    pub lock: String,
 }
 
 /// The caller's provider tokens; empty reads public sources anonymously.
@@ -267,26 +276,6 @@ impl Publisher {
         answer
     }
 
-    /// The newest release of `package` at its Hub (`cozy run org/pkg/fn` names none): the
-    /// newest final release by version, else the newest pre-release; yanked ones never.
-    pub fn newest_release(&self, source: &hub::Source, package: &str) -> Result<String, Failure> {
-        let catalog = Catalog::new(source).map_err(|e| ("catalog_read_failed", e.0))?;
-        let (org, name) = package
-            .split_once('/')
-            .ok_or(("release_root_invalid", "package must be org/name".to_string()))?;
-        let card = catalog
-            .json(&format!("/v1/packages/{}/{}", hub::escape(org), hub::escape(name)))
-            .map_err(|e| ("catalog_read_failed", e.0))?;
-        let releases = card["releases"].as_array().into_iter().flatten().filter(|row| {
-            row["yanked"].as_bool() != Some(true) && row["yanked_at"].as_str().is_none_or(str::is_empty)
-        });
-        releases
-            .filter_map(|row| row["release"].as_str())
-            .max_by(|a, b| release_order(a).cmp(&release_order(b)))
-            .map(str::to_string)
-            .ok_or(("release_absent", format!("{package} has no release that is not yanked")))
-    }
-
     /// One run's preparation on the calling thread, reported through `observe`: a held
     /// installation and resolution answer at once.
     pub fn prepare_now(
@@ -351,6 +340,23 @@ impl Publisher {
         })
     }
 
+    /// The component names a held checkpoint's header declares.
+    fn components(&self, manifest: &str) -> Result<Vec<String>, Failure> {
+        let sha = manifest.trim_start_matches("sha256:");
+        let absent = |e: String| ("checkpoint_absent", format!("{manifest}: {e}"));
+        let length = fs::metadata(self.store.manifest_path(sha)).map_err(|e| absent(e.to_string()))?.len();
+        let held = self
+            .store
+            .read_manifest(&tensorfs_core::ids::ObjectRef { sha256: sha.to_string(), length })
+            .map_err(|e| absent(e.to_string()))?;
+        let header = held
+            .header()
+            .map(|reference| tensorfs_core::checkpoint::load_header(&self.store, reference))
+            .transpose()
+            .map_err(|e| absent(e.to_string()))?;
+        Ok(header.map(|h| h.components.into_iter().map(|(name, _)| name).collect()).unwrap_or_default())
+    }
+
     /// A slot's model this machine's store holds, by its exact manifest.
     fn held_grant(&self, installation: &Installation, path: &str, reference: &domain::Ref) -> Result<ModelGrant, Failure> {
         let sha = sha256::hex(&reference.digest);
@@ -410,13 +416,9 @@ impl Publisher {
                 }
             }
         }
-        let catalog = Catalog::new(source).map_err(|e| Refused {
-            code: "catalog_read_failed",
-            message: e.0,
-        })?;
         let _fetching = self.fetch(vec![manifest.to_string()]);
         let keep = self.protected(service).map_err(io_failure).map_err(|(code, message)| Refused { code, message })?;
-        ensure(&self.store, &catalog, repository, manifest, &keep, bytes)
+        ensure(&self.store, source, repository, manifest, &keep, bytes)
             .map_err(|(code, message)| Refused { code, message })
     }
 
@@ -469,10 +471,6 @@ impl Publisher {
             while others() {
                 std::thread::sleep(tick);
             }
-            let catalog = match Catalog::new(&source) {
-                Ok(catalog) => catalog,
-                Err(e) => break Err(("catalog_read_failed", e.0)),
-            };
             let keep = match self.protected(service) {
                 Ok(keep) => keep,
                 Err(e) => break Err(io_failure(e)),
@@ -495,7 +493,7 @@ impl Publisher {
                         }
                     }
                 });
-                let result = ensure_with(&self.store, &catalog, &repository, manifest, &keep, &pull, &|_, _| ());
+                let result = ensure_with(&self.store, &source, &repository, manifest, &keep, &pull, &|_, _| ());
                 done.store(true, std::sync::atomic::Ordering::Release);
                 result
             });
@@ -612,7 +610,7 @@ impl Publisher {
         let origin = hub::origin_key(&request.source.origin).unwrap_or_default();
         let package = request.installed.as_ref().map(|i| i.package.as_str()).unwrap_or(&request.package);
         let release = request.installed.as_ref().map(|i| i.release.as_str()).unwrap_or(&request.release);
-        let key = json!({"installation":alias,"package":package,"release":release,"hub":origin,"owner":request.owner,"bindings":request.binding_revision,"entrypoint":request.entrypoint,"choices":choices,"gpu":gpu});
+        let key = json!({"installation":alias,"package":package,"release":release,"hub":origin,"owner":request.owner,"entrypoint":request.entrypoint,"choices":choices,"gpu":gpu});
         format!("hub-{}", sha256::hex_digest(key.to_string().as_bytes()))
     }
 
@@ -671,7 +669,6 @@ impl Publisher {
         request: &Request,
         job: &Job,
     ) -> Result<Prepared, Failure> {
-        let catalog = Catalog::new(&request.source).map_err(|e| ("catalog_read_failed", e.0))?;
         let held = match &request.installed {
             Some(installed) => Some(installed.clone()),
             None => service
@@ -687,7 +684,7 @@ impl Publisher {
                     "this owner has not prepared the named installation".into(),
                 ))
             }
-            _ => self.install(service, actor, request, &catalog, job)?,
+            _ => self.install(service, actor, request, job)?,
         };
         if !declares_models(&installation, &request.entrypoint) {
             return Ok(Prepared {
@@ -699,7 +696,7 @@ impl Publisher {
             "capability_unavailable",
             "this callable needs a GPU and this machine has none configured".to_string(),
         ))?;
-        let plan = self.model(service, &gpu, actor, &installation, request, &catalog, job)?;
+        let plan = self.model(service, &gpu, actor, &installation, request, job)?;
         Ok(Prepared {
             installation,
             plan: Some(plan),
@@ -711,57 +708,32 @@ impl Publisher {
         service: &Service,
         actor: &str,
         request: &Request,
-        catalog: &Catalog,
         job: &Job,
     ) -> Result<Installation, Failure> {
         job.stage(format!(
             "installing {}@{}",
             request.package, request.release
         ));
-        let (org, name) = request.package.split_once('/').ok_or((
+        let (_, name) = request.package.split_once('/').ok_or((
             "release_root_invalid",
             "package must be org/name".to_string(),
         ))?;
-        let base = format!(
-            "/v1/packages/{}/{}/releases/{}",
-            hub::escape(org),
-            hub::escape(name),
-            hub::escape(&request.release)
-        );
-        let release = catalog
-            .json(&base)
-            .map_err(|e| ("catalog_read_failed", e.0))?;
-        if release.pointer("/release/release").and_then(Value::as_str)
-            != Some(request.release.as_str())
-        {
+        let card = request.card.as_ref().ok_or((
+            "release_card_absent",
+            format!("the run carries no card for {}@{}, which this signer has not installed", request.package, request.release),
+        ))?;
+        if !card.interface.is_object() {
             return Err((
-                "catalog_read_failed",
-                format!("{base} named another release"),
+                "package_prepare_interface_missing",
+                "the release card carries no package interface".to_string(),
             ));
         }
-        let interface = release
-            .get("package_interface")
-            .filter(|v| v.is_object())
-            .cloned()
-            .ok_or((
-                "package_prepare_interface_missing",
-                "the release carries no package interface".to_string(),
-            ))?;
-        let python = release
-            .get("python_version")
-            .and_then(Value::as_str)
+        let interface = card.interface.clone();
+        let python = Some(card.python_version.as_str())
             .filter(|v| !v.is_empty())
             .unwrap_or(&self.sdk.python)
             .to_string();
-        let lock = catalog
-            .bytes(&format!("{base}/locked-requirements"), 16 << 20)
-            .map_err(|e| ("catalog_read_failed", e.0))?;
-        let lock = String::from_utf8(lock).map_err(|_| {
-            (
-                "package_prepare_locked_requirements_invalid",
-                "locked requirements are not UTF-8".to_string(),
-            )
-        })?;
+        let lock = card.lock.clone();
         let split = split_lock(
             &lock,
             name,
@@ -1080,7 +1052,10 @@ impl Publisher {
         ))
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// The run's model grants, every Hub slot exact as its choice names it (th-241): a
+    /// pinned checkpoint, or the widest rung of its binding this machine's GPUs fit. The
+    /// widest fitting rung's GPU count is the group's width; 0 lets each slot's declared
+    /// degrees decide. A slot with no choice is refused: the machine resolves nothing.
     fn model(
         &self,
         service: &Service,
@@ -1088,7 +1063,6 @@ impl Publisher {
         actor: &str,
         installation: &Installation,
         request: &Request,
-        catalog: &Catalog,
         job: &Job,
     ) -> Result<GpuPlan, Failure> {
         let interface: Value = serde_json::from_slice(&installation.interface).map_err(|_| {
@@ -1105,14 +1079,7 @@ impl Publisher {
             ))?;
         let gpu_model = gpu_name(&gpu.config().envelope()[0]);
         let width = gpu.width();
-        let (org, _) = installation.package.split_once('/').unwrap_or_default();
-        // Unpublished code (local/) has no owner bindings; its org-relative names are its owner's.
-        let local = org == "local";
-        let account = if local { request.owner.as_str() } else { org };
-        let mut bindings: Option<Value> = None;
         let mut grants = vec![];
-        // The widest fitting rung's GPU count is the group's width (Runtime
-        // `machine_model_defaults.select`); 0 lets every slot's declared degrees decide.
         let mut degree = 0u32;
         for slot in &slots {
             let path = slot
@@ -1121,15 +1088,14 @@ impl Publisher {
                 .unwrap_or_default()
                 .to_string();
             let parameter = path.rsplit('.').next().unwrap_or_default().to_string();
-            job.stage(format!("resolving the model for {path}"));
+            job.stage(format!("choosing the model for {path}"));
             let choice = request
                 .choices
                 .iter()
                 .find(|c| c.parameter == path || c.parameter == parameter)
-                .cloned()
-                .unwrap_or_default();
+                .ok_or(("model_choice_absent", format!("the run names no model for {path}")))?;
             if !choice.source.is_empty() {
-                grants.push(self.source_grant(installation, &path, &choice, &request.providers, job)?);
+                grants.push(self.source_grant(installation, &path, choice, &request.providers, job)?);
                 continue;
             }
             if let (Some(reference), true) = (
@@ -1140,108 +1106,16 @@ impl Publisher {
                 grants.push(self.held_grant(installation, &path, reference)?);
                 continue;
             }
-            let (model, release, lane, manifest) = if let Some(reference) =
-                choice.manifest.as_ref().filter(|m| m.digest.len() == 32)
-            {
-                (
-                    choice.repository.clone(),
-                    format!("sha256:{}", sha256::hex(&reference.digest)),
-                    choice.lane.clone(),
-                    true,
-                )
-            } else if !choice.repository.is_empty() {
-                (
-                    choice.repository.clone(),
-                    choice.release.clone(),
-                    choice.lane.clone(),
-                    false,
-                )
-            } else {
-                let row = model_binding(catalog, installation, slot, &mut bindings)?;
-                let mut model = row
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                if !model.contains('/') && !model.is_empty() {
-                    if account.is_empty() {
-                        return Err((
-                            "model_binding_absent",
-                            format!("{path} names its owner's model and this run names no owner"),
-                        ));
-                    }
-                    model = format!("{account}/{model}");
-                }
-                let (lane, gpus) = rung(row.get("ladder"), &gpu_model, width).ok_or((
-                    "model_binding_absent",
-                    format!("no rung of {path}'s ladder fits {width}x {gpu_model:?}"),
-                ))?;
-                degree = degree.max(gpus);
-                (
-                    model,
-                    row.get("release")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    lane,
-                    false,
-                )
-            };
-            if model.is_empty() {
-                return Err((
-                    "model_binding_absent",
-                    format!("{path} names no model repository"),
-                ));
-            }
-            let reference = if release.is_empty() {
-                model.clone()
-            } else {
-                format!("{model}@{release}")
-            };
-            let mut query = format!("/v1/models/resolve?ref={}", hub::escape(&reference));
-            if !lane.is_empty() && !manifest {
-                query.push_str(&format!("&lane={}", hub::escape(&lane)));
-            }
-            let resolved = catalog
-                .json(&query)
-                .map_err(|e| ("catalog_read_failed", e.0))?;
-            let manifest_id = resolved
-                .get("manifest_id")
-                .and_then(Value::as_str)
-                .ok_or((
-                    "catalog_read_failed",
-                    "model resolution named no manifest".to_string(),
-                ))?
-                .to_string();
-            let manifest_id = if manifest_id.starts_with("sha256:") {
-                manifest_id
-            } else {
-                format!("sha256:{manifest_id}")
-            };
-            let field = |name: &str, fallback: &str| {
-                resolved
-                    .get(name)
-                    .and_then(Value::as_str)
-                    .unwrap_or(fallback)
-                    .to_string()
-            };
+            let exact = exact(choice, &path, (&gpu_model, width))?;
+            degree = degree.max(exact.gpus);
             grants.push(ModelGrant {
                 package: installation.package.clone(),
-                slot: path.clone(),
-                repository: field("model", &model),
-                release: field("release", &release),
-                lane: field("lane", &lane),
-                manifest: manifest_id,
-                components: resolved
-                    .get("components")
-                    .and_then(Value::as_array)
-                    .map(|c| {
-                        c.iter()
-                            .filter_map(Value::as_str)
-                            .map(String::from)
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                slot: path,
+                repository: exact.repository,
+                release: exact.release,
+                lane: exact.lane,
+                manifest: exact.manifest,
+                components: vec![],
             });
         }
         let _fetching = self.fetch(grants.iter().map(|g| g.manifest.clone()).collect());
@@ -1260,10 +1134,11 @@ impl Publisher {
             .collect();
         let mut parts: HashMap<&str, Option<Vec<String>>> = HashMap::new();
         for grant in &grants {
-            let part: Option<Vec<String>> = declared.get(grant.slot.as_str()).map(|names| {
-                grant.components.iter().filter(|c| names.contains(&c.as_str())).cloned().collect()
-            });
-            let part = part.filter(|part| !part.is_empty() && part.len() < grant.components.len());
+            // An exact choice names no components before its header is here: the slot's
+            // declared ones are its part (a checkpoint lacking one downloads whole).
+            let part: Option<Vec<String>> =
+                declared.get(grant.slot.as_str()).map(|names| names.iter().map(|n| n.to_string()).collect());
+            let part = part.filter(|part| !part.is_empty());
             // A checkpoint two slots share downloads whole if either needs all of it.
             let merged = match (parts.remove(grant.manifest.as_str()), part) {
                 (Some(Some(mut a)), Some(b)) => {
@@ -1283,7 +1158,7 @@ impl Publisher {
             .filter(|g| fetched.insert(g.manifest.clone()) && !g.repository.is_empty() && !g.repository.starts_with("local/"))
             .map(|g| (g, parts.get(g.manifest.as_str()).cloned().flatten().unwrap_or_default()))
             .collect();
-        let landed = download_all(&self.store, catalog, &downloads, &keep, job)?;
+        let landed = download_all(&self.store, &request.source, &downloads, &keep, job)?;
         let mut remainders = self.remainders.lock().unwrap();
         for (grant, hold) in landed {
             remainders
@@ -1298,6 +1173,9 @@ impl Publisher {
                 .push(hold);
         }
         drop(remainders);
+        for grant in grants.iter_mut().filter(|g| g.components.is_empty() && !g.repository.is_empty()) {
+            grant.components = self.components(&grant.manifest)?;
+        }
         for grant in &mut grants {
             let parameter = grant
                 .slot
@@ -1310,7 +1188,7 @@ impl Publisher {
                 .iter()
                 .find(|c| c.parameter == grant.slot || c.parameter == parameter)
             {
-                apply_adapters(&self.store, catalog, choice, grant, &keep, &request.providers, job)?;
+                apply_adapters(&self.store, &request.source, choice, grant, &keep, &request.providers, job)?;
             }
         }
         job.stage(format!("preparing {}", request.package));
@@ -1352,119 +1230,44 @@ pub(crate) fn machine_gpu(service: &Service) -> (String, usize) {
     })
 }
 
-/// A job's model input, resolved as a direct run's slot is: an exact checkpoint as chosen;
-/// else the chosen repository (or the package's binding, then its authored ladder) at the
-/// chosen release (else the binding's, else the newest the Hub lists with the lane) and the
-/// chosen lane (else the ladder's rung for this machine). Returns (repository, manifest id).
-pub(crate) fn job_input(
-    catalog: &Catalog,
-    installation: &Installation,
-    slot: &Value,
-    choice: Option<&domain::ModelChoice>,
-    owner: &str,
-    (gpu, width): (&str, usize),
-) -> Result<(String, String), Failure> {
-    let path = slot["path"].as_str().unwrap_or_default();
-    let chosen = choice.cloned().unwrap_or_default();
-    if let Some(digest) = chosen.manifest.as_ref().filter(|m| m.digest.len() == 32) {
-        return Ok((chosen.repository, format!("sha256:{}", sha256::hex(&digest.digest))));
+/// A Hub model slot's exact checkpoint as its choice names it (th-241: the caller resolved
+/// it): the pinned manifest, or the widest rung of its binding this machine's GPUs fit.
+pub(crate) struct Exact {
+    pub repository: String,
+    pub release: String,
+    pub lane: String,
+    pub manifest: String,
+    /// The rung's GPU count; 0 for a pinned checkpoint.
+    pub gpus: u32,
+}
+
+pub(crate) fn exact(choice: &domain::ModelChoice, path: &str, (gpu, width): (&str, usize)) -> Result<Exact, Failure> {
+    if choice.repository.is_empty() {
+        return Err(("model_choice_inexact", format!("{path}'s choice names no model repository")));
     }
-    let mut cached = None;
-    let row = match (chosen.repository.is_empty(), chosen.lane.is_empty()) {
-        (false, false) => Value::Null,
-        _ => model_binding(catalog, installation, slot, &mut cached)?,
-    };
-    let mut model = match chosen.repository.is_empty() {
-        true => row["model"].as_str().unwrap_or_default().to_string(),
-        false => chosen.repository.clone(),
-    };
-    if !model.contains('/') && !model.is_empty() {
-        let org = installation.package.split_once('/').map_or("", |(org, _)| org);
-        let account = if org == "local" || org.is_empty() { owner } else { org };
-        if account.is_empty() {
-            return Err(("model_binding_absent", format!("{path} names its owner's model and this run names no owner")));
+    let (lane, manifest, gpus) = match &choice.manifest {
+        Some(reference) if reference.digest.len() == 32 => (choice.lane.clone(), &reference.digest, 0),
+        _ if choice.rungs.is_empty() => {
+            return Err(("model_choice_inexact", format!("{path}'s choice names no exact checkpoint")));
         }
-        model = format!("{account}/{model}");
-    }
-    let (org, name) = model.split_once('/').ok_or((
-        "model_binding_absent",
-        format!("{path} names no model repository"),
-    ))?;
-    let lane = match chosen.lane.is_empty() {
-        false => chosen.lane.clone(),
-        true => rung(row.get("ladder"), gpu, width).map(|(lane, _)| lane).ok_or((
-            "model_binding_absent",
-            format!("no rung of {path}'s ladder fits {width}x {gpu:?}"),
-        ))?,
+        _ => {
+            let rung = rung(&choice.rungs, gpu, width).ok_or((
+                "model_binding_absent",
+                format!("no rung of {path}'s binding fits {width}x {gpu:?}"),
+            ))?;
+            (rung.lane.clone(), &rung.manifest.digest, rung.gpus)
+        }
     };
-    let mut release = match (chosen.release.is_empty(), chosen.repository.is_empty()) {
-        (false, _) => chosen.release.clone(),
-        (true, true) => row["release"].as_str().unwrap_or_default().to_string(),
-        (true, false) => String::new(),
-    };
-    if release.is_empty() {
-        let card = catalog
-            .json(&format!("/v1/models/{}/{}", hub::escape(org), hub::escape(name)))
-            .map_err(|e| ("catalog_read_failed", e.0))?;
-        release = card["releases"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .rev()
-            .find(|r| {
-                r["yanked"].as_bool() != Some(true)
-                    && r["lanes"].as_array().into_iter().flatten().any(|l| l["lane"] == lane.as_str())
-            })
-            .and_then(|r| r["release"].as_str())
-            .ok_or(("model_binding_absent", format!("{model} has no release with lane {lane}")))?
-            .to_string();
-    }
-    let query = format!(
-        "/v1/models/resolve?ref={}&lane={}",
-        hub::escape(&format!("{model}@{release}")),
-        hub::escape(&lane)
-    );
-    let resolved = catalog.json(&query).map_err(|e| ("catalog_read_failed", e.0))?;
-    let manifest = resolved["manifest_id"].as_str().ok_or((
-        "catalog_read_failed",
-        "model resolution named no manifest".to_string(),
-    ))?;
-    let manifest = match manifest.starts_with("sha256:") {
-        true => manifest.to_string(),
-        false => format!("sha256:{manifest}"),
-    };
-    Ok((resolved["model"].as_str().unwrap_or(&model).to_string(), manifest))
+    Ok(Exact {
+        repository: choice.repository.clone(),
+        release: choice.release.clone(),
+        lane,
+        manifest: format!("sha256:{}", sha256::hex(manifest)),
+        gpus,
+    })
 }
 
-/// One package's own slot default: its Hub bindings, then its authored ladder. A dependency
-/// installed in another package's environment still asks under its own package identity.
-pub(crate) fn model_binding(
-    catalog: &Catalog,
-    installation: &Installation,
-    slot: &Value,
-    cached: &mut Option<Value>,
-) -> Result<Value, Failure> {
-    let (org, name) = installation.package.split_once('/').ok_or((
-        "model_binding_absent", "the model's package identity must be org/name".into(),
-    ))?;
-    let path = slot["path"].as_str().unwrap_or_default();
-    if cached.is_none() && org != "local" {
-        *cached = Some(catalog.json(&format!(
-            "/v1/packages/{}/{}/bindings", hub::escape(org), hub::escape(name),
-        )).map_err(|e| ("catalog_read_failed", e.0))?);
-    }
-    cached.as_ref()
-        .and_then(|b| b["bindings"].as_array())
-        .and_then(|rows| rows.iter().find(|row| row["slot"].as_str() == Some(path)))
-        .cloned()
-        .or_else(|| authored(slot))
-        .ok_or(("model_binding_absent", format!(
-            "{} binds no model to {path}; bind one with `cozy package bind`", installation.package,
-        )))
-}
 
-/// A provider source made into a local model by TensorFS `source_model`, kept as the local
-/// repository named by the source and its profiles (a later choice of it is held).
 fn make_source(
     store: &Store,
     source: &str,
@@ -1506,16 +1309,17 @@ fn make_source(
     .map_err(|e| refused("model_source_failed", e))
 }
 
-/// Download one exact checkpoint; `keep` names what its GC must not evict (`protected`).
+/// Download one exact checkpoint, anonymously unless the run's capability names it (an
+/// owner's unpublished checkpoint); `keep` names what its GC must not evict (`protected`).
 fn ensure(
     store: &Store,
-    catalog: &Catalog,
+    source: &hub::Source,
     repository: &str,
     manifest: &str,
     keep: &[String],
     bytes: &(dyn Fn(u64, u64) + Sync),
 ) -> Result<(), Failure> {
-    ensure_with(store, catalog, repository, manifest, keep, &Pull::default(), bytes).map(drop)
+    ensure_with(store, source, repository, manifest, keep, &Pull::default(), bytes).map(drop)
 }
 
 /// How one ensure pulls: some components only (held until dropped), its streams, its stop.
@@ -1528,13 +1332,14 @@ struct Pull {
 
 fn ensure_with(
     store: &Store,
-    catalog: &Catalog,
+    source: &hub::Source,
     repository: &str,
     manifest: &str,
     keep: &[String],
     pull: &Pull,
     bytes: &(dyn Fn(u64, u64) + Sync),
 ) -> Result<Option<tensorfs_core::ensure::PartHold>, Failure> {
+    let catalog = Catalog::for_op(source, hub::Op::Read { model: repository, manifest })?;
     let credential = catalog.credential();
     let refspec = format!("{repository}@{manifest}");
     let mut keep = keep.to_vec();
@@ -1549,19 +1354,25 @@ fn ensure_with(
     );
     request.keep = &keep;
     request.on_event = Some(&on_event);
-    request.components = &pull.components;
     request.cancellation = pull.cancellation.clone();
     if let Some(streams) = pull.streams {
         request.streams = streams;
     }
-    if pull.components.is_empty() {
-        return tensorfs_core::ensure::ensure(&request)
-            .map(|_| None)
-            .map_err(|e| refused("model_download_failed", e));
+    let refusal = |e| {
+        let (code, message) = refused("model_download_failed", e);
+        catalog.reason(code, message)
+    };
+    if !pull.components.is_empty() {
+        request.components = &pull.components;
+        match tensorfs_core::ensure::ensure_part(&request) {
+            Ok((_, hold)) => return Ok(Some(hold)),
+            // A component the slot declares that this checkpoint lacks: the whole of it, as
+            // for a slot that declares none.
+            Err(e) if e.code == tensorfs_core::err::Code::NOT_CONTAINED => request.components = &[],
+            Err(e) => return Err(refusal(e)),
+        }
     }
-    tensorfs_core::ensure::ensure_part(&request)
-        .map(|(_, hold)| Some(hold))
-        .map_err(|e| refused("model_download_failed", e))
+    tensorfs_core::ensure::ensure(&request).map(|_| None).map_err(refusal)
 }
 
 /// Every checkpoint a preparation needs, downloaded at once under one stage whose bytes are
@@ -1569,7 +1380,7 @@ fn ensure_with(
 /// The first refusal is the answer, once every download has ended.
 fn download_all<'g>(
     store: &Store,
-    catalog: &Catalog,
+    source: &hub::Source,
     grants: &[(&'g ModelGrant, Vec<String>)],
     keep: &[String],
     job: &Job,
@@ -1594,7 +1405,7 @@ fn download_all<'g>(
                 let moved = &moved;
                 scope.spawn(move || {
                     let pull = Pull { components: part.clone(), ..Pull::default() };
-                    ensure_with(store, catalog, &grant.repository, &grant.manifest, keep, &pull, &|done, total| {
+                    ensure_with(store, source, &grant.repository, &grant.manifest, keep, &pull, &|done, total| {
                         let (done, total) = {
                             let mut moved = moved.lock().unwrap();
                             moved[at] = (done, total);
@@ -1627,114 +1438,11 @@ fn refused(code: &'static str, refusal: tensorfs_core::err::Refusal) -> Failure 
     }
 }
 
-/// One caller adapter's exact checkpoint at the Hub (the worker's `checkpoint()` for an
-/// adapter: no ladder; a named lane, else the release's bf16/fp16/fp32 lane, else its
-/// smallest), returned as (repository, "sha256:<hex>").
-fn resolve_adapter(
-    catalog: &Catalog,
-    adapter: &domain::DownloadAdapterRef,
-) -> Result<(String, String), Failure> {
-    let model = adapter.model.clone();
-    let Some((org, name)) = model.split_once('/') else {
-        return Err((
-            "model_override_invalid",
-            format!("adapter {model:?} names no org/model repository"),
-        ));
-    };
-    let mut lane = adapter.lane.clone();
-    let reference = if !adapter.manifest.is_empty() {
-        format!("{model}@{}", adapter.manifest)
-    } else {
-        if lane.is_empty() {
-            let card = catalog
-                .json(&format!(
-                    "/v1/models/{}/{}",
-                    hub::escape(org),
-                    hub::escape(name)
-                ))
-                .map_err(|e| ("catalog_read_failed", e.0))?;
-            let releases = card
-                .get("releases")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let release = releases
-                .iter()
-                .rev()
-                .find(|r| {
-                    r.get("yanked").and_then(Value::as_bool) != Some(true)
-                        && (adapter.release.is_empty()
-                            || r.get("release").and_then(Value::as_str)
-                                == Some(adapter.release.as_str()))
-                })
-                .ok_or((
-                    "model_override_invalid",
-                    format!("{model} has no such release"),
-                ))?;
-            let lanes: Vec<(String, u64)> = release
-                .get("lanes")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|l| {
-                    Some((
-                        l.get("lane")?.as_str()?.to_string(),
-                        l.get("bytes").and_then(Value::as_u64).unwrap_or(u64::MAX),
-                    ))
-                })
-                .collect();
-            lane = ["bf16", "fp16", "fp32"]
-                .into_iter()
-                .find(|full| lanes.iter().any(|(l, _)| l == full))
-                .map(String::from)
-                .or_else(|| {
-                    lanes
-                        .iter()
-                        .min_by_key(|(l, bytes)| (*bytes, l.clone()))
-                        .map(|(l, _)| l.clone())
-                })
-                .ok_or((
-                    "model_override_invalid",
-                    format!("{model} has no lane to serve as an adapter"),
-                ))?;
-        }
-        if adapter.release.is_empty() {
-            model.clone()
-        } else {
-            format!("{model}@{}", adapter.release)
-        }
-    };
-    let mut query = format!("/v1/models/resolve?ref={}", hub::escape(&reference));
-    if adapter.manifest.is_empty() && !lane.is_empty() {
-        query.push_str(&format!("&lane={}", hub::escape(&lane)));
-    }
-    let resolved = catalog
-        .json(&query)
-        .map_err(|e| ("catalog_read_failed", e.0))?;
-    let manifest = resolved.get("manifest_id").and_then(Value::as_str).ok_or((
-        "catalog_read_failed",
-        "adapter resolution named no manifest".to_string(),
-    ))?;
-    let manifest = if manifest.starts_with("sha256:") {
-        manifest.to_string()
-    } else {
-        format!("sha256:{manifest}")
-    };
-    Ok((
-        resolved
-            .get("model")
-            .and_then(Value::as_str)
-            .unwrap_or(&model)
-            .to_string(),
-        manifest,
-    ))
-}
-
 /// A slot's caller adapters applied to its resolved base: each adapter downloaded, then one
 /// adapter view composed (`adapter_views`); the grant then names the view.
 fn apply_adapters(
     store: &Store,
-    catalog: &Catalog,
+    source: &hub::Source,
     choice: &domain::ModelChoice,
     grant: &mut ModelGrant,
     keep: &[String],
@@ -1765,9 +1473,15 @@ fn apply_adapters(
     let mut selections = vec![];
     for adapter in &choice.adapters {
         let manifest = if adapter.source.is_empty() {
-            let (repository, manifest) = resolve_adapter(catalog, adapter)?;
-            ensure(store, catalog, &repository, &manifest, &keep, &|d, t| job.bytes(d, t))?;
-            manifest
+            // Exact as the caller resolved it (th-241): the machine reads no model card.
+            if adapter.model.is_empty() || !adapter.manifest.starts_with("sha256:") {
+                return Err((
+                    "adapter_inexact",
+                    format!("an adapter of {} names no exact checkpoint", grant.slot),
+                ));
+            }
+            ensure(store, source, &adapter.model, &adapter.manifest, &keep, &|d, t| job.bytes(d, t))?;
+            adapter.manifest.clone()
         } else {
             // A provider-source LoRA (civitai://, hf://) is made here, normalized at ingest.
             let made = make_source(store, &adapter.source, &adapter.profiles, providers, &|stage, moved, total| {
@@ -1815,27 +1529,6 @@ fn io_failure(error: io::Error) -> Failure {
     ("release_root_preparation_failed", error.to_string())
 }
 
-/// A slot's authored default ladder (`[org/]model@release/lane` rungs) in an owner binding's
-/// shape: one model and release, each rung naming its lane.
-fn authored(slot: &Value) -> Option<Value> {
-    let rungs = slot.get("default_ladder")?.as_array()?;
-    let parse = |rung: &Value| {
-        let (model, rest) = rung.get("lane")?.as_str()?.split_once('@')?;
-        let (release, lane) = rest.split_once('/')?;
-        Some((model.to_string(), release.to_string(), lane.to_string()))
-    };
-    let (model, release, _) = parse(rungs.first()?)?;
-    let ladder: Vec<Value> = rungs
-        .iter()
-        .filter_map(|rung| {
-            let mut rung = rung.clone();
-            rung["lane"] = json!(parse(&rung)?.2);
-            Some(rung)
-        })
-        .collect();
-    Some(json!({"model": model, "release": release, "ladder": ladder}))
-}
-
 fn model_slots(interface: &Value, entrypoint: &str) -> Option<Vec<Value>> {
     interface
         .get("entrypoints")?
@@ -1856,9 +1549,11 @@ pub fn declares_models(installation: &Installation, entrypoint: &str) -> bool {
 
 /// The widest rung this machine holds (its GPU pattern fits the device and it asks for at
 /// most `available` of them; the first among equals): its lane and GPU count (0 unstated).
-fn rung(ladder: Option<&Value>, gpu: &str, available: usize) -> Option<(String, u32)> {
+/// The rung `available` GPUs named `gpu` run: the widest that fits, the owner's first among
+/// equals. A rung's `gpu` is "*" (or empty), or tokens the GPU's name holds in order.
+fn rung<'a>(rungs: &'a [domain::ModelRung], gpu: &str, available: usize) -> Option<&'a domain::ModelRung> {
     let fits = |pattern: &str| {
-        if pattern == "*" {
+        if pattern.is_empty() || pattern == "*" {
             return true;
         }
         let have: Vec<String> = gpu
@@ -1874,15 +1569,12 @@ fn rung(ladder: Option<&Value>, gpu: &str, available: usize) -> Option<(String, 
             .filter(|t| !t.is_empty())
             .all(|token| rest.any(|t| t == token))
     };
-    let gpus = |r: &Value| r.get("gpus").and_then(Value::as_u64).unwrap_or(0);
-    ladder?
-        .as_array()?
+    rungs
         .iter()
         .rev()
-        .filter(|r| gpus(r) as usize <= available)
-        .filter(|r| fits(r.get("gpu").and_then(Value::as_str).unwrap_or("*")))
-        .max_by_key(|r| gpus(r))
-        .and_then(|r| Some((r.get("lane")?.as_str()?.to_string(), gpus(r) as u32)))
+        .filter(|r| r.gpus as usize <= available)
+        .filter(|r| fits(&r.gpu))
+        .max_by_key(|r| r.gpus)
 }
 
 /// The configured device's model name from the NVIDIA driver's proc files (no CUDA/NVML).
@@ -2042,22 +1734,6 @@ fn split_lock(lock: &str, name: &str, release: &str, own_sdk: bool) -> Result<Lo
     })
 }
 
-/// A release's place in version order: final releases after every pre-release, then each
-/// numeric part of the release and of its pre-release tag (`1.0.0-rc.2`, `2.4.0rc1`).
-fn release_order(release: &str) -> (bool, Vec<u64>, Vec<u64>) {
-    let numbers = |text: &str| -> Vec<u64> {
-        text.split(|c: char| !c.is_ascii_digit())
-            .filter(|part| !part.is_empty())
-            .map(|part| part.parse().unwrap_or(u64::MAX))
-            .collect()
-    };
-    let split = release
-        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
-        .unwrap_or(release.len());
-    let (version, tag) = release.split_at(split);
-    (tag.is_empty(), numbers(version), numbers(tag))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2146,17 +1822,6 @@ mod tests {
     }
 
     #[test]
-    fn the_newest_release_is_by_version_and_final_before_pre_release() {
-        fn newest<'a>(releases: &[&'a str]) -> &'a str {
-            releases.iter().copied().max_by_key(|r| release_order(r)).unwrap()
-        }
-        assert_eq!(newest(&["2.9.0", "2.10.0", "2.4.1"]), "2.10.0");
-        assert_eq!(newest(&["2.6.0", "3.0.0rc1"]), "2.6.0");
-        assert_eq!(newest(&["1.0.0-rc.1", "1.0.0-rc.2"]), "1.0.0-rc.2");
-        assert_eq!(newest(&["1.0.0-rc.2", "1.0.0"]), "1.0.0");
-    }
-
-    #[test]
     fn lock_keeps_indexes_pins_and_drops_sdk_rows_only_for_an_own_sdk() {
         let lock = "--index-url https://pypi.org/simple\n--extra-index-url https://hub/v1/index/o/simple/\ncozy-runtime==0.18.67 ; sys_platform == 'linux' --hash=sha256:aa\nSDXL==2.3.24 --hash=sha256:bb\ntorch==2.14.0 ; platform_machine == 'x86_64' --hash=sha256:cc\n";
         let own = split_lock(lock, "sdxl", "2.3.24", true).unwrap();
@@ -2205,48 +1870,60 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rung_is_the_widest_group_the_machine_holds() {
-        let ladder = json!([{"gpu":"*","lane":"bf16"},{"gpu":"rtx 4090","lane":"fp8"},{"gpu":"h100","gpus":4,"lane":"bf16"}]);
-        assert_eq!(
-            rung(Some(&ladder), "NVIDIA GeForce RTX 4090", 1),
-            Some(("bf16".into(), 0))
-        );
-        let ladder = json!([{"gpu":"rtx 4090","lane":"fp8"}]);
-        assert_eq!(
-            rung(Some(&ladder), "NVIDIA GeForce RTX 4090", 1),
-            Some(("fp8".into(), 0))
-        );
-        assert_eq!(rung(Some(&ladder), "NVIDIA A40", 2), None);
-        let h3 = json!([{"gpu":"H100","gpus":2,"lane":"fp8-pruned"},{"gpu":"H100","gpus":4,"lane":"fp8-pruned"},{"gpu":"H200","gpus":1,"lane":"fp8-pruned"}]);
-        assert_eq!(rung(Some(&h3), "NVIDIA H100 80GB HBM3", 1), None);
-        assert_eq!(
-            rung(Some(&h3), "NVIDIA H100 80GB HBM3", 2),
-            Some(("fp8-pruned".into(), 2))
-        );
-        assert_eq!(
-            rung(Some(&h3), "NVIDIA H100 80GB HBM3", 8),
-            Some(("fp8-pruned".into(), 4))
-        );
+    fn rungs(ladder: &[(&str, u32, &str)]) -> Vec<domain::ModelRung> {
+        ladder
+            .iter()
+            .enumerate()
+            .map(|(i, (gpu, gpus, lane))| domain::ModelRung {
+                gpu: gpu.to_string(),
+                gpus: *gpus,
+                lane: lane.to_string(),
+                manifest: domain::Ref { digest: vec![i as u8; 32], length: 1 },
+            })
+            .collect()
     }
 
     #[test]
-    fn an_authored_default_reads_as_a_binding_of_its_one_model() {
-        let slot = json!({"default_ladder":[{"gpu":"H100","gpus":2,"lane":"h3@1.2.0/fp8"},{"gpu":"*","lane":"h3@1.2.0/bf16"}]});
-        let row = authored(&slot).unwrap();
-        assert_eq!(row["model"], "h3");
-        assert_eq!(row["release"], "1.2.0");
-        assert_eq!(
-            rung(row.get("ladder"), "NVIDIA H100 80GB HBM3", 2),
-            Some(("fp8".into(), 2))
-        );
-        assert_eq!(
-            rung(row.get("ladder"), "NVIDIA A40", 1),
-            Some(("bf16".into(), 0))
-        );
-        let slot = json!({"default_ladder":[{"gpu":"*","lane":"cozy/sdxl@1/plain"}]});
-        assert_eq!(authored(&slot).unwrap()["model"], "cozy/sdxl");
-        assert_eq!(authored(&json!({})), None);
+    fn rung_is_the_widest_group_the_machine_holds() {
+        let lane = |ladder: &[domain::ModelRung], gpu, width| rung(ladder, gpu, width).map(|r| (r.lane.clone(), r.gpus));
+        let ladder = rungs(&[("*", 0, "bf16"), ("rtx 4090", 0, "fp8"), ("h100", 4, "bf16")]);
+        assert_eq!(lane(&ladder, "NVIDIA GeForce RTX 4090", 1), Some(("bf16".into(), 0)));
+        let ladder = rungs(&[("rtx 4090", 0, "fp8")]);
+        assert_eq!(lane(&ladder, "NVIDIA GeForce RTX 4090", 1), Some(("fp8".into(), 0)));
+        assert_eq!(lane(&ladder, "NVIDIA A40", 2), None);
+        let h3 = rungs(&[("H100", 2, "fp8-pruned"), ("H100", 4, "fp8-pruned"), ("H200", 1, "fp8-pruned")]);
+        assert_eq!(lane(&h3, "NVIDIA H100 80GB HBM3", 1), None);
+        assert_eq!(lane(&h3, "NVIDIA H100 80GB HBM3", 2), Some(("fp8-pruned".into(), 2)));
+        assert_eq!(lane(&h3, "NVIDIA H100 80GB HBM3", 8), Some(("fp8-pruned".into(), 4)));
+    }
+
+    /// A Hub slot's checkpoint is exact as its choice names it, a pinned manifest or the rung
+    /// this machine fits; anything else is refused, never resolved at a Hub.
+    #[test]
+    fn a_hub_choice_is_exact_or_refused() {
+        let pinned = domain::ModelChoice {
+            repository: "proof/probe".into(),
+            lane: "bf16".into(),
+            manifest: Some(domain::Ref { digest: vec![7; 32], length: 9 }),
+            ..Default::default()
+        };
+        let got = self::exact(&pinned, "touch.models.source", ("", 0)).unwrap();
+        assert_eq!((got.manifest, got.gpus), (format!("sha256:{}", "07".repeat(32)), 0));
+        let laddered = domain::ModelChoice {
+            repository: "proof/probe".into(),
+            release: "1.0.0".into(),
+            rungs: rungs(&[("h100", 2, "fp8"), ("*", 0, "bf16")]),
+            ..Default::default()
+        };
+        let got = self::exact(&laddered, "touch.models.source", ("NVIDIA H100 80GB HBM3", 2)).unwrap();
+        assert_eq!((got.lane.as_str(), got.gpus, got.release.as_str()), ("fp8", 2, "1.0.0"));
+        assert_eq!(got.manifest, format!("sha256:{}", "00".repeat(32)));
+        let got = self::exact(&laddered, "touch.models.source", ("NVIDIA A40", 1)).unwrap();
+        assert_eq!(got.lane, "bf16");
+        let named = domain::ModelChoice { repository: "proof/probe".into(), release: "1.0.0".into(), ..Default::default() };
+        assert_eq!(self::exact(&named, "touch.models.source", ("", 0)).err().unwrap().0, "model_choice_inexact");
+        let unnamed = domain::ModelChoice { manifest: pinned.manifest.clone(), ..Default::default() };
+        assert_eq!(self::exact(&unnamed, "touch.models.source", ("", 0)).err().unwrap().0, "model_choice_inexact");
     }
 
     /// A source choice becomes the slot's grant through TensorFS `source_model`, as a local
@@ -2300,66 +1977,4 @@ mod tests {
         assert!(tensors.iter().any(|(key, _)| key.ends_with("attn1.to_q.lora_A.weight")));
         let _ = std::fs::remove_dir_all(root);
     }
-
-    /// A job's model input named by repository alone resolves as a direct run's slot does:
-    /// the newest release with the ladder's lane, then that lane's checkpoint, at the Hub.
-    /// Nothing chosen takes the package's own ladder; an exact checkpoint reads nothing.
-    #[test]
-    fn a_job_model_input_selector_resolves_at_the_hub() {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let origin = format!("http://{}", listener.local_addr().unwrap());
-        let manifest = "ab".repeat(32);
-        let served = std::thread::spawn(move || {
-            let mut seen = vec![];
-            for _ in 0..3 {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut bytes = Vec::new();
-                while !bytes.ends_with(b"\r\n\r\n") {
-                    let mut byte = [0];
-                    assert_eq!(stream.read(&mut byte).unwrap(), 1);
-                    bytes.push(byte[0]);
-                }
-                let line = String::from_utf8(bytes).unwrap().lines().next().unwrap().to_string();
-                let body = if line.starts_with("GET /v1/models/proof/probe ") {
-                    json!({"releases":[{"release":"0.9.0","lanes":[{"lane":"bf16"}]},
-                        {"release":"1.0.0","lanes":[{"lane":"bf16"}]},{"release":"2.0.0","lanes":[{"lane":"fp8"}]}]})
-                } else {
-                    json!({"model":"proof/probe","release":"1.0.0","lane":"bf16","manifest_id":format!("sha256:{}", "ab".repeat(32))})
-                }
-                .to_string();
-                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
-                seen.push(line);
-            }
-            seen
-        });
-        let source = hub::Source::pod(&origin, "wrk", "t", None, vec![]);
-        let catalog = Catalog::new(&source).unwrap();
-        let installation = Installation {
-            actor: "alice".into(),
-            alias: "probe".into(),
-            generation: String::new(),
-            package: "local/probe".into(),
-            release: "0.1.0".into(),
-            interface: vec![],
-        };
-        let slot = json!({"path":"touch.models.source","class":"probe.Probe",
-            "default_ladder":[{"gpu":"*","lane":"proof/probe@1.0.0/bf16"}]});
-        let named = domain::ModelChoice { parameter: "source".into(), repository: "proof/probe".into(), ..Default::default() };
-        let resolved = job_input(&catalog, &installation, &slot, Some(&named), "alice", ("", 0)).unwrap();
-        assert_eq!(resolved, ("proof/probe".to_string(), format!("sha256:{manifest}")));
-        let defaulted = job_input(&catalog, &installation, &slot, None, "alice", ("", 0)).unwrap();
-        assert_eq!(defaulted.1, format!("sha256:{manifest}"));
-        let exact = domain::ModelChoice {
-            repository: "proof/probe".into(),
-            manifest: Some(domain::Ref { digest: vec![7; 32], ..Default::default() }),
-            ..Default::default()
-        };
-        assert_eq!(job_input(&catalog, &installation, &slot, Some(&exact), "alice", ("", 0)).unwrap().1, format!("sha256:{}", "07".repeat(32)));
-        let seen = served.join().unwrap();
-        assert!(seen[0].starts_with("GET /v1/models/proof/probe "), "{seen:?}");
-        assert!(seen[1].contains("ref=proof%2Fprobe%401.0.0") && seen[1].contains("lane=bf16"), "{seen:?}");
-        assert!(seen[2].contains("ref=proof%2Fprobe%401.0.0") && seen[2].contains("lane=bf16"), "{seen:?}");
-    }
 }
-

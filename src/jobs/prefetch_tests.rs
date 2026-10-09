@@ -28,7 +28,7 @@ fn prefetch_choices_cross_the_native_handler_and_keep_callee_authority() {
         publisher: None,
         local: None,
         own_hub: None,
-        grants: Default::default(),
+        leaf: None,
         jobs: Default::default(),
     });
     let jobs = Jobs::configure(&service, store, Some(&runs)).unwrap();
@@ -59,7 +59,7 @@ fn prefetch_choices_cross_the_native_handler_and_keep_callee_authority() {
         )
         .unwrap();
     let context = json!({
-        "installation": "installed", "owner": "alice", "binding_revision": "choices-1",
+        "installation": "installed", "owner": "alice",
         "attention_kernel": "", "models": [],
     });
     service

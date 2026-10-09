@@ -135,9 +135,8 @@ impl Hub {
         }
     }
 
-    /// The rental's current authorized keys, their lease and the owner's bindings revision (0
-    /// from a Hub that states none).
-    pub async fn authorized_keys(&self) -> Result<(Vec<VerifyingKey>, Duration, i64), Refusal> {
+    /// The rental's current authorized keys and their lease.
+    pub async fn authorized_keys(&self) -> Result<(Vec<VerifyingKey>, Duration), Refusal> {
         let (status, answer) = self
             .call(Method::GET, "/v1/worker/rental/authorized-keys", None)
             .await?;
@@ -151,8 +150,6 @@ impl Hub {
             worker_id: String,
             authorized_keys: Vec<String>,
             lease_seconds: u64,
-            #[serde(default)]
-            bindings_revision: i64,
         }
         let invalid = || Refusal::Transport("rental authority metadata is invalid".into());
         let document: Document = serde_json::from_slice(&answer).map_err(|_| invalid())?;
@@ -170,7 +167,7 @@ impl Hub {
             })
             .collect::<Option<Vec<_>>>()
             .ok_or_else(invalid)?;
-        Ok((keys, Duration::from_secs(document.lease_seconds), document.bindings_revision))
+        Ok((keys, Duration::from_secs(document.lease_seconds)))
     }
 
     /// Tells the Hub where this booting machine listens. Ok(false): a Hub that takes no

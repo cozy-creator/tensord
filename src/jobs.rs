@@ -820,7 +820,7 @@ impl Jobs {
             ));
         }
         // A serving call's request, and the models it passed by value to the callee's slots
-        // (null leaves a slot to the callee's own ladder and the owner's bindings).
+        // (null leaves a slot to the choice the job carries for it).
         let (request_input, choices) = match parent.serving.contains(&callable) {
             true => serving_call(&input, entrypoint)?,
             false => (input.clone(), vec![]),
