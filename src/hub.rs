@@ -88,6 +88,20 @@ fn origin_of(url: &str) -> &str {
         .map_or(url, |end| &url[..after + end])
 }
 
+/// Whether `url` is a file the run's Hub publishes (its index's file door).
+pub fn publishes(source: &Source, url: &str) -> bool {
+    origin_key(origin_of(url)).is_some_and(|key| origin_key(&source.origin) == Some(key))
+}
+
+/// Where its published files are read: the file door answers with one redirect to its
+/// object store.
+pub fn files_policy(source: &Source) -> Result<SourcePolicy, Refusal> {
+    Ok(SourcePolicy {
+        max_redirects: 1,
+        ..Catalog::new(source)?.policy
+    })
+}
+
 /// An absolute URL at a valid origin, without query or fragment.
 fn valid_url(url: &str) -> bool {
     valid_origin(origin_of(url)) && !url.contains(['?', '#'])
