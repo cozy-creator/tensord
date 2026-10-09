@@ -22,7 +22,14 @@ use std::{
     sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
-use tensorfs_core::{sha256, store::Store};
+use tensorfs_core::{
+    err::{Code, Refusal},
+    fetch::{DeliveryGrant, FetchPlan},
+    ids::ObjectRef,
+    sha256,
+    store::Store,
+    transport::{self, Anonymous, Deadline, Ledger, Ranged, SourcePolicy},
+};
 use crate::catalog::normalized;
 
 /// How each published environment gets its Runtime SDK. Empty `requirements` keeps the
@@ -148,7 +155,7 @@ struct Environment<'a> {
     python: &'a str,
     interface: &'a Value,
     release: &'a str,
-    hub_origin: &'a str,
+    source: &'a hub::Source,
 }
 
 pub struct Publisher {
@@ -746,7 +753,7 @@ impl Publisher {
             python: &python,
             interface: &interface,
             release: &request.release,
-            hub_origin: &request.source.origin,
+            source: &request.source,
         };
         self.generation(service.catalog.root(), &identity, &wanted, job)?;
         let held = service.catalog.resolve(&identity).map_err(io_failure)?;
@@ -784,7 +791,7 @@ impl Publisher {
             python,
             interface,
             release,
-            hub_origin,
+            source,
         } = *wanted;
         let locks = generations.join(".locks");
         fs::create_dir_all(&locks).map_err(io_failure)?;
@@ -800,7 +807,8 @@ impl Publisher {
         }
         fs::create_dir(&dir).map_err(io_failure)?;
         let write = |name: &str, body: &str| fs::write(dir.join(name), body).map_err(io_failure);
-        write("requirements.txt", &split.exact)?;
+        let exact = self.hub_files(&split.exact, source, &dir, job)?;
+        write("requirements.txt", &exact)?;
         write("constraints.txt", &split.constraints)?;
         let mut sdk_choice = if self.sdk.requirements.is_empty() {
             "locked"
@@ -887,7 +895,7 @@ impl Publisher {
             ))?;
         File::create(dir.join(".hold")).map_err(io_failure)?;
         let (source_digest, callees) = match &self.sdk.client_wheel {
-            Some(_) => describe_environment(&py, &split.distribution, hub_origin)?,
+            Some(_) => describe_environment(&py, &split.distribution, &source.origin)?,
             None => (String::new(), vec![]),
         };
         let record = json!({"identity":identity,"package":split.distribution,"version":release,"application":application,"python":interpreter,"dependencies":installed_sdk(&env),"interface":interface,"sdk":sdk_choice,"sdk_fallback":sdk_fallback,"source_digest":source_digest,"callees":callees});
@@ -907,6 +915,70 @@ impl Publisher {
         File::open(generations)
             .and_then(|d| d.sync_all())
             .map_err(io_failure)
+    }
+
+    /// The lock's rows its Hub publishes, through TensorFS's downloader instead of uv's: 1 MiB
+    /// ranged parts side by side, a late one asked again, verified by the lock's sha256 into
+    /// the store, then installed by uv from that file. uv asks one GET per wheel and waits out
+    /// every stall of it (run 5107, oczy: the install sat in two ~147 s rounds behind the
+    /// Hub's 302 to R2, while TensorFS moved 51 GiB from the same R2 in 91 s). PyPI rows stay
+    /// uv's and the image's seeded cache's.
+    fn hub_files(&self, exact: &str, source: &hub::Source, dir: &Path, job: &Job) -> Result<String, Failure> {
+        let files: Vec<HubFile> = exact.lines().filter_map(|line| hub_file(line, source)).collect();
+        if files.is_empty() {
+            return Ok(exact.to_string());
+        }
+        job.stage(format!("downloading {} package files", files.len()));
+        let policy = hub::files_policy(source).map_err(|e| ("catalog_read_failed", e.0))?;
+        let wheels = dir.join("wheels");
+        fs::create_dir(&wheels).map_err(io_failure)?;
+        let fetched: Vec<Result<PathBuf, Failure>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = files
+                .iter()
+                .map(|file| scope.spawn(|| self.hub_wheel(file, &policy, &wheels)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap_or_else(|_| Err(io_failure(io::Error::other("a package file download panicked")))))
+                .collect()
+        });
+        let mut local = HashMap::new();
+        for (file, path) in files.iter().zip(fetched) {
+            local.insert(file.url.as_str(), format!("file://{}", path?.display()));
+        }
+        Ok(exact
+            .lines()
+            .map(|line| match hub_file(line, source) {
+                Some(file) => line.replacen(&file.url, &local[file.url.as_str()], 1),
+                None => line.to_string(),
+            })
+            .map(|line| line + "\n")
+            .collect())
+    }
+
+    fn hub_wheel(&self, file: &HubFile, policy: &SourcePolicy, wheels: &Path) -> Result<PathBuf, Failure> {
+        let failed = |e: Refusal| ("package_file_download_failed", format!("{}: {e}", file.url));
+        if !self.store.contains(&file.sha256) {
+            let ledger = Ledger::new();
+            let object = ObjectRef {
+                sha256: file.sha256.clone(),
+                length: probe(&file.url, policy, &ledger).map_err(failed)?,
+            };
+            let (plan, _) = FetchPlan::of_objects(&self.store, "package-files", std::slice::from_ref(&object))
+                .map_err(failed)?;
+            if !plan.wanted.is_empty() {
+                let grant = DeliveryGrant::mint(&plan, &object).map_err(failed)?;
+                let ranged = Ranged { streams: transport::STREAMS, part: 1 << 20 };
+                transport::fetch_ranged(&self.store, &grant, &file.url, policy, &Anonymous, Deadline::none(), &ledger, ranged, None)
+                    .map_err(failed)?;
+            }
+        }
+        let blob = self.store.blob_path(&file.sha256);
+        let path = wheels.join(&file.name);
+        fs::hard_link(&blob, &path)
+            .or_else(|_| fs::copy(&blob, &path).map(drop))
+            .map_err(io_failure)?;
+        Ok(path)
     }
 
     /// This machine's own uv cache, which `reclaim` manages; None when an image's seeded cache
@@ -1525,6 +1597,46 @@ fn stage_of(progress: &Progress) -> String {
     }
 }
 
+/// A lock row the run's Hub publishes: `name @ <url>/<file>.whl ... --hash=sha256:<hex>`.
+struct HubFile {
+    url: String,
+    sha256: String,
+    name: String,
+}
+
+fn hub_file(line: &str, source: &hub::Source) -> Option<HubFile> {
+    let mut words = line.split_whitespace();
+    let (_, at, url) = (words.next()?, words.next()?, words.next()?);
+    let sha256 = words.find_map(|word| word.strip_prefix("--hash=sha256:"))?;
+    let name = url.rsplit('/').next()?;
+    let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+');
+    (at == "@"
+        && name.ends_with(".whl")
+        && !name.starts_with('.')
+        && name.chars().all(plain)
+        && sha256.len() == 64
+        && sha256.chars().all(|c| c.is_ascii_hexdigit())
+        && hub::publishes(source, url))
+    .then(|| HubFile {
+        url: url.to_string(),
+        sha256: sha256.to_ascii_lowercase(),
+        name: name.to_string(),
+    })
+}
+
+/// A file's length, asked again on a fresh connection while an ask stays silent past the
+/// transport's noise floor, as its downloader asks a late part again.
+fn probe(url: &str, policy: &SourcePolicy, ledger: &Ledger) -> Result<u64, Refusal> {
+    let mut attempt = 1;
+    loop {
+        let deadline = Deadline::after_seconds(Some(ledger.floor().as_secs_f64()));
+        match transport::probe_length(url, policy, &Anonymous, deadline, ledger) {
+            Err(e) if e.code == Code::DEADLINE_EXCEEDED && attempt < transport::FETCH_ATTEMPTS => attempt += 1,
+            answer => return answer,
+        }
+    }
+}
+
 fn io_failure(error: io::Error) -> Failure {
     ("release_root_preparation_failed", error.to_string())
 }
@@ -1766,6 +1878,168 @@ mod tests {
         zip.write_all(record.as_bytes()).unwrap();
         zip.finish().unwrap();
         path
+    }
+
+    /// A loopback Hub whose file door redirects to a loopback object store answering ranges,
+    /// as the Hub's 302 to R2 does. Answers every request on its own connection.
+    fn file_door(objects: HashMap<String, Vec<u8>>, asks: Arc<Mutex<Vec<String>>>, stall: Option<usize>) -> String {
+        use std::io::{BufRead, BufReader};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let base = origin.clone();
+        let stalled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let (objects, asks, base, stalled) = (objects.clone(), asks.clone(), base.clone(), stalled.clone());
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let (mut range, mut header) = (None, String::new());
+                    while reader.read_line(&mut header).unwrap_or(0) > 2 {
+                        if let Some((name, value)) = header.split_once(':') {
+                            if name.eq_ignore_ascii_case("range") {
+                                let (first, last) = value.trim().trim_start_matches("bytes=").split_once('-').unwrap();
+                                range = Some((first.parse::<usize>().unwrap(), last.parse::<usize>().unwrap()));
+                            }
+                        }
+                        header.clear();
+                    }
+                    let mut words = line.split_whitespace();
+                    let (method, path) = (words.next().unwrap().to_string(), words.next().unwrap().to_string());
+                    asks.lock().unwrap().push(format!("{method} {path} {range:?}"));
+                    // The first ask of the stalled part answers nothing, as a cold R2 object can.
+                    if stall.is_some() && range.map(|(first, _)| first) == stall
+                        && !stalled.swap(true, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        std::thread::sleep(Duration::from_secs(120));
+                        return;
+                    }
+                    let mut out = stream;
+                    let answer = match path.split('/').collect::<Vec<_>>().as_slice() {
+                        ["", "v1", "index", "acme", "files", sha, _] => format!(
+                            "HTTP/1.1 302 Found\r\nLocation: {base}/objects/{sha}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                        .into_bytes(),
+                        ["", "objects", sha] => {
+                            let body = &objects[*sha];
+                            let (status, first, last) = match range {
+                                Some((first, last)) => ("206 Partial Content", first, last.min(body.len() - 1)),
+                                None => ("200 OK", 0, body.len() - 1),
+                            };
+                            let mut answer = format!(
+                                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Range: bytes {first}-{last}/{}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                                last + 1 - first,
+                                body.len()
+                            )
+                            .into_bytes();
+                            if method == "GET" {
+                                answer.extend_from_slice(&body[first..=last]);
+                            }
+                            answer
+                        }
+                        _ => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+                    };
+                    let _ = out.write_all(&answer);
+                });
+            }
+        });
+        origin
+    }
+
+    /// The lock's rows its Hub publishes come through TensorFS in ranged parts after the file
+    /// door's redirect, land verified, and uv installs them from disk; a PyPI row is left to
+    /// uv, and bytes that do not hash to the lock's sha256 are refused. Real uv, no network.
+    #[test]
+    fn hub_published_rows_download_ranged_and_install_from_disk() {
+        use std::io::Write as _;
+        let root = std::env::temp_dir().join(format!("cm-hub-files-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let wheel = root.join("acme_pkg-1.0-py3-none-any.whl");
+        let mut zip = zip::ZipWriter::new(File::create(&wheel).unwrap());
+        let stored = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let payload: Vec<u8> = (0..(5u32 << 19)).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        let info = "acme_pkg-1.0.dist-info";
+        for (name, body) in [
+            ("acme_pkg/__init__.py".to_string(), b"VALUE = 7\n".to_vec()),
+            ("acme_pkg/blob.bin".into(), payload),
+            (format!("{info}/METADATA"), b"Metadata-Version: 2.1\nName: acme-pkg\nVersion: 1.0\n".to_vec()),
+            (format!("{info}/WHEEL"), b"Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n".to_vec()),
+            (format!("{info}/RECORD"), format!("acme_pkg/__init__.py,,\nacme_pkg/blob.bin,,\n{info}/METADATA,,\n{info}/WHEEL,,\n{info}/RECORD,,\n").into_bytes()),
+        ] {
+            zip.start_file(name, stored).unwrap();
+            zip.write_all(&body).unwrap();
+        }
+        zip.finish().unwrap();
+        let bytes = fs::read(&wheel).unwrap();
+        let good = sha256::hex_digest(&bytes);
+        let bad = sha256::hex_digest(b"other bytes");
+        let asks = Arc::new(Mutex::new(vec![]));
+        let origin = file_door(HashMap::from([(good.clone(), bytes.clone()), (bad.clone(), bytes)]), asks.clone(), None);
+        let source = hub::Source::new(&origin, None, vec![], None).unwrap();
+        let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
+        let publisher = Publisher::new(&root.join("published"), PackageSdk::default(), store).unwrap();
+        let pypi = "six @ https://files.pythonhosted.org/packages/six-1.17.0-py2.py3-none-any.whl --hash=sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274";
+        let exact = format!(
+            "--index-url https://pypi.org/simple\n{pypi}\nacme-pkg @ {origin}/v1/index/acme/files/{good}/acme_pkg-1.0-py3-none-any.whl --hash=sha256:{good}\n"
+        );
+        let dir = root.join("generation");
+        fs::create_dir_all(&dir).unwrap();
+        let rewritten = publisher.hub_files(&exact, &source, &dir, &Job::default()).unwrap();
+        let local = dir.join("wheels/acme_pkg-1.0-py3-none-any.whl");
+        assert_eq!(
+            rewritten,
+            format!("--index-url https://pypi.org/simple\n{pypi}\nacme-pkg @ file://{} --hash=sha256:{good}\n", local.display())
+        );
+        assert_eq!(sha256::hex_digest(&fs::read(&local).unwrap()), good);
+        let parts = asks.lock().unwrap().iter().filter(|ask| ask.starts_with("GET /objects/") && ask.contains("Some") && !ask.contains("Some((0, 0))")).count();
+        assert!(parts >= 3, "a 2.5 MiB wheel comes in 1 MiB parts: {:?}", asks.lock().unwrap());
+
+        let row = rewritten.lines().last().unwrap();
+        fs::write(dir.join("requirements.txt"), format!("{row}\n")).unwrap();
+        let env = dir.join("env");
+        let python = env.join("bin/python");
+        for args in [
+            vec!["venv", "-q", "--python", "3.12", env.to_str().unwrap()],
+            vec!["pip", "install", "-q", "--offline", "--no-config", "--python", python.to_str().unwrap(),
+                "--require-hashes", "--no-deps", "--requirements", dir.join("requirements.txt").to_str().unwrap()],
+        ] {
+            assert!(Command::new("uv").args(&args).env("UV_CACHE_DIR", root.join("uv-cache")).status().unwrap().success(), "{args:?}");
+        }
+        let value = Command::new(&python).args(["-c", "import acme_pkg; print(acme_pkg.VALUE)"]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&value.stdout).trim(), "7");
+
+        let tampered = format!("acme-pkg @ {origin}/v1/index/acme/files/{bad}/acme_pkg-1.0-py3-none-any.whl --hash=sha256:{bad}\n");
+        let other = root.join("tampered");
+        fs::create_dir_all(&other).unwrap();
+        let (code, why) = publisher.hub_files(&tampered, &source, &other, &Job::default()).unwrap_err();
+        assert_eq!(code, "package_file_download_failed", "{why}");
+        assert!(!publisher.store.contains(&bad));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A part whose first ask never answers is asked again once its peers are home, so the
+    /// file lands in seconds where one GET (uv's) would wait out its read timeout.
+    #[test]
+    fn a_stalled_part_of_a_hub_file_is_asked_again() {
+        let root = std::env::temp_dir().join(format!("cm-hub-stall-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("generation")).unwrap();
+        let bytes: Vec<u8> = (0..(3u32 << 20)).map(|i| (i.wrapping_mul(2246822519) >> 11) as u8).collect();
+        let sha = sha256::hex_digest(&bytes);
+        let asks = Arc::new(Mutex::new(vec![]));
+        let origin = file_door(HashMap::from([(sha.clone(), bytes)]), asks.clone(), Some(1 << 20));
+        let source = hub::Source::new(&origin, None, vec![], None).unwrap();
+        let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
+        let publisher = Publisher::new(&root.join("published"), PackageSdk::default(), store).unwrap();
+        let exact = format!("acme-data @ {origin}/v1/index/acme/files/{sha}/acme_data-1.0-py3-none-any.whl --hash=sha256:{sha}\n");
+        let began = Instant::now();
+        publisher.hub_files(&exact, &source, &root.join("generation"), &Job::default()).unwrap();
+        let took = began.elapsed();
+        let stalled = asks.lock().unwrap().iter().filter(|ask| ask.ends_with("Some((1048576, 2097151))")).count();
+        assert_eq!(stalled, 2, "{:?}", asks.lock().unwrap());
+        assert!(took < Duration::from_secs(30), "took {took:?}");
+        assert_eq!(sha256::hex_digest(&fs::read(root.join("generation/wheels/acme_data-1.0-py3-none-any.whl")).unwrap()), sha);
+        let _ = fs::remove_dir_all(root);
     }
 
     /// The machine's own Runtime goes into an environment whose packages admit it; one whose
