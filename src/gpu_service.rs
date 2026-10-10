@@ -3590,8 +3590,7 @@ fn ending(error: io::Error, executor: DeviceExecutor) -> io::Error {
 }
 
 /// Every error ends the run once its executor is gone: FAILED with the reason, or CANCELED
-/// when a cancel was journaled. Only a never-authorized attempt hit by a transient OS
-/// shortage returns to the queue; a deterministic pre-start failure is FAILED.
+/// when a cancel was journaled. Nothing returns to the queue to fail again.
 pub(crate) fn settle(engine: &Arc<Engine>, id: &str, error: &io::Error) -> io::Result<()> {
     let record = engine.get(id)?;
     if record.state.terminal() {
@@ -3605,9 +3604,6 @@ pub(crate) fn settle(engine: &Arc<Engine>, id: &str, error: &io::Error) -> io::R
         .unwrap_or(true);
     if !ended {
         return Ok(()); // exit unproven: the reservation stays charged and nonterminal
-    }
-    if record.state == State::Starting && crate::process::transient(error) {
-        return engine.defer_managed(id, format!("device startup unavailable: {error}"));
     }
     if let Some(ended) = error
         .get_ref()

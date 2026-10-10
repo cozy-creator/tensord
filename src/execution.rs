@@ -269,11 +269,6 @@ impl Engine {
         self.journal.lock().unwrap().bind_preparation(record)
     }
 
-    pub(crate) fn defer_managed(&self, id: &str, reason: String) -> io::Result<()> {
-        self.journal.lock().unwrap().defer_unstarted(id, reason)?;
-        self.notify_activity();
-        Ok(())
-    }
     /// The attempt stays with its dispatcher, awaiting a fresh executor; false if a cancel
     /// ended it.
     pub(crate) fn redeliver(&self, id: &str) -> io::Result<bool> {
@@ -528,12 +523,10 @@ impl Engine {
         self.owned.lock().unwrap().contains(id)
     }
 
-    pub fn wait_for_environment(&self, id: &str, reason: Option<String>) -> io::Result<Execution> {
-        let record = self
-            .journal
-            .lock()
-            .unwrap()
-            .wait_for_environment(id, reason)?;
+    /// See `Journal::fail_unstarted`.
+    pub fn fail_unstarted(&self, id: &str, code: &str, reason: impl Into<String>) -> io::Result<Execution> {
+        let failure = crate::journal::Failure::machine(code, reason);
+        let record = self.journal.lock().unwrap().fail_unstarted(id, failure)?;
         self.notify_activity();
         Ok(record)
     }
@@ -646,11 +639,8 @@ impl Engine {
             });
         if let Err(error) = launched {
             owned.remove(&id);
-            self.journal
-                .lock()
-                .unwrap()
-                .defer_unstarted(&id, format!("supervisor launch failed: {error}"))?;
-            self.notify_activity();
+            drop(owned);
+            self.fail_unstarted(&id, "executor_launch_failed", format!("supervisor launch failed: {error}"))?;
             return Err(error);
         }
         Ok(true)
@@ -1045,11 +1035,7 @@ impl Engine {
                 continue;
             }
             if record.state == State::Starting {
-                journal.defer_unstarted(
-                    &record.id,
-                    "owner restarted before start authorization; no authored work dispatched"
-                        .into(),
-                )?;
+                journal.requeue_unstarted(&record.id)?;
             } else if record.invocation.job && record.pause_actor.is_some() {
                 // A pausing job's root is replayed by design: it rests paused.
                 journal.finish(&record.id, Outcome::Paused)?;
@@ -1122,14 +1108,6 @@ impl Engine {
         })();
         let (mut child, mut reader, exact) = match launch {
             Ok(value) => value,
-            Err(error) if crate::process::transient(&error) => {
-                self.journal
-                    .lock()
-                    .unwrap()
-                    .defer_unstarted(id, format!("runner launch failed: {error}"))?;
-                self.notify_activity();
-                return Ok(());
-            }
             Err(error) => {
                 // Nothing authored ran; a deterministic launch failure is not retried.
                 let reason = format!("runner did not start: {error}");

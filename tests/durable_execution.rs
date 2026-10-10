@@ -628,7 +628,7 @@ fn never_authorized_restart_can_retry_only_after_exact_birth_ends() {
     reopened.reconcile().unwrap();
     let record = reopened.get(&id).unwrap();
     assert_eq!(record.state, State::Queued);
-    assert!(record.waiting_reason.is_some());
+    assert!(record.waiting_reason.is_none(), "dispatched again at once, never parked");
     assert!(reopened.dispatch(&id, fixture.config()).unwrap());
     let deadline = Instant::now() + Duration::from_secs(15);
     while !reopened.get(&id).unwrap().state.terminal() {
@@ -724,15 +724,12 @@ fn a_pause_holds_unstarted_work_and_a_resume_starts_a_fresh_attempt() {
     journal.resume(&queued).unwrap();
     assert!(journal.claim(&queued).unwrap());
     assert_eq!(journal.get(&queued).unwrap().attempt, 2);
-    journal.defer_unstarted(&queued, "spawn".into()).unwrap();
+    journal.requeue_unstarted(&queued).unwrap();
 
-    // Claimed but never authorized: a pause makes the deferral rest, not queue.
+    // Claimed but never authorized: a pause makes the requeue rest, not queue.
     assert!(journal.claim(&queued).unwrap());
     journal.pause(&queued, "owner", false).unwrap();
-    assert_eq!(
-        journal.defer_unstarted(&queued, "spawn".into()).unwrap().state,
-        State::Paused
-    );
+    assert_eq!(journal.requeue_unstarted(&queued).unwrap().state, State::Paused);
     assert_eq!(journal.cancel(&queued, "owner").unwrap().state, State::Canceled);
 
     // Preparing: it rests once prepared, never dispatchable in between.

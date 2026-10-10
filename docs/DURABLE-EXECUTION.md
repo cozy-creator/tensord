@@ -66,9 +66,10 @@ let file = engine.open_result(&record.id, 0)?;  // re-verifies digest and length
 - After the terminal event the channel closes; a runner that then neither exits nor makes
   measurable CPU/IO progress is killed before it is reaped.
 - A runner `Canceled` without a durable `cancel_actor` becomes `failed`.
-- A launch failure or an exit before `Ready` is `failed` with the reason (and stderr tail). Only a
-  transient OS shortage (EAGAIN, ENOMEM, EMFILE, ENFILE) returns the record to `queued` with a
-  `waiting_reason`.
+- A launch failure or an exit before `Ready` is `failed` with the reason (and stderr tail).
+- Every job ends completed or failed: a queued job this machine cannot start (its environment not
+  held, CPU or GPU execution not configured) fails with that reason at once. Nothing is parked to
+  wait, and nothing returns to the queue to fail again.
 
 `reconcile` (records not supervised by this process):
 - birth alive, or liveness unknown: stays nonterminal;
