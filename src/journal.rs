@@ -70,7 +70,7 @@ pub struct Preparation {
     pub document: Vec<u8>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Installation {
     pub actor: String,
     pub alias: String,
@@ -78,6 +78,9 @@ pub struct Installation {
     pub package: String,
     pub release: String,
     pub interface: Vec<u8>,
+    /// The Hub origin a published release came from; empty for local code.
+    #[serde(default)]
+    pub hub: String,
 }
 
 #[derive(Clone, Debug)]
@@ -656,10 +659,20 @@ impl Journal {
     pub fn bind_installation(&mut self, record: Installation) -> io::Result<Installation> {
         validate_scope(&record.actor, &record.alias, &record.generation)?;
         if let Some(prior) = self.installation(&record.actor, &record.alias)? {
-            if prior != record {
+            if prior == record {
+                return Ok(prior);
+            }
+            // A record from before installations named their Hub is the same installation.
+            if !prior.hub.is_empty() || (Installation { hub: record.hub.clone(), ..prior }) != record {
                 return Err(admission(AdmissionError::BindingConflict));
             }
-            return Ok(prior);
+            self.connection
+                .execute(
+                    "UPDATE installations SET record=?3 WHERE actor=?1 AND alias=?2",
+                    params![record.actor, record.alias, encoded(&record)?],
+                )
+                .map_err(db_error)?;
+            return Ok(record);
         }
         self.connection
             .execute(
@@ -668,6 +681,26 @@ impl Journal {
             )
             .map_err(db_error)?;
         Ok(record)
+    }
+
+    /// Drop `actor`'s installation `alias` with its preparations, the resolutions naming them
+    /// and its warm set members. Answers the installation removed, if there was one.
+    pub fn remove_installation(&mut self, actor: &str, alias: &str) -> io::Result<Option<Installation>> {
+        let Some(installed) = self.installation(actor, alias)? else {
+            return Ok(None);
+        };
+        let tx = self.connection.transaction().map_err(db_error)?;
+        for statement in [
+            "DELETE FROM resolutions WHERE actor=?1 AND preparation IN
+                (SELECT id FROM preparations WHERE actor=?1 AND json_extract(record,'$.installation')=?2)",
+            "DELETE FROM preparations WHERE actor=?1 AND json_extract(record,'$.installation')=?2",
+            "DELETE FROM warm_sets WHERE actor=?1 AND json_extract(record,'$.installation')=?2",
+            "DELETE FROM installations WHERE actor=?1 AND alias=?2",
+        ] {
+            tx.execute(statement, params![actor, alias]).map_err(db_error)?;
+        }
+        tx.commit().map_err(db_error)?;
+        Ok(Some(installed))
     }
 
     pub fn resolution(&self, actor: &str, key: &str) -> io::Result<Option<String>> {

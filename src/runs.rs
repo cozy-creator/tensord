@@ -49,6 +49,8 @@ pub struct SetItem {
 pub struct Spec {
     /// Prepare only (`kind: warm`): install and download, then succeed.
     pub warm: bool,
+    /// `kind: remove`: the caller's installations of the source leave the machine.
+    pub remove: bool,
     /// A warm run's whole warm set for its caller, replacing the previous one.
     pub set: Option<Vec<SetItem>>,
     /// `kind: job`: `entrypoint` names an `@app.job`; its installed declaration selects its device.
@@ -569,6 +571,9 @@ impl Runs {
                 asset_bindings: vec![],
             }))
         };
+        if spec.remove {
+            return self.remove(actor, &spec).map(Some);
+        }
         if let Some(items) = &spec.set {
             return self.warm_set(actor, &spec, items, &observe);
         }
@@ -800,6 +805,56 @@ impl Runs {
         }))
     }
 
+    /// A remove run: the caller's installations its source names leave the journal, their
+    /// warm set members and the GPU pool, and each environment no installation or unfinished
+    /// run names any more is deleted unless a process still holds it (reclaim deletes it once
+    /// that ends). A release names its package at the run's Hub (any Hub for local/ code, or
+    /// for an installation recorded before installations named theirs).
+    fn remove(&self, actor: &str, spec: &Spec) -> Result<ResultRecord, Refused> {
+        let hub = spec.hub.clone().or_else(|| self.own_hub.clone());
+        let origin = hub.and_then(|hub| hub::origin_key(&hub.origin)).unwrap_or_default();
+        let named = |installed: &Installation| match &spec.source {
+            Source::Installation(alias) => &installed.alias == alias,
+            Source::Release { package, release } => {
+                &installed.package == package
+                    && (release.is_empty() || &installed.release == release)
+                    && (package.starts_with("local/") || installed.hub.is_empty() || installed.hub == origin)
+            }
+            Source::Local(_) | Source::Models => false,
+        };
+        let engine = &self.service.engine;
+        let mut removed = vec![];
+        for installed in engine.installations(actor)?.into_iter().filter(|i| named(i)) {
+            if let Some(gone) = engine.with_journal(|j| j.remove_installation(actor, &installed.alias))? {
+                removed.push(gone);
+            }
+        }
+        let generations: std::collections::BTreeSet<String> = removed.iter().map(|i| i.generation.clone()).collect();
+        if let Some(gpu) = self.service.gpu() {
+            gpu.drop_members(actor, &generations);
+        }
+        let bound = engine.with_journal(|j| j.bound_generations())?;
+        let (mut reclaimed, mut retained) = (0u64, vec![]);
+        for generation in generations.iter().filter(|g| !bound.contains(*g)) {
+            if let Some(gpu) = self.service.gpu() {
+                gpu.end_generation(generation);
+            }
+            match crate::reclaim::remove_generation(self.service.catalog.root(), generation)? {
+                Some(bytes) => reclaimed += bytes,
+                None => retained.push(generation.clone()),
+            }
+        }
+        let rows: Vec<Value> = removed
+            .iter()
+            .map(|i| json!({"package": i.package, "release": i.release, "installation": i.alias, "hub": i.hub}))
+            .collect();
+        Ok(ResultRecord {
+            value: json!({"removed": rows, "reclaimed_bytes": reclaimed, "retained": retained}),
+            artifacts: vec![],
+            asset_bindings: vec![],
+        })
+    }
+
     /// The run's installation and model plan: through the Hub when it needs one (a release,
     /// or held code declaring models), else held code with the operator's configured grants.
     /// Unobserved, it is a hint's: its downloads go behind the ones calls wait on.
@@ -935,6 +990,7 @@ impl Runs {
             .map_err(|_| refused("package_interface_invalid", "held interface is corrupt"))?;
         let prefix = format!("{entrypoint}.");
         let mut spec = Spec {
+            remove: false,
             warm: false,
             set: None,
             job,
@@ -1251,6 +1307,7 @@ mod tests {
 
     fn spec(source: Source, warm: bool, digest: &str) -> Spec {
         Spec {
+            remove: false,
             warm,
             set: None,
             job: false,
@@ -1295,6 +1352,7 @@ mod tests {
             actor:"alice".into(),alias:"installed".into(),generation,
             package:"alice/fixture".into(),release:"2.0.0".into(),
             interface:serde_json::to_vec(&interface).unwrap(),
+            hub: String::new(),
         }).unwrap();
         let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
         let objects = Arc::new(Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap());
@@ -1415,6 +1473,7 @@ mod tests {
         // This function binds no model, so its member holds its code and says why no more.
         let alias = service.engine.installations("alice").unwrap()[0].alias.clone();
         let set = |digest: &str, items: Vec<SetItem>| Spec {
+            remove: false,
             set: Some(items),
             ..spec(Source::Models, true, digest)
         };
@@ -1438,7 +1497,7 @@ mod tests {
             panic!("one member kept")
         };
         let record: KeptMember = serde_json::from_str(record).unwrap();
-        assert_eq!((actor.as_str(), record.installation, record.level.as_str()), ("alice", alias, "imported"));
+        assert_eq!((actor.as_str(), record.installation, record.level.as_str()), ("alice", alias.clone(), "imported"));
         assert_eq!(STANDARD.decode(record.item).unwrap(), b"as sent");
         // Its empty set clears it.
         let cleared = runs.submit("alice", "set-2", set("s2", vec![])).unwrap();
@@ -1458,6 +1517,31 @@ mod tests {
         assert_eq!(theirs.code, "local_source_incomplete");
         assert!(theirs.message.contains(&manifest), "{}", theirs.message);
         assert!(service.engine.get_public("bob", "run-1").is_err());
+
+        // A remove run takes the installation away and deletes its environment; another
+        // finds nothing to remove; the written code installs again.
+        let generation = service.engine.installations("alice").unwrap()[0].generation.clone();
+        let package = || Source::Release { package: "local/cozy-machine-cpu-lifecycle".into(), release: String::new() };
+        let remove = |id: &str| {
+            let spec = Spec { remove: true, ..spec(package(), false, id) };
+            settled(&service.engine, &runs.submit("alice", id, spec).unwrap().id)
+        };
+        let removed = remove("remove-1");
+        assert_eq!(removed.state, State::Completed, "{:?}", removed.failure);
+        let value = removed.result.unwrap().value;
+        assert_eq!(value["removed"][0]["installation"], alias.as_str(), "{value}");
+        assert!(service.engine.installations("alice").unwrap().is_empty());
+        // Deleted, unless the finished run's process had not let it go yet.
+        let retained = value["retained"] == json!([generation]);
+        assert_eq!(root.join("generations").join(&generation).exists(), retained, "{value}");
+        assert!(retained || value["reclaimed_bytes"].as_u64().unwrap() > 0, "{value}");
+        let none = remove("remove-2").result.unwrap().value;
+        assert_eq!(none["removed"], json!([]), "{none}");
+        let back = runs
+            .submit("alice", "warm-2", spec(Source::Local(manifest.clone()), true, "w2"))
+            .unwrap();
+        assert_eq!(settled(&service.engine, &back.id).state, State::Completed);
+        assert_eq!(service.engine.installations("alice").unwrap().len(), 1);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1519,6 +1603,7 @@ mod tests {
         let installed = service.engine.bind_installation(Installation {
             actor:"alice".into(),alias:"caller".into(),generation:generation.clone(),
             package:"first/caller".into(),release:"1.0.0".into(),interface:serde_json::to_vec(&caller).unwrap(),
+            hub: String::new(),
         }).unwrap();
         let selected = runs.callee_view(installed, "callee:app").unwrap();
         assert_eq!((&selected.alias, &selected.generation), (&"caller".to_string(), &generation));
@@ -1598,6 +1683,7 @@ mod tests {
         service.engine.bind_installation(crate::journal::Installation {
             actor: "alice".into(), alias: "pkg".into(), generation: "g1".into(), package: "org/pkg".into(),
             release: "1.0.0".into(), interface: serde_json::to_vec(&interface).unwrap(),
+            hub: String::new(),
         }).unwrap();
         runs.jobs.lock().unwrap().insert("7".into(), JobContext {
             installation: "pkg".into(), hub: None, providers: Default::default(), owner: "alice".into(),

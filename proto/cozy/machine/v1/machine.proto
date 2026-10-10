@@ -28,6 +28,11 @@ enum RunKind {
   RUN_KIND_JOB = 1;
   RUN_KIND_WARM = 2;    // prepare only: install and download, then succeed
   RUN_KIND_UPDATE = 3;  // stage, verify and activate a software cohort at idle
+  // `remove/1`: the caller's installations of the source leave the machine: an installation
+  // by its name, or a release's package (its release, or every release when empty) from the
+  // run's Hub (local/ packages from none). Their environments are deleted once no process and
+  // no other installation holds them.
+  RUN_KIND_REMOVE = 4;
 }
 
 // How far a function is kept ready; each level includes the ones before it.
@@ -357,6 +362,7 @@ message Environment {
   string runtime = 5;       // the cozy-runtime installed in it
   string level = 6;         // what it holds now (as WarmItem.holds), in a warm set or not
   string warning = 7;       // why it does not run the machine's own Runtime; empty when it does
+  string hub = 8;           // the Hub origin a published installation came from; empty for local code
 }
 message Disk {
   uint64 total_bytes = 1;

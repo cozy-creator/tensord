@@ -33,6 +33,7 @@ fn restart_ends_a_retained_gpu_birth_before_admitting_gpu_work() {
             package: "fixture".into(),
             release: "1".into(),
             interface: b"{}".to_vec(),
+            hub: String::new(),
         })
         .unwrap();
     journal

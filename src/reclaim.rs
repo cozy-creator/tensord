@@ -152,6 +152,19 @@ impl Entry {
     }
 }
 
+/// Delete generation `identity` under `generations` now (a removed installation's), unless a
+/// process holds it: renamed first, so no resolve finds it. The bytes it freed, or None when
+/// it is held (an executor of it still runs); reclaim removes it once nothing names it.
+pub fn remove_generation(generations: &Path, identity: &str) -> io::Result<Option<u64>> {
+    let path = generations.join(identity);
+    let Ok(filesystem) = fs::metadata(&path).map(|m| m.dev()) else {
+        return Ok(Some(0));
+    };
+    let bytes = releasable(&path, filesystem, &open_files()).unwrap_or(0);
+    let mut entry = Entry { kind: Kind::Generation, path, used: SystemTime::now(), hold: None, pointers: vec![] };
+    Ok(entry.remove()?.then_some(bytes))
+}
+
 /// Newest write, or read of a file, anywhere inside: an entry's last use. A read stamps a
 /// file's access at most daily (relatime); a filesystem that never does falls back to
 /// writes. A directory's own access time is this scan's, so it never counts.

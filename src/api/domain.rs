@@ -219,6 +219,7 @@ pub struct MachinePackage {
     pub installation_id: String,
     pub package: String,
     pub release: String,
+    /// The Hub origin a published release came from; empty for local code.
     pub origin: String,
     pub installed_at_ms: u64,
     pub sdk: Vec<ImageDistribution>,
