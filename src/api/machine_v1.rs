@@ -334,10 +334,10 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<(crate::runs::Spec, Option<v1::HubAc
 /// A typed refusal: the status carries its code as `cozy-error-code`, its message as text.
 fn refused(code: &str, message: &str) -> Status {
     let status = match code {
-        "run_id_conflict" => Status::already_exists(format!("{code}: {message}")),
-        c if c.starts_with("invalid") => Status::invalid_argument(format!("{code}: {message}")),
-        "object_storage_failed" => Status::unavailable(format!("{code}: {message}")),
-        _ => Status::failed_precondition(format!("{code}: {message}")),
+        "run_id_conflict" => Status::already_exists(message),
+        c if c.starts_with("invalid") => Status::invalid_argument(message),
+        "object_storage_failed" => Status::unavailable(message),
+        _ => Status::failed_precondition(message),
     };
     let mut status = status;
     if let Ok(value) = code.parse() {
@@ -367,29 +367,29 @@ fn spell(bytes: &[u8]) -> String {
     format!("sha256:{}", tensorfs_core::sha256::hex(bytes))
 }
 
-/// The outcome's typed reason: the code its message leads with, and who caused it.
+/// The current outcome carries a stable code and a plain detail separately.
 fn reason(body: &Value) -> v1::Reason {
-    let message = body["safe_message"].as_str().unwrap_or_default();
-    let code = message
-        .split_once(": ")
-        .map(|(code, _)| code)
-        .filter(|code| {
-            !code.is_empty()
-                && code
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b == b'_' || b == b'.')
-        })
-        .unwrap_or(if body["status"].as_u64() == Some(4) {
-            "canceled"
-        } else {
-            "failed"
-        });
     let origin = match body["cause"]["origin"].as_u64() {
         Some(1) => "author",
         Some(2) => "runtime",
         Some(6) => "request",
         _ => "machine",
     };
+    message_reason(
+        body["error_code"].as_str().unwrap_or_default(),
+        body["safe_message"].as_str().unwrap_or_default(),
+        origin,
+    )
+}
+
+fn message_reason(code: &str, message: &str, origin: &str) -> v1::Reason {
+    if code.is_empty() {
+        return v1::Reason {
+            code: "failure_record_invalid".into(),
+            message: "the recorded failure has no structured error code".into(),
+            origin: "machine".into(),
+        };
+    }
     v1::Reason {
         code: code.into(),
         message: message.into(),
@@ -451,22 +451,18 @@ impl Log {
                 },
                 memoized: body["memoized"].as_bool().unwrap_or_default(),
                 computation_digest: body["computation_digest"].as_str().unwrap_or_default().into(),
-                reason: match body["error"].as_str().unwrap_or_default() {
-                    "" => None,
-                    message => Some(v1::Reason {
-                        code: message
-                            .split_once(": ")
-                            .map(|(code, _)| code)
-                            .filter(|code| {
-                                code.bytes()
-                                    .all(|b| b.is_ascii_lowercase() || b == b'_' || b == b'.')
-                            })
-                            .unwrap_or(body["status"].as_str().unwrap_or("failed"))
-                            .into(),
-                        message: message.into(),
-                        origin: "runtime".into(),
-                    }),
-                },
+                reason: (!body["error_code"].as_str().unwrap_or_default().is_empty()
+                    || matches!(
+                        body["status"].as_str(),
+                        Some("failed" | "canceled" | "refused")
+                    ))
+                .then(|| {
+                    message_reason(
+                        body["error_code"].as_str().unwrap_or_default(),
+                        body["error"].as_str().unwrap_or_default(),
+                        "runtime",
+                    )
+                }),
             }),
             "log" => v1::run_event::Event::Log(v1::LogLine {
                 level: body["level"].as_str().unwrap_or("info").into(),
@@ -993,6 +989,61 @@ fn from_offset(bytes: Bytes, mut offset: u64) -> std::io::Result<Box<dyn Read + 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn transport_refusal_keeps_code_in_metadata_and_detail_plain() {
+        let refusal = refused("model_choice_absent", "no model for generate_image.models.model");
+        assert_eq!(refusal.metadata().get("cozy-error-code").unwrap(), "model_choice_absent");
+        assert_eq!(refusal.message(), "no model for generate_image.models.model");
+    }
+
+    #[test]
+    fn typed_reason_preserves_literal_details_and_requires_a_code() {
+        let body = json!({"status":3,"error_code":"model_choice_absent",
+            "cause":{"origin":6},
+            "safe_message":"model_choice_absent: is literal detail, not an encoded prefix"});
+        let value = reason(&body);
+        assert_eq!(value.code, "model_choice_absent");
+        assert_eq!(value.message, body["safe_message"].as_str().unwrap());
+        assert_eq!(value.origin, "request");
+        assert_eq!(
+            reason(&json!({"status":3,"safe_message":"model_choice_absent: old"})).code,
+            "failure_record_invalid"
+        );
+    }
+
+    #[test]
+    fn typed_call_reason_does_not_depend_on_nonempty_detail() {
+        let call = |status: &str, code: &str, detail: &str| {
+            let event = Log::default()
+                .event(domain::MachineExecutionEvent {
+                    kind: "call".into(),
+                    body_canonical_bytes: serde_json::to_vec(&json!({
+                        "status": status, "error_code": code, "error": detail
+                    }))
+                    .unwrap(),
+                    ..Default::default()
+                })
+                .unwrap();
+            let Some(v1::run_event::Event::Call(call)) = event.event else {
+                panic!("expected call event");
+            };
+            call.reason
+        };
+        for status in ["failed", "canceled", "refused"] {
+            let reason = call(status, "work_declined", "").unwrap();
+            assert_eq!(reason.code, "work_declined");
+            assert_eq!(reason.message, "");
+            assert_eq!(reason.origin, "runtime");
+            assert_eq!(
+                call(status, "", "old_code: detail").unwrap().code,
+                "failure_record_invalid"
+            );
+        }
+        assert_eq!(call("succeeded", "", "a literal note"), None);
+        assert_eq!(call("", "work_declined", "").unwrap().code, "work_declined");
+    }
 
     /// A read from any offset answers exactly the bytes after it, across parts, and reads
     /// none before it: the parts it skips are not read at all.

@@ -3020,10 +3020,8 @@ mod v1_api {
         let done = outcome(&events);
         assert_eq!(done.status, "failed", "{done:?}");
         let reason = done.reason.clone().unwrap_or_default();
-        assert!(
-            reason.code.contains("segment_failed") || reason.message.contains("segment_failed"),
-            "{reason:?}"
-        );
+        assert_eq!(reason.code, "segment_failed", "{reason:?}");
+        assert!(!reason.message.starts_with("segment_failed:"), "{reason:?}");
         assert!(reason.message.contains("segment 2 of 3"), "{reason:?}");
         // The child that failed is a failed run with the authored reason; the one before it
         // succeeded; no third segment ran.
@@ -3053,6 +3051,9 @@ mod v1_api {
         .unwrap();
         let failed = outcome(&second);
         assert_eq!(failed.status, "failed", "{second:?}");
+        let child_reason = failed.reason.as_ref().unwrap();
+        assert_eq!(child_reason.code, "unhandled_exception");
+        assert!(!child_reason.message.starts_with("unhandled_exception:"), "{child_reason:?}");
         assert!(
             format!("{:?}", failed.reason).contains("cannot be rendered"),
             "{failed:?}"

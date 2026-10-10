@@ -77,7 +77,10 @@ impl Fixture {
             ..Default::default()
         };
         let (run, _) = self.engine.accept_run("alice", id, id, invocation).unwrap();
-        let ended = Outcome::Failed("settled".into());
+        let ended = Outcome::Failed(cozy_machine::journal::Failure::machine(
+            "test_failed",
+            "settled",
+        ));
         self.engine.end_preparation(&run.id, ended).unwrap();
         self.engine.acknowledge_collection(&run.id).unwrap();
         let result = self.engine.root.join("results").join(&run.id);

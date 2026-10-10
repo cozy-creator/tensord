@@ -445,7 +445,7 @@ impl Jobs {
             self.parents.lock().unwrap().remove(id);
             executor.shutdown()?;
             let failure = Failure::executor("refused", "runtime", "job_command_too_large", &why);
-            return engine.finish(id, Outcome::Failed(failure.encode())).map(drop);
+            return engine.finish(id, Outcome::Failed(failure)).map(drop);
         }
         let reply = executor.command(&command, &mut services);
         self.parents.lock().unwrap().remove(id);
@@ -582,7 +582,7 @@ impl Jobs {
             };
             let failure =
                 Failure::executor(terminal, &prepared.origin, &prepared.code, &prepared.detail);
-            engine.finish(id, Outcome::Failed(failure.encode()))?;
+            engine.finish(id, Outcome::Failed(failure))?;
             return executor.shutdown();
         }
         let inputs = stage_inputs(&self.store, self.identity, &spool, &invocation.inputs)?;
@@ -978,15 +978,11 @@ impl Jobs {
                 answer.byte_grants = grants;
             }
             State::Failed => {
-                let message =
-                    Failure::decode(record.failure.as_deref().unwrap_or_default()).message;
-                let code = match message.split_once(": ") {
-                    Some((code, _)) if !code.is_empty() && !code.contains(' ') => code.to_string(),
-                    _ => "child_failed".into(),
-                };
+                let failure = Failure::decode(record.failure.as_deref().unwrap_or_default())
+                    .map_err(|error| ("failure_record_invalid", error.to_string()))?;
                 answer.ok = false;
-                answer.code = code;
-                answer.detail = message.chars().take(1024).collect();
+                answer.code = failure.code;
+                answer.detail = failure.message.chars().take(1024).collect();
             }
             State::Canceled => {
                 answer.ok = false;
@@ -1215,7 +1211,7 @@ fn conclude(
             if let Err(error) = custody {
                 engine.finish(
                     id,
-                    Outcome::Failed(Failure::custody(&error.to_string()).encode()),
+                    Outcome::Failed(Failure::custody(&error.to_string())),
                 )?;
             }
         }
@@ -1235,7 +1231,7 @@ fn conclude(
                 &outcome.code,
                 &outcome.message,
             );
-            engine.finish(id, Outcome::Failed(failure.encode()))?;
+            engine.finish(id, Outcome::Failed(failure))?;
         }
     }
     Ok(())
@@ -1704,6 +1700,7 @@ fn record_upload(engine: &Engine, id: &str, upload: &crate::weights::Upload) {
         "label": format!("Upload checkpoint to {}", upload.destination),
         "status": if upload.error.is_some() { "failed" } else { "succeeded" },
         "error": upload.error.clone().unwrap_or_default(),
+        "error_code": if upload.error.is_some() { "weights_upload_failed" } else { "" },
         "called_unix_ms": upload.called_ms, "finished_unix_ms": upload.finished_ms, "measurements": Value::Null,
     });
     let key = format!("weights:{}/{}", upload.output, upload.transaction);
@@ -1722,10 +1719,16 @@ fn record_call(
     call: &ChildCall,
     record: &Execution,
 ) -> bool {
-    let (status, error) = match record.state {
-        State::Completed => ("succeeded", String::new()),
-        State::Canceled => ("canceled", "the child run was canceled".to_string()),
-        _ => ("failed", Failure::decode(record.failure.as_deref().unwrap_or_default()).message),
+    let (status, error_code, error) = match record.state {
+        State::Completed => ("succeeded", String::new(), String::new()),
+        State::Canceled => ("canceled", "child_canceled".into(), "the child run was canceled".into()),
+        _ => match Failure::decode(record.failure.as_deref().unwrap_or_default()) {
+            Ok(failure) => ("failed", failure.code, failure.message),
+            Err(error) => {
+                eprintln!("job {}: invalid child failure record: {error}", parent.id);
+                return false;
+            }
+        },
     };
     let measurements = engine
         .with_journal(|journal| journal.measurements(&record.id))
@@ -1736,7 +1739,7 @@ fn record_call(
     let body = json!({
         "request": call.request, "parent": parent.request, "index": index,
         "attempt": record.attempt.max(1), "module": call.module, "export": call.function,
-        "label": call.label, "status": status, "error": error,
+        "label": call.label, "status": status, "error_code": error_code, "error": error,
         "called_unix_ms": record.accepted_at_ms, "finished_unix_ms": record.finished_at_ms,
         "measurements": measurements, "computation_digest": call.computation,
         // Answered from a held result: a memoized call that did not run (its `memo` is unset).

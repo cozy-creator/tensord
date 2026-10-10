@@ -2199,7 +2199,7 @@ impl GpuPool {
             };
             let session = match self.new_session(engine, &held, &plan, on_birth) {
                 Err(error) if error.kind() == io::ErrorKind::Unsupported => {
-                    engine.finish(id, Outcome::Failed(error.to_string()))?;
+                    engine.finish(id, Outcome::Failed(Failure::machine("executor_unsupported", error.to_string())))?;
                     return Ok(());
                 }
                 session => session?,
@@ -2679,7 +2679,7 @@ impl GpuPool {
                     traceback: prepared.traceback.clone(),
                 },
             );
-            engine.finish(id, Outcome::Failed(failure.encode()))?;
+            engine.finish(id, Outcome::Failed(failure))?;
             return Ok(true);
         }
         let prepared = command_ok(prepared)?;
@@ -2866,7 +2866,7 @@ impl GpuPool {
                     engine.finish(
                         id,
                         Outcome::Failed(
-                            crate::journal::Failure::custody(&error.to_string()).encode(),
+                            crate::journal::Failure::custody(&error.to_string()),
                         ),
                     )?;
                 }
@@ -2884,8 +2884,7 @@ impl GpuPool {
                             &outcome.origin,
                             &outcome.code,
                             &outcome.message,
-                        )
-                        .encode(),
+                        ),
                     ),
                 )?;
             }
@@ -3432,14 +3431,14 @@ pub(crate) fn settle(engine: &Arc<Engine>, id: &str, error: &io::Error) -> io::R
     } else if let Some(refusal) = refused(error) {
         // The executor's own reason, typed: a group's first fault names its GPU.
         Outcome::Failed(
-            Failure::executor("failed", "runtime", &refusal.code, &refusal.detail).encode(),
+            Failure::executor("failed", "runtime", &refusal.code, &refusal.detail),
         )
     } else if record.state == State::Starting {
         Outcome::Failed(
-            Failure::abandoned(&format!("device executor did not start: {error}")).encode(),
+            Failure::abandoned(&format!("device executor did not start: {error}")),
         )
     } else {
-        Outcome::Failed(Failure::abandoned(&format!("device executor ended: {error}")).encode())
+        Outcome::Failed(Failure::abandoned(&format!("device executor ended: {error}")))
     };
     engine.finish(id, outcome).map(drop)
 }

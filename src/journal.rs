@@ -324,7 +324,7 @@ fn timestamp() -> i64 {
 impl Journal {
     pub fn open(root: &Path) -> io::Result<Self> {
         fs::create_dir_all(root)?;
-        let connection = Connection::open(root.join("executions.sqlite3")).map_err(db_error)?;
+        let mut connection = Connection::open(root.join("executions.sqlite3")).map_err(db_error)?;
         connection
             .execute_batch(
                 "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
@@ -390,6 +390,7 @@ impl Journal {
             CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_request ON executions(actor,request_id) WHERE actor IS NOT NULL;
             CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_submission ON executions(actor,submission_id) WHERE actor IS NOT NULL;
             CREATE INDEX IF NOT EXISTS executions_actor_order ON executions(actor,id) WHERE actor IS NOT NULL; COMMIT;").map_err(db_error)?;
+        crate::failure_upgrade::upgrade(&mut connection)?;
         // A journal from before held memos kept their use (#148's builds) gains the column.
         let used: bool = connection
             .query_row("SELECT COUNT(*) FROM pragma_table_info('held_memos') WHERE name='used_ms'", [], |r| r.get(0))
@@ -1318,7 +1319,7 @@ impl Journal {
                 }
                 Outcome::Failed(reason) => {
                     record.state = State::Failed;
-                    record.failure = Some(reason);
+                    record.failure = Some(reason.encode());
                 }
                 Outcome::Canceled => record.state = State::Canceled,
                 Outcome::Paused => return Err(db_error("a preparation pauses once prepared")),
@@ -1348,9 +1349,10 @@ impl Journal {
                 status: 3,
                 cause: 7,
                 origin: 3,
-                message: "preparation_interrupted: the machine restarted while this run was preparing; run it again".into(),
+                code: "preparation_interrupted".into(),
+                message: "the machine restarted while this run was preparing; run it again".into(),
             };
-            self.end_preparation(&id, Outcome::Failed(failure.encode()))?;
+            self.end_preparation(&id, Outcome::Failed(failure))?;
         }
         Ok(())
     }
@@ -2334,7 +2336,7 @@ impl Journal {
                 }
                 Outcome::Failed(reason) => {
                     record.state = State::Failed;
-                    record.failure = Some(reason);
+                    record.failure = Some(reason.encode());
                 }
                 Outcome::Canceled => {
                     if record.cancel_actor.is_none() {
@@ -2358,70 +2360,126 @@ impl Journal {
     }
 }
 
-/// Why a run did not complete, in the retained outcome body's terms (numeric codes:
-/// status FAILED=3/REFUSED=2/ABANDONED=5; cause codes and origins as numbered there).
-/// Stored as JSON in `Execution::failure`; older plain text reads as an executor fault.
+/// A retained failure carries its stable code separately from its plain detail.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Failure {
     pub status: u8,
     pub cause: u8,
     pub origin: u8,
+    pub code: String,
     pub message: String,
 }
 impl Failure {
-    /// An executor's own terminal (`refused`/`failed`, origin `request`/`runtime`/`author`).
     pub fn executor(terminal: &str, origin: &str, code: &str, message: &str) -> Self {
-        let coded = format!("{code}: {message}");
-        let (status, cause, origin, message) = match (terminal, origin, code) {
-            ("refused", ..) | (_, "request", _) => (2, 1, 6, coded),
-            (_, _, "device_out_of_memory") => {
-                (3, 7, 2, format!("accepted_envelope_breach: {coded}"))
-            }
-            (_, "runtime", _) => (3, 7, 2, coded),
-            (_, "author", _) => (3, 6, 1, coded),
-            _ => (3, 7, 3, coded),
+        let (status, cause, origin) = match (terminal, origin, code) {
+            ("refused", ..) | (_, "request", _) => (2, 1, 6),
+            (_, "runtime", _) | (_, _, "device_out_of_memory") => (3, 7, 2),
+            (_, "author", _) => (3, 6, 1),
+            _ => (3, 7, 3),
+        };
+        let (code, message) = if code == "device_out_of_memory" && status != 2 {
+            (
+                "accepted_envelope_breach".to_string(),
+                format!("device_out_of_memory: {message}"),
+            )
+        } else {
+            (code.to_string(), message.to_string())
         };
         Self {
             status,
             cause,
             origin,
+            code,
             message,
         }
     }
-    /// The executor process ended under the attempt.
+    pub fn machine(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            status: 3,
+            cause: 7,
+            origin: 3,
+            code: code.into(),
+            message: message.into(),
+        }
+    }
     pub fn abandoned(why: &str) -> Self {
         Self {
             status: 5,
             cause: 16,
             origin: 3,
-            message: format!("executor invalidated: {why}"),
+            code: "executor_invalidated".into(),
+            message: why.into(),
         }
     }
-    /// Results could not be taken into custody (encoding, checksums, storage).
     pub fn custody(why: &str) -> Self {
         Self {
             status: 3,
             cause: 10,
             origin: 4,
-            message: format!("result custody failed: {why}"),
+            code: "result_custody_failed".into(),
+            message: why.into(),
         }
     }
     pub fn encode(&self) -> String {
-        serde_json::to_string(self).unwrap_or_default()
+        serde_json::to_string(self).expect("failure fields are JSON strings and integers")
     }
-    pub fn decode(text: &str) -> Self {
-        serde_json::from_str(text).unwrap_or_else(|_| Self {
-            status: 3,
-            cause: 7,
-            origin: 3,
-            message: text.into(),
-        })
+    pub fn decode(text: &str) -> io::Result<Self> {
+        serde_json::from_str(text).map_err(db_error)
+    }
+}
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+#[cfg(test)]
+mod failure_message_tests {
+    use super::*;
+
+    #[test]
+    fn nested_typed_failures_preserve_plain_details() {
+        let code = "model_choice_absent";
+        let detail = "the run names no model for generate_image.models.model";
+        let mut failure = Failure::executor("failed", "author", code, detail);
+        for _ in 0..3 {
+            failure = Failure::decode(&failure.encode()).unwrap();
+            assert_eq!(failure.code, code);
+            assert_eq!(failure.message, detail);
+            failure = Failure::executor("failed", "author", &failure.code, &failure.message);
+        }
+        assert_eq!(failure.to_string(), format!("{code}: {detail}"));
+    }
+
+    #[test]
+    fn current_decoder_rejects_unstructured_formats_and_preserves_literal_details() {
+        assert!(Failure::decode("model_choice_absent: detail").is_err());
+        assert!(Failure::decode(
+            r#"{"status":3,"cause":7,"origin":3,"message":"model_choice_absent: detail"}"#
+        )
+        .is_err());
+        let detail = "the field literally contains model_choice_absent: keep this";
+        let failure = Failure::machine("model_choice_absent", detail);
+        assert_eq!(Failure::decode(&failure.encode()).unwrap().message, detail);
+    }
+
+    #[test]
+    fn refused_oom_keeps_its_request_code_without_an_accepted_breach() {
+        for (terminal, origin) in [("refused", "runtime"), ("failed", "request")] {
+            let failure = Failure::executor(terminal, origin, "device_out_of_memory", "too large");
+            assert_eq!((failure.status, failure.cause, failure.origin), (2, 1, 6));
+            assert_eq!(failure.code, "device_out_of_memory");
+            assert_eq!(failure.message, "too large");
+        }
+        let accepted = Failure::executor("failed", "runtime", "device_out_of_memory", "GPU full");
+        assert_eq!(accepted.code, "accepted_envelope_breach");
+        assert_eq!(accepted.message, "device_out_of_memory: GPU full");
     }
 }
 
 pub enum Outcome {
     Completed(ResultRecord),
-    Failed(String),
+    Failed(Failure),
     Canceled,
     Paused,
 }
@@ -2514,7 +2572,7 @@ mod pause_tests {
         );
 
         // The held attempt has ended: its executor failing to shut down changes nothing.
-        let late = Outcome::Failed("device executor ended".into());
+        let late = Outcome::Failed(Failure::abandoned("device executor ended"));
         assert_eq!(
             journal.finish(&starting, late).unwrap().state,
             State::Paused

@@ -496,7 +496,7 @@ fn cursor_reservation_renewal_never_reuses_old_cursors_and_accepts_older_records
     let finished = journal
         .finish(
             &id,
-            journal::Outcome::Failed("owned cursor driver ended".into()),
+            journal::Outcome::Failed(journal::Failure::abandoned("owned cursor driver ended")),
         )
         .unwrap();
     assert!(finished.revision > renewed.revision_ceiling);

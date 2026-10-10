@@ -337,21 +337,22 @@ impl NativeBackend {
         if record.process.is_some() {
             body["execution_started"] = json!(true);
         }
-        let (status, code, origin, message) = match record.state {
-            State::Completed => (1, 0, 2, "completed".to_string()),
-            State::Canceled => (4, 11, 6, "explicitly canceled".to_string()),
+        let (status, code, origin, message, error_code) = match record.state {
+            State::Completed => (1, 0, 2, "completed".to_string(), String::new()),
+            State::Canceled => (4, 11, 6, "explicitly canceled".to_string(), "canceled".into()),
             _ => {
                 let failure = crate::journal::Failure::decode(
                     record
                         .failure
                         .as_deref()
-                        .unwrap_or("the run failed without a recorded reason"),
-                );
+                        .unwrap_or_default(),
+                ).map_err(problem)?;
                 (
                     failure.status,
                     failure.cause,
                     failure.origin,
                     safe(&failure.message, 4096),
+                    failure.code,
                 )
             }
         };
@@ -362,6 +363,9 @@ impl NativeBackend {
             json!({"code":code,"origin":origin,"detail":safe(&message, 1024)})
         };
         body["safe_message"] = json!(message);
+        if !error_code.is_empty() {
+            body["error_code"] = json!(error_code);
+        }
         // Observation only: the failed attempt's bundle, written before the run settled.
         if let Some((triage, _)) = self.service.engine.triage(&record.id).map_err(problem)? {
             body["triage_bundle"] = json!({"subject_id":triage.subject_id,
@@ -893,7 +897,7 @@ impl MachineBackend for NativeBackend {
         let actor = actor_id(actor);
         let jobs = self.service.jobs();
         let typed = |refused: crate::objects::Refused| {
-            refusal(refused.code, &format!("{}: {}", refused.code, refused.message))
+            refusal(refused.code, &refused.message)
         };
         let changed = match domain::MachineExecutionAction::try_from(request.action) {
             Ok(domain::MachineExecutionAction::Pause) => jobs
@@ -1524,7 +1528,7 @@ print(json.dumps({"identity": generation.identity}))
                             &outcome.code,
                             &outcome.message,
                         );
-                        engine.finish(&id, crate::journal::Outcome::Failed(failure.encode()))?;
+                        engine.finish(&id, crate::journal::Outcome::Failed(failure))?;
                         return executor.shutdown();
                     }
                     let (value, bindings) =
@@ -1760,7 +1764,7 @@ mod terminal_tests {
             assert!(journal.claim(&queued.id)?);
             journal.register_process(&queued.id, crate::execution::process_birth(std::process::id())?)?;
             let started = journal.running(&queued.id, None)?;
-            journal.finish(&queued.id, Outcome::Failed("author_failed: it stopped".into()))?;
+            journal.finish(&queued.id, Outcome::Failed(crate::journal::Failure::executor("failed", "author", "author_failed", "it stopped")))?;
             Ok((queued, started))
         }).unwrap();
         let execution = domain::MachineExecutionQuery {

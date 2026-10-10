@@ -401,11 +401,12 @@ impl Runs {
                                 } else {
                                     3
                                 },
-                                message: format!("{}: {}", refusal.code, refusal.message),
+                                code: refusal.code.into(),
+                                message: refusal.message,
                             };
                             this.service
                                 .engine
-                                .end_preparation(&run, Outcome::Failed(failure.encode()))
+                                .end_preparation(&run, Outcome::Failed(failure))
                                 .map(drop)
                         }
                     };
@@ -1214,7 +1215,7 @@ mod tests {
         let journal = rusqlite::Connection::open(root.join("state/execution/executions.sqlite3")).unwrap();
         let future = "UPDATE executions SET state='future-state' WHERE id=?1";
         journal.execute(future, [&unknown]).unwrap();
-        service.engine.end_preparation(&ended, Outcome::Failed("ended".into())).unwrap();
+        service.engine.end_preparation(&ended, Outcome::Failed(Failure::machine("failed", "ended"))).unwrap();
         let kept = |model: &str| format!("sha256:{}", model.repeat(64));
         assert_eq!(publisher.caches(&service).unwrap().keep, [kept("a"), kept("b")]);
         // An unreadable context is no list at all, for this pass only.

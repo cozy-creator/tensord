@@ -105,7 +105,13 @@ fn seed(state: PathBuf, gib: u64, key_seed: &str) -> io::Result<()> {
         ..Default::default()
     };
     journal.append_product(&record.id, None, &cozy_machine::products::encode(&product))?;
-    journal.finish(&record.id, Outcome::Failed("bench output seeded".into()))?;
+    journal.finish(
+        &record.id,
+        Outcome::Failed(cozy_machine::journal::Failure::machine(
+            "bench_seeded",
+            "bench output seeded",
+        )),
+    )?;
     let _ = holder.kill();
     let _ = holder.wait();
     hash.fill(0);

@@ -1049,7 +1049,7 @@ impl Engine {
                 // A pausing job's root is replayed by design: it rests paused.
                 journal.finish(&record.id, Outcome::Paused)?;
             } else {
-                journal.finish(&record.id, Outcome::Failed("owner lost before durable result custody; exact executor birth has ended; started work will not be replayed".into()))?;
+                journal.finish(&record.id, Outcome::Failed(crate::journal::Failure::machine("machine_stopped", "owner lost before durable result custody; exact executor birth has ended; started work will not be replayed")))?;
             }
             changed = true;
         }
@@ -1074,7 +1074,13 @@ impl Engine {
         }
         if let Some(reason) = &config.unavailable {
             // Known before any launch: fail now rather than start a runner that cannot import.
-            self.finish(id, Outcome::Failed(reason.clone()))?;
+            self.finish(
+                id,
+                Outcome::Failed(crate::journal::Failure::machine(
+                    "executor_unavailable",
+                    reason.clone(),
+                )),
+            )?;
             return Ok(());
         }
         let output_root = self.root.join("staging").join(id);
@@ -1123,7 +1129,13 @@ impl Engine {
                 // Nothing authored ran; a deterministic launch failure is not retried.
                 let reason = format!("runner did not start: {error}");
                 self.runner_triage(id, 0, &reason, &logs);
-                self.finish(id, Outcome::Failed(reason))?;
+                self.finish(
+                    id,
+                    Outcome::Failed(crate::journal::Failure::machine(
+                        "executor_launch_failed",
+                        reason,
+                    )),
+                )?;
                 return Ok(());
             }
         };
@@ -1144,22 +1156,28 @@ impl Engine {
                 } if status.success() => {
                     match self.bound_custody(id, &output_root, value, artifacts, asset_bindings) {
                         Ok(result) => Outcome::Completed(result),
-                        Err(error) => Outcome::Failed(format!("result custody failed: {error}")),
+                        Err(error) => {
+                            Outcome::Failed(crate::journal::Failure::machine("result_custody_failed", error.to_string()))
+                        }
                     }
                 }
-                RunnerEvent::Result { .. } => {
-                    Outcome::Failed(format!("executor reported result but exited {status}"))
-                }
+                RunnerEvent::Result { .. } => Outcome::Failed(crate::journal::Failure::machine(
+                    "executor_exit_failed",
+                    format!("executor reported result but exited {status}"),
+                )),
                 RunnerEvent::Failed { code, detail, .. } => {
-                    Outcome::Failed(format!("{code}: {detail}"))
+                    Outcome::Failed(crate::journal::Failure::machine(&code, detail))
                 }
                 RunnerEvent::Canceled { .. } if self.get(id)?.cancel_actor.is_some() => {
                     Outcome::Canceled
                 }
-                RunnerEvent::Canceled { .. } => {
-                    Outcome::Failed("runner canceled without durable cancellation authority".into())
-                }
-                _ => Outcome::Failed("runner ended without a terminal result".into()),
+                RunnerEvent::Canceled { .. } => Outcome::Failed(crate::journal::Failure::machine(
+                    "cancel_not_authorized",
+                    "runner canceled without durable cancellation authority",
+                )),
+                _ => Outcome::Failed(crate::journal::Failure::machine(
+                    "executor_no_result", "runner ended without a terminal result",
+                )),
             },
             Err(error) => {
                 let record = self.get(id)?;
@@ -1167,19 +1185,24 @@ impl Engine {
                     Outcome::Canceled
                 } else if record.state == State::Starting {
                     // Ended before authorization: no authored code ran; its exit is the reason.
-                    Outcome::Failed(format!(
-                        "runner ended before start ({status}): {error}; {}",
-                        crate::process::tail(&logs.join(format!("{id}.stderr.log")))
+                    Outcome::Failed(crate::journal::Failure::machine(
+                        "executor_launch_failed",
+                        format!(
+                            "runner ended before start ({status}): {error}; {}",
+                            crate::process::tail(&logs.join(format!("{id}.stderr.log")))
+                        ),
                     ))
                 } else {
-                    Outcome::Failed(format!("executor ended {status}: {error}"))
+                    Outcome::Failed(crate::journal::Failure::machine("executor_failed", format!(
+                        "executor ended {status}: {error}"
+                    )))
                 }
             }
         };
         // Custody is complete: a settled run never has a spool.
         drop(spool);
         if let Outcome::Failed(reason) = &outcome {
-            self.runner_triage(id, exact.birth.pid, reason, &logs);
+            self.runner_triage(id, exact.birth.pid, &reason.to_string(), &logs);
         }
         self.finish(id, outcome)?;
         Ok(())
@@ -1612,7 +1635,13 @@ mod tests {
         assert_eq!(engine.resume(&run.id).unwrap().state, State::Queued);
         let second = |engine: Arc<Engine>, id: String| {
             engine
-                .finish(&id, Outcome::Failed("the second attempt ran".into()))
+                .finish(
+                    &id,
+                    Outcome::Failed(crate::journal::Failure::machine(
+                        "test_failed",
+                        "the second attempt ran",
+                    )),
+                )
                 .map(drop)
         };
         assert!(
