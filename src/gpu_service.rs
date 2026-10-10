@@ -2566,7 +2566,9 @@ impl GpuPool {
                     models,
                     authorized_device_limit_bytes:
                         device_total.or(self.config.authorized_device_limit_bytes),
-                    attention_pin: String::new(),
+                    // A first request must choose its build before default model
+                    // selection imports another, incompatible kernel artifact.
+                    attention_pin: load_attention_pin(engine, id, load_only)?,
                     stages: false,
                     sealed_tiers: session.unsealed.is_none(),
                     model_sources: true,
@@ -4063,10 +4065,45 @@ impl Services for Callbacks<'_> {
     }
 }
 
+/// A prewarm has no request. Otherwise construction must see the same explicit
+/// choice that PrepareRequest and Invoke will later receive from the journal.
+fn load_attention_pin(engine: &Engine, id: &str, load_only: bool) -> io::Result<String> {
+    if load_only {
+        return Ok(String::new());
+    }
+    Ok(engine.get(id)?.invocation.attention_kernel)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn first_load_uses_its_request_pin_but_prewarm_has_none() {
+        let root = std::env::temp_dir().join(format!("load-attention-{}", uuid::Uuid::new_v4()));
+        let engine = Engine::open(&root).unwrap();
+        let selected = "base/fl2va_dit=kitchen-sol-producer-sage2-fp16pv-shared-qkv";
+        let (first, _) = engine.accept_run(
+            "actor", "first", "first-spec",
+            crate::journal::Invocation {
+                attention_kernel: selected.into(),
+                ..Default::default()
+            },
+        ).unwrap();
+        let (next, _) = engine.accept_run(
+            "actor", "next", "next-spec", crate::journal::Invocation::default(),
+        ).unwrap();
+        assert_eq!(load_attention_pin(&engine, &first.id, false).unwrap(), selected);
+        assert_eq!(load_attention_pin(&engine, &next.id, false).unwrap(), "");
+        assert_eq!(load_attention_pin(&engine, &first.id, true).unwrap(), "");
+        assert_eq!(load_attention_pin(&engine, "no-run-for-prewarm", true).unwrap(), "");
+        assert!(load_attention_pin(&engine, "missing-request", false).is_err());
+        // Construction and both later request commands consume one durable value.
+        assert_eq!(engine.get(&first.id).unwrap().invocation.attention_kernel, selected);
+        drop(engine);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn the_image_boot_runs_machine_kernels_from_the_executors_runtime_wheel() {
