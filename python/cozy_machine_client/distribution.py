@@ -52,9 +52,14 @@ def package_name(found: importlib.metadata.Distribution, packages: dict[str, str
         url = urlsplit(msgspec.json.decode(record).get("url", ""))
         path = [unquote(part) for part in url.path.split("/")]
         expected = origin(urlsplit(hub_origin)) if hub_origin else None
-        if (expected is not None and origin(url) == expected
-                and len(path) == 7 and path[1:3] == ["v1", "index"]
-                and path[3] and "/" not in path[3]
-                and normalized(path[4]) == name and path[5] and "/" not in path[4]):
-            return f"{path[3]}/{name}"
+        if expected is not None and origin(url) == expected:
+            if not (len(path) == 7 and path[1:3] == ["v1", "index"]
+                    and all(part and "/" not in part for part in path[3:])
+                    and path[4] != "files" and path[6].endswith(".whl")):
+                raise ValueError(
+                    f"unsupported Hub wheel route for {name}; republish its locked dependency "
+                    "using /v1/index/<org>/<package>/<release>/<wheel>"
+                )
+            if normalized(path[4]) == name:
+                return f"{path[3]}/{name}"
     return f"local/{name}"

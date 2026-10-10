@@ -861,6 +861,8 @@ impl Publisher {
             release,
             source,
         } = *wanted;
+        // Reject obsolete/invalid same-Hub provenance before any environment or download.
+        let callee_packages = hub_packages(&split.exact, source)?;
         let locks = generations.join(".locks");
         fs::create_dir_all(&locks).map_err(io_failure)?;
         let lock = File::create(locks.join(format!("{identity}.lock"))).map_err(io_failure)?;
@@ -963,7 +965,7 @@ impl Publisher {
             ))?;
         File::create(dir.join(".hold")).map_err(io_failure)?;
         let (source_digest, callees) = match &self.sdk.client_wheel {
-            Some(_) => describe_environment(&py, &split.distribution, &source.origin, &hub_packages(&split.exact, source))?,
+            Some(_) => describe_environment(&py, &split.distribution, &source.origin, &callee_packages)?,
             None => (String::new(), vec![]),
         };
         let record = json!({"identity":identity,"package":split.distribution,"version":release,"application":application,"python":interpreter,"dependencies":installed_sdk(&env),"interface":interface,"sdk":sdk_choice,"sdk_fallback":sdk_fallback,"source_digest":source_digest,"callees":callees});
@@ -1695,24 +1697,36 @@ fn stage_of(progress: &Progress) -> String {
 /// Hub; without this the environment's describer called a Hub-published callee
 /// `local/<name>`, and the run's model choices addressed to `<org>/<name>/...` never reached
 /// it (long_form's generate_image: model_choice_absent).
-fn hub_packages(exact: &str, source: &hub::Source) -> BTreeMap<String, String> {
-    exact
-        .lines()
-        .filter_map(|line| {
-            let file = hub_file(line, source)?;
-            let path = file.url.split_once("://")?.1.split_once('/')?.1;
-            let distribution = normalized(file.name.split('-').next()?);
-            let parts = path.split('/').collect::<Vec<_>>();
-            let org = match parts.as_slice() {
-                ["v1", "index", org, package, release, _]
-                    if !release.is_empty() && normalized(package) == distribution => *org,
-                // A release can bundle a third-party wheel (H3's Diffusers); that
-                // does not make the bundled distribution a package in this org.
-                _ => return None,
-            };
-            (!org.is_empty()).then(|| (distribution.clone(), format!("{org}/{distribution}")))
-        })
-        .collect()
+fn hub_packages(exact: &str, source: &hub::Source) -> Result<BTreeMap<String, String>, Failure> {
+    let mut packages = BTreeMap::new();
+    for file in exact.lines().filter_map(|line| hub_file(line, source)) {
+        let invalid = || {
+            (
+            "package_dependency_provenance_invalid",
+            format!("unsupported Hub wheel route for {}; republish its locked dependency using /v1/index/<org>/<package>/<release>/<wheel>", file.name),
+        )
+        };
+        let path = file
+            .url
+            .split_once("://")
+            .and_then(|(_, rest)| rest.split_once('/'))
+            .map(|(_, path)| path)
+            .ok_or_else(invalid)?;
+        let parts = path.split('/').collect::<Vec<_>>();
+        let ["v1", "index", org, package, release, _] = parts.as_slice() else {
+            return Err(invalid());
+        };
+        if org.is_empty() || package.is_empty() || *package == "files" || release.is_empty() {
+            return Err(invalid());
+        }
+        let distribution = normalized(file.name.split('-').next().ok_or_else(invalid)?);
+        // A current release can bundle a third-party wheel (H3's Diffusers).
+        // Its provenance is valid, but it is not the release's own Hub App.
+        if normalized(package) == distribution {
+            packages.insert(distribution.clone(), format!("{org}/{distribution}"));
+        }
+    }
+    Ok(packages)
 }
 
 /// A lock row the run's Hub publishes: `name @ <url>/<file>.whl ... --hash=sha256:<hex>`.
@@ -1979,13 +1993,63 @@ mod tests {
         let sha = "61bd8e93a4cb4b56127115dda87aee267008cc0b52bd59321fc12e522f6c3628";
         let row = |url: &str| format!("qwen-image-2 @ {url} --hash=sha256:{sha}\n");
         let route = "/v1/index/paul/qwen-image-2/0.3.0/qwen_image_2-0.3.0-py3-none-any.whl";
-        assert_eq!(hub_packages(&row(&format!("https://cozy-e2e-6.ngrok.app{route}")), &source),
-            BTreeMap::from([("qwen-image-2".into(), "paul/qwen-image-2".into())]));
-        assert!(hub_packages(&row(&format!("https://tensorhub.com{route}")), &source).is_empty());
+        assert_eq!(
+            hub_packages(
+                &row(&format!("https://cozy-e2e-6.ngrok.app{route}")),
+                &source
+            )
+            .unwrap(),
+            BTreeMap::from([("qwen-image-2".into(), "paul/qwen-image-2".into())])
+        );
+        assert!(
+            hub_packages(&row(&format!("https://tensorhub.com{route}")), &source)
+                .unwrap()
+                .is_empty()
+        );
         let legacy = format!("https://cozy-e2e-6.ngrok.app/v1/index/paul/files/{sha}/qwen_image_2-0.3.0-py3-none-any.whl");
-        assert!(hub_packages(&row(&legacy), &source).is_empty());
+        assert_eq!(
+            hub_packages(&row(&legacy), &source).unwrap_err().0,
+            "package_dependency_provenance_invalid"
+        );
         let bundled = format!("diffusers @ https://cozy-e2e-6.ngrok.app/v1/index/paul/minimax-h3/1.27.1/diffusers-0.41.0.dev0-py3-none-any.whl --hash=sha256:{sha}\n");
-        assert!(hub_packages(&bundled, &source).is_empty());
+        assert!(hub_packages(&bundled, &source).unwrap().is_empty());
+    }
+
+    #[test]
+    fn obsolete_hub_route_refuses_before_download_or_cached_generation_reuse() {
+        let root = std::env::temp_dir().join(format!("cm-callee-provenance-{}", uuid::Uuid::new_v4()));
+        let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
+        let publisher = Publisher::new(&root.join("published"), PackageSdk::default(), store).unwrap();
+        let source = hub::Source::new("https://unreachable.invalid", None, vec![], None).unwrap();
+        let exact = format!("qwen-image-2 @ https://unreachable.invalid/v1/index/paul/files/{}/qwen_image_2-0.3.0-py3-none-any.whl --hash=sha256:{}\n", "a".repeat(64), "a".repeat(64));
+        let split = split_lock(&exact, "qwen-image-2", "0.3.0", false).unwrap();
+        let python = "3.12".to_string();
+        let interface = json!({"application":"qwen_image_2:app"});
+        let release = "0.3.0".to_string();
+        let wanted = Environment {
+            split: &split,
+            python: &python,
+            interface: &interface,
+            release: &release,
+            source: &source,
+        };
+        let generations = root.join("generations");
+        fs::create_dir_all(generations.join("cached")).unwrap();
+        let cached = generations.join("cached/generation.json");
+        fs::write(&cached, b"prior generation remains untouched").unwrap();
+        for identity in ["fresh", "cached"] {
+            let (code, detail) = publisher
+                .generation(&generations, identity, &wanted, &Job::default())
+                .unwrap_err();
+            assert_eq!(code, "package_dependency_provenance_invalid");
+            assert!(detail.contains("unsupported Hub wheel route") && detail.contains("republish"));
+        }
+        assert!(!generations.join("fresh").exists() && !generations.join(".locks").exists());
+        assert_eq!(
+            fs::read(&cached).unwrap(),
+            b"prior generation remains untouched"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// A wheel with nothing but its metadata: `name` `version`, requiring `requires`.
@@ -2150,7 +2214,7 @@ mod tests {
         // describer reads it inside the environment (msgspec is its one dependency).
         assert!(Command::new("uv").args(["pip", "install", "-q", "--no-config", "--python", python.to_str().unwrap(), "msgspec"])
             .env("UV_CACHE_DIR", root.join("uv-cache")).status().unwrap().success());
-        let packages = hub_packages(&exact, &source);
+        let packages = hub_packages(&exact, &source).unwrap();
         assert_eq!(packages, BTreeMap::from([("acme-pkg".to_string(), "acme/acme-pkg".to_string())]));
         let named = |packages: &BTreeMap<String, String>| {
             let script = format!(
