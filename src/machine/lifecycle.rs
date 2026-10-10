@@ -1,6 +1,6 @@
 //! A rental's lifecycle: it releases itself after 15 minutes with no job queued for it or
-//! running on it, used or not (owner ruling 2026-10-10); an explicit keepalive restarts that
-//! clock once. The clock is durable state, never a sample held in memory: the journal's last
+//! running on it, used or not (owner ruling 2026-10-10); every run asked of it is a job (a
+//! call, a job, a warm-up, an upload); an explicit keepalive restarts that clock once. The clock is durable state, never a sample held in memory: the journal's last
 //! job end and the ledger's idle start (this rental's first boot, or a keepalive), so restarts
 //! and updates neither shorten nor lose it. Also the Hub lease of authorized keys.
 use super::hub::{Hub, Refusal};
