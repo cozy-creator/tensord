@@ -420,7 +420,10 @@ mod tests {
             fs::read_dir(&out).unwrap().map(|e| e.unwrap().path()).find(|p| p.extension().is_some_and(|e| e == "whl")).unwrap()
         };
         let (caller, memo) = (wheel_of("cpu_caller"), wheel_of("cpu_memo"));
-        let compiled = run(Command::new("uv").args(["pip", "compile", "--quiet", "--generate-hashes", "--python-version", "3.12", "--no-header", "--find-links"])
+        // A settled Runtime: the newest may be mid-upload (its sdist visible before its wheels).
+        fs::write(m.root.join("settled.txt"), "cozy-runtime<0.19\n").unwrap();
+        let compiled = run(Command::new("uv").args(["pip", "compile", "--quiet", "--generate-hashes", "--python-version", "3.12", "--no-header", "--constraint"])
+            .arg(m.root.join("settled.txt")).arg("--find-links")
             .arg(memo.parent().unwrap()).arg(repo.join("tests/fixtures/cpu_caller/pyproject.toml")));
         let requirements = compiled.replace("cozy-machine-cpu-memo==0.1.0", &format!("cozy-machine-cpu-memo @ file://{}", memo.display()));
         let wheel = write(&m.objects, "alice", &fs::read(&caller).unwrap());
@@ -435,6 +438,34 @@ mod tests {
         assert!(held.record.callees.iter().any(|c| c.distribution == "cozy-machine-cpu-memo"), "{:?}", held.record.callees);
         let site = held.record.python.parent().unwrap().parent().unwrap().join("lib/python3.12/site-packages");
         assert!(!fs::symlink_metadata(site.join("cpu_memo/__init__.py")).unwrap().file_type().is_symlink());
+        assert!(fs::symlink_metadata(site.join("msgspec/__init__.py")).unwrap().file_type().is_symlink());
+
+        // A locked source capture (a directory with its uv.lock, as an editable install sends):
+        // the same, with the callee its lock holds by path.
+        let project = m.root.join("locked");
+        for (fixture, to) in [("cpu_caller", ""), ("cpu_memo", "deps/cpu_memo")] {
+            let (from, module) = (repo.join("tests/fixtures").join(fixture), fixture);
+            fs::create_dir_all(project.join(to).join(module)).unwrap();
+            for name in ["pyproject.toml", "package.toml", &format!("{module}/__init__.py")] {
+                fs::copy(from.join(name), project.join(to).join(name)).unwrap();
+            }
+        }
+        let pyproject = fs::read_to_string(project.join("pyproject.toml")).unwrap();
+        fs::write(project.join("pyproject.toml"), pyproject + "\n[tool.uv]\nconstraint-dependencies = [\"cozy-runtime<0.19\"]\n[tool.uv.sources]\ncozy-machine-cpu-memo = { path = \"deps/cpu_memo\" }\n").unwrap();
+        run(Command::new("uv").args(["lock", "--python", "3.12", "--project"]).arg(&project));
+        let tree = archive(&project, &["pyproject.toml", "uv.lock", "package.toml", "cpu_caller/__init__.py",
+            "deps/cpu_memo/pyproject.toml", "deps/cpu_memo/package.toml", "deps/cpu_memo/cpu_memo/__init__.py"]);
+        let source = write(&m.objects, "alice", &tree);
+        let manifest = serde_json::json!({"package": "local/cozy-machine-cpu-caller", "release": "0.1.0", "python_version": "3.12",
+            "source": {"digest": source.digest, "length": source.length}});
+        let manifest = write(&m.objects, "alice", manifest.to_string().as_bytes());
+        let installed = sources.install(&m.service, "alice", &manifest.digest).unwrap();
+        let held = m.service.catalog.resolve(&installed.generation).unwrap();
+        assert!(held.record.callees.iter().any(|c| c.distribution == "cozy-machine-cpu-memo"), "{:?}", held.record.callees);
+        let site = held.record.python.parent().unwrap().parent().unwrap().join("lib/python3.12/site-packages");
+        for copied in ["cpu_caller/__init__.py", "cpu_memo/__init__.py"] {
+            assert!(!fs::symlink_metadata(site.join(copied)).unwrap().file_type().is_symlink(), "{copied} is linked");
+        }
         assert!(fs::symlink_metadata(site.join("msgspec/__init__.py")).unwrap().file_type().is_symlink());
         let _ = fs::remove_dir_all(m.root);
     }
