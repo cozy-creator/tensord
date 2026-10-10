@@ -1,8 +1,10 @@
-//! A rental idle past its deadline whose Hub never answered through that whole idle window cannot
-//! be ended by the Hub, so it ends itself at its provider and billing stops: the real binary,
-//! a stand-in provider API, and a Hub that cannot be reached. The provider key it ends itself
-//! with is the machine's alone: gone from every process environment and from the files the
-//! provider copies it into, and still handed to an activated Runtime update's service.
+//! A rental releases itself after its idle window with no job queued or running, used or not
+//! (owner ruling 2026-10-10), and a restart neither shortens nor extends that clock. Its Hub
+//! never answered through that whole idle window, so it ends itself at its provider and billing
+//! stops: the real binary, a stand-in provider API, and a Hub that cannot be reached. The
+//! provider key it ends itself with is the machine's alone: gone from every process environment
+//! and from the files the provider copies it into, and still handed to an activated Runtime
+//! update's service.
 mod common;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::SigningKey;
@@ -14,6 +16,11 @@ use std::{
     sync::mpsc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use cozy_machine::api::{
+    capability::{self, Grant},
+    v1::{self, machine_client::MachineClient},
+};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
 struct Machine(Child);
 impl Drop for Machine {
@@ -23,64 +30,17 @@ impl Drop for Machine {
     }
 }
 
-#[test]
-fn accepted_terminal_history_prevents_unused_timeout_after_a_service_restart() {
-    use cozy_machine::journal::{Invocation, Journal};
-
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target/used-rental-history")
-        .join(uuid::Uuid::new_v4().to_string());
-    std::fs::create_dir_all(&root).unwrap();
-    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let (provider_port, received) = provider();
-    let mut machine = launch(&root, port, provider_port);
-    let start = Instant::now();
-    while common::receipt(&root, port).is_none() {
-        assert!(start.elapsed() < Duration::from_secs(120));
-        assert!(machine.0.try_wait().unwrap().is_none());
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(machine.0.id() as i32),
-        nix::sys::signal::Signal::SIGTERM,
-    ).unwrap();
-    machine.0.wait().unwrap();
-    // A legacy short accepted run can finish before the old one-second sampler sees it.
-    let mut journal = Journal::open(&root.join("var/lib/cozy/rust-machine/execution")).unwrap();
-    assert!(!journal.has_executions().unwrap());
-    let execution = journal.accept("short-prior-work", Invocation {
-        package: "test/accepted-work".into(), input: serde_json::json!({}), ..Default::default()
-    }).unwrap();
-    journal.cancel(&execution.id, "test-owner").unwrap();
-    assert!(journal.has_executions().unwrap());
-    drop(journal);
-    let ledger = root.join("var/lib/cozy/machine/idle.json");
-    let mut idle: serde_json::Value = serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
-    idle["deadline_ms"] = serde_json::json!(1);
-    idle["work_observed"] = serde_json::json!(false);
-    std::fs::write(&ledger, serde_json::to_vec(&idle).unwrap()).unwrap();
-    let mut restarted = launch(&root, port, provider_port);
-    let start = Instant::now();
-    while common::receipt(&root, port).is_none() {
-        assert!(start.elapsed() < Duration::from_secs(120));
-        assert!(restarted.0.try_wait().unwrap().is_none());
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    assert!(received.recv_timeout(Duration::from_secs(3)).is_err());
-    assert!(restarted.0.try_wait().unwrap().is_none());
-    let idle: serde_json::Value = serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
-    assert_eq!(idle["work_observed"], true);
-    assert_eq!(idle["released"], false);
-    drop(restarted);
-    drop(machine);
-    std::fs::remove_dir_all(root).unwrap();
+fn launch(root: &Path, port: u16, provider: u16) -> Machine {
+    launch_idle(root, port, provider, 900)
 }
 
-fn launch(root: &Path, port: u16, provider: u16) -> Machine {
+/// `launch` with an idle window of `idle` seconds.
+fn launch_idle(root: &Path, port: u16, provider: u16, idle: u32) -> Machine {
     let owner = SigningKey::from_bytes(&[3; 32]).verifying_key();
     Machine(
         Command::new(env!("CARGO_BIN_EXE_cozy-machine"))
             .env_clear()
+            .env("COZY_RENTAL_IDLE_SECONDS", idle.to_string())
             .env("PATH", "/usr/bin:/bin")
             .env("COZY_MACHINE_ROOT", root)
             .env("COZY_WORKER_ID", "ends-itself")
@@ -237,7 +197,7 @@ fn a_rental_the_hub_cannot_hear_ends_itself_at_its_provider() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64;
-    idle["deadline_ms"] = serde_json::json!(now - 1);
+    idle["idle_since_ms"] = serde_json::json!(now - 900_001);
     std::fs::write(&ledger, serde_json::to_vec(&idle).unwrap()).unwrap();
     let mut machine = launch(&root, port, provider_port);
     let (method, path, authorization, body) = received
@@ -341,4 +301,194 @@ fn an_older_service_is_never_handed_the_provider_key() {
     );
     drop(machine);
     std::fs::remove_dir_all(&root).unwrap();
+}
+
+const IDLE: u32 = 6;
+
+fn now_ms() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+}
+
+fn root(name: &str) -> PathBuf {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(name)
+        .join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&root).unwrap();
+    root
+}
+
+fn ready(machine: &mut Machine, root: &Path, port: u16) {
+    let start = Instant::now();
+    while common::receipt(root, port).is_none() {
+        assert!(start.elapsed() < Duration::from_secs(120), "no receipt");
+        assert!(machine.0.try_wait().unwrap().is_none(), "the machine exited");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn stop(machine: &mut Machine) {
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(machine.0.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    machine.0.wait().unwrap();
+}
+
+/// The owner's client and machine cap.
+async fn owner(root: &Path, port: u16) -> (MachineClient<Channel>, String) {
+    let pem = std::fs::read(root.join("run/cozy/bootstrap/tls.crt")).unwrap();
+    let endpoint = Endpoint::from_shared(format!("https://127.0.0.1:{port}"))
+        .unwrap()
+        .tls_config(ClientTlsConfig::new().ca_certificate(Certificate::from_pem(pem)).domain_name("cozy-worker"))
+        .unwrap();
+    let grant = Grant {
+        machine: "ends-itself".into(),
+        action: capability::MACHINE.into(),
+        expires: now_ms() / 1000 + 600,
+        ..Default::default()
+    };
+    let cap = capability::mint(&SigningKey::from_bytes(&[3; 32]), grant);
+    (MachineClient::new(endpoint.connect().await.unwrap()), cap)
+}
+
+fn authorized<T>(message: T, cap: &str) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(message);
+    request.metadata_mut().insert("authorization", format!("Cozy-Cap {cap}").parse().unwrap());
+    request
+}
+
+/// The idle deadline Status reports; `keepalive` restarts the clock first.
+async fn deadline(client: &mut MachineClient<Channel>, cap: &str, keepalive: bool) -> i64 {
+    let mut frames = client.status(authorized(v1::StatusRequest { keepalive }, cap)).await.unwrap().into_inner();
+    frames.message().await.unwrap().unwrap().idle_deadline_unix_ms
+}
+
+/// A Hub whose every request is held open, as one stalled mid-preparation, until `close`.
+struct HeldHub {
+    origin: String,
+    close: mpsc::Sender<()>,
+}
+fn held_hub() -> HeldHub {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let (close, closed) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let mut held = vec![];
+        while closed.try_recv() == Err(mpsc::TryRecvError::Empty) {
+            if let Ok((stream, _)) = listener.accept() {
+                held.push(stream);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+    HeldHub { origin, close }
+}
+
+/// Submits a call of a release that prepares from `hub`: a job queued for this rental.
+async fn submit(client: &mut MachineClient<Channel>, cap: &str, id: &str, hub: &str) -> tonic::Streaming<v1::RunEvent> {
+    let spec = v1::RunSpec {
+        kind: v1::RunKind::Call as i32,
+        source: Some(v1::run_spec::Source::Release(v1::Release { package: "acme/stalled".into(), ..Default::default() })),
+        entrypoint: "generate".into(),
+        hub: Some(v1::HubAccess { origin: hub.into(), ..Default::default() }),
+        ..Default::default()
+    };
+    let request = v1::RunRequest { id: id.into(), after: 0, spec: Some(spec) };
+    let mut events = client.run(authorized(request, cap)).await.unwrap().into_inner();
+    assert!(events.message().await.unwrap().is_some(), "the job was accepted");
+    events
+}
+
+/// The run's end (its outcome event), whenever it comes.
+async fn ended(events: &mut tonic::Streaming<v1::RunEvent>) -> v1::Outcome {
+    while let Some(event) = events.message().await.unwrap() {
+        if let Some(v1::run_event::Event::Outcome(outcome)) = event.event {
+            return outcome;
+        }
+    }
+    panic!("the run's log ended without an outcome");
+}
+
+/// A job queued for the rental holds it past any number of idle windows; the clock starts when
+/// that job ends, and the used rental releases one window later.
+#[tokio::test]
+async fn a_job_holds_the_rental_and_its_end_starts_the_idle_clock() {
+    let root = root("idle-job");
+    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let (provider_port, received) = provider();
+    let mut machine = launch_idle(&root, port, provider_port, IDLE);
+    ready(&mut machine, &root, port);
+    let (mut client, cap) = owner(&root, port).await;
+    let idle_ms = i64::from(IDLE) * 1000;
+    let renewed = deadline(&mut client, &cap, true).await;
+    let at = now_ms();
+    assert!((renewed - at - idle_ms).abs() < 1_000, "keepalive answers the real deadline: {renewed} at {at}");
+    let hub = held_hub();
+    let mut events = submit(&mut client, &cap, "stalled-1", &hub.origin).await;
+    let working = deadline(&mut client, &cap, false).await;
+    assert!(working >= renewed, "a queued job holds the clock at now + the window");
+    assert!(
+        received.recv_timeout(Duration::from_millis(3 * idle_ms as u64)).is_err(),
+        "the rental released itself while a job was queued for it"
+    );
+    drop(hub.close);
+    let outcome = tokio::time::timeout(Duration::from_secs(120), ended(&mut events)).await.unwrap();
+    let end = now_ms();
+    assert_eq!(outcome.status, "failed", "{outcome:?}");
+    // Status reads the jobs the machine sampled within the last second.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let due = deadline(&mut client, &cap, false).await;
+    assert!(due > end - 1_000 + idle_ms - 1_000 && due <= end + idle_ms, "{due} vs end {end}");
+    let (method, _, _, body) = received
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the used rental did not release itself after its idle window");
+    let released = now_ms();
+    assert!(method == "POST" && body.contains("podTerminate"), "{body}");
+    assert!(released >= due - 500, "released at {released}, before its deadline {due}");
+    assert!(released < due + 5_000, "released at {released}, long after its deadline {due}");
+    drop(machine);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A restart mid-job never releases early: a job preparing when the service stopped ends at the
+/// restart, which starts the clock. A restart mid-idle keeps the exact deadline.
+#[tokio::test]
+async fn a_restart_neither_shortens_nor_extends_the_idle_clock() {
+    let root = root("idle-restart");
+    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let (provider_port, received) = provider();
+    let idle_ms = 3 * i64::from(IDLE) * 1000;
+    let idle = 3 * IDLE;
+    let mut machine = launch_idle(&root, port, provider_port, idle);
+    ready(&mut machine, &root, port);
+    let (mut client, cap) = owner(&root, port).await;
+    let hub = held_hub();
+    let events = submit(&mut client, &cap, "stalled-2", &hub.origin).await;
+    drop((events, client));
+    stop(&mut machine);
+    // Down longer than the whole window: the clock from before the job ran out long ago.
+    std::thread::sleep(Duration::from_millis(idle_ms as u64 + 1_000));
+    let relaunched = now_ms();
+    let mut machine = launch_idle(&root, port, provider_port, idle);
+    ready(&mut machine, &root, port);
+    let (mut client, cap) = owner(&root, port).await;
+    let first = deadline(&mut client, &cap, false).await;
+    assert!(first >= relaunched + idle_ms, "the job ended at the restart: {first} vs {relaunched}");
+    assert!(received.recv_timeout(Duration::from_millis(idle_ms as u64 / 3)).is_err(), "released early after a restart mid-job");
+    drop(client);
+    stop(&mut machine);
+    let mut machine = launch_idle(&root, port, provider_port, idle);
+    ready(&mut machine, &root, port);
+    let (mut client, cap) = owner(&root, port).await;
+    assert_eq!(deadline(&mut client, &cap, false).await, first, "a restart mid-idle keeps the deadline");
+    let wait = (first - now_ms() + 5_000).max(0) as u64;
+    received.recv_timeout(Duration::from_millis(wait)).expect("no release at the kept deadline");
+    let released = now_ms();
+    assert!(released >= first - 500, "released at {released}, before its deadline {first}");
+    drop(hub.close);
+    drop(machine);
+    std::fs::remove_dir_all(root).unwrap();
 }

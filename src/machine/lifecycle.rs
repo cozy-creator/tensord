@@ -1,63 +1,67 @@
-//! A rental's lifecycle: the idle ledger (shared with the Go agent's `idle.json`), explicit
-//! keepalive, the Hub lease of authorized keys and the idle release that ends billing.
+//! A rental's lifecycle: it releases itself after 15 minutes with no job queued for it or
+//! running on it, used or not (owner ruling 2026-10-10); an explicit keepalive restarts that
+//! clock once. The clock is durable state, never a sample held in memory: the journal's last
+//! job end and the ledger's idle start (this rental's first boot, or a keepalive), so restarts
+//! and updates neither shorten nor lose it. Also the Hub lease of authorized keys.
 use super::hub::{Hub, Refusal};
 use crate::api::auth::Keys;
 use std::{
-    collections::BTreeMap,
     io,
     path::PathBuf,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tonic::Status;
 
-/// The fixed rental idle window, `RentalIdleTimeoutSeconds` in the worker protocol and CLI.
+/// A rental's idle window, `RentalIdleTimeoutSeconds` in the CLI.
 pub const IDLE_GRACE_MS: i64 = 900_000;
+
+/// The journal's jobs: one queued or running, and when the last one stopped.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Jobs {
+    pub working: bool,
+    pub ended_ms: i64,
+}
 
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
-struct IdleState {
-    deadline_ms: i64,
+struct Ledger {
+    /// When the idle clock last started without a job: first boot, or a keepalive.
+    idle_since_ms: i64,
     released: bool,
-    work_observed: bool,
-    /// Known use whose ledger write failed. Hold release and retry; accepted history
-    /// recovers a crash before this pending write succeeds.
-    #[serde(skip)]
-    work_pending: bool,
-    unknown: bool,
+}
+
+struct State {
+    ledger: Ledger,
+    jobs: Jobs,
+    /// The admission epoch `jobs` was read after: a later admission may have queued a job.
+    sampled: u64,
     /// An update is activating: no new work is admitted until it exits or fails.
-    #[serde(skip)]
     activating: bool,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    keepalives: BTreeMap<String, [i64; 2]>,
 }
 
 pub struct Lifecycle {
     rental: bool,
+    /// The idle window: `IDLE_GRACE_MS` unless the grant names another.
+    grace: i64,
     path: PathBuf,
-    state: Mutex<(IdleState, i64)>, // the ledger and the in-memory renewal from observed work
+    state: Mutex<State>,
     admissions: AtomicUsize,
+    epoch: AtomicU64,
 }
 
-/// Holds idle release while a call that may start work is in flight.
+/// Holds the release while a call that may queue a job is in flight.
 pub struct Admission(Arc<Lifecycle>);
-
-impl Admission {
-    /// Successful work acceptance becomes durable before this admission fence is dropped.
-    pub fn work(&self) -> io::Result<()> {
-        self.0.work()
-    }
-}
 
 /// Closes admission while an update waits for admitted work to drain and replaces the
 /// service. Dropping it (a failed activation) reopens admission.
 pub struct Activation(Arc<Lifecycle>);
 impl Drop for Activation {
     fn drop(&mut self) {
-        self.0.state.lock().unwrap().0.activating = false;
+        self.0.state.lock().unwrap().activating = false;
     }
 }
 impl Drop for Admission {
@@ -74,53 +78,61 @@ pub fn now_ms() -> i64 {
 }
 
 impl Lifecycle {
-    /// `fresh` begins this root's first idle window; a restart keeps the persisted ledger.
-    pub fn open(path: PathBuf, rental: bool, fresh: bool) -> io::Result<Arc<Self>> {
-        let mut state = match std::fs::read(&path) {
-            Ok(raw) if !fresh && rental => serde_json::from_slice(&raw)
+    /// `fresh` starts this root's first idle clock; a restart keeps the persisted ledger.
+    pub fn open(path: PathBuf, rental: bool, fresh: bool, grace: i64) -> io::Result<Arc<Self>> {
+        let mut ledger: Ledger = match std::fs::read(&path) {
+            Ok(raw) if !fresh => serde_json::from_slice(&raw)
                 .map_err(|e| io::Error::other(format!("the idle ledger is unreadable: {e}")))?,
-            Ok(_) => IdleState::default(),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => IdleState::default(),
+            Ok(_) => Ledger::default(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ledger::default(),
             Err(e) => return Err(e),
         };
-        // A persistent machine begins a new idle session each start; it never releases.
-        if state.deadline_ms == 0 && !state.released {
-            state.deadline_ms = now_ms() + IDLE_GRACE_MS;
+        if ledger.idle_since_ms == 0 {
+            ledger.idle_since_ms = now_ms();
         }
         let lifecycle = Arc::new(Self {
             rental,
+            grace,
             path,
-            state: Mutex::new((state, 0)),
+            state: Mutex::new(State { ledger, jobs: Jobs::default(), sampled: 0, activating: false }),
             admissions: AtomicUsize::new(0),
+            epoch: AtomicU64::new(0),
         });
-        lifecycle.save(&lifecycle.state.lock().unwrap().0)?;
+        lifecycle.save(&lifecycle.state.lock().unwrap().ledger)?;
         Ok(lifecycle)
     }
 
-    fn save(&self, state: &IdleState) -> io::Result<()> {
-        super::identity::write_atomic(&self.path, &serde_json::to_vec(state)?, 0o600)
+    fn save(&self, ledger: &Ledger) -> io::Result<()> {
+        super::identity::write_atomic(&self.path, &serde_json::to_vec(ledger)?, 0o600)
     }
 
-    fn due(state: &(IdleState, i64), now: i64) -> bool {
-        state.0.released
-            || (!state.0.work_observed
-                && !state.0.work_pending
-                && now >= state.0.deadline_ms.max(state.1))
+    /// When the idle clock ends: 15 minutes after the later of its start and the last job's
+    /// end; while a job is queued or running, 15 minutes from now.
+    fn deadline(&self, state: &State, now: i64) -> i64 {
+        if state.jobs.working && !state.ledger.released {
+            return now + self.grace;
+        }
+        state.ledger.idle_since_ms.max(state.jobs.ended_ms) + self.grace
+    }
+
+    fn due(&self, state: &State, now: i64) -> bool {
+        state.ledger.released || (!state.jobs.working && now >= self.deadline(state, now))
     }
 
     pub fn admit(self: &Arc<Self>) -> Result<Admission, Status> {
         let state = self.state.lock().unwrap();
-        if state.0.activating {
+        if state.activating {
             return Err(Status::unavailable(
                 "machine_updating: the machine is activating an update; submit again once it is back",
             ));
         }
-        if self.rental && Self::due(&state, now_ms()) {
+        if self.rental && self.due(&state, now_ms()) {
             return Err(Status::unavailable(
-                "machine_released: this rental released itself after its idle deadline",
+                "machine_released: this rental released itself after 15 minutes idle",
             ));
         }
         self.admissions.fetch_add(1, Ordering::AcqRel);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
         Ok(Admission(self.clone()))
     }
 
@@ -128,87 +140,51 @@ impl Lifecycle {
     /// before activation or refused after it, never accepted while the service exits.
     pub fn activate(self: &Arc<Self>) -> Result<Activation, Status> {
         let mut state = self.state.lock().unwrap();
-        if state.0.activating || state.0.released {
+        if state.activating || state.ledger.released {
             return Err(Status::unavailable(
                 "the machine is already activating or released",
             ));
         }
-        state.0.activating = true;
+        state.activating = true;
         Ok(Activation(self.clone()))
     }
 
-    /// A used rental ends explicitly, never through the unused-rental timeout.
-    pub fn work(&self) -> io::Result<()> {
+    /// The admission epoch, read before the journal is.
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    /// The journal's jobs as read after admission epoch `epoch`.
+    pub fn observe(&self, jobs: Jobs, epoch: u64) {
         let mut state = self.state.lock().unwrap();
-        if state.0.work_observed {
-            return Ok(());
-        }
-        state.0.work_pending = true;
-        let mut used = state.0.clone();
-        used.work_observed = true;
-        used.work_pending = false;
-        self.save(&used)?;
-        state.0 = used;
-        Ok(())
+        state.jobs = jobs;
+        state.sampled = epoch;
     }
 
-    /// Folds one known activity sample in. Observed work durably marks this rental used;
-    /// unreadable activity is handled by the caller without inventing a used observation.
-    pub fn observe(&self, busy: bool) -> io::Result<i64> {
-        let now = now_ms();
-        let mut state = self.state.lock().unwrap();
-        if state.0.released {
-            return Ok(now);
-        }
-        if busy {
-            state.1 = state.1.max(now + IDLE_GRACE_MS);
-            state.0.work_pending |= !state.0.work_observed;
-        }
-        let target = state.0.deadline_ms.max(state.1);
-        if target - state.0.deadline_ms >= IDLE_GRACE_MS / 2 || state.0.work_pending {
-            let mut observed = state.0.clone();
-            observed.deadline_ms = target;
-            observed.work_observed |= state.0.work_pending;
-            observed.work_pending = false;
-            self.save(&observed)?;
-            state.0 = observed;
-        }
-        Ok(target)
+    /// The last job end this lifecycle has read.
+    pub fn ended_ms(&self) -> i64 {
+        self.state.lock().unwrap().jobs.ended_ms
     }
 
-    /// An explicit owner keepalive, idempotent per request id (worker.v1).
-    pub fn keepalive(&self, id: &str) -> Result<(i64, i64), Status> {
-        self.reset(Some(id))
-    }
-
-    /// `Status{keepalive}`: one explicit reset of the idle deadline; answers the new deadline.
+    /// `Status{keepalive}`: restarts the idle clock once; answers the new deadline.
     pub fn renew(&self) -> Result<i64, Status> {
-        self.reset(None).map(|(_, deadline)| deadline)
-    }
-
-    fn reset(&self, id: Option<&str>) -> Result<(i64, i64), Status> {
+        if !self.rental {
+            return Ok(0);
+        }
         let now = now_ms();
         let mut state = self.state.lock().unwrap();
-        if self.rental && Self::due(&state, now) {
+        if self.due(&state, now) {
             return Err(Status::failed_precondition(
-                "this machine's idle release is already due or committed",
+                "this rental's idle release is already due or committed",
             ));
         }
-        if let Some(seen) = id.and_then(|id| state.0.keepalives.get(id)) {
-            return Ok((seen[0], if state.0.work_observed || state.0.work_pending { 0 } else { seen[1] }));
-        }
-        if state.0.keepalives.len() >= 256 {
-            state.0.keepalives.clear();
-        }
-        let deadline = if state.0.work_observed || state.0.work_pending { 0 } else { now + IDLE_GRACE_MS };
-        if let Some(id) = id {
-            state.0.keepalives.insert(id.to_owned(), [now, deadline]);
-        }
-        state.0.deadline_ms = state.0.deadline_ms.max(deadline);
-        self.save(&state.0).map_err(|e| {
+        let mut ledger = state.ledger.clone();
+        ledger.idle_since_ms = ledger.idle_since_ms.max(now);
+        self.save(&ledger).map_err(|e| {
             Status::unavailable(format!("the idle ledger could not be written: {e}"))
         })?;
-        Ok((now, deadline))
+        state.ledger = ledger;
+        Ok(self.deadline(&state, now))
     }
 
     /// Calls that may start work, in flight now.
@@ -216,49 +192,38 @@ impl Lifecycle {
         self.admissions.load(Ordering::Acquire)
     }
 
-    /// Only unused rentals release automatically. A committed release remains irreversible.
-    pub fn releases(&self) -> bool {
-        let state = self.state.lock().unwrap();
-        self.rental && (state.0.released || (!state.0.work_observed && !state.0.work_pending))
-    }
-
+    /// When this rental releases itself if no job comes first; 0 for a machine that never does.
     pub fn deadline_ms(&self) -> i64 {
-        let state = self.state.lock().unwrap();
-        state.0.deadline_ms.max(state.1)
+        match self.rental {
+            true => self.deadline(&self.state.lock().unwrap(), now_ms()),
+            false => 0,
+        }
     }
 
     pub fn released(&self) -> bool {
-        self.state.lock().unwrap().0.released
+        self.state.lock().unwrap().ledger.released
     }
 
-    /// Unknown activity blocks a new release, but cannot undo committed cleanup.
-    fn observe_before_release(&self, busy: impl FnOnce() -> io::Result<bool>) -> io::Result<()> {
-        if self.released() {
-            return Ok(());
-        }
-        if self.state.lock().unwrap().0.work_pending {
-            self.work()?;
-        }
-        self.observe(busy()?).map(|_| ())
-    }
-
-    /// Takes the release once the deadline passed and nothing holds it. Irreversible.
+    /// Takes the release once the idle clock ran out on a current reading. Irreversible.
     fn claim(&self) -> io::Result<bool> {
         let mut state = self.state.lock().unwrap();
         if !self.rental {
             return Ok(false);
         }
-        if state.0.released {
+        if state.ledger.released {
             return Ok(true);
         }
-        if state.0.activating
+        if state.activating
             || self.admissions.load(Ordering::Acquire) > 0
-            || !Self::due(&state, now_ms())
+            || state.sampled != self.epoch()
+            || !self.due(&state, now_ms())
         {
             return Ok(false);
         }
-        state.0.released = true;
-        self.save(&state.0)?;
+        let mut ledger = state.ledger.clone();
+        ledger.released = true;
+        self.save(&ledger)?;
+        state.ledger = ledger;
         Ok(true)
     }
 }
@@ -293,42 +258,44 @@ pub async fn keep_authority(hub: Arc<Hub>, keys: Keys) {
     }
 }
 
-/// Watches activity and releases the rental once its idle deadline passed with nothing held.
-/// Returns when the Hub accepted the release, or when the rental ended itself: idle past its
-/// deadline with no answer from the Hub through that whole idle window, the Hub cannot end it,
-/// so it ends itself at its provider (`provider`, else by stopping) and billing stops.
+/// Reads the journal's jobs each second and releases the rental once 15 minutes passed with
+/// none. Returns when the Hub accepted the release, or when the rental ended itself: idle past
+/// its deadline with no answer from the Hub through that whole idle window, the Hub cannot end
+/// it, so it ends itself at its provider (`provider`, else by stopping) and billing stops.
 pub async fn release_when_idle(
     lifecycle: Arc<Lifecycle>,
     hub: Arc<Hub>,
     provider: Option<super::provider::ProviderSelf>,
-    busy: impl Fn() -> io::Result<bool>,
+    jobs: impl Fn(i64) -> io::Result<Jobs>,
 ) {
     let mut next_ask = 0;
     loop {
-        if let Err(error) = lifecycle.observe_before_release(&busy) {
-            eprintln!("cozy-machine: cannot observe rental activity: {error}");
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            continue;
+        let epoch = lifecycle.epoch();
+        match jobs(lifecycle.ended_ms()) {
+            Ok(read) => lifecycle.observe(read, epoch),
+            Err(error) => {
+                eprintln!("cozy-machine: cannot read this rental's jobs: {error}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
         }
         let now = now_ms();
-        if now >= lifecycle.deadline_ms() && now >= next_ask {
+        if now >= next_ask {
             match lifecycle.claim() {
-                Ok(true) => {
-                    match hub.release().await {
-                        Ok(()) => {
-                            eprintln!("cozy-machine: idle deadline passed; Tensorhub accepted the release");
+                Ok(true) => match hub.release().await {
+                    Ok(()) => {
+                        eprintln!("cozy-machine: 15 minutes without a job; Tensorhub accepted the release");
+                        return;
+                    }
+                    Err(error) => {
+                        eprintln!("cozy-machine: idle release not accepted; retrying without extending the deadline: {error}");
+                        next_ask = now + 5_000;
+                        if unheard(hub.contact_ms(), lifecycle.deadline_ms(), lifecycle.grace) {
+                            end_without_hub(provider.as_ref()).await;
                             return;
                         }
-                        Err(error) => {
-                            eprintln!("cozy-machine: idle release not accepted; retrying without extending the deadline: {error}");
-                            next_ask = now + 5_000;
-                            if unheard(hub.contact_ms(), lifecycle.deadline_ms()) {
-                                end_without_hub(provider.as_ref()).await;
-                                return;
-                            }
-                        }
                     }
-                }
+                },
                 Ok(false) => (),
                 Err(error) => {
                     eprintln!("cozy-machine: idle release could not be recorded: {error}")
@@ -340,8 +307,8 @@ pub async fn release_when_idle(
 }
 
 /// The Hub has not answered since this idle window began: it cannot hear the release.
-fn unheard(contact_ms: i64, deadline_ms: i64) -> bool {
-    contact_ms < deadline_ms - IDLE_GRACE_MS
+fn unheard(contact_ms: i64, deadline_ms: i64, grace: i64) -> bool {
+    contact_ms < deadline_ms - grace
 }
 
 async fn end_without_hub(provider: Option<&super::provider::ProviderSelf>) {
@@ -361,140 +328,108 @@ async fn end_without_hub(provider: Option<&super::provider::ProviderSelf>) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn unreadable_activity_holds_only_before_release_is_committed() {
-        let dir = std::env::temp_dir().join(format!("release-uncertainty-{}", uuid::Uuid::new_v4()));
+    fn opened(fresh: bool, dir: &std::path::Path) -> Arc<Lifecycle> {
+        Lifecycle::open(dir.join("idle.json"), true, fresh, IDLE_GRACE_MS).unwrap()
+    }
+
+    fn dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("{name}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let lifecycle = Lifecycle::open(dir.join("idle.json"), true, true).unwrap();
-        let unreadable = || Err(io::Error::other("activity unavailable"));
-        assert!(lifecycle.observe_before_release(unreadable).is_err());
-        assert!(lifecycle.releases(), "uncertainty did not mark application use");
-        lifecycle.state.lock().unwrap().0.deadline_ms = 1;
+        dir
+    }
+
+    /// Moves the idle clock's start back by `ms`, as if that time had passed.
+    fn age(lifecycle: &Lifecycle, ms: i64) {
+        lifecycle.state.lock().unwrap().ledger.idle_since_ms -= ms;
+    }
+
+    fn read(lifecycle: &Lifecycle, working: bool, ended_ms: i64) {
+        lifecycle.observe(Jobs { working, ended_ms }, lifecycle.epoch());
+    }
+
+    #[test]
+    fn a_rental_used_or_not_releases_after_fifteen_minutes_without_a_job() {
+        let dir = dir("idle-rule");
+        let lifecycle = opened(true, &dir);
+        read(&lifecycle, false, 0);
+        assert!(!lifecycle.claim().unwrap(), "a new rental has its 15 minutes");
+        age(&lifecycle, IDLE_GRACE_MS);
+        // A job queued or running holds it, however long the clock has been idle before.
+        read(&lifecycle, true, 0);
+        assert!(!lifecycle.claim().unwrap());
+        assert!(lifecycle.deadline_ms() >= now_ms() + IDLE_GRACE_MS - 1_000);
+        // The clock starts when that job ends: a used rental releases 15 minutes later.
+        let ended = now_ms();
+        read(&lifecycle, false, ended);
+        assert_eq!(lifecycle.deadline_ms(), ended + IDLE_GRACE_MS);
+        assert!(!lifecycle.claim().unwrap());
+        read(&lifecycle, false, ended - IDLE_GRACE_MS);
+        assert!(lifecycle.claim().unwrap(), "a used rental idle 15 minutes releases");
+        assert!(lifecycle.admit().is_err(), "a released rental admits nothing");
+        assert!(lifecycle.renew().is_err(), "nor restarts its clock");
+        let again = opened(false, &dir);
+        assert!(again.released(), "a committed release survives a restart");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn keepalive_restarts_the_clock_once_and_a_restart_keeps_it() {
+        let dir = dir("idle-keepalive");
+        let lifecycle = opened(true, &dir);
+        age(&lifecycle, IDLE_GRACE_MS - 60_000);
+        read(&lifecycle, false, 0);
+        let before = lifecycle.deadline_ms();
+        let renewed = lifecycle.renew().unwrap();
+        assert!(renewed >= before + IDLE_GRACE_MS - 61_000, "{before} -> {renewed}");
+        let restarted = opened(false, &dir);
+        read(&restarted, false, 0);
+        assert_eq!(restarted.deadline_ms(), renewed, "a restart neither shortens nor extends it");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_ledger_without_an_idle_start_starts_the_clock_at_boot() {
+        let dir = dir("idle-old-ledger");
+        std::fs::write(dir.join("idle.json"), br#"{"deadline_ms":1,"work_observed":true}"#).unwrap();
+        let lifecycle = opened(false, &dir);
+        read(&lifecycle, false, 0);
+        assert!(lifecycle.deadline_ms() >= now_ms() + IDLE_GRACE_MS - 1_000);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_admission_or_a_reading_from_before_it_holds_the_release() {
+        let dir = dir("idle-admission");
+        let lifecycle = opened(true, &dir);
+        let epoch = lifecycle.epoch();
+        let held = lifecycle.admit().unwrap();
+        age(&lifecycle, IDLE_GRACE_MS);
+        lifecycle.observe(Jobs::default(), epoch);
+        assert!(!lifecycle.claim().unwrap(), "an admitted call holds the release");
+        drop(held);
+        assert!(!lifecycle.claim().unwrap(), "a reading from before that admission is stale");
+        read(&lifecycle, false, 0);
         assert!(lifecycle.claim().unwrap());
-        assert!(lifecycle.observe_before_release(unreadable).is_ok());
-        assert!(lifecycle.claim().unwrap(), "committed release still retries cleanup");
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn used_transition_retries_after_a_failed_durable_write() {
-        let dir = std::env::temp_dir().join(format!("used-write-failure-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("idle.json");
-        let lifecycle = Lifecycle::open(path.clone(), true, true).unwrap();
-        std::fs::remove_file(&path).unwrap();
-        std::fs::create_dir(&path).unwrap();
-        let admission = lifecycle.admit().unwrap();
-        assert!(admission.work().is_err());
-        drop(admission);
-        lifecycle.state.lock().unwrap().0.deadline_ms = 1;
-        assert!(!lifecycle.state.lock().unwrap().0.work_observed);
-        assert!(!lifecycle.releases(), "known pending use holds release");
-        assert!(!lifecycle.claim().unwrap());
-        assert!(lifecycle.observe(false).is_err(), "idle still retries pending use");
-        assert!(!lifecycle.claim().unwrap());
-        std::fs::remove_dir(&path).unwrap();
-        lifecycle.observe(false).unwrap();
-        let restarted = Lifecycle::open(path, true, false).unwrap();
-        assert!(!restarted.releases());
-        assert!(!restarted.claim().unwrap());
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn accepted_work_wins_expiry_while_admission_is_held_and_survives_restart() {
-        let dir = std::env::temp_dir().join(format!("used-rental-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("idle.json");
-        let lifecycle = Lifecycle::open(path.clone(), true, true).unwrap();
-        let admitted = lifecycle.admit().unwrap();
-        lifecycle.state.lock().unwrap().0.deadline_ms = 0;
-        assert!(!lifecycle.claim().unwrap(), "pending acceptance is held");
-        admitted.work().unwrap();
-        drop(admitted);
-        assert!(!lifecycle.releases());
-        assert!(!lifecycle.claim().unwrap(), "used rental cannot expire");
-        assert!(lifecycle.admit().is_ok());
-        let restarted = Lifecycle::open(path, true, false).unwrap();
-        assert!(!restarted.releases());
-        assert!(!restarted.claim().unwrap());
-        assert!(restarted.admit().is_ok());
-        assert_eq!(restarted.keepalive("optional-owner-keepalive").unwrap().1, 0);
-        assert_eq!(restarted.renew().unwrap(), 0);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn observed_preparation_is_used_but_maintenance_and_idle_observation_are_not() {
-        let dir = std::env::temp_dir().join(format!("rental-activity-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("idle.json");
-        let lifecycle = Lifecycle::open(path.clone(), true, true).unwrap();
-        lifecycle.observe(false).unwrap();
-        drop(lifecycle.activate().unwrap());
-        assert!(lifecycle.releases());
-        lifecycle.observe(true).unwrap();
-        assert!(!lifecycle.releases());
-        let restarted = Lifecycle::open(path, true, false).unwrap();
-        restarted.state.lock().unwrap().0.deadline_ms = 0;
-        assert!(!restarted.claim().unwrap());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn a_rental_ends_itself_only_when_the_hub_was_silent_through_the_idle_window() {
-        let deadline = 10 * IDLE_GRACE_MS;
-        assert!(unheard(0, deadline), "never heard");
-        assert!(
-            unheard(deadline - IDLE_GRACE_MS - 1, deadline),
-            "last heard before the window"
-        );
-        assert!(
-            !unheard(deadline - IDLE_GRACE_MS, deadline),
-            "heard as the window began"
-        );
-        assert!(!unheard(deadline - 1, deadline), "heard during the window");
-    }
-
-    #[test]
-    fn keepalive_is_idempotent_work_renews_and_release_is_irreversible() {
-        let dir = std::env::temp_dir().join(format!("cozy-idle-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("idle.json");
-        let lifecycle = Lifecycle::open(path.clone(), true, true).unwrap();
-        let first = lifecycle.keepalive("a").unwrap();
-        assert_eq!(lifecycle.keepalive("a").unwrap(), first);
-        let held = lifecycle.admit().unwrap();
-        lifecycle.state.lock().unwrap().0.deadline_ms = 0;
-        assert!(
-            !lifecycle.claim().unwrap(),
-            "an admitted call holds the release"
-        );
-        drop(held);
-        assert!(
-            lifecycle.admit().is_err(),
-            "a due release admits no new work"
-        );
-        assert!(lifecycle.claim().unwrap());
-        // A restart keeps the committed release; the Go agent reads the same ledger.
-        let again = Lifecycle::open(path.clone(), true, false).unwrap();
-        assert!(again.released());
-        assert!(again.keepalive("b").is_err());
-        let raw: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(raw["released"], true);
-        assert!(raw["deadline_ms"].is_i64());
-        std::fs::remove_dir_all(dir).unwrap();
+        let (deadline, grace) = (10 * IDLE_GRACE_MS, IDLE_GRACE_MS);
+        assert!(unheard(0, deadline, grace), "never heard");
+        assert!(unheard(deadline - grace - 1, deadline, grace), "last heard before the window");
+        assert!(!unheard(deadline - grace, deadline, grace), "heard as the window began");
+        assert!(!unheard(deadline - 1, deadline, grace), "heard during the window");
     }
 
     /// A rental due for release does not release while an update activates.
     #[test]
     fn activation_holds_the_release() {
-        let dir = std::env::temp_dir().join(format!("cozy-activation-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let lifecycle = Lifecycle::open(dir.join("idle.json"), true, true).unwrap();
+        let dir = dir("idle-activation");
+        let lifecycle = opened(true, &dir);
         let activation = lifecycle.activate().unwrap();
-        lifecycle.state.lock().unwrap().0.deadline_ms = 0;
+        age(&lifecycle, IDLE_GRACE_MS);
+        read(&lifecycle, false, 0);
         assert!(!lifecycle.claim().unwrap());
         drop(activation);
         assert!(lifecycle.claim().unwrap());

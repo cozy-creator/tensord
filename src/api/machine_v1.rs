@@ -612,11 +612,6 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
             let followed = async move {
                 if let Some(spec) = spec {
                     submit(&backend, actor, &request.id, spec).await?;
-                    if let Some(admission) = &admitted {
-                        admission.work().map_err(|error| {
-                            Status::unavailable(format!("accepted work's rental state: {error}"))
-                        })?;
-                    }
                 }
                 drop(admitted);
                 stream_run(backend, actor, request.id, request.after, limit, events).await
@@ -636,7 +631,8 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
     ) -> Result<Response<v1::WriteResult>, Status> {
         let caller = self.caller(request.metadata())?;
         caller.machine()?;
-        let _admitted = self.admit()?;
+        // An upload is not a job: it neither holds nor delays a rental's idle release.
+        drop(self.admit()?);
         let runs = self
             .backend
             .runs()
