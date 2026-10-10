@@ -2,7 +2,6 @@
 import hashlib
 import importlib.metadata
 import re
-from urllib.parse import unquote, urlsplit
 
 import msgspec
 
@@ -22,38 +21,15 @@ def record_digest(found: importlib.metadata.Distribution | None) -> str:
     return "sha256:" + hashlib.sha256(msgspec.json.encode(rows)).hexdigest()
 
 
-def origin(url):
-    try:
-        if (url.scheme not in ("http", "https") or not url.hostname
-                or url.username is not None or url.password is not None):
-            return None
-        port = url.port
-        return url.scheme, url.hostname.lower(), port if port is not None else (443 if url.scheme == "https" else 80)
-    except ValueError:
-        return None
-
-
-def package_name(found: importlib.metadata.Distribution, packages: dict[str, str], hub_origin: str = "") -> str:
-    """The explicit capture identity, else the Hub index of its locked direct wheel URL.
-
-    Reading installed PEP 610 metadata needs neither imports nor another catalog read.
-    A wheel without provenance from this preparation's Hub is local code, never guessed
-    to belong to either the root's org or an unrelated host's similarly named index.
-    """
+def package_name(found: importlib.metadata.Distribution, packages: dict[str, str]) -> str:
+    """The Hub package the machine read from the release's lock, else local code. An installed
+    wheel's own provenance is never read: Hub rows install from local files, and a file door's
+    URL is the Hub's to reshape (th-245)."""
     name = normalized(found.metadata["Name"])
-    if name in packages:
-        package = packages[name]
-        org, separator, distribution = package.partition("/")
-        if not separator or not org or "/" in distribution or normalized(distribution) != name:
-            raise ValueError(f"callee {name!r} names a different package: {package!r}")
-        return package
-    record = found.read_text("direct_url.json")
-    if record:
-        url = urlsplit(msgspec.json.decode(record).get("url", ""))
-        path = [unquote(part) for part in url.path.split("/")]
-        expected = origin(urlsplit(hub_origin)) if hub_origin else None
-        if (expected is not None and origin(url) == expected
-                and len(path) == 7 and path[1:3] == ["v1", "index"]
-                and path[4] == "files" and path[3] and "/" not in path[3]):
-            return f"{path[3]}/{name}"
-    return f"local/{name}"
+    package = packages.get(name)
+    if package is None:
+        return f"local/{name}"
+    org, separator, distribution = package.partition("/")
+    if not separator or not org or "/" in distribution or normalized(distribution) != name:
+        raise ValueError(f"callee {name!r} names a different package: {package!r}")
+    return package

@@ -188,6 +188,7 @@ type Failure = (&'static str, String);
 #[derive(Clone, Copy)]
 struct Environment<'a> {
     split: &'a Lock,
+    org: &'a str,
     python: &'a str,
     interface: &'a Value,
     release: &'a str,
@@ -818,6 +819,7 @@ impl Publisher {
         let identity = sha256::hex_digest(json!({"lock":lock,"python":python,"hub":hub::origin_key(&request.source.origin),"sdk":self.sdk.requirements,"links":self.sdk.find_links,"client":self.sdk.client_wheel}).to_string().as_bytes())[..32].to_string();
         let wanted = Environment {
             split: &split,
+            org,
             python: &python,
             interface: &interface,
             release: &release,
@@ -856,6 +858,7 @@ impl Publisher {
     ) -> Result<(), Failure> {
         let Environment {
             split,
+            org,
             python,
             interface,
             release,
@@ -963,7 +966,7 @@ impl Publisher {
             ))?;
         File::create(dir.join(".hold")).map_err(io_failure)?;
         let (source_digest, callees) = match &self.sdk.client_wheel {
-            Some(_) => describe_environment(&py, &split.distribution, &source.origin, &hub_packages(&split.exact, source))?,
+            Some(_) => describe_environment(&py, &split.distribution, &hub_packages(&split.exact, org, source))?,
             None => (String::new(), vec![]),
         };
         let record = json!({"identity":identity,"package":split.distribution,"version":release,"application":application,"python":interpreter,"dependencies":installed_sdk(&env),"interface":interface,"sdk":sdk_choice,"sdk_fallback":sdk_fallback,"source_digest":source_digest,"callees":callees});
@@ -1689,24 +1692,17 @@ fn stage_of(progress: &Progress) -> String {
     }
 }
 
-/// The package each lock row the run's Hub publishes installs, by distribution: the org its
-/// index names (`<origin>/v1/index/<org>/files/<sha256>/<wheel>`). Those rows install from
-/// local files (`hub_files`), so an installed callee's own provenance no longer names the
-/// Hub; without this the environment's describer called a Hub-published callee
-/// `local/<name>`, and the run's model choices addressed to `<org>/<name>/...` never reached
-/// it (long_form's generate_image: model_choice_absent).
-fn hub_packages(exact: &str, source: &hub::Source) -> BTreeMap<String, String> {
+/// The Hub package each lock row its Hub publishes installs, by distribution: the row's own
+/// name in the release's org, the one org a Hub lock pins. Never read from the row's URL: the
+/// file door's shape is the Hub's to change (th-245 did, and every callee became
+/// `local/<name>`, so choices addressed to `<org>/<name>/...` reached none: run 5234). Those
+/// rows install from local files (`hub_files`), so the installed wheel names no Hub either.
+fn hub_packages(exact: &str, org: &str, source: &hub::Source) -> BTreeMap<String, String> {
     exact
         .lines()
-        .filter_map(|line| {
-            let file = hub_file(line, source)?;
-            let path = file.url.split_once("://")?.1.split_once('/')?.1;
-            let ["v1", "index", org, "files", _, _] = path.split('/').collect::<Vec<_>>()[..] else {
-                return None;
-            };
-            let distribution = normalized(file.name.split('-').next()?);
-            (!org.is_empty()).then(|| (distribution.clone(), format!("{org}/{distribution}")))
-        })
+        .filter(|line| hub_file(line, source).is_some())
+        .filter_map(|line| line.split_whitespace().next())
+        .map(|name| (normalized(name), format!("{org}/{}", normalized(name))))
         .collect()
 }
 
@@ -1840,7 +1836,6 @@ struct Lock {
 pub fn describe_environment(
     python: &str,
     root: &str,
-    hub_origin: &str,
     packages: &BTreeMap<String, String>,
 ) -> Result<(String, Vec<crate::catalog::Callee>), Failure> {
     #[derive(serde::Deserialize)]
@@ -1861,7 +1856,7 @@ pub fn describe_environment(
         .stderr(Stdio::inherit())
         .spawn()
         .and_then(|mut child| {
-            let request = json!({"kind": "describe_environment", "root": root, "hub_origin": hub_origin, "packages": packages}).to_string();
+            let request = json!({"kind": "describe_environment", "root": root, "packages": packages}).to_string();
             child.stdin.take().expect("piped").write_all(request.as_bytes())?;
             child.wait_with_output()
         });
@@ -2035,12 +2030,13 @@ mod tests {
                     }
                     let mut out = stream;
                     let answer = match path.split('/').collect::<Vec<_>>().as_slice() {
-                        ["", "v1", "index", "acme", "files", sha, _] => format!(
-                            "HTTP/1.1 302 Found\r\nLocation: {base}/objects/{sha}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        // The Hub's file door (th-245): a wheel by its claiming package and release.
+                        ["", "v1", "index", "acme", _, _, wheel] => format!(
+                            "HTTP/1.1 302 Found\r\nLocation: {base}/objects/{wheel}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                         )
                         .into_bytes(),
-                        ["", "objects", sha] => {
-                            let body = &objects[*sha];
+                        ["", "objects", wheel] => {
+                            let body = &objects[*wheel];
                             let (status, first, last) = match range {
                                 Some((first, last)) => ("206 Partial Content", first, last.min(body.len() - 1)),
                                 None => ("200 OK", 0, body.len() - 1),
@@ -2093,13 +2089,13 @@ mod tests {
         let good = sha256::hex_digest(&bytes);
         let bad = sha256::hex_digest(b"other bytes");
         let asks = Arc::new(Mutex::new(vec![]));
-        let origin = file_door(HashMap::from([(good.clone(), bytes.clone()), (bad.clone(), bytes)]), asks.clone(), None);
+        let origin = file_door(HashMap::from([("acme_pkg-1.0-py3-none-any.whl".to_string(), bytes)]), asks.clone(), None);
         let source = hub::Source::new(&origin, None, vec![], None).unwrap();
         let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
         let publisher = Publisher::new(&root.join("published"), PackageSdk::default(), store).unwrap();
         let pypi = "six @ https://files.pythonhosted.org/packages/six-1.17.0-py2.py3-none-any.whl --hash=sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274";
         let exact = format!(
-            "--index-url https://pypi.org/simple\n{pypi}\nacme-pkg @ {origin}/v1/index/acme/files/{good}/acme_pkg-1.0-py3-none-any.whl --hash=sha256:{good}\n"
+            "--index-url https://pypi.org/simple\n{pypi}\nacme-pkg @ {origin}/v1/index/acme/acme-pkg/1.0/acme_pkg-1.0-py3-none-any.whl --hash=sha256:{good}\n"
         );
         let dir = root.join("generation");
         fs::create_dir_all(&dir).unwrap();
@@ -2130,12 +2126,12 @@ mod tests {
         // describer reads it inside the environment (msgspec is its one dependency).
         assert!(Command::new("uv").args(["pip", "install", "-q", "--no-config", "--python", python.to_str().unwrap(), "msgspec"])
             .env("UV_CACHE_DIR", root.join("uv-cache")).status().unwrap().success());
-        let packages = hub_packages(&exact, &source);
+        let packages = hub_packages(&exact, "acme", &source);
         assert_eq!(packages, BTreeMap::from([("acme-pkg".to_string(), "acme/acme-pkg".to_string())]));
         let named = |packages: &BTreeMap<String, String>| {
             let script = format!(
                 "import importlib.metadata,json;from cozy_machine_client.distribution import package_name;\
-                 print(package_name(importlib.metadata.distribution('acme-pkg'),json.loads('{}'),'{origin}'))",
+                 print(package_name(importlib.metadata.distribution('acme-pkg'),json.loads('{}')))",
                 serde_json::to_string(packages).unwrap()
             );
             let out = Command::new(&python).args(["-c", &script])
@@ -2146,7 +2142,7 @@ mod tests {
         assert_eq!(named(&packages), "acme/acme-pkg");
         assert_eq!(named(&BTreeMap::new()), "local/acme-pkg", "without the lock's identity");
 
-        let tampered = format!("acme-pkg @ {origin}/v1/index/acme/files/{bad}/acme_pkg-1.0-py3-none-any.whl --hash=sha256:{bad}\n");
+        let tampered = format!("acme-pkg @ {origin}/v1/index/acme/acme-pkg/1.0/acme_pkg-1.0-py3-none-any.whl --hash=sha256:{bad}\n");
         let other = root.join("tampered");
         fs::create_dir_all(&other).unwrap();
         let (code, why) = publisher.hub_files(&tampered, &source, &other, &Job::default()).unwrap_err();
@@ -2164,11 +2160,11 @@ mod tests {
         let bytes: Vec<u8> = (0..(3u32 << 20)).map(|i| (i.wrapping_mul(2246822519) >> 11) as u8).collect();
         let sha = sha256::hex_digest(&bytes);
         let asks = Arc::new(Mutex::new(vec![]));
-        let origin = file_door(HashMap::from([(sha.clone(), bytes)]), asks.clone(), Some(1 << 20));
+        let origin = file_door(HashMap::from([("acme_data-1.0-py3-none-any.whl".to_string(), bytes)]), asks.clone(), Some(1 << 20));
         let source = hub::Source::new(&origin, None, vec![], None).unwrap();
         let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
         let publisher = Publisher::new(&root.join("published"), PackageSdk::default(), store).unwrap();
-        let exact = format!("acme-data @ {origin}/v1/index/acme/files/{sha}/acme_data-1.0-py3-none-any.whl --hash=sha256:{sha}\n");
+        let exact = format!("acme-data @ {origin}/v1/index/acme/acme-data/1.0/acme_data-1.0-py3-none-any.whl --hash=sha256:{sha}\n");
         let began = Instant::now();
         publisher.hub_files(&exact, &source, &root.join("generation"), &Job::default()).unwrap();
         let took = began.elapsed();
