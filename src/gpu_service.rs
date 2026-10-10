@@ -874,6 +874,50 @@ impl GpuPool {
             device.memory.with(|gpu| gpu.members = plans.clone());
         }
     }
+    /// `actor`'s warm set without the members of removed `generations`.
+    pub fn drop_members(&self, actor: &str, generations: &std::collections::BTreeSet<String>) {
+        let mut kept = self.warm_set(actor);
+        let before = kept.len();
+        kept.retain(|member| !generations.contains(&member.held.record.identity));
+        if kept.len() != before {
+            self.set_members(actor, kept);
+        }
+    }
+    /// A removed generation leaves memory now: each idle executor of it ends while its lane's
+    /// call slots are free, then its import-only parent once childless. One in a call ends
+    /// with the call's tenancy, as any idle executor does.
+    pub fn end_generation(&self, identity: &str) {
+        let lanes: Vec<(String, usize, u32)> = {
+            let sessions = self.sessions.lock().unwrap();
+            let idle = sessions.values().filter(|s| s.generation == identity);
+            idle.map(|s| (s.plan.clone(), s.start, s.degree)).collect()
+        };
+        for (plan, start, degree) in lanes {
+            let Some(permit) = self.reserved.take(None, true, start..start + degree as usize, &[]) else {
+                continue;
+            };
+            if let Err(error) = self.carry_out(start, &Step::End(plan)) {
+                eprintln!("ending a removed package's executor: {error}");
+            }
+            drop(permit);
+        }
+        let parents: Vec<Arc<Zygote>> = {
+            let mut zygotes = self.zygotes.lock().unwrap();
+            let ended: Vec<App> = zygotes
+                .iter()
+                .filter(|((generation, _), zygote)| generation == identity && zygote.childless())
+                .map(|(key, _)| key.clone())
+                .collect();
+            ended.into_iter().filter_map(|key| zygotes.remove(&key)).collect()
+        };
+        for zygote in parents {
+            if let ZygoteState::Ready(parent) = std::mem::take(&mut *zygote.state.lock().unwrap()) {
+                if let Err(error) = parent.shutdown() {
+                    eprintln!("ending a removed package's import-only executor: {error}");
+                }
+            }
+        }
+    }
     /// One pass over `actor`'s warm set: each member is brought as far toward its level as
     /// free room and the room of idle tenants outside every warm set allow. It never takes
     /// from another member or a running call, and keeps the reason when it stops short.
@@ -1192,6 +1236,7 @@ impl GpuPool {
                 package: package.into(),
                 release: release.into(),
                 interface: serde_json::to_vec(&held.record.interface)?,
+                hub: String::new(),
             })
             .map(Some)
     }

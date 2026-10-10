@@ -44,6 +44,7 @@ fn prefetch_choices_cross_the_native_handler_and_keep_callee_authority() {
             package: "local/fixture".into(),
             release: "1".into(),
             interface: serde_json::to_vec(&interface).unwrap(),
+            hub: String::new(),
         })
         .unwrap();
     let (record, _) = service

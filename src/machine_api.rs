@@ -663,7 +663,7 @@ impl MachineBackend for NativeBackend {
                 installation_id: installed.alias,
                 package: installed.package,
                 release: installed.release,
-                origin: "local".into(),
+                origin: installed.hub,
                 sdk,
                 entrypoints,
                 warning,
@@ -1369,6 +1369,7 @@ print(json.dumps({"identity": generation.identity}))
                 package: held.record.package.clone(),
                 release: held.record.version.clone(),
                 interface: serde_json::to_vec(&held.record.interface).unwrap(),
+                hub: String::new(),
             })
             .unwrap();
         let digest = format!("sha256:{}", "a".repeat(64));

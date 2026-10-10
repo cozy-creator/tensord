@@ -12,7 +12,8 @@ pub(super) type Frames = Pin<Box<dyn Stream<Item = Result<v1::StatusFrame, Statu
 /// `warm/1`: a warm run with no entrypoint installs its code and makes its model choices
 /// present. `warm/2`: a warm run's `set` replaces the caller's warm set, and Status reports the
 /// set and each environment's level. `upload/1`: a warm run of one provider source puts it in
-/// its weights destination.
+/// its weights destination. `remove/1`: a remove run drops the caller's installations and
+/// deletes their environments once nothing holds them; Status names each one's Hub.
 pub const CAPABILITIES: &[&str] = &[
     "status/1",
     "run/1",
@@ -22,6 +23,7 @@ pub const CAPABILITIES: &[&str] = &[
     "warm/2",
     "upload/1",
     "local-models/1",
+    "remove/1",
 ];
 
 const LIVE: [&str; 4] = ["queued", "starting", "running", "paused"];
@@ -224,6 +226,7 @@ fn held(
                 .map(|d| d.version)
                 .unwrap_or_default(),
             warning: p.warning,
+            hub: p.origin,
         })
         .collect();
     Ok((runs, environments))

@@ -873,6 +873,7 @@ impl Publisher {
                 release,
                 interface: serde_json::to_vec(&held.record.interface)
                     .map_err(|e| io_failure(io::Error::other(e)))?,
+                hub: hub::origin_key(&request.source.origin).unwrap_or_default(),
             })
             .map_err(io_failure)
     }
@@ -2385,6 +2386,7 @@ mod tests {
             package: "org/sdxl".into(),
             release: "1".into(),
             interface: vec![],
+            hub: String::new(),
         };
         let choice = domain::ModelChoice {
             parameter: "unet".into(),

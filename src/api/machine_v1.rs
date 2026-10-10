@@ -244,13 +244,14 @@ fn member(mut item: v1::WarmItem) -> Result<crate::runs::SetItem, Status> {
 /// A Run spec as this machine's run sources (`runs`), and the Hub it reads. Its digest (the
 /// Hub's origin alone) makes the id idempotent: the same id with another spec is refused.
 fn spec_of(mut spec: v1::RunSpec) -> Result<(crate::runs::Spec, Option<v1::HubAccess>), Status> {
-    let (warm, job) = match v1::RunKind::try_from(spec.kind) {
-        Ok(v1::RunKind::Call) => (false, false),
-        Ok(v1::RunKind::Warm) => (true, false),
-        Ok(v1::RunKind::Job) => (false, true),
+    let (warm, job, remove) = match v1::RunKind::try_from(spec.kind) {
+        Ok(v1::RunKind::Call) => (false, false, false),
+        Ok(v1::RunKind::Warm) => (true, false, false),
+        Ok(v1::RunKind::Job) => (false, true, false),
+        Ok(v1::RunKind::Remove) => (false, false, true),
         _ => {
             return Err(Status::unimplemented(
-                "Run takes calls, jobs, warm-ups and updates",
+                "Run takes calls, jobs, warm-ups, removals and updates",
             ))
         }
     };
@@ -294,8 +295,12 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<(crate::runs::Spec, Option<v1::HubAc
         Some(set) => Some(set.items.into_iter().map(member).collect::<Result<_, _>>()?),
     };
     let models = choices(spec.models)?;
+    if remove && !matches!(source, crate::runs::Source::Release { .. } | crate::runs::Source::Installation(_)) {
+        return Err(Status::invalid_argument("a removal names a release or an installation"));
+    }
     Ok((crate::runs::Spec {
         warm,
+        remove,
         set,
         job,
         parent: String::new(),

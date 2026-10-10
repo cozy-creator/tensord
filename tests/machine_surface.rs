@@ -170,6 +170,7 @@ print(json.dumps({"identity": generation.identity}))
             package: generation["package"].as_str().unwrap().into(),
             release: generation["version"].as_str().unwrap().into(),
             interface: serde_json::to_vec(&generation["interface"]).unwrap(),
+            hub: String::new(),
         })
         .unwrap();
 }

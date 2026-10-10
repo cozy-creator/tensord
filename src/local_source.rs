@@ -207,6 +207,7 @@ impl LocalSources {
             package: manifest.package,
             release: manifest.release,
             interface: prepared.interface_bytes,
+            hub: String::new(),
         })?;
         service.changed_environment()?;
         Ok(installed)
