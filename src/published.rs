@@ -831,7 +831,9 @@ impl Publisher {
         }
         job.stage(format!("installing {}@{release}", request.package));
         let base = format!("/v1/packages/{}/{}/releases/{}", hub::escape(org), hub::escape(name), hub::escape(&release));
-        let card = catalog.json(&base).map_err(|e| ("catalog_read_failed", e.0))?;
+        let card = catalog.json(&base).map_err(|e| absent(e, "release_absent", || {
+            format!("{} has no release {release} at {}", request.package, catalog.origin())
+        }))?;
         if card.pointer("/release/release").and_then(Value::as_str) != Some(release.as_str()) {
             return Err(("catalog_read_failed", format!("{base} named another release")));
         }
@@ -1684,10 +1686,19 @@ fn apply_adapters(
 
 /// The newest release of `org/name` at the Hub (a run naming none): the newest final release
 /// by version, else the newest pre-release; yanked ones never.
+/// A catalog read the Hub answered 404 to is the thing named absent there; any other failure
+/// is the read's.
+fn absent(refusal: hub::Refusal, code: &'static str, named: impl FnOnce() -> String) -> Failure {
+    match refusal.0.contains("HTTP 404") {
+        true => (code, named()),
+        false => ("catalog_read_failed", refusal.0),
+    }
+}
+
 fn newest_release(catalog: &Catalog, org: &str, name: &str) -> Result<String, Failure> {
     let card = catalog
         .json(&format!("/v1/packages/{}/{}", hub::escape(org), hub::escape(name)))
-        .map_err(|e| ("catalog_read_failed", e.0))?;
+        .map_err(|e| absent(e, "package_absent", || format!("{org}/{name} is not published at {}", catalog.origin())))?;
     card["releases"]
         .as_array()
         .into_iter()
@@ -2184,6 +2195,16 @@ mod tests {
 
     /// A part whose first ask never answers is asked again once its peers are home, so the
     /// file lands in seconds where one GET (uv's) would wait out its read timeout.
+    /// A package or release the Hub does not have is named absent there, not a failed read.
+    #[test]
+    fn an_absent_package_is_named() {
+        let origin = file_door(HashMap::new(), Arc::new(Mutex::new(vec![])), None);
+        let catalog = Catalog::new(&hub::Source::new(&origin, None, vec![], None).unwrap()).unwrap();
+        let (code, message) = newest_release(&catalog, "acme", "nope").unwrap_err();
+        assert_eq!(code, "package_absent");
+        assert!(message.starts_with("acme/nope is not published at http://127.0.0.1:"), "{message}");
+    }
+
     #[test]
     fn a_stalled_part_of_a_hub_file_is_asked_again() {
         let root = std::env::temp_dir().join(format!("cm-hub-stall-{}", uuid::Uuid::new_v4()));
