@@ -138,7 +138,12 @@ pub struct Gpu {
     pub device: String,
     /// Each plan's next request shape (PrepareRequest features), for its learned activations.
     shapes: BTreeMap<String, String>,
-    clock: u64,
+}
+
+/// One clock for every GPU's ledger, so recency compares across GPUs.
+fn tick() -> u64 {
+    static CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    CLOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
 impl Gpu {
@@ -176,13 +181,12 @@ impl Gpu {
 
     /// A spawn admitted: charged `reserved` until it reports.
     pub fn starting(&mut self, plan: &str, reserved: u64) {
-        self.clock += 1;
         self.tenants.insert(
             plan.into(),
             Tenant {
                 pid: 0,
                 phase: Phase::Starting,
-                last_used: self.clock,
+                last_used: tick(),
                 reserved,
                 cap: reserved,
                 mapped: false,
@@ -211,12 +215,11 @@ impl Gpu {
     }
 
     pub fn active(&mut self, plan: &str, cap: u64) {
-        self.clock += 1;
         if let Some(tenant) = self.tenants.get_mut(plan) {
             tenant.phase = Phase::Active;
             tenant.cap = cap;
             tenant.reserved = 0;
-            tenant.last_used = self.clock;
+            tenant.last_used = tick();
             tenant.mapped = true;
         }
     }
@@ -661,27 +664,15 @@ impl Gpu {
         Decision::Wait
     }
 
-    /// Every live tenant as `(plan, weights, pinned now)`, `first` ahead and then most
-    /// recently used first: the order host pinned budgets are shared in.
-    pub fn pinned_order(&self, first: &str) -> Vec<(String, u64, u64)> {
-        let mut rows: Vec<_> = self.tenants.iter().collect();
-        rows.sort_by_key(|(plan, t)| (plan.as_str() != first, std::cmp::Reverse(t.last_used)));
-        let mut order: Vec<_> = rows
-            .into_iter()
-            .map(|(plan, _)| {
-                let facts = self.facts(plan);
-                (
-                    plan.clone(),
-                    facts.weights.unwrap_or(0),
-                    facts.pinned.unwrap_or(0),
-                )
-            })
-            .collect();
-        if !self.tenants.contains_key(first) {
-            let facts = self.facts(first);
-            order.insert(0, (first.into(), facts.weights.unwrap_or(0), 0));
-        }
-        order
+    /// Every live tenant as `(plan, weights, pinned now, last used)`: what host pinned budgets
+    /// are shared by.
+    pub fn pinned_rows(&self) -> Vec<(String, u64, u64, u64)> {
+        let row = |(plan, tenant): (&String, &Tenant)| {
+            let facts = self.facts(plan);
+            let (weights, pinned) = (facts.weights.unwrap_or(0), facts.pinned.unwrap_or(0));
+            (plan.clone(), weights, pinned, tenant.last_used)
+        };
+        self.tenants.iter().map(row).collect()
     }
 
     /// A sample below the floor during a call: the running tenant's lowered cap, never below

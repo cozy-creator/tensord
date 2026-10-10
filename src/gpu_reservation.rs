@@ -1,12 +1,16 @@
 //! One call slot per GPU. A call takes every slot of its lane; an accelerator job retains
 //! its GPU's slot for its managed family, and serving descendants borrow one serialized call
-//! there. A GPU an earlier waiting request needs is not taken afresh by a later one.
+//! there. A GPU an earlier waiting request needs is not taken afresh by a later one, unless
+//! the later one's family holds a slot already (the earlier one may be waiting on it).
 use std::{
     ops::Range,
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
 };
 
-pub(crate) struct Slots(Mutex<Vec<Option<State>>>);
+pub(crate) struct Slots {
+    slots: Mutex<Vec<Option<State>>>,
+    freed: Condvar,
+}
 struct State {
     family: Option<String>,
     holders: usize,
@@ -19,9 +23,13 @@ pub(crate) struct Permit {
 }
 impl Slots {
     pub(crate) fn new(width: usize) -> Arc<Self> {
-        Arc::new(Self(Mutex::new((0..width).map(|_| None).collect())))
+        Arc::new(Self {
+            slots: Mutex::new((0..width).map(|_| None).collect()),
+            freed: Condvar::new(),
+        })
     }
-    /// Every slot of `devices`, or none. A slot `waiting` marks is only borrowed by its family.
+    /// Every slot of `devices`, or none. A slot `waiting` marks is taken only by a family that
+    /// holds a slot already.
     pub(crate) fn take(
         self: &Arc<Self>,
         family: Option<&str>,
@@ -29,9 +37,10 @@ impl Slots {
         devices: Range<usize>,
         waiting: &[bool],
     ) -> Option<Permit> {
-        let mut slots = self.0.lock().unwrap();
+        let mut slots = self.slots.lock().unwrap();
+        let held = family.is_some_and(|family| Self::held(&slots, family));
         let usable = devices.clone().all(|device| match slots.get(device) {
-            Some(None) => !waiting.get(device).copied().unwrap_or(false),
+            Some(None) => held || !waiting.get(device).copied().unwrap_or(false),
             Some(Some(state)) => {
                 family.is_some() && state.family.as_deref() == family && (!call || !state.calling)
             }
@@ -61,10 +70,27 @@ impl Slots {
             call,
         })
     }
+    fn held(slots: &[Option<State>], family: &str) -> bool {
+        slots
+            .iter()
+            .flatten()
+            .any(|state| state.family.as_deref() == Some(family))
+    }
+    /// Whether `family` holds any GPU's slot.
+    pub(crate) fn holds(&self, family: &str) -> bool {
+        Self::held(&self.slots.lock().unwrap(), family)
+    }
+    /// Wait until no call holds `device`'s slot (a job's own reservation may stay).
+    pub(crate) fn quiet(&self, device: usize) {
+        let mut slots = self.slots.lock().unwrap();
+        while slots[device].as_ref().is_some_and(|state| state.calling) {
+            slots = self.freed.wait(slots).unwrap();
+        }
+    }
 }
 impl Drop for Permit {
     fn drop(&mut self) {
-        let mut slots = self.slots.0.lock().unwrap();
+        let mut slots = self.slots.slots.lock().unwrap();
         for slot in &mut slots[self.devices.clone()] {
             let state = slot.as_mut().expect("a live GPU reservation");
             state.holders -= 1;
@@ -75,6 +101,7 @@ impl Drop for Permit {
                 *slot = None;
             }
         }
+        self.slots.freed.notify_all();
     }
 }
 
@@ -205,10 +232,35 @@ mod tests {
         assert!(slots.take(None, true, 2..3, &waiting).is_none());
         let job = slots.take(Some("job"), false, 2..3, &[]).unwrap();
         assert!(slots.take(Some("job"), true, 2..3, &waiting).is_some()); // its family borrows
+        // A family holding a slot takes a free GPU an earlier request waits for: that request
+        // may be waiting on the family's job.
+        let marked = [false, false, false, true];
+        assert!(slots.take(None, true, 3..4, &marked).is_none());
+        assert!(slots.take(Some("job"), true, 3..4, &marked).is_some());
+        assert!(slots.take(Some("other"), true, 3..4, &marked).is_none());
         drop((first, second));
         assert!(slots.take(None, true, 0..2, &[]).is_some());
         drop(job);
         assert!(slots.take(None, true, 0..4, &[]).is_some());
+    }
+
+    #[test]
+    fn a_job_waits_for_its_familys_call_on_its_gpu_to_end() {
+        let slots = Slots::new(1);
+        let child = slots.take(Some("job"), true, 0..1, &[]).unwrap();
+        let job = slots.take(Some("job"), false, 0..1, &[]).unwrap();
+        let (done, seen) = std::sync::mpsc::channel();
+        let waiter = slots.clone();
+        let thread = std::thread::spawn(move || {
+            waiter.quiet(0);
+            done.send(()).unwrap();
+        });
+        let wait = std::time::Duration::from_millis(200);
+        assert!(seen.recv_timeout(wait).is_err(), "the child's call still runs");
+        drop(child);
+        seen.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        thread.join().unwrap();
+        drop(job);
     }
     #[test]
     fn ordinary_calls_and_warm_work_remain_exclusive() {

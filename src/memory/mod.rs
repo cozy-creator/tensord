@@ -292,8 +292,8 @@ impl GpuMemory {
         })
     }
 
-    /// Whether a call of `plan` fits in the room there is now, with no step on another tenant:
-    /// its learned want, else what its spawn needs. True without NVML.
+    /// Whether a call of `plan` fits in the room there is now, with no step on another tenant.
+    /// False while its want was never learned; true without NVML.
     pub fn fits(&self, plan: &str, holdings: impl Fn() -> Vec<Holding>) -> bool {
         let Some(sample) = self.sample() else {
             return true;
@@ -301,8 +301,7 @@ impl GpuMemory {
         let held = holdings();
         self.with(|gpu| {
             gpu.holdings = held;
-            let want = gpu.grant_want(plan).unwrap_or_else(|| gpu.spawn_need(plan));
-            gpu.room(plan, &sample) >= want
+            gpu.grant_want(plan).is_some_and(|want| gpu.room(plan, &sample) >= want)
         })
     }
 
@@ -365,14 +364,6 @@ impl GpuMemory {
             gpu.set_cap(plan, cap);
             Ok(cap)
         })
-    }
-
-    /// Host pinned budgets, `first` ahead and then most recently used first, from the live
-    /// host (cgroup path and `MemAvailable`). None: the host is unreadable.
-    pub fn pinned_budgets(&self, first: &str) -> Option<std::collections::BTreeMap<String, u64>> {
-        let order = self.with(|gpu| gpu.pinned_order(first));
-        let memory = crate::host_memory::read();
-        host::pinned_split(memory.available, memory.shmem, &order)
     }
 
     /// The floor this GPU keeps now (the executor's own floor follows it).

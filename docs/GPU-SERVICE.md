@@ -39,12 +39,18 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   startup fence or an active GPU record this machine run does not supervise. CPU dispatch continues.
 - Placement (`GpuPool::place`): a group takes the first K GPUs. A one-GPU call takes, in order, a
   free GPU with its plan's idle executor; a free GPU where its learned want fits beside the tenants
-  there without evicting any (a replica when the plan runs elsewhere too); or, when the plan runs
-  nowhere, the first free GPU. A new executor's GPU is logged as `memory: {"event": "place"}`. Otherwise it waits, and the GPUs
-  it waits for are not taken afresh by later requests in that pass (its family may still borrow).
-  A GPU that never ran the plan first copies its learned facts from one that did. Replicas share
-  the host tier's layouts and are ordinary tenants of their GPU's memory policy. `loads.jsonl` and
-  `invokes.jsonl` name each line's `gpus`.
+  there without evicting any (a replica when the plan runs elsewhere too; never for a plan with
+  nothing learned); or, when the plan runs nowhere or its family holds a GPU, the first free or
+  borrowed one. Otherwise it waits, and later requests in that pass do not take the GPUs it waits
+  for afresh, except a family that holds a slot (the waiter may wait on it). Prefetches yield to
+  queued requests. A GPU that never ran the plan first copies its learned facts from one that did.
+  Replicas share the host tier's layouts and are ordinary tenants of their GPU's memory policy. A
+  new executor's GPU is logged as `memory: {"event": "place"}`; `loads.jsonl` and `invokes.jsonl`
+  name each line's `gpus`.
+- A memory step on a GPU runs under that GPU's call slot; host pressure ends idle executors only on
+  GPUs no call holds. A resumed accelerator job prepares its GPU once no family call runs there.
+- Host admission counts executors admitted and not yet loaded. Pinned budgets are shared over every
+  GPU's executors (a group's once), most recently used first.
 - Startup: every journaled birth still alive from a previous machine run (GPU births including
   completed requests', and any nonterminal run's) is killed, since nothing can adopt it. GPU
   dispatch stays fenced until each exit is observed. Leftover executor scopes of this machine
