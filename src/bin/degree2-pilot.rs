@@ -236,6 +236,7 @@ fn exec(
             models: Vec::new(),
             authorized_device_limit_bytes: Some(config.authorized_device_limit_bytes),
             attention_pin: String::new(),
+            request_id: String::new(),
             stages: false,
             sealed_tiers: false,
             model_sources: false,

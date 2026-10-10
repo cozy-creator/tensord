@@ -543,6 +543,11 @@ impl Jobs {
                 models: vec![],
                 authorized_device_limit_bytes: None,
                 attention_pin: String::new(),
+                request_id: if executor.hello.offers(device_executor::LOAD_REQUEST_ATTENTION) {
+                    record.id.clone()
+                } else {
+                    String::new()
+                },
                 stages: false,
                 sealed_tiers: false,
                 model_sources: false,

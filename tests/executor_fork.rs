@@ -126,6 +126,7 @@ fn a_forked_executor_is_sealed_serves_and_is_reaped_with_its_status() {
                 models: Vec::new(),
                 authorized_device_limit_bytes: None,
                 attention_pin: String::new(),
+                request_id: String::new(),
                 stages: false,
                 device_weights: false,
                 cap_bytes: None,
