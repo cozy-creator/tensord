@@ -9,8 +9,8 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
 ## Configuration
 
 `cozy-machine serve --gpu-config <json>` loads a root-sealed `GpuConfig`:
-- `devices`: the GPU envelope, `"0"` or `"0,1,..."`. A plan of degree K runs on the first K;
-  its executor is sealed to those K (`CUDA_VISIBLE_DEVICES`).
+- `devices`: the GPU envelope, `"0"` or `"0,1,..."`. A plan of degree K > 1 runs on the first K;
+  a one-GPU plan on any of them. An executor is sealed to its lane (`CUDA_VISIBLE_DEVICES`).
 - `models: [ModelGrant { package, slot, repository, release, lane, manifest, components }]`: the only
   authority over cached model bytes.
 - `packages: [{ package, release, distribution, generation }]`: published-package mapping.
@@ -35,8 +35,16 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
 
 ## Dispatch
 
-- One slot: GPU work dispatches only when no GPU record is active and no startup fence exists.
-  CPU dispatch continues meanwhile.
+- One call slot per GPU: a call takes every slot of its lane. GPU dispatch is fenced only by a
+  startup fence or an active GPU record this machine run does not supervise. CPU dispatch continues.
+- Placement (`GpuPool::place`): a group takes the first K GPUs. A one-GPU call takes, in order, a
+  free GPU with its plan's idle executor; a free GPU where its learned want fits beside the tenants
+  there without evicting any (a replica when the plan runs elsewhere too: `memory: {"event":
+  "replica"}`); or, when the plan runs nowhere, the first free GPU. Otherwise it waits, and the GPUs
+  it waits for are not taken afresh by later requests in that pass (its family may still borrow).
+  A GPU that never ran the plan first copies its learned facts from one that did. Replicas share
+  the host tier's layouts and are ordinary tenants of their GPU's memory policy. `loads.jsonl` and
+  `invokes.jsonl` name each line's `gpus`.
 - Startup: every journaled birth still alive from a previous machine run (GPU births including
   completed requests', and any nonterminal run's) is killed, since nothing can adopt it. GPU
   dispatch stays fenced until each exit is observed. Leftover executor scopes of this machine
@@ -113,7 +121,8 @@ thread.
 
 ## Known gaps
 
-- Groups always take the first K envelope GPUs; one GPU call runs at a time machine-wide. No adapters.
+- Groups always take the first K envelope GPUs. Degree 2 custody, warm members and import-only
+  parents live on the first GPU; replicas elsewhere never share GPU weights. No adapters.
 - Per-rank caps and cells need an executor with `rank_cells/1` and `process_cap/1`; otherwise every
   rank takes the smallest cap and only rank 0's GPU has a floor watchdog cell.
 - Executors before `process_cap/1` get only a plane budget: their context and activations are

@@ -522,6 +522,10 @@ impl Engine {
     pub fn supervising(&self) -> usize {
         self.owned.lock().unwrap().len()
     }
+    /// Whether this machine run supervises `id`.
+    pub fn owns(&self, id: &str) -> bool {
+        self.owned.lock().unwrap().contains(id)
+    }
 
     pub fn wait_for_environment(&self, id: &str, reason: Option<String>) -> io::Result<Execution> {
         let record = self
