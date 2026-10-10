@@ -232,11 +232,12 @@ impl Jobs {
         engine: &Arc<Engine>,
         record: &Execution,
         held: HeldGeneration,
+        waiting: &[bool],
     ) -> io::Result<bool> {
         let allocation = if record.invocation.accelerator {
             let pool = self.service.upgrade().and_then(|s| s.gpu())
                 .ok_or_else(|| io::Error::other("accelerator_job_unavailable: no configured GPU"))?;
-            let Some(allocation) = pool.job_allocation(engine, record)? else { return Ok(false); };
+            let Some(allocation) = pool.job_allocation(engine, record, waiting)? else { return Ok(false); };
             Some(allocation)
         } else { None };
         let (jobs, job) = (self.clone(), record.invocation.job);

@@ -292,6 +292,20 @@ impl GpuMemory {
         })
     }
 
+    /// Whether a call of `plan` fits in the room there is now, with no step on another tenant:
+    /// its learned want, else what its spawn needs. True without NVML.
+    pub fn fits(&self, plan: &str, holdings: impl Fn() -> Vec<Holding>) -> bool {
+        let Some(sample) = self.sample() else {
+            return true;
+        };
+        let held = holdings();
+        self.with(|gpu| {
+            gpu.holdings = held;
+            let want = gpu.grant_want(plan).unwrap_or_else(|| gpu.spawn_need(plan));
+            gpu.room(plan, &sample) >= want
+        })
+    }
+
     /// Until `free_bytes` are free beside the floor: holdings `plan`'s own executor let go
     /// are dropped, then idle tenants give room (weights first, then processes); then `plan`'s
     /// cap rises into what is there. Its rank cell, when present, receives the grant before
