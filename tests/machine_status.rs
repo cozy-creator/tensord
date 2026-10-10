@@ -129,6 +129,76 @@ fn deadline_on_disk(root: &Path) -> i64 {
 }
 
 #[tokio::test]
+async fn a_used_rental_reports_zero_deadline_after_restart_and_keepalive() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target/machine-status-used")
+        .join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&root).unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let mut first = boot(&root, port, "rental");
+    receipt(&mut first, &root, port);
+    let pem = std::fs::read(root.join("run/cozy/bootstrap/tls.crt")).unwrap();
+    let endpoint = Endpoint::from_shared(format!("https://127.0.0.1:{port}"))
+        .unwrap()
+        .tls_config(ClientTlsConfig::new().ca_certificate(Certificate::from_pem(pem)).domain_name("cozy-worker"))
+        .unwrap();
+    let mut client = MachineClient::new(endpoint.connect().await.unwrap());
+    let owner = cap("");
+    let submit = |id: &str, source| {
+        let mut request = Request::new(v1::RunRequest {
+            id: id.into(), after: 0,
+            spec: Some(v1::RunSpec { kind: v1::RunKind::Warm as i32,
+                source, entrypoint: "unused-test".into(), ..Default::default() }),
+        });
+        request.metadata_mut().insert("authorization", format!("Cozy-Cap {owner}").parse().unwrap());
+        request
+    };
+    // A malformed request is not application use. An accepted warmup is use even if
+    // its later package preparation fails, and no one-second sampler tick is required.
+    let mut invalid = submit("invalid", None);
+    invalid.get_mut().spec.as_mut().unwrap().kind = v1::RunKind::Call as i32;
+    let mut refused = client.run(invalid).await.unwrap().into_inner();
+    assert!(refused.message().await.is_err());
+    let ledger = root.join("var/lib/cozy/machine/idle.json");
+    let unused: serde_json::Value = serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
+    assert_eq!(unused["work_observed"], false);
+    let mut accepted = client.run(submit("accepted-warm", Some(v1::run_spec::Source::Installation("not-installed".into()))))
+        .await.unwrap().into_inner();
+    let event = tokio::time::timeout(Duration::from_secs(10), accepted.message()).await.unwrap().unwrap();
+    assert!(event.is_some());
+    let used: serde_json::Value = serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
+    assert_eq!(used["work_observed"], true, "Run acceptance persisted before its first observation");
+    drop((accepted, refused, client));
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(first.0.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    ).unwrap();
+    first.0.wait().unwrap();
+    let mut idle: serde_json::Value = serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
+    idle["deadline_ms"] = serde_json::json!(1);
+    std::fs::write(&ledger, serde_json::to_vec(&idle).unwrap()).unwrap();
+    let mut restarted = boot(&root, port, "rental");
+    receipt(&mut restarted, &root, port);
+    let pem = std::fs::read(root.join("run/cozy/bootstrap/tls.crt")).unwrap();
+    let endpoint = Endpoint::from_shared(format!("https://127.0.0.1:{port}"))
+        .unwrap()
+        .tls_config(ClientTlsConfig::new().ca_certificate(Certificate::from_pem(pem)).domain_name("cozy-worker"))
+        .unwrap();
+    let mut client = MachineClient::new(endpoint.connect().await.unwrap());
+    let owner = cap("");
+    for keepalive in [false, true] {
+        let mut frames = client.status(status(keepalive, Some(&owner))).await.unwrap().into_inner();
+        let frame = frames.message().await.unwrap().unwrap();
+        assert_eq!(frame.phase, "ready");
+        assert_eq!(frame.idle_deadline_unix_ms, 0);
+    }
+    assert!(restarted.0.try_wait().unwrap().is_none());
+    drop(restarted);
+    drop(first);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn status_answers_identity_to_anyone_and_the_machine_to_its_owner() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target/machine-status")

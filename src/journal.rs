@@ -1561,6 +1561,13 @@ impl Journal {
             .map(readable)
     }
 
+    /// Accepted history remains evidence of use even after every execution is terminal.
+    pub fn has_executions(&self) -> io::Result<bool> {
+        self.connection
+            .query_row("SELECT EXISTS(SELECT 1 FROM executions)", [], |row| row.get(0))
+            .map_err(db_error)
+    }
+
     /// Record ownership before native begin, serialized with cancellation/attempt changes.
     pub fn bind_derived_output(
         &mut self,

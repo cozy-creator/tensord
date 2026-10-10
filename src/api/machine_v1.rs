@@ -616,6 +616,11 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
             let followed = async move {
                 if let Some(spec) = spec {
                     submit(&backend, actor, &request.id, spec).await?;
+                    if let Some(admission) = &admitted {
+                        admission.work().map_err(|error| {
+                            Status::unavailable(format!("accepted work's rental state: {error}"))
+                        })?;
+                    }
                 }
                 drop(admitted);
                 stream_run(backend, actor, request.id, request.after, limit, events).await

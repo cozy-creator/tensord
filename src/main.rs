@@ -181,6 +181,11 @@ fn run_machine(
     let generations = engine.join("generations");
     let owner = Owner::new(&engine, &layout.store, 16 * 1024 * 1024, Duration::from_secs(300))?;
     let service = cozy_machine::service::Service::open(&engine, &generations, 1)?;
+    // A legacy short run may have completed between the old activity sampler's ticks.
+    // Durable accepted history still proves that this rental has already been used.
+    if rental && service.engine.has_executions()? {
+        lifecycle.work()?;
+    }
     let paths = cozy_machine::machine::update::Paths::new(&engine, &layout.root);
     let updates = {
         let (service, admitted) = (service.clone(), lifecycle.clone());
@@ -252,7 +257,7 @@ fn run_machine(
                         hub.clone(),
                         keys,
                     ));
-                    let busy = move || !service.idle().unwrap_or(false);
+                    let busy = move || service.idle().map(|idle| !idle);
                     cozy_machine::machine::lifecycle::release_when_idle(lifecycle, hub, provider, busy).await;
                 });
                 // The Hub accepted the release, or the rental ended itself: this process ends.

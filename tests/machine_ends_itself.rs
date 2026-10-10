@@ -3,6 +3,7 @@
 //! a stand-in provider API, and a Hub that cannot be reached. The provider key it ends itself
 //! with is the machine's alone: gone from every process environment and from the files the
 //! provider copies it into, and still handed to an activated Runtime update's service.
+mod common;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::SigningKey;
 use std::{
@@ -20,6 +21,59 @@ impl Drop for Machine {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+#[test]
+fn accepted_terminal_history_prevents_unused_timeout_after_a_service_restart() {
+    use cozy_machine::journal::{Invocation, Journal};
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target/used-rental-history")
+        .join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&root).unwrap();
+    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let (provider_port, received) = provider();
+    let mut machine = launch(&root, port, provider_port);
+    let start = Instant::now();
+    while common::receipt(&root, port).is_none() {
+        assert!(start.elapsed() < Duration::from_secs(120));
+        assert!(machine.0.try_wait().unwrap().is_none());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(machine.0.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    ).unwrap();
+    machine.0.wait().unwrap();
+    // A legacy short accepted run can finish before the old one-second sampler sees it.
+    let mut journal = Journal::open(&root.join("var/lib/cozy/rust-machine/execution")).unwrap();
+    assert!(!journal.has_executions().unwrap());
+    let execution = journal.accept("short-prior-work", Invocation {
+        package: "test/accepted-work".into(), input: serde_json::json!({}), ..Default::default()
+    }).unwrap();
+    journal.cancel(&execution.id, "test-owner").unwrap();
+    assert!(journal.has_executions().unwrap());
+    drop(journal);
+    let ledger = root.join("var/lib/cozy/machine/idle.json");
+    let mut idle: serde_json::Value = serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
+    idle["deadline_ms"] = serde_json::json!(1);
+    idle["work_observed"] = serde_json::json!(false);
+    std::fs::write(&ledger, serde_json::to_vec(&idle).unwrap()).unwrap();
+    let mut restarted = launch(&root, port, provider_port);
+    let start = Instant::now();
+    while common::receipt(&root, port).is_none() {
+        assert!(start.elapsed() < Duration::from_secs(120));
+        assert!(restarted.0.try_wait().unwrap().is_none());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(received.recv_timeout(Duration::from_secs(3)).is_err());
+    assert!(restarted.0.try_wait().unwrap().is_none());
+    let idle: serde_json::Value = serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
+    assert_eq!(idle["work_observed"], true);
+    assert_eq!(idle["released"], false);
+    drop(restarted);
+    drop(machine);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 fn launch(root: &Path, port: u16, provider: u16) -> Machine {

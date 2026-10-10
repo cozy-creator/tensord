@@ -17,7 +17,7 @@ use tonic::Status;
 /// The fixed rental idle window, `RentalIdleTimeoutSeconds` in the worker protocol and CLI.
 pub const IDLE_GRACE_MS: i64 = 900_000;
 
-#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 struct IdleState {
     deadline_ms: i64,
@@ -40,6 +40,13 @@ pub struct Lifecycle {
 
 /// Holds idle release while a call that may start work is in flight.
 pub struct Admission(Arc<Lifecycle>);
+
+impl Admission {
+    /// Successful work acceptance becomes durable before this admission fence is dropped.
+    pub fn work(&self) -> io::Result<()> {
+        self.0.work()
+    }
+}
 
 /// Closes admission while an update waits for admitted work to drain and replaces the
 /// service. Dropping it (a failed activation) reopens admission.
@@ -91,7 +98,8 @@ impl Lifecycle {
     }
 
     fn due(state: &(IdleState, i64), now: i64) -> bool {
-        state.0.released || now >= state.0.deadline_ms.max(state.1)
+        state.0.released
+            || (!state.0.work_observed && now >= state.0.deadline_ms.max(state.1))
     }
 
     pub fn admit(self: &Arc<Self>) -> Result<Admission, Status> {
@@ -123,12 +131,17 @@ impl Lifecycle {
         Ok(Activation(self.clone()))
     }
 
-    /// Accepted work renews the deadline.
+    /// A used rental ends explicitly, never through the unused-rental timeout.
     pub fn work(&self) -> io::Result<()> {
         let mut state = self.state.lock().unwrap();
-        state.0.deadline_ms = state.0.deadline_ms.max(now_ms() + IDLE_GRACE_MS);
-        state.0.work_observed = true;
-        self.save(&state.0)
+        if state.0.work_observed {
+            return Ok(());
+        }
+        let mut used = state.0.clone();
+        used.work_observed = true;
+        self.save(&used)?;
+        state.0 = used;
+        Ok(())
     }
 
     /// Folds one activity sample in. Busy (or unreadable) work holds the deadline; the
@@ -144,9 +157,11 @@ impl Lifecycle {
         }
         let target = state.0.deadline_ms.max(state.1);
         if target - state.0.deadline_ms >= IDLE_GRACE_MS / 2 || busy && !state.0.work_observed {
-            state.0.deadline_ms = target;
-            state.0.work_observed |= busy;
-            self.save(&state.0)?;
+            let mut observed = state.0.clone();
+            observed.deadline_ms = target;
+            observed.work_observed |= busy;
+            self.save(&observed)?;
+            state.0 = observed;
         }
         Ok(target)
     }
@@ -170,12 +185,12 @@ impl Lifecycle {
             ));
         }
         if let Some(seen) = id.and_then(|id| state.0.keepalives.get(id)) {
-            return Ok((seen[0], seen[1]));
+            return Ok((seen[0], if state.0.work_observed { 0 } else { seen[1] }));
         }
         if state.0.keepalives.len() >= 256 {
             state.0.keepalives.clear();
         }
-        let deadline = now + IDLE_GRACE_MS;
+        let deadline = if state.0.work_observed { 0 } else { now + IDLE_GRACE_MS };
         if let Some(id) = id {
             state.0.keepalives.insert(id.to_owned(), [now, deadline]);
         }
@@ -191,9 +206,10 @@ impl Lifecycle {
         self.admissions.load(Ordering::Acquire)
     }
 
-    /// A rental releases itself at its idle deadline; a persistent machine never does.
+    /// Only unused rentals release automatically. A committed release remains irreversible.
     pub fn releases(&self) -> bool {
-        self.rental
+        let state = self.state.lock().unwrap();
+        self.rental && (state.0.released || !state.0.work_observed)
     }
 
     pub fn deadline_ms(&self) -> i64 {
@@ -264,11 +280,20 @@ pub async fn release_when_idle(
     lifecycle: Arc<Lifecycle>,
     hub: Arc<Hub>,
     provider: Option<super::provider::ProviderSelf>,
-    busy: impl Fn() -> bool,
+    busy: impl Fn() -> io::Result<bool>,
 ) {
     let mut next_ask = 0;
     loop {
-        if let Err(error) = lifecycle.observe(busy()) {
+        let active = match busy() {
+            Ok(active) => active,
+            Err(error) => {
+                // Uncertainty holds this check; it is not proof of application use.
+                eprintln!("cozy-machine: cannot observe rental activity: {error}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+        if let Err(error) = lifecycle.observe(active) {
             eprintln!("cozy-machine: idle ledger: {error}");
         }
         let now = now_ms();
@@ -321,6 +346,65 @@ async fn end_without_hub(provider: Option<&super::provider::ProviderSelf>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn used_transition_retries_after_a_failed_durable_write() {
+        let dir = std::env::temp_dir().join(format!("used-write-failure-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("idle.json");
+        let lifecycle = Lifecycle::open(path.clone(), true, true).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(lifecycle.work().is_err());
+        assert!(lifecycle.releases(), "failed persistence did not commit used state");
+        assert!(lifecycle.observe(true).is_err());
+        assert!(lifecycle.releases());
+        std::fs::remove_dir(&path).unwrap();
+        lifecycle.work().unwrap();
+        let restarted = Lifecycle::open(path, true, false).unwrap();
+        assert!(!restarted.releases());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn accepted_work_wins_expiry_while_admission_is_held_and_survives_restart() {
+        let dir = std::env::temp_dir().join(format!("used-rental-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("idle.json");
+        let lifecycle = Lifecycle::open(path.clone(), true, true).unwrap();
+        let admitted = lifecycle.admit().unwrap();
+        lifecycle.state.lock().unwrap().0.deadline_ms = 0;
+        assert!(!lifecycle.claim().unwrap(), "pending acceptance is held");
+        admitted.work().unwrap();
+        drop(admitted);
+        assert!(!lifecycle.releases());
+        assert!(!lifecycle.claim().unwrap(), "used rental cannot expire");
+        assert!(lifecycle.admit().is_ok());
+        let restarted = Lifecycle::open(path, true, false).unwrap();
+        assert!(!restarted.releases());
+        assert!(!restarted.claim().unwrap());
+        assert!(restarted.admit().is_ok());
+        assert_eq!(restarted.keepalive("optional-owner-keepalive").unwrap().1, 0);
+        assert_eq!(restarted.renew().unwrap(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn observed_preparation_is_used_but_maintenance_and_idle_observation_are_not() {
+        let dir = std::env::temp_dir().join(format!("rental-activity-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("idle.json");
+        let lifecycle = Lifecycle::open(path.clone(), true, true).unwrap();
+        lifecycle.observe(false).unwrap();
+        drop(lifecycle.activate().unwrap());
+        assert!(lifecycle.releases());
+        lifecycle.observe(true).unwrap();
+        assert!(!lifecycle.releases());
+        let restarted = Lifecycle::open(path, true, false).unwrap();
+        restarted.state.lock().unwrap().0.deadline_ms = 0;
+        assert!(!restarted.claim().unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn a_rental_ends_itself_only_when_the_hub_was_silent_through_the_idle_window() {
