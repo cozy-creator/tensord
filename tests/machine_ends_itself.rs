@@ -456,8 +456,8 @@ async fn a_job_holds_the_rental_and_its_end_starts_the_idle_clock() {
     let hub = held_hub();
     // A controller's warm request is a job: asked of the machine, it holds the rental.
     let mut events = submit_kind(&mut client, &cap, "stalled-1", &hub.origin, v1::RunKind::Warm).await;
-    let working = deadline(&mut client, &cap, false).await;
-    assert!(working >= renewed, "a queued job holds the clock at now + the window");
+    assert_eq!(deadline(&mut client, &cap, false).await, 0, "a queued job has no deadline");
+    assert_eq!(deadline(&mut client, &cap, true).await, 0, "nor does a keepalive give it one");
     // Its Hub connection is waited on while alive and probed for liveness at the transfer's
     // measured window (a 5 s sample, 6 still samples): a dead one fails the job.
     let (local, remote) = hub.accepted.recv_timeout(Duration::from_secs(30)).expect("the run never reached its Hub");

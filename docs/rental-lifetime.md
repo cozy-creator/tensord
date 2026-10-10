@@ -17,5 +17,5 @@ job it's going to work on."
   explicit `cozy rental keepalive`, which restarts it once.
 - The clock is durable: the journal's last job end and the ledger's idle start (`idle.json`). A
   restart or update neither shortens nor extends it; a job a restart interrupts ends at the restart.
-- Status reports the real deadline: now + 15 minutes while a job is queued or running, else the
-  clock's end. 0 only for a machine that never releases itself.
+- Status reports a deadline only once the rental is idle: the clock's end. While a job is queued
+  or running there is none (0), as for a machine that never releases itself.

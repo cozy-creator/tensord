@@ -106,17 +106,24 @@ impl Lifecycle {
         super::identity::write_atomic(&self.path, &serde_json::to_vec(ledger)?, 0o600)
     }
 
-    /// When the idle clock ends: 15 minutes after the later of its start and the last job's
-    /// end; while a job is queued or running, 15 minutes from now.
-    fn deadline(&self, state: &State, now: i64) -> i64 {
-        if state.jobs.working && !state.ledger.released {
-            return now + self.grace;
-        }
+    /// When the idle clock runs out: 15 minutes after the later of its start and the last
+    /// job's end.
+    fn idle_end(&self, state: &State) -> i64 {
         state.ledger.idle_since_ms.max(state.jobs.ended_ms) + self.grace
     }
 
     fn due(&self, state: &State, now: i64) -> bool {
-        state.ledger.released || (!state.jobs.working && now >= self.deadline(state, now))
+        state.ledger.released || (!state.jobs.working && now >= self.idle_end(state))
+    }
+
+    /// The deadline a caller is told: none (0) while a job is queued or running, or while an
+    /// admission may have queued one since the journal was last read.
+    fn deadline(&self, state: &State) -> i64 {
+        let working = state.jobs.working || self.admitted() > 0 || state.sampled != self.epoch();
+        match working && !state.ledger.released {
+            true => 0,
+            false => self.idle_end(state),
+        }
     }
 
     pub fn admit(self: &Arc<Self>) -> Result<Admission, Status> {
@@ -184,7 +191,7 @@ impl Lifecycle {
             Status::unavailable(format!("the idle ledger could not be written: {e}"))
         })?;
         state.ledger = ledger;
-        Ok(self.deadline(&state, now))
+        Ok(self.deadline(&state))
     }
 
     /// Calls that may start work, in flight now.
@@ -192,10 +199,11 @@ impl Lifecycle {
         self.admissions.load(Ordering::Acquire)
     }
 
-    /// When this rental releases itself if no job comes first; 0 for a machine that never does.
+    /// When this rental releases itself if no job comes first. 0: no deadline, because a job
+    /// is queued or running, or because this machine never releases itself.
     pub fn deadline_ms(&self) -> i64 {
         match self.rental {
-            true => self.deadline(&self.state.lock().unwrap(), now_ms()),
+            true => self.deadline(&self.state.lock().unwrap()),
             false => 0,
         }
     }
@@ -357,7 +365,7 @@ mod tests {
         // A job queued or running holds it, however long the clock has been idle before.
         read(&lifecycle, true, 0);
         assert!(!lifecycle.claim().unwrap());
-        assert!(lifecycle.deadline_ms() >= now_ms() + IDLE_GRACE_MS - 1_000);
+        assert_eq!(lifecycle.deadline_ms(), 0, "a job queued or running has no deadline");
         // The clock starts when that job ends: a used rental releases 15 minutes later.
         let ended = now_ms();
         read(&lifecycle, false, ended);
