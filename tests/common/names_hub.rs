@@ -82,6 +82,23 @@ pub fn serve(store: &Store, model: Model, package: Option<Package>) -> (String, 
     (format!("http://127.0.0.1:{port}"), heard)
 }
 
+/// Each wheel the release's lock pins at this Hub, as the Hub renders its row (th-245): its
+/// distribution, and its file door `/v1/index/<org>/<package>/<release>/<wheel>` under the
+/// release that claims it (the release itself, or a callee's own). No other door answers.
+fn doors(package: &Package) -> impl Iterator<Item = (String, String, &[u8])> {
+    let (org, name) = package.name.split_once('/').unwrap();
+    let root = (name.to_string(), package.release.clone(), &package.wheel, &package.bytes);
+    let callees = package.callees.iter().map(|(wheel, bytes)| {
+        let mut parts = wheel.split('-');
+        let (distribution, version) = (parts.next().unwrap().replace('_', "-"), parts.next().unwrap().to_string());
+        (distribution, version, wheel, bytes)
+    });
+    std::iter::once(root).chain(callees).map(move |(distribution, release, wheel, bytes)| {
+        let door = format!("/v1/index/{org}/{distribution}/{release}/{wheel}");
+        (distribution, door, bytes.as_slice())
+    })
+}
+
 fn absent() -> Response {
     (StatusCode::NOT_FOUND, r#"{"error":{"code":"tensorfs.closure_denied","message":"absent"}}"#).into_response()
 }
@@ -138,25 +155,17 @@ async fn answer(State(served): State<Arc<Served>>, method: Method, uri: Uri, hea
                 "python_version": "3.12"}))
         }
         (Method::GET, p) if p == format!("{release_path}/locked-requirements") => {
-            // Rows at the Hub's file door, as it renders them: `/v1/index/<org>/files/<sha256>/<wheel>`.
-            let package = package.unwrap();
-            let (org, _) = package.name.split_once('/').unwrap();
-            let lock: String = std::iter::once((&package.wheel, &package.bytes))
-                .chain(package.callees.iter().map(|(wheel, bytes)| (wheel, bytes)))
-                .map(|(wheel, bytes)| {
+            let lock: String = doors(package.unwrap())
+                .map(|(distribution, door, bytes)| {
                     let sha = tensorfs_core::sha256::hex_digest(bytes);
-                    let distribution = wheel.split('-').next().unwrap().replace('_', "-");
-                    format!("{distribution} @ {}/v1/index/{org}/files/{sha}/{wheel} --hash=sha256:{sha}\n", served.origin)
+                    format!("{distribution} @ {}{door} --hash=sha256:{sha}\n", served.origin)
                 })
                 .collect::<String>()
-                + &package.pypi;
+                + &package.unwrap().pypi;
             (StatusCode::OK, lock).into_response()
         }
-        (Method::GET, p) if package.is_some_and(|package| p.ends_with(&format!("/{}", package.wheel))) => {
-            ranged(&package.unwrap().bytes, &headers)
-        }
-        (Method::GET, p) if package.is_some_and(|package| package.callees.iter().any(|(wheel, _)| p.ends_with(&format!("/{wheel}")))) => {
-            let (_, bytes) = package.unwrap().callees.iter().find(|(wheel, _)| p.ends_with(&format!("/{wheel}"))).unwrap();
+        (Method::GET, p) if package.is_some_and(|package| doors(package).any(|(_, door, _)| door == p)) => {
+            let (_, _, bytes) = doors(package.unwrap()).find(|(_, door, _)| door == p).unwrap();
             ranged(bytes, &headers)
         }
         (Method::POST, "/v1/tensorfs/closure") => {
