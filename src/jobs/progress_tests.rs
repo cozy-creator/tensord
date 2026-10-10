@@ -52,9 +52,8 @@ fn a_relayed_child_stage_carries_its_download_bytes() {
     let mut relay = |stage: &str, call: Option<&str>| -> Value {
         let mut event = json!({"event": "progress", "request_id": job, "kind": "progress", "stage": stage,
             "advance": 0, "step_ms": 0.0, "call_attempt": 1});
-        if let Some(call) = call {
-            event["call_request"] = call.into();
-        }
+        // The Runtime always sends the key: null when the frame names no child (run 5257).
+        event["call_request"] = call.map_or(Value::Null, Value::from);
         let body = serde_json::to_vec(&event).unwrap();
         let (mut runtime, mut machine) = UnixStream::pair().unwrap();
         runtime.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
