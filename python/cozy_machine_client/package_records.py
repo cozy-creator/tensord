@@ -72,11 +72,15 @@ class DescribeInstalled(msgspec.Struct, tag="describe_installed", tag_field="kin
 class DescribeEnvironment(msgspec.Struct, tag="describe_environment", tag_field="kind"):
     root: str
     packages: dict[str, str] = {}
+    # Also the root's own installed interface, in the same process.
+    interface: bool = False
 
 
 class DescribedEnvironment(msgspec.Struct, tag="described_environment", tag_field="kind"):
     source_digest: str
     callees: list[Callee]
+    # The root's interface document as JSON text, when asked for.
+    interface: str = ""
 
 
 class Described(msgspec.Struct, tag="described", tag_field="kind"):

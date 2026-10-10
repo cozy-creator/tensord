@@ -264,5 +264,5 @@ def test_generation_collected_only_after_last_holder(tmp_path):
 def test_install_records_whether_the_cpu_runner_adapter_imports(generation):
     assert generation.cpu_bridge == ""
     # An interpreter without the adapter: the reason is recorded, the install is not refused.
-    from cozy_machine_client.packages import probe_cpu_bridge
-    assert "cozy_machine_client" in probe_cpu_bridge(Path("/usr/bin/python3"))
+    from cozy_machine_client.packages import bridge_result, probe_cpu_bridge
+    assert "cozy_machine_client" in bridge_result(probe_cpu_bridge(Path("/usr/bin/python3")))
