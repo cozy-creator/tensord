@@ -1367,21 +1367,24 @@ impl Journal {
     }
 
     /// A restarted machine holds no preparation and no run's Hub token: each preparing run
-    /// ends FAILED (nothing of it was started).
+    /// ends FAILED (nothing of it was started). A job an older machine parked to wait ends
+    /// FAILED with the reason it waited on.
     pub(crate) fn interrupt_preparations(&mut self) -> io::Result<()> {
-        let preparing: Vec<String> = {
+        let waiting: Vec<(String, String)> = {
             let mut statement = self
                 .connection
-                .prepare("SELECT id FROM executions WHERE state='queued' AND json_extract(record,'$.waiting_reason')=?1")
+                .prepare("SELECT id, json_extract(record,'$.waiting_reason') FROM executions WHERE state='queued' AND json_extract(record,'$.waiting_reason') IS NOT NULL")
                 .map_err(db_error)?;
             let rows = statement
-                .query_map([PREPARING], |row| row.get::<_, i64>(0))
+                .query_map([], |row| Ok((row.get::<_, i64>(0)?.to_string(), row.get::<_, String>(1)?)))
                 .map_err(db_error)?;
-            rows.map(|id| id.map(|id| id.to_string()))
-                .collect::<Result<_, _>>()
-                .map_err(db_error)?
+            rows.collect::<Result<_, _>>().map_err(db_error)?
         };
-        for id in preparing {
+        let (preparing, parked): (Vec<_>, Vec<_>) = waiting.into_iter().partition(|(_, reason)| reason == PREPARING);
+        for (id, reason) in parked {
+            self.fail_unstarted(&id, Failure::machine("environment_unavailable", reason))?;
+        }
+        for (id, _) in preparing {
             let failure = Failure {
                 status: 3,
                 cause: 7,
@@ -2060,21 +2063,6 @@ impl Journal {
     }
 
     /// Only one dispatcher can claim a never-started attempt.
-    pub fn wait_for_environment(
-        &mut self,
-        id: &str,
-        reason: Option<String>,
-    ) -> io::Result<Execution> {
-        self.update(id, |record| {
-            if record.state != State::Queued || record.waiting_reason == reason {
-                return Ok(false);
-            }
-            record.waiting_reason = reason;
-            Ok(true)
-        })
-    }
-
-    /// Only one dispatcher can claim a never-started attempt.
     pub fn claim(&mut self, id: &str) -> io::Result<bool> {
         let mut claimed = false;
         self.update(id, |record| {
@@ -2090,9 +2078,10 @@ impl Journal {
         Ok(claimed)
     }
 
-    /// Retry is legal only when no start authorization could have reached package code.
-    /// Dispatcher calls this after exact termination (or before any spawn).
-    pub fn defer_unstarted(&mut self, id: &str, reason: String) -> io::Result<Execution> {
+    /// A never-authorized attempt the machine's own restart interrupted is dispatched again at
+    /// once: nothing of it ran, and the restart was not its failure. Called after exact
+    /// termination.
+    pub fn requeue_unstarted(&mut self, id: &str) -> io::Result<Execution> {
         self.update(id, |record| {
             if record.state != State::Starting {
                 return Err(db_error(
@@ -2100,14 +2089,34 @@ impl Journal {
                 ));
             }
             record.process = None;
-            record.waiting_reason = Some(reason);
+            record.waiting_reason = None;
             record.state = if record.cancel_actor.is_some() {
                 State::Canceled
             } else if record.pause_actor.is_some() {
-                record.waiting_reason = None;
                 State::Paused
             } else {
                 State::Queued
+            };
+            Ok(true)
+        })
+    }
+
+    /// A job that cannot start ends FAILED with its reason, never parked to wait or queued to
+    /// fail again: every job ends completed or failed, and the user resubmits.
+    pub fn fail_unstarted(&mut self, id: &str, failure: Failure) -> io::Result<Execution> {
+        self.update(id, |record| {
+            if !matches!(record.state, State::Queued | State::Starting) {
+                return Ok(false);
+            }
+            record.process = None;
+            record.waiting_reason = None;
+            record.state = if record.cancel_actor.is_some() {
+                State::Canceled
+            } else if record.pause_actor.is_some() {
+                State::Paused
+            } else {
+                record.failure = Some(failure.clone().encode());
+                State::Failed
             };
             Ok(true)
         })

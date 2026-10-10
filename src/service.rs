@@ -299,16 +299,8 @@ impl Service {
                 .insert(record.id.clone(), hold);
         }
     }
+    /// An install or GPU configuration changed what can dispatch.
     pub fn changed_environment(&self) -> io::Result<()> {
-        // Explicit install/update completion, not an identical failed retry loop.
-        for record in self.engine.nonterminal(usize::MAX)? {
-            if record.state == State::Queued
-                && record.waiting_reason.is_some()
-                && self.catalog.resolve(&record.invocation.generation).is_ok()
-            {
-                self.engine.wait_for_environment(&record.id, None)?;
-            }
-        }
         self.engine.notify_activity();
         Ok(())
     }
@@ -464,26 +456,20 @@ impl Service {
                 let held = match self.catalog.resolve(&record.invocation.generation) {
                     Ok(held) => held,
                     Err(error) => {
-                        self.engine.wait_for_environment(
-                            &record.id,
-                            Some(format!("held generation unavailable: {error}")),
-                        )?;
+                        self.engine.fail_unstarted(&record.id, "environment_unavailable",
+                            format!("held generation unavailable: {error}"))?;
                         continue;
                     }
                 };
                 if !held.record.owns(&record.invocation.module, &record.invocation.package) {
-                    self.engine.wait_for_environment(
-                        &record.id,
-                        Some("held package identity differs from accepted invocation".into()),
-                    )?;
+                    self.engine.fail_unstarted(&record.id, "environment_unavailable",
+                        "held package identity differs from accepted invocation")?;
                     continue;
                 }
                 if crate::jobs::Jobs::takes(&record) {
                     let Some(jobs) = &jobs else {
-                        self.engine.wait_for_environment(
-                            &record.id,
-                            Some("CPU execution is not configured on this machine".into()),
-                        )?;
+                        self.engine.fail_unstarted(&record.id, "capability_unavailable",
+                            "CPU execution is not configured on this machine")?;
                         continue;
                     };
                     if record.invocation.job {
@@ -506,10 +492,8 @@ impl Service {
                         continue;
                     }
                     let Some(gpu) = self.gpu() else {
-                        self.engine.wait_for_environment(
-                            &record.id,
-                            Some("GPU execution operation is not configured".into()),
-                        )?;
+                        self.engine.fail_unstarted(&record.id, "capability_unavailable",
+                            "GPU execution is not configured on this machine")?;
                         continue;
                     };
                     let preparation = self

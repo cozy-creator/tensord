@@ -22,7 +22,8 @@ recovery applies after the old process has actually exited.
 
 After a service restart, reconciliation observes exact process births. A live or unobservably dead
 executor leaves its obligation nonterminal; it is not adopted. A starting attempt whose process
-has ended returns to the queue because no authored work was authorized. A running attempt whose
+has ended is dispatched again at once because no authored work was authorized; if it cannot
+start, it fails. A running attempt whose
 process has ended fails unless it was a job already pausing. Completed outcomes and collected
 outputs remain durable. A paused job resumes as a new attempt of the same transaction, reusing
 its declared checkpoints and already finished children; this is distinct from replaying an

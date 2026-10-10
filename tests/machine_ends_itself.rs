@@ -303,7 +303,8 @@ fn an_older_service_is_never_handed_the_provider_key() {
     std::fs::remove_dir_all(&root).unwrap();
 }
 
-const IDLE: u32 = 6;
+/// Long enough for a fresh boot to prove readiness on a loaded host before its window ends.
+const IDLE: u32 = 15;
 
 fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
@@ -412,7 +413,7 @@ async fn ended(events: &mut tonic::Streaming<v1::RunEvent>) -> v1::Outcome {
     panic!("the run's log ended without an outcome");
 }
 
-/// A job queued for the rental holds it past any number of idle windows; the clock starts when
+/// A job queued for the rental holds it past its idle window, twice over; the clock starts when
 /// that job ends, and the used rental releases one window later.
 #[tokio::test]
 async fn a_job_holds_the_rental_and_its_end_starts_the_idle_clock() {
@@ -431,9 +432,10 @@ async fn a_job_holds_the_rental_and_its_end_starts_the_idle_clock() {
     let working = deadline(&mut client, &cap, false).await;
     assert!(working >= renewed, "a queued job holds the clock at now + the window");
     assert!(
-        received.recv_timeout(Duration::from_millis(3 * idle_ms as u64)).is_err(),
+        received.recv_timeout(Duration::from_millis(2 * idle_ms as u64)).is_err(),
         "the rental released itself while a job was queued for it"
     );
+    let closed = now_ms();
     drop(hub.close);
     let outcome = tokio::time::timeout(Duration::from_secs(120), ended(&mut events)).await.unwrap();
     let end = now_ms();
@@ -441,7 +443,8 @@ async fn a_job_holds_the_rental_and_its_end_starts_the_idle_clock() {
     // Status reads the jobs the machine sampled within the last second.
     tokio::time::sleep(Duration::from_millis(1_500)).await;
     let due = deadline(&mut client, &cap, false).await;
-    assert!(due > end - 1_000 + idle_ms - 1_000 && due <= end + idle_ms, "{due} vs end {end}");
+    // The job ended between the Hub's close and its outcome reaching this client.
+    assert!(due >= closed + idle_ms && due <= end + idle_ms, "{due} vs closed {closed}, end {end}");
     let (method, _, _, body) = received
         .recv_timeout(Duration::from_secs(60))
         .expect("the used rental did not release itself after its idle window");
@@ -460,8 +463,8 @@ async fn a_restart_neither_shortens_nor_extends_the_idle_clock() {
     let root = root("idle-restart");
     let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let (provider_port, received) = provider();
-    let idle_ms = 3 * i64::from(IDLE) * 1000;
-    let idle = 3 * IDLE;
+    let idle_ms = 2 * i64::from(IDLE) * 1000;
+    let idle = 2 * IDLE;
     let mut machine = launch_idle(&root, port, provider_port, idle);
     ready(&mut machine, &root, port);
     let (mut client, cap) = owner(&root, port).await;
@@ -489,6 +492,50 @@ async fn a_restart_neither_shortens_nor_extends_the_idle_clock() {
     let released = now_ms();
     assert!(released >= first - 500, "released at {released}, before its deadline {first}");
     drop(hub.close);
+    drop(machine);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Every job ends completed or failed. Two jobs an earlier machine left behind, one queued and
+/// one claimed but never authorized, cannot start (their environment is not held): each fails
+/// once with that reason, is never queued to fail again, and the rental, with no job left,
+/// releases itself one idle window later.
+#[tokio::test]
+async fn a_job_that_cannot_start_fails_once_and_the_rental_idles_out() {
+    use cozy_machine::journal::{Invocation, Journal, State};
+    let root = root("idle-unstartable");
+    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let (provider_port, received) = provider();
+    let mut machine = launch(&root, port, provider_port);
+    ready(&mut machine, &root, port);
+    stop(&mut machine);
+    let journal_root = root.join("var/lib/cozy/rust-machine/execution");
+    let mut journal = Journal::open(&journal_root).unwrap();
+    let job = || Invocation { package: "acme/absent".into(), input: serde_json::json!({}), ..Default::default() };
+    let queued = journal.accept("left-queued", job()).unwrap().id;
+    let claimed = journal.accept("left-claimed", job()).unwrap().id;
+    assert!(journal.claim(&claimed).unwrap());
+    drop(journal);
+    let launched = now_ms();
+    let mut machine = launch_idle(&root, port, provider_port, IDLE);
+    let (_, _, _, body) = received
+        .recv_timeout(Duration::from_secs(120))
+        .expect("a rental whose jobs cannot start never idled out");
+    let released = now_ms();
+    assert!(body.contains("podTerminate"), "{body}");
+    assert!(released >= launched + i64::from(IDLE) * 1000 - 500, "released {released}, launched {launched}");
+    let start = Instant::now();
+    while machine.0.try_wait().unwrap().is_none() {
+        assert!(start.elapsed() < Duration::from_secs(60), "the machine kept running after ending its pod");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let journal = Journal::open(&journal_root).unwrap();
+    for id in [queued, claimed] {
+        let record = journal.get(&id).unwrap();
+        assert_eq!(record.state, State::Failed, "{record:?}");
+        assert!(record.attempt <= 1, "queued to fail again: attempt {}", record.attempt);
+        assert!(record.failure.as_ref().unwrap().to_string().contains("environment_unavailable"), "{:?}", record.failure);
+    }
     drop(machine);
     std::fs::remove_dir_all(root).unwrap();
 }
