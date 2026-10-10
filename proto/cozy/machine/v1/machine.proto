@@ -277,6 +277,7 @@ message ReadRequest {
   uint64 offset = 4;
   uint64 if_rev = 5;  // nonzero: refuse (FAILED_PRECONDITION) unless the output is at this rev
   uint64 tail = 6;    // a log's newest bytes, from a line start
+  uint64 length = 7;  // nonzero: at most this many bytes from offset (one range of a parallel read)
 }
 message OutputTarget {
   string run = 1;
@@ -291,6 +292,7 @@ message ReadFrame {
   string digest = 3;  // sha256:<hex>, once the output is final
   string media_type = 4;
   bytes data = 5;
+  uint64 end = 6;  // the first frame: where this read's bytes end; zero from a machine without ranges
 }
 
 // ---- Status (D2) -------------------------------------------------------------------------
