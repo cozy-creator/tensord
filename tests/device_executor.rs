@@ -100,6 +100,7 @@ fn prepared(version: &str, generation_path: &str) -> (DeviceExecutor, PathBuf) {
                 models: Vec::new(),
                 authorized_device_limit_bytes: None,
                 attention_pin: String::new(),
+                request_id: String::new(),
                 stages: false,
                 device_weights: false,
                 cap_bytes: None,

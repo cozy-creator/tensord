@@ -1460,6 +1460,7 @@ print(json.dumps({"identity": generation.identity}))
                             models: Vec::new(),
                             authorized_device_limit_bytes: None,
                             attention_pin: String::new(),
+                            request_id: String::new(),
                             stages: false,
                             device_weights: false,
                             cap_bytes: None,

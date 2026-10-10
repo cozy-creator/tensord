@@ -365,6 +365,7 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
             models: Vec::new(),
             authorized_device_limit_bytes: Some(config.authorized_device_limit_bytes),
             attention_pin: String::new(),
+            request_id: String::new(),
             stages,
             device_weights: false,
             cap_bytes: None,

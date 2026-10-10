@@ -27,6 +27,8 @@ use std::{
 };
 
 pub const MAX_DEVICE_FRAME: usize = 64 * 1024;
+/// Request-scoped first Load selection and cancellable, pre-construction kernel wait.
+pub const LOAD_REQUEST_ATTENTION: &str = "attention.load_request/1";
 /// Chunks of one weight set's shared GPU regions crossing in one exchange.
 const MAX_SHARED_FDS: u32 = 1 << 16;
 pub const RESULT_DOCUMENT: &str = "result.canonical";
@@ -212,6 +214,9 @@ pub enum DeviceCommand {
         authorized_device_limit_bytes: Option<u64>,
         #[serde(skip_serializing_if = "String::is_empty")]
         attention_pin: String,
+        /// Accepted request whose cold kernel wait can be canceled; absent for prewarm.
+        #[serde(skip_serializing_if = "String::is_empty")]
+        request_id: String,
         stages: bool,
         /// `host_tiers.sealed/1`: each weight set asks for TensorD's sealed CPU-buffer layout.
         #[serde(skip_serializing_if = "is_false")]

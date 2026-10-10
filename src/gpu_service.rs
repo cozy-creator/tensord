@@ -925,6 +925,9 @@ impl GpuPool {
         plan: &GpuPlan,
         sessions: &mut BTreeMap<String, Session>,
     ) -> io::Result<&'static str> {
+        if !sessions.get(&plan.id).is_some_and(|session| session.loaded) {
+            return Ok("its model construction is not loaded");
+        }
         let level = self.levels.lock().unwrap().get(&plan.id).map(|(_, level)| *level);
         if level == Some(Level::Gpu) {
             return Ok("mapped");
@@ -999,6 +1002,11 @@ impl GpuPool {
     }
     /// Note what a loaded executor that is kept holds now, for Status.
     fn note_level(&self, session: &Session) {
+        if !session.loaded {
+            // A canceled kernel preflight may retain the process, never model weights.
+            self.levels.lock().unwrap().remove(&session.plan);
+            return;
+        }
         let mapped = |gpu: &mut crate::memory::policy::Gpu| {
             gpu.tenant(&session.plan).is_some_and(|tenant| tenant.mapped)
         };
@@ -1525,9 +1533,10 @@ impl GpuPool {
         sessions: &mut BTreeMap<String, Session>,
         member: bool,
     ) -> io::Result<&'static str> {
-        if sessions.contains_key(&plan.id) {
+        if sessions.get(&plan.id).is_some_and(|session| session.loaded) {
             return Ok("already loaded");
         }
+        let cold = !sessions.contains_key(&plan.id);
         let lane = self.lane(plan.degree)?;
         let mut load_caps = vec![];
         for (index, device) in lane.iter().enumerate() {
@@ -1550,17 +1559,22 @@ impl GpuPool {
             return Ok("host_memory: no host room beside the warm set and what this host's other programs used recently");
         }
         if !member {
-            load_caps = self.decide(&plan.id, plan.degree, true, sessions)?;
+            load_caps = self.decide(&plan.id, plan.degree, cold, sessions)?;
         }
-        for device in lane {
-            device
-                .memory
-                .with(|gpu| gpu.starting(&plan.id, gpu.spawn_need(&plan.id)));
-        }
-        let mut session = self.new_session(engine, held, &plan, |birth, _| {
-            self.first().with(|gpu| gpu.spawned(&plan.id, birth.pid));
-            Ok(())
-        })?;
+        let mut session = match sessions.remove(&plan.id) {
+            Some(session) => session, // Canceled preflight: retain its in-flight builder.
+            None => {
+                for device in lane {
+                    device
+                        .memory
+                        .with(|gpu| gpu.starting(&plan.id, gpu.spawn_need(&plan.id)));
+                }
+                self.new_session(engine, held, &plan, |birth, _| {
+                    self.first().with(|gpu| gpu.spawned(&plan.id, birth.pid));
+                    Ok(())
+                })?
+            }
+        };
         match self.call(
             engine,
             "",
@@ -2176,6 +2190,11 @@ impl GpuPool {
         }
         let cold = !sessions.contains_key(&plan.id);
         let mut load_caps = vec![];
+        if !cold && !sessions[&plan.id].loaded {
+            // A canceled preflight kept only its context/build, not a Load grant forever.
+            self.host_room(&plan.id, sessions, false);
+            load_caps = self.decide(&plan.id, plan.degree, false, sessions)?;
+        }
         if cold {
             self.host_room(&plan.id, sessions, false);
             // A context and the first working set are reserved on every GPU of the group
@@ -2556,7 +2575,10 @@ impl GpuPool {
                 .map_or(-1, |share| i64::try_from(share).unwrap_or(i64::MAX));
             let started = std::time::Instant::now();
             let (load_cap, load_group) = rank_grant(load_caps);
-            let loaded = command_ok(session.executor.command_with(
+            let (request_id, attention_pin) = load_attention_request(
+                engine, id, load_only, &session.executor.hello,
+            )?;
+            let loaded = session.executor.command_with(
                 &DeviceCommand::Load {
                     construction: plan.id.clone(),
                     devices: lane.clone(),
@@ -2566,7 +2588,10 @@ impl GpuPool {
                     models,
                     authorized_device_limit_bytes:
                         device_total.or(self.config.authorized_device_limit_bytes),
-                    attention_pin: String::new(),
+                    // A first request must choose its build before default model
+                    // selection imports another, incompatible kernel artifact.
+                    attention_pin,
+                    request_id,
                     stages: false,
                     sealed_tiers: session.unsealed.is_none(),
                     model_sources: true,
@@ -2577,7 +2602,13 @@ impl GpuPool {
                 },
                 &load_group,
                 &mut callbacks,
-            )?)?;
+            )?;
+            if session.executor.hello.offers(device_executor::LOAD_REQUEST_ATTENTION)
+                && finish_canceled_load(engine, id, session.loaded, &loaded)?
+            {
+                return Ok(true); // Unloaded, but its shared kernel builder keeps running.
+            }
+            let loaded = command_ok(loaded)?;
             let facts = self.observe(
                 &plan.id,
                 plan.degree,
@@ -4063,10 +4094,216 @@ impl Services for Callbacks<'_> {
     }
 }
 
+/// A prewarm has no request. Otherwise construction must see the same explicit
+/// choice that PrepareRequest and Invoke will later receive from the journal.
+fn load_attention_request(
+    engine: &Engine,
+    id: &str,
+    load_only: bool,
+    hello: &device_executor::Hello,
+) -> io::Result<(String, String)> {
+    if load_only || !hello.offers(device_executor::LOAD_REQUEST_ATTENTION) {
+        return Ok((String::new(), String::new()));
+    }
+    Ok((id.into(), engine.get(id)?.invocation.attention_kernel))
+}
+
+/// Only Runtime's pre-construction cancellation leaves an unloaded process reusable.
+/// A later Load refusal may have partial model state and still takes normal disposal.
+fn finish_canceled_load(
+    engine: &Engine,
+    id: &str,
+    loaded: bool,
+    reply: &Frame,
+) -> io::Result<bool> {
+    if loaded
+        || reply.ok
+        || reply.code != "attention_load_preflight_canceled"
+        || reply.terminal != "canceled"
+        || !reply.poisoned.is_empty()
+        || engine.get(id)?.cancel_actor.is_none()
+    {
+        return Ok(false);
+    }
+    engine.finish(id, Outcome::Canceled)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn first_load_uses_its_request_pin_but_prewarm_has_none() {
+        let root = std::env::temp_dir().join(format!("load-attention-{}", uuid::Uuid::new_v4()));
+        let engine = Engine::open(&root).unwrap();
+        let hello = device_executor::Hello {
+            memory: vec![device_executor::LOAD_REQUEST_ATTENTION.into()],
+            ..Default::default()
+        };
+        let selected = "base/fl2va_dit=kitchen-sol-producer-sage2-fp16pv-shared-qkv";
+        let (first, _) = engine
+            .accept_run(
+                "actor",
+                "first",
+                "first-spec",
+                crate::journal::Invocation {
+                    attention_kernel: selected.into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let (next, _) = engine
+            .accept_run(
+                "actor",
+                "next",
+                "next-spec",
+                crate::journal::Invocation::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            load_attention_request(&engine, &first.id, false, &hello).unwrap(),
+            (first.id.clone(), selected.into())
+        );
+        assert_eq!(
+            load_attention_request(&engine, &next.id, false, &hello).unwrap(),
+            (next.id.clone(), String::new())
+        );
+        assert_eq!(
+            load_attention_request(&engine, &first.id, true, &hello).unwrap(),
+            (String::new(), String::new())
+        );
+        assert_eq!(
+            load_attention_request(&engine, "no-run-for-prewarm", true, &hello).unwrap(),
+            (String::new(), String::new())
+        );
+        assert!(load_attention_request(&engine, "missing-request", false, &hello).is_err());
+        // An older Runtime may understand the field but would make its value sticky.
+        assert_eq!(
+            load_attention_request(
+                &engine,
+                &first.id,
+                false,
+                &device_executor::Hello::default()
+            )
+            .unwrap(),
+            (String::new(), String::new())
+        );
+        // Construction and both later request commands consume one durable value.
+        assert_eq!(
+            engine.get(&first.id).unwrap().invocation.attention_kernel,
+            selected
+        );
+        let load = |request_id, attention_pin| DeviceCommand::Load {
+            construction: "model".into(),
+            devices: String::new(),
+            sequence_parallel_degree: 1,
+            binding: Box::default(),
+            budgets: Budgets::default(),
+            models: Vec::new(),
+            authorized_device_limit_bytes: None,
+            attention_pin,
+            request_id,
+            stages: false,
+            sealed_tiers: false,
+            model_sources: false,
+            staged_tiers: false,
+            pinned_bytes: None,
+            device_weights: false,
+            cap_bytes: None,
+        };
+        let (request, pin) = load_attention_request(&engine, &first.id, false, &hello).unwrap();
+        let frame = serde_json::to_value(load(request, pin)).unwrap();
+        assert_eq!(frame["request_id"], first.id);
+        assert_eq!(frame["attention_pin"], selected);
+        let (request, pin) = load_attention_request(&engine, "prewarm", true, &hello).unwrap();
+        let frame = serde_json::to_value(load(request, pin)).unwrap();
+        assert!(frame.get("request_id").is_none());
+        assert!(frame.get("attention_pin").is_none());
+        drop(engine);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn only_a_journaled_preconstruction_cancel_keeps_an_unloaded_executor() {
+        let root = std::env::temp_dir().join(format!("load-cancel-{}", uuid::Uuid::new_v4()));
+        let engine = Engine::open(&root).unwrap();
+        let accept = |public_id: &str| {
+            let invocation = crate::journal::Invocation {
+                attention_kernel: "dit=full-family".into(),
+                ..Default::default()
+            };
+            let (record, _) = engine
+                .accept_run("actor", public_id, public_id, invocation.clone())
+                .unwrap();
+            engine
+                .bind_prepared(&record.id, invocation, "fixture-plan")
+                .unwrap();
+            engine
+                .with_journal(|journal| {
+                    assert!(journal.claim(&record.id)?);
+                    journal.register_process(
+                        &record.id,
+                        crate::process::process_birth(std::process::id())?,
+                    )?;
+                    journal.running(&record.id, None)?;
+                    Ok(())
+                })
+                .unwrap();
+            record.id
+        };
+        let hello = device_executor::Hello {
+            memory: vec![device_executor::LOAD_REQUEST_ATTENTION.into()],
+            ..Default::default()
+        };
+        let id = accept("first");
+        let reply = Frame {
+            code: "attention_load_preflight_canceled".into(),
+            terminal: "canceled".into(),
+            origin: "request".into(),
+            ..Frame::default()
+        };
+        assert!(!finish_canceled_load(&engine, &id, false, &reply).unwrap());
+        engine.cancel_run("actor", "first").unwrap();
+        assert_eq!(engine.get(&id).unwrap().state, State::Running);
+        assert!(!finish_canceled_load(&engine, &id, true, &reply).unwrap());
+        assert!(!finish_canceled_load(
+            &engine,
+            &id,
+            false,
+            &Frame {
+                code: "cancelled".into(),
+                ..reply.clone()
+            }
+        )
+        .unwrap());
+        assert!(!finish_canceled_load(
+            &engine,
+            &id,
+            false,
+            &Frame {
+                poisoned: "partial model".into(),
+                ..reply.clone()
+            }
+        )
+        .unwrap());
+        assert!(finish_canceled_load(&engine, &id, false, &reply).unwrap());
+        let canceled = engine.get(&id).unwrap();
+        assert_eq!(canceled.state, State::Canceled);
+        assert!(canceled.failure.is_none() && canceled.result.is_none());
+        let next = accept("later");
+        assert!(!finish_canceled_load(&engine, &next, false, &reply).unwrap());
+        assert_eq!(
+            load_attention_request(&engine, &next, false, &hello)
+                .unwrap()
+                .0,
+            next
+        );
+        assert_eq!(engine.get(&next).unwrap().state, State::Running);
+        drop(engine);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn the_image_boot_runs_machine_kernels_from_the_executors_runtime_wheel() {
