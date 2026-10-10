@@ -273,6 +273,7 @@ mod tests {
             staging_root: root.join("staging"),
             sdk: vec![],
             uv: "uv".into(),
+            seed_cache: None,
         };
         Machine { root, service, store, objects, installer }
     }
@@ -373,6 +374,69 @@ mod tests {
         assert_eq!(installed_sdk(&held.record.python), "0.18.101 0.3.92");
         assert_eq!(held.record.sdk_fallback, "");
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// With an image's seeded cache, a local package's dependencies are links into it, as a
+    /// published package's are: on a pod's overlayfs a hardlink copies each file up (the A4000
+    /// rental reclaimed 196 MiB of copies from one weightless edit's environment).
+    #[test]
+    fn a_local_package_links_its_dependencies_from_the_seeded_cache() {
+        let m = machine("cm-seeded");
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let seed = m.root.join("seed");
+        fs::create_dir_all(&seed).unwrap();
+        let sources = LocalSources::new(
+            m.objects.clone(),
+            InstallerConfig { seed_cache: Some(seed.clone()), ..m.installer.clone() },
+            m.store.clone(),
+        );
+        // As `cozy run ./dir` captures it: the project's wheel and its locked requirements.
+        let fixture = repo.join("tests/fixtures/cpu_input");
+        run(Command::new("uv").current_dir(&fixture).args(["build", "--wheel", "--out-dir"]).arg(m.root.join("wheel")));
+        let built = fs::read_dir(m.root.join("wheel")).unwrap().map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|e| e == "whl")).unwrap();
+        let requirements = run(Command::new("uv").args(["pip", "compile", "--quiet", "--generate-hashes", "--python-version", "3.12", "--no-header"])
+            .arg(fixture.join("pyproject.toml")));
+        let wheel = write(&m.objects, "alice", &fs::read(&built).unwrap());
+        let locked = write(&m.objects, "alice", requirements.as_bytes());
+        let name = built.file_name().unwrap().to_string_lossy();
+        let manifest = serde_json::json!({"package": "local/cozy-machine-cpu-input", "release": "0.1.0", "python_version": "3.12",
+            "wheels": [{"name": name, "digest": wheel.digest, "length": wheel.length}],
+            "requirements": {"digest": locked.digest, "length": locked.length}});
+        let manifest = write(&m.objects, "alice", manifest.to_string().as_bytes());
+        let installed = sources.install(&m.service, "alice", &manifest.digest).unwrap();
+        let python = m.service.catalog.resolve(&installed.generation).unwrap().record.python;
+        let site = python.parent().unwrap().parent().unwrap().join("lib/python3.12/site-packages");
+        // A locked dependency links into the seed; the App the Runtime describes is copied.
+        let dependency = site.join("msgspec/__init__.py");
+        assert!(fs::symlink_metadata(&dependency).unwrap().file_type().is_symlink(), "msgspec was copied into the environment");
+        assert!(fs::canonicalize(&dependency).unwrap().starts_with(fs::canonicalize(&seed).unwrap()));
+        assert!(!fs::symlink_metadata(site.join("cpu_input/__init__.py")).unwrap().file_type().is_symlink());
+
+        // A callee App among the locked dependencies is copied too: the environment describes it.
+        let wheel_of = |fixture: &str| {
+            let out = m.root.join(fixture);
+            run(Command::new("uv").current_dir(repo.join("tests/fixtures").join(fixture)).args(["build", "--wheel", "--out-dir"]).arg(&out));
+            fs::read_dir(&out).unwrap().map(|e| e.unwrap().path()).find(|p| p.extension().is_some_and(|e| e == "whl")).unwrap()
+        };
+        let (caller, memo) = (wheel_of("cpu_caller"), wheel_of("cpu_memo"));
+        let compiled = run(Command::new("uv").args(["pip", "compile", "--quiet", "--generate-hashes", "--python-version", "3.12", "--no-header", "--find-links"])
+            .arg(memo.parent().unwrap()).arg(repo.join("tests/fixtures/cpu_caller/pyproject.toml")));
+        let requirements = compiled.replace("cozy-machine-cpu-memo==0.1.0", &format!("cozy-machine-cpu-memo @ file://{}", memo.display()));
+        let wheel = write(&m.objects, "alice", &fs::read(&caller).unwrap());
+        let locked = write(&m.objects, "alice", requirements.as_bytes());
+        let name = caller.file_name().unwrap().to_string_lossy();
+        let manifest = serde_json::json!({"package": "local/cozy-machine-cpu-caller", "release": "0.1.0", "python_version": "3.12",
+            "wheels": [{"name": name, "digest": wheel.digest, "length": wheel.length}],
+            "requirements": {"digest": locked.digest, "length": locked.length}});
+        let manifest = write(&m.objects, "alice", manifest.to_string().as_bytes());
+        let installed = sources.install(&m.service, "alice", &manifest.digest).unwrap();
+        let held = m.service.catalog.resolve(&installed.generation).unwrap();
+        assert!(held.record.callees.iter().any(|c| c.distribution == "cozy-machine-cpu-memo"), "{:?}", held.record.callees);
+        let site = held.record.python.parent().unwrap().parent().unwrap().join("lib/python3.12/site-packages");
+        assert!(!fs::symlink_metadata(site.join("cpu_memo/__init__.py")).unwrap().file_type().is_symlink());
+        assert!(fs::symlink_metadata(site.join("msgspec/__init__.py")).unwrap().file_type().is_symlink());
+        let _ = fs::remove_dir_all(m.root);
     }
 
     /// A package pinning a vendored dev Runtime (how unreleased Runtime code is tested; it is

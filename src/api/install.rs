@@ -24,6 +24,9 @@ pub struct InstallerConfig {
     pub sdk: Vec<PathBuf>,
     /// The machine's uv (`machine::client::uv`): the helper runs it, whatever PATH the machine had.
     pub uv: PathBuf,
+    /// An image's baked uv cache: local environments symlink into it as published ones do, so
+    /// overlayfs never copies its payload (Torch) into each environment of each edit.
+    pub seed_cache: Option<PathBuf>,
 }
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 pub struct Dependency {
@@ -186,6 +189,9 @@ pub fn prepare_uploaded(
         .env_clear()
         .envs(crate::launch_identity::inherited())
         .env("PATH", helper_path(&config.uv))
+        .envs(config.seed_cache.iter().flat_map(|seed| {
+            [("UV_CACHE_DIR", seed.as_os_str()), ("UV_LINK_MODE", std::ffi::OsStr::new("symlink"))]
+        }))
         .arg("-m")
         .arg("cozy_machine_client.installer")
         .arg("install-captured")

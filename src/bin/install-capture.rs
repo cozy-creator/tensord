@@ -91,6 +91,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             staging_root: output.join("staging"),
             sdk: vec![],
             uv: "uv".into(),
+            seed_cache: None,
         },
         &uploaded,
     )?;
