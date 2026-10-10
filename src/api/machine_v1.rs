@@ -727,8 +727,8 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
         let caller = self.caller(request.metadata())?;
         let request = request.into_inner();
         let actor = caller.actor;
-        let (offset, if_rev) = (request.offset, request.if_rev);
-        let (meta, bytes): (v1::ReadFrame, Bytes) = match request.target {
+        let (offset, if_rev, length) = (request.offset, request.if_rev, request.length);
+        let (mut meta, bytes): (v1::ReadFrame, Bytes) = match request.target {
             Some(v1::read_request::Target::Output(target)) => {
                 let index = (target.index > 0).then_some(target.index);
                 caller.run(&target.run, Some((&target.output, index)))?;
@@ -751,7 +751,7 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
                     length: snapshot.length,
                     digest: snapshot.sha256.clone().unwrap_or_default(),
                     media_type: snapshot.media_type.clone(),
-                    data: vec![],
+                    ..Default::default()
                 };
                 (meta, Bytes::Parts(snapshot.parts))
             }
@@ -776,7 +776,7 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
                     length: bytes.len() as u64,
                     digest: spell(&tensorfs_core::sha256::digest(&bytes)),
                     media_type: "application/json".into(),
-                    data: vec![],
+                    ..Default::default()
                 };
                 (meta, Bytes::Held(bytes))
             }
@@ -806,7 +806,7 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
                     length: bytes.len() as u64,
                     digest: String::new(),
                     media_type: "text/plain".into(),
-                    data: vec![],
+                    ..Default::default()
                 };
                 (meta, Bytes::Held(bytes))
             }
@@ -815,10 +815,17 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
         if offset > meta.length {
             return Err(Status::out_of_range("offset is past the end"));
         }
-        let bytes = from_offset(bytes, offset).map_err(|e| Status::data_loss(e.to_string()))?;
+        // A range (`length`) is one part of a parallel read; the first frame says where it ends.
+        meta.end = match length {
+            0 => meta.length,
+            length => offset.saturating_add(length).min(meta.length),
+        };
+        let bytes = from_offset(bytes, offset)
+            .map_err(|e| Status::data_loss(e.to_string()))?
+            .take(meta.end - offset);
         let (sender, receiver) = tokio::sync::mpsc::channel(4);
         tokio::task::spawn_blocking(move || {
-            let (mut bytes, mut left) = (bytes, meta.length - offset);
+            let (mut bytes, mut left) = (bytes, meta.end - offset);
             let ended_early = || Err(Status::data_loss("output bytes ended early"));
             if sender.blocking_send(Ok(meta)).is_err() {
                 return;

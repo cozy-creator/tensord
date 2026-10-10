@@ -168,9 +168,26 @@ async fn read(
     client: &mut v1::machine_client::MachineClient<Channel>,
     offset: u64,
 ) -> tonic::Streaming<v1::ReadFrame> {
+    read_range(client, offset, 0).await
+}
+
+async fn read_range(
+    client: &mut v1::machine_client::MachineClient<Channel>,
+    offset: u64,
+    length: u64,
+) -> tonic::Streaming<v1::ReadFrame> {
     let target = v1::OutputTarget { run: "run".into(), output: "image".into(), index: 0, ..Default::default() };
-    let request = v1::ReadRequest { target: Some(v1::read_request::Target::Output(target)), offset, ..Default::default() };
+    let request =
+        v1::ReadRequest { target: Some(v1::read_request::Target::Output(target)), offset, length, ..Default::default() };
     client.read(authorized(request, &machine_cap())).await.unwrap().into_inner()
+}
+
+async fn rest(mut frames: tonic::Streaming<v1::ReadFrame>) -> Result<Vec<u8>, tonic::Status> {
+    let mut bytes = vec![];
+    while let Some(frame) = frames.message().await? {
+        bytes.extend(frame.data);
+    }
+    Ok(bytes)
 }
 
 /// A reattach (every daemon restart) past earlier products keeps each output's revision and
@@ -272,4 +289,30 @@ async fn a_short_output_read_is_data_loss() {
     let mut bytes = read(&mut client, 5).await;
     bytes.message().await.unwrap().unwrap();
     assert_eq!(bytes.message().await.unwrap_err().code(), Code::DataLoss);
+}
+
+/// A range is one part of a parallel read: exactly its bytes, its end in the first frame,
+/// clamped at the output's end, and a short output is short only where the range reaches.
+#[tokio::test]
+async fn a_range_reads_its_bytes_alone() {
+    let (mut client, _) = serve(Run { live: false, held: 8 }).await;
+    let mut frames = read_range(&mut client, 2, 4).await;
+    let meta = frames.message().await.unwrap().unwrap();
+    assert_eq!((meta.length, meta.end), (128 << 20, 6));
+    assert_eq!(rest(frames).await.unwrap(), b"byte");
+
+    let mut frames = read_range(&mut client, (128 << 20) - 3, 1 << 20).await;
+    assert_eq!(frames.message().await.unwrap().unwrap().end, 128 << 20);
+    assert_eq!(rest(frames).await.unwrap(), [0; 3]);
+
+    let mut frames = read(&mut client, (128 << 20) - 1).await;
+    assert_eq!(frames.message().await.unwrap().unwrap().end, 128 << 20);
+
+    let (mut client, _) = serve(Run { live: false, held: 3 }).await;
+    let mut frames = read_range(&mut client, 0, 3).await;
+    assert_eq!(frames.message().await.unwrap().unwrap().end, 3);
+    assert_eq!(rest(frames).await.unwrap(), b"8 b");
+    let mut frames = read_range(&mut client, 1, 4).await;
+    frames.message().await.unwrap().unwrap();
+    assert_eq!(rest(frames).await.unwrap_err().code(), Code::DataLoss);
 }

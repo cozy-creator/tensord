@@ -1,5 +1,5 @@
 //! Development tool: Read throughput from a far machine. `seed` (on the machine's host) journals
-//! one finished run with a large output; `measure` (on the client) reads it N times through
+//! one finished run with a large output (MiB); `measure` (on the client) reads it N times through
 //! `cozy.machine.v1` Read and prints MB/s. Not proof of
 //! anything but the transport.
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -42,8 +42,8 @@ fn key(seed: &str) -> SigningKey {
     SigningKey::from_bytes(&tensorfs_core::sha256::digest(seed.as_bytes()))
 }
 
-fn seed(state: PathBuf, gib: u64, key_seed: &str) -> io::Result<()> {
-    let length = gib << 30;
+fn seed(state: PathBuf, mib: u64, key_seed: &str) -> io::Result<()> {
+    let length = mib << 20;
     let store =
         tensorfs_core::store::Store::ensure(&state.join("tensorfs")).map_err(io::Error::other)?;
     let mut hash = sha2_digest(Noise {
@@ -233,7 +233,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("seed") => seed(PathBuf::from(&args[2]), args[3].parse()?, &args[4])?,
         Some("key") => println!("{}", URL_SAFE_NO_PAD.encode(key(&args[2]).verifying_key().as_bytes())),
         Some("measure") => measure(&args).await?,
-        _ => eprintln!("usage: read-bench seed STATE GIB KEYSEED | key KEYSEED | measure HOST:PORT LEAF.pem WORKER KEYSEED RUN_NUMBER REPEAT [LIMIT_BYTES [SERVER_PID [WINDOWS: adaptive,fixed,default]]]"),
+        _ => eprintln!("usage: read-bench seed STATE MIB KEYSEED | key KEYSEED | measure HOST:PORT LEAF.pem WORKER KEYSEED RUN_NUMBER REPEAT [LIMIT_BYTES [SERVER_PID [WINDOWS: adaptive,fixed,default]]]"),
     }
     Ok(())
 }
