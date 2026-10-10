@@ -4330,11 +4330,12 @@ mod tests {
         assert_eq!(group_degree(&mixed, 0, 4).unwrap(), 1);
     }
 
-    /// A pool over four GPUs NVML does not know (this host's own stay untouched): every GPU
-    /// has room.
-    fn four_gpus() -> (PathBuf, Arc<GpuPool>, Arc<Engine>) {
+    /// A fresh pool over `width` GPUs NVML does not know (this host's own stay untouched):
+    /// every GPU has room.
+    fn pool_of(width: usize) -> (PathBuf, Arc<GpuPool>, Arc<Engine>) {
         let root = std::env::temp_dir().join(format!("gpu-place-{}", uuid::Uuid::new_v4()));
-        let config: GpuConfig = serde_json::from_value(json!({"devices": "GPU-a,GPU-b,GPU-c,GPU-d",
+        let devices: Vec<_> = (0..width).map(|gpu| format!("GPU-test-{gpu}")).collect();
+        let config: GpuConfig = serde_json::from_value(json!({"devices": devices.join(","),
             "authorized_device_limit_bytes": null, "prespawn": false})).unwrap();
         let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
         let pool = GpuPool::new(&root.join("gpu"), config, store).unwrap();
@@ -4354,7 +4355,7 @@ mod tests {
 
     #[test]
     fn calls_of_one_plan_spread_over_free_gpus_and_a_waiting_group_keeps_its_place() {
-        let (root, pool, engine) = four_gpus();
+        let (root, pool, engine) = pool_of(4);
         let (image, film) = (plan("image", 1), plan("film", 2));
         let place = |plan: &GpuPlan, waiting: &mut [bool]| pool.place(&engine, plan, None, waiting);
         let serving = |gpu: usize| pool.devices[gpu].memory.with(|ledger| ledger.starting("image", 0));
@@ -4386,11 +4387,31 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// A fresh pod's burst of one unlearned plan: its first call starts on GPU 0, the second at
+    /// once on empty GPU 1, the third waits for either.
+    #[test]
+    fn a_cold_burst_runs_on_every_empty_gpu_at_once() {
+        let (root, pool, engine) = pool_of(2);
+        let image = plan("image", 1);
+        let mut waiting = vec![false; 2];
+        let (gpu, first) = pool.place(&engine, &image, None, &mut waiting).unwrap();
+        assert_eq!(gpu, 0);
+        pool.devices[0].memory.with(|ledger| ledger.starting("image", 0));
+        let (gpu, second) = pool.place(&engine, &image, None, &mut waiting).unwrap();
+        assert_eq!(gpu, 1);
+        pool.devices[1].memory.with(|ledger| ledger.starting("image", 0));
+        assert!(pool.place(&engine, &image, None, &mut waiting).is_none());
+        assert_eq!(waiting, [true, true]);
+        drop((first, second));
+        pool.stop().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
     /// A job's children run although a foreign request waits for the job's GPUs, and the
     /// resumed job starts only once its child's call on its GPU ended.
     #[test]
     fn a_jobs_family_is_never_queued_behind_a_request_that_waits_for_the_job() {
-        let (root, pool, engine) = four_gpus();
+        let (root, pool, engine) = pool_of(4);
         let job = engine
             .submit(
                 "job",
@@ -4432,7 +4453,7 @@ mod tests {
     /// over every GPU's executors, a group's once.
     #[test]
     fn host_room_and_pinned_budgets_span_every_gpu() {
-        let (root, pool, _engine) = four_gpus();
+        let (root, pool, _engine) = pool_of(4);
         let available = u64::try_from(crate::host_memory::read().available).unwrap();
         let need = available / 10 * 6;
         let learn = |gpu: usize| {

@@ -448,6 +448,15 @@ impl Gpu {
             .is_some_and(|want| self.room(plan, sample) + reclaimable >= want)
     }
 
+    /// Whether a call of `plan` fits in the room there is now with no step on another tenant:
+    /// its learned want, or, never learned, a GPU that holds nothing at all to evict.
+    pub fn fits(&self, plan: &str, sample: &Sample) -> bool {
+        match self.grant_want(plan) {
+            Some(want) => self.room(plan, sample) >= want,
+            None => self.tenants.is_empty() && self.holdings.is_empty(),
+        }
+    }
+
     /// The weights a call of `plan` puts on the GPU: what one kept mapped with nothing evicted
     /// (an entrypoint may use only part of its construction), else every weight it registers.
     fn call_weights(&self, plan: &str) -> Option<u64> {
@@ -710,6 +719,25 @@ mod tests {
             display: false,
             processes: Some(processes.iter().copied().collect()),
         }
+    }
+    #[test]
+    fn an_unlearned_plan_fits_only_a_gpu_with_nothing_to_evict() {
+        // A fresh pod's cold burst: its first call starts on GPU 0, the next fits empty GPU 1.
+        let (mut first, empty) = (Gpu::default(), Gpu::default());
+        let card = sample(96 * GIB, 95 * GIB, &[]);
+        assert!(first.fits("image", &card));
+        first.starting("image", first.spawn_need("image"));
+        assert!(empty.fits("image", &card));
+        // Beside another tenant only a learned want fits.
+        let mut shared = Gpu::default();
+        loaded(&mut shared, "film", 7, 20 * GIB, 4 * GIB);
+        let card = sample(96 * GIB, 70 * GIB, &[(7, 26 * GIB)]);
+        assert!(!shared.fits("image", &card));
+        shared.learned.load("image", 30 * GIB, GIB);
+        shared.learned.call("image", "", 4 * GIB, &BTreeMap::new());
+        assert!(shared.fits("image", &card));
+        shared.learned.load("image", 70 * GIB, GIB);
+        assert!(!shared.fits("image", &card));
     }
     fn loaded(gpu: &mut Gpu, plan: &str, pid: u32, weights: u64, activation: u64) {
         gpu.starting(plan, gpu.spawn_need(plan));
