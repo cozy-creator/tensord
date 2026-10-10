@@ -39,8 +39,8 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   startup fence or an active GPU record this machine run does not supervise. CPU dispatch continues.
 - Placement (`GpuPool::place`): a group takes the first K GPUs. A one-GPU call takes, in order, a
   free GPU with its plan's idle executor; a free GPU where its learned want fits beside the tenants
-  there without evicting any (a replica when the plan runs elsewhere too; never for a plan with
-  nothing learned); or, when the plan runs nowhere or its family holds a GPU, the first free or
+  there without evicting any (a replica when the plan runs elsewhere too; a plan with nothing
+  learned fits only a GPU that holds nothing); or, when the plan runs nowhere or its family holds a GPU, the first free or
   borrowed one. Otherwise it waits, and later requests in that pass do not take the GPUs it waits
   for afresh, except a family that holds a slot (the waiter may wait on it). Prefetches yield to
   queued requests. A GPU that never ran the plan first copies its learned facts from one that did.

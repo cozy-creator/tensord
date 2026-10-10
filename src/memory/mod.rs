@@ -292,8 +292,8 @@ impl GpuMemory {
         })
     }
 
-    /// Whether a call of `plan` fits in the room there is now, with no step on another tenant.
-    /// False while its want was never learned; true without NVML.
+    /// Whether a call of `plan` fits here now with no step on another tenant (`Gpu::fits`).
+    /// True without NVML.
     pub fn fits(&self, plan: &str, holdings: impl Fn() -> Vec<Holding>) -> bool {
         let Some(sample) = self.sample() else {
             return true;
@@ -301,7 +301,7 @@ impl GpuMemory {
         let held = holdings();
         self.with(|gpu| {
             gpu.holdings = held;
-            gpu.grant_want(plan).is_some_and(|want| gpu.room(plan, &sample) >= want)
+            gpu.fits(plan, &sample)
         })
     }
 
