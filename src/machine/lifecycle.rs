@@ -144,8 +144,8 @@ impl Lifecycle {
         Ok(())
     }
 
-    /// Folds one activity sample in. Busy (or unreadable) work holds the deadline; the
-    /// ledger is rewritten only when the persisted deadline falls half a window behind.
+    /// Folds one known activity sample in. Observed work durably marks this rental used;
+    /// unreadable activity is handled by the caller without inventing a used observation.
     pub fn observe(&self, busy: bool) -> io::Result<i64> {
         let now = now_ms();
         let mut state = self.state.lock().unwrap();
