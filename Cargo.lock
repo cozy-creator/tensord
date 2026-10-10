@@ -354,7 +354,7 @@ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
 name = "cozy-machine"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2057,7 +2057,7 @@ dependencies = [
 [[package]]
 name = "tensorfs-core"
 version = "0.7.0"
-source = "git+https://github.com/cozy-creator/tensorfs.git?tag=v0.7.1#5323e1b85eec67f71e51155fda8b73406abcd471"
+source = "git+https://github.com/cozy-creator/tensorfs.git?tag=v0.7.2#de80029e8263e75aaa86d16cf37a6b5a669ad7b3"
 dependencies = [
  "base64 0.22.1",
  "fs2",
@@ -2077,7 +2077,7 @@ dependencies = [
 [[package]]
 name = "tensorfs-plane"
 version = "0.7.0"
-source = "git+https://github.com/cozy-creator/tensorfs.git?tag=v0.7.1#5323e1b85eec67f71e51155fda8b73406abcd471"
+source = "git+https://github.com/cozy-creator/tensorfs.git?tag=v0.7.2#de80029e8263e75aaa86d16cf37a6b5a669ad7b3"
 dependencies = [
  "libc",
  "libloading",
