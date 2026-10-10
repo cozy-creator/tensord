@@ -27,7 +27,7 @@ use tensorfs_core::{
     ids::ObjectRef,
     sha256,
     store::Store,
-    transport::{self, Anonymous, Deadline, Ledger, Ranged, SourcePolicy},
+    transport::{self, Anonymous, Deadline, Ledger, PullCancellation, Ranged, SourcePolicy},
 };
 use crate::catalog::normalized;
 
@@ -139,6 +139,8 @@ struct Job {
     progress: Mutex<Progress>,
     changed: Condvar,
     observer: Option<Observer>,
+    /// A hint's preparation: no call waits on its downloads (`Lanes`).
+    behind: bool,
 }
 impl Default for Progress {
     fn default() -> Self {
@@ -204,6 +206,54 @@ pub struct Publisher {
     fetching: Mutex<HashMap<String, usize>>,
     /// Checkpoints a run started on part of: the rest downloads behind it (`complete_behind`).
     remainders: Mutex<HashMap<String, Remainder>>,
+    lanes: Lanes,
+}
+
+/// Downloads a call waits on run at once, at full speed. One none waits on (a hint's, a
+/// checkpoint's remainder) goes behind them: it starts only while there are none, stops as
+/// one starts, keeping what it landed, and starts again once none is left.
+#[derive(Default)]
+struct Lanes {
+    state: Mutex<(usize, Vec<PullCancellation>)>,
+    changed: Condvar,
+}
+
+impl Lanes {
+    fn run<T>(&self, behind: bool, pull: impl Fn(Option<PullCancellation>) -> Result<T, Failure>) -> Result<T, Failure> {
+        if !behind {
+            let _waited = Waited::on(self);
+            return pull(None);
+        }
+        loop {
+            let stop = PullCancellation::default();
+            self.changed.wait_while(self.state.lock().unwrap(), |(waited, _)| *waited > 0).unwrap().1.push(stop.clone());
+            let result = pull(Some(stop.clone()));
+            let yielded = stop.is_cancelled();
+            stop.cancel();
+            self.state.lock().unwrap().1.retain(|stop| !stop.is_cancelled());
+            match result {
+                Err(_) if yielded => continue,
+                result => return result,
+            }
+        }
+    }
+}
+
+/// One download a call waits on, from its start to its end: every one behind it stops.
+struct Waited<'a>(&'a Lanes);
+impl<'a> Waited<'a> {
+    fn on(lanes: &'a Lanes) -> Self {
+        let (waited, behind) = &mut *lanes.state.lock().unwrap();
+        *waited += 1;
+        behind.drain(..).for_each(|stop| stop.cancel());
+        Self(lanes)
+    }
+}
+impl Drop for Waited<'_> {
+    fn drop(&mut self) {
+        self.0.state.lock().unwrap().0 -= 1;
+        self.0.changed.notify_all();
+    }
 }
 
 /// The rest of a checkpoint whose declared components a run downloaded first.
@@ -215,8 +265,8 @@ struct Remainder {
     started: bool,
 }
 
-/// Streams a remainder downloads with while no preparation waits on it: well under a
-/// foreground pull's, so the running request keeps the link and the disk.
+/// Streams a remainder downloads with: well under a foreground pull's, so the running request
+/// keeps the link and the disk.
 const BEHIND_STREAMS: usize = 64;
 
 /// One preparation's manifests in `Publisher::fetching`, released when it ends.
@@ -248,6 +298,7 @@ impl Publisher {
             jobs: Mutex::new(HashMap::new()),
             fetching: Mutex::new(HashMap::new()),
             remainders: Mutex::new(HashMap::new()),
+            lanes: Lanes::default(),
         }))
     }
 
@@ -321,19 +372,21 @@ impl Publisher {
     }
 
     /// One run's preparation on the calling thread, reported through `observe`: a held
-    /// installation and resolution answer at once.
+    /// installation and resolution answer at once. One nobody observes is a hint's
+    /// (`model_prefetch`): no call waits on it, so its downloads go behind (`Lanes`).
     pub fn prepare_now(
         &self,
         service: &Arc<Service>,
         actor: &str,
         request: &Request,
-        observe: Observer,
+        observe: Option<Observer>,
     ) -> Result<Prepared, Failure> {
         if let Ok(Some(prepared)) = self.held(service, actor, request) {
             return Ok(prepared);
         }
         let job = Job {
-            observer: Some(observe),
+            behind: observe.is_none(),
+            observer: observe,
             ..Default::default()
         };
         self.work(service, actor, request, &job)
@@ -355,7 +408,7 @@ impl Publisher {
                 format!("{path} names a source and a catalog checkpoint"),
             ));
         }
-        let made = make_source(&self.store, &choice.source, &choice.profiles, providers, &|stage, moved, total| {
+        let made = self.make(&choice.source, &choice.profiles, providers, job.behind, &|stage, moved, total| {
             job.set(Progress::Preparing {
                 stage: format!("{stage} for {path}"),
                 moved,
@@ -437,8 +490,24 @@ impl Publisher {
         providers: &Providers,
         progress: &(dyn Fn(&str, u64, u64) + Sync),
     ) -> Result<tensorfs_core::source_model::Made, Refused> {
-        make_source(&self.store, source, profiles, providers, progress)
+        self.make(source, profiles, providers, false, progress)
             .map_err(|(code, message)| Refused { code, message })
+    }
+
+    /// A provider source made into a local model (`make_source`) in its lane (`Lanes`).
+    fn make(&self, source: &str, profiles: &[String], providers: &Providers, behind: bool,
+        progress: &(dyn Fn(&str, u64, u64) + Sync)) -> Result<tensorfs_core::source_model::Made, Failure> {
+        self.lanes.run(behind, |stop| make_source(&self.store, source, profiles, providers, stop, progress))
+    }
+
+    /// One resolved checkpoint downloaded (`ensure_with`) in its lane (`Lanes`), under what no
+    /// store GC may evict as each attempt starts (`protected`).
+    fn ensure(&self, service: &Service, source: &hub::Source, checkpoint: &Named, pull: &Pull,
+        bytes: &(dyn Fn(u64, u64) + Sync)) -> Result<Option<tensorfs_core::ensure::PartHold>, Failure> {
+        self.lanes.run(pull.behind, |stop| {
+            let keep = self.protected(service).map_err(io_failure)?;
+            ensure_with(&self.store, source, checkpoint, &keep, pull, stop, bytes)
+        })
     }
 
     /// The checkpoint `named` is: a hash as given, a name as the Hub answers it (one closure
@@ -481,14 +550,13 @@ impl Publisher {
             }
         }
         let _fetching = self.fetch(vec![named.manifest.clone()]);
-        let keep = self.protected(service).map_err(io_failure).map_err(failed)?;
-        ensure(&self.store, source, &named, &keep, bytes).map_err(failed)?;
+        self.ensure(service, source, &named, &Pull::default(), bytes).map_err(failed)?;
         Ok(named)
     }
 
     /// Downloads the rest of every checkpoint `run`'s preparation took part of, once the run
-    /// is on its GPU. A remainder yields while a preparation fetches another checkpoint, and
-    /// speeds up for one waiting on it; its parts stay held from GC until it is recorded.
+    /// is on its GPU, behind every download a call waits on (`Lanes`); its parts stay held
+    /// from GC until it is recorded.
     pub fn complete_behind(self: &Arc<Self>, service: &Arc<Service>, run: &str) {
         let pending: Vec<String> = {
             let mut remainders = self.remainders.lock().unwrap();
@@ -513,12 +581,11 @@ impl Publisher {
     }
 
     fn remainder(&self, service: &Service, run: &str, manifest: &str) {
-        let tick = std::time::Duration::from_secs(1);
         while matches!(
             service.engine.get(run).map(|record| record.state),
             Ok(crate::journal::State::Queued | crate::journal::State::Starting)
         ) {
-            std::thread::sleep(tick);
+            std::thread::sleep(Duration::from_secs(1));
         }
         let Some((checkpoint, source)) = self
             .remainders
@@ -529,44 +596,8 @@ impl Publisher {
         else {
             return;
         };
-        let others = || self.fetching.lock().unwrap().keys().any(|m| m != manifest);
-        let waited_on = || self.fetching.lock().unwrap().contains_key(manifest);
-        let outcome = loop {
-            while others() {
-                std::thread::sleep(tick);
-            }
-            let keep = match self.protected(service) {
-                Ok(keep) => keep,
-                Err(e) => break Err(io_failure(e)),
-            };
-            let urgent = waited_on();
-            let cancellation = tensorfs_core::transport::PullCancellation::default();
-            let pull = Pull {
-                components: Vec::new(),
-                streams: (!urgent).then_some(BEHIND_STREAMS),
-                cancellation: Some(cancellation.clone()),
-            };
-            let done = std::sync::atomic::AtomicBool::new(false);
-            let result = std::thread::scope(|scope| {
-                scope.spawn(|| {
-                    while !done.load(std::sync::atomic::Ordering::Acquire) {
-                        std::thread::park_timeout(tick);
-                        if others() || (!urgent && waited_on()) {
-                            cancellation.cancel();
-                            return;
-                        }
-                    }
-                });
-                let result = ensure_with(&self.store, &source, &checkpoint, &keep, &pull, &|_, _| ());
-                done.store(true, std::sync::atomic::Ordering::Release);
-                result
-            });
-            match result {
-                Ok(_) => break Ok(()),
-                Err(_) if cancellation.is_cancelled() => continue,
-                Err(failure) => break Err(failure),
-            }
-        };
+        let pull = Pull { streams: Some(BEHIND_STREAMS), behind: true, ..Pull::default() };
+        let outcome = self.ensure(service, &source, &checkpoint, &pull, &|_, _| ());
         if let Err((code, detail)) = outcome {
             eprintln!("checkpoint {manifest}: the rest did not download ({code}: {detail})");
         }
@@ -1263,7 +1294,6 @@ impl Publisher {
             });
         }
         let _fetching = self.fetch(grants.iter().map(|g| g.manifest.clone()).collect());
-        let keep = self.protected(service).map_err(io_failure)?;
         // One download per checkpoint (a source model is already here), all at once: a LoRA
         // never waits behind its 100 GB base.
         // A slot that declares the components its callable uses has those downloaded first;
@@ -1302,7 +1332,7 @@ impl Publisher {
             .filter(|g| fetched.insert(g.manifest.clone()) && !g.repository.is_empty() && !g.repository.starts_with("local/"))
             .map(|g| (g, parts.get(g.manifest.as_str()).cloned().flatten().unwrap_or_default()))
             .collect();
-        let landed = download_all(&self.store, &request.source, &downloads, &keep, job)?;
+        let landed = download_all(self, service, &request.source, &downloads, job)?;
         let mut remainders = self.remainders.lock().unwrap();
         for (grant, hold) in landed {
             remainders
@@ -1333,7 +1363,7 @@ impl Publisher {
                 .find(|c| c.parameter == grant.slot || c.parameter == parameter)
             {
                 let resolve = |named| self.resolve(service, &request.source, named, &request.catalog_revision);
-                apply_adapters(&self.store, &request.source, &resolve, choice, grant, &keep, &request.providers, job)?;
+                apply_adapters(self, service, &request.source, &resolve, choice, grant, &request.providers, job)?;
             }
         }
         job.stage(format!("preparing {}", request.package));
@@ -1402,6 +1432,7 @@ fn make_source(
     source: &str,
     profiles: &[String],
     providers: &Providers,
+    cancellation: Option<PullCancellation>,
     progress: &(dyn Fn(&str, u64, u64) + Sync),
 ) -> Result<tensorfs_core::source_model::Made, Failure> {
     let mut sorted = profiles.to_vec();
@@ -1432,38 +1463,30 @@ fn make_source(
             access: &access,
             registry: None,
             progress,
-            cancellation: None,
+            cancellation,
         },
     )
     .map_err(|e| refused("model_source_failed", e))
 }
 
-/// Download one resolved checkpoint: a release's lane anonymously, the owner's checkpoint by
-/// hash under the run's capability; `keep` names what its GC must not evict (`protected`).
-fn ensure(
-    store: &Store,
-    source: &hub::Source,
-    checkpoint: &Named,
-    keep: &[String],
-    bytes: &(dyn Fn(u64, u64) + Sync),
-) -> Result<(), Failure> {
-    ensure_with(store, source, checkpoint, keep, &Pull::default(), bytes).map(drop)
-}
-
-/// How one ensure pulls: some components only (held until dropped), its streams, its stop.
+/// How one ensure pulls: some components only (held until dropped), its streams, and whether
+/// no call waits on it (`Lanes`).
 #[derive(Default)]
 struct Pull {
     components: Vec<String>,
     streams: Option<usize>,
-    cancellation: Option<tensorfs_core::transport::PullCancellation>,
+    behind: bool,
 }
 
+/// Download one resolved checkpoint: a release's lane anonymously, the owner's checkpoint by
+/// hash under the run's capability; `keep` names what its GC must not evict (`protected`).
 fn ensure_with(
     store: &Store,
     source: &hub::Source,
     checkpoint: &Named,
     keep: &[String],
     pull: &Pull,
+    cancellation: Option<PullCancellation>,
     bytes: &(dyn Fn(u64, u64) + Sync),
 ) -> Result<Option<tensorfs_core::ensure::PartHold>, Failure> {
     let (model, manifest) = (checkpoint.repository.as_str(), checkpoint.manifest.as_str());
@@ -1486,7 +1509,7 @@ fn ensure_with(
     request.lane = &checkpoint.lane;
     request.keep = &keep;
     request.on_event = Some(&on_event);
-    request.cancellation = pull.cancellation.clone();
+    request.cancellation = cancellation;
     if let Some(streams) = pull.streams {
         request.streams = streams;
     }
@@ -1511,10 +1534,10 @@ fn ensure_with(
 /// their sum; a checkpoint with a part named downloads that part only, and answers its hold.
 /// The first refusal is the answer, once every download has ended.
 fn download_all<'g>(
-    store: &Store,
+    publisher: &Publisher,
+    service: &Service,
     source: &hub::Source,
     grants: &[(&'g ModelGrant, Vec<String>)],
-    keep: &[String],
     job: &Job,
 ) -> Result<Vec<(&'g ModelGrant, tensorfs_core::ensure::PartHold)>, Failure> {
     if grants.is_empty() {
@@ -1536,8 +1559,8 @@ fn download_all<'g>(
             .map(|(at, (grant, part))| {
                 let moved = &moved;
                 scope.spawn(move || {
-                    let pull = Pull { components: part.clone(), ..Pull::default() };
-                    ensure_with(store, source, &Named::of(grant), keep, &pull, &|done, total| {
+                    let pull = Pull { components: part.clone(), behind: job.behind, ..Pull::default() };
+                    publisher.ensure(service, source, &Named::of(grant), &pull, &|done, total| {
                         let (done, total) = {
                             let mut moved = moved.lock().unwrap();
                             moved[at] = (done, total);
@@ -1574,19 +1597,21 @@ fn refused(code: &'static str, refusal: tensorfs_core::err::Refusal) -> Failure 
 /// adapter view composed (`adapter_views`); the grant then names the view.
 #[allow(clippy::too_many_arguments)]
 fn apply_adapters(
-    store: &Store,
+    publisher: &Publisher,
+    service: &Service,
     source: &hub::Source,
     resolve: &dyn Fn(Named) -> Result<Named, Failure>,
     choice: &domain::ModelChoice,
     grant: &mut ModelGrant,
-    keep: &[String],
     providers: &Providers,
     job: &Job,
 ) -> Result<(), Failure> {
-    let mut keep = keep.to_vec();
     if choice.adapters.is_empty() {
         return Ok(());
     }
+    let store = &publisher.store;
+    // Each adapter is held from GC (`protected`) while the next one downloads.
+    let mut fetching = vec![];
     job.stage(format!("preparing model adapters for {}", grant.slot));
     let object = |manifest: &str| -> Result<tensorfs_core::ids::ObjectRef, Failure> {
         let hex = manifest.trim_start_matches("sha256:");
@@ -1617,11 +1642,12 @@ fn apply_adapters(
                 lane: adapter.lane.clone(),
                 manifest: adapter.manifest.clone(),
             })?;
-            ensure(store, source, &named, &keep, &|d, t| job.bytes(d, t))?;
+            let pull = Pull { behind: job.behind, ..Pull::default() };
+            publisher.ensure(service, source, &named, &pull, &|d, t| job.bytes(d, t))?;
             named.manifest
         } else {
             // A provider-source LoRA (civitai://, hf://) is made here, normalized at ingest.
-            let made = make_source(store, &adapter.source, &adapter.profiles, providers, &|stage, moved, total| {
+            let made = publisher.make(&adapter.source, &adapter.profiles, providers, job.behind, &|stage, moved, total| {
                 job.set(Progress::Preparing {
                     stage: format!("{stage} for an adapter of {}", grant.slot),
                     moved,
@@ -1630,7 +1656,7 @@ fn apply_adapters(
             })?;
             format!("sha256:{}", made.manifest.sha256)
         };
-        keep.push(manifest.clone());
+        fetching.push(publisher.fetch(vec![manifest.clone()]));
         let strength = if adapter.scale.is_empty() {
             1.0
         } else {
@@ -1958,6 +1984,10 @@ fn split_lock(lock: &str, name: &str, release: &str, own_sdk: bool) -> Result<Lo
         sdk,
     })
 }
+
+#[cfg(test)]
+#[path = "../tests/common/names_hub.rs"]
+mod names_hub;
 
 #[cfg(test)]
 mod tests {
@@ -2382,7 +2412,7 @@ mod tests {
     fn a_civitai_lora_adapter_source_becomes_peft_factors() {
         let root = std::env::temp_dir().join(format!("cm-lora-{}", uuid::Uuid::new_v4()));
         let store = Store::ensure(&root.join("tensorfs")).unwrap();
-        let made = make_source(&store, "civitai://145907", &[], &Providers::default(), &|_, _, _| {}).unwrap();
+        let made = make_source(&store, "civitai://145907", &[], &Providers::default(), None, &|_, _, _| {}).unwrap();
         assert_eq!(made.profiles, ["sdxl/lora-kohya/1"]);
         let manifest = store.read_manifest(&made.manifest).unwrap();
         let header = tensorfs_core::checkpoint::load_header(&store, manifest.header().unwrap()).unwrap();
@@ -2390,5 +2420,135 @@ mod tests {
         assert_eq!(component, "unet");
         assert!(tensors.iter().any(|(key, _)| key.ends_with("attn1.to_q.lora_A.weight")));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A real checkpoint of `objects` distinct one-object tensors, in a source store.
+    fn checkpoint(store: &Store, objects: usize, tag: u8) -> ObjectRef {
+        use tensorfs_core::{
+            dtype::Dtype,
+            header::{Body, Closure, Header, Part, Tensor},
+            manifest::{Draft, Entry},
+            registry,
+            store::Fault,
+        };
+        let put = |bytes: &[u8]| store.put_stream(&mut &bytes[..], None, &Fault::default()).unwrap().obj;
+        let spec = registry::seeds().into_iter().find(|seed| seed.alias == "plain/1").unwrap().spec;
+        let tensors = (0..objects)
+            .map(|at| {
+                let value: Vec<u8> = (0..4096u32).flat_map(|i| [i.to_le_bytes(), [at as u8, tag, 0, 0]].concat()).collect();
+                let shape = vec![2048u64, 4];
+                let body = Body::Segments(vec![put(&value)]);
+                let part = Part { dtype: Dtype::F32, shape: shape.clone(), body };
+                let tensor = Tensor { dtype: Dtype::F32, shape, encoding: spec.object_id(), parts: vec![("value".into(), part)] };
+                (format!("w{at:03}"), tensor)
+            })
+            .collect();
+        let header = Header { configs: vec![], assets: vec![], encodings: vec![spec], components: vec![("model".into(), tensors)] };
+        header.validate(&Closure::default()).unwrap();
+        let header = put(&header.canonical_bytes().unwrap());
+        let manifest = Draft { entries: vec![("model.cozytensors".into(), Entry::CozyTensors(header))] }.seal().unwrap();
+        store.put_manifest(&manifest).unwrap().obj
+    }
+
+    /// A machine's publisher and service, and a loopback Hub serving `model` from `source`
+    /// whose every object answer takes `pace`.
+    struct Bench {
+        root: PathBuf,
+        source: Arc<Store>,
+        service: Arc<Service>,
+        publisher: Arc<Publisher>,
+    }
+
+    impl Bench {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("cm-lanes-{}", uuid::Uuid::new_v4()));
+            let source = Arc::new(Store::ensure(&root.join("source")).unwrap());
+            let service = Service::open(&root.join("state"), &root.join("g"), 1).unwrap();
+            let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
+            let publisher = Publisher::new(&root.join("published"), PackageSdk::default(), store).unwrap();
+            Self { root, source, service, publisher }
+        }
+
+        fn hub(&self, repository: &str, manifest: &ObjectRef, pace: u64) -> (hub::Source, Named, names_hub::Heard) {
+            let model = names_hub::Model {
+                repository: repository.into(),
+                release: "1.0.0".into(),
+                lane: "bf16".into(),
+                manifest: manifest.clone(),
+            };
+            let (origin, heard) = names_hub::paced(&self.source, model, None, Duration::from_millis(pace));
+            let named = Named { repository: repository.into(), release: "1.0.0".into(), lane: "bf16".into(), manifest: manifest.id() };
+            (hub::Source::new(&origin, None, vec!["localhost".into()], None).unwrap(), named, heard)
+        }
+    }
+
+    fn count(heard: &names_hub::Heard, asked: &str) -> usize {
+        heard.lock().unwrap().iter().filter(|h| h.starts_with(asked)).count()
+    }
+
+    /// Over a real link a download no call waits on (a hint's, a remainder) stops while one a
+    /// call waits on runs, and starts again once it ends, keeping what it landed.
+    #[test]
+    fn a_download_no_call_waits_on_goes_behind_one_a_call_does() {
+        let bench = Bench::new();
+        let (later, now) = (checkpoint(&bench.source, 40, 1), checkpoint(&bench.source, 8, 2));
+        let (behind_hub, behind, behind_heard) = bench.hub("acme/later", &later, 25);
+        let (waited_hub, waited, _) = bench.hub("acme/now", &now, 300);
+        let objects = |heard| count(heard, "GET /o/");
+        let pull = Pull { streams: Some(1), behind: true, ..Pull::default() };
+        std::thread::scope(|scope| {
+            let hint = scope.spawn(|| bench.publisher.ensure(&bench.service, &behind_hub, &behind, &pull, &|_, _| ()));
+            while objects(&behind_heard) < 3 && !hint.is_finished() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let before = objects(&behind_heard);
+            bench.publisher.download(&bench.service, &waited_hub, waited, "", &|_, _| ()).unwrap();
+            let during = objects(&behind_heard) - before;
+            // Alongside, it would have asked for ~12 more objects in the 300 ms the call took.
+            assert!(during <= 2, "{during} objects moved behind a download a call waited on");
+            hint.join().unwrap().unwrap();
+        });
+        assert_eq!(count(&behind_heard, "POST /v1/tensorfs/closure"), 2, "it stopped and started again");
+        let asked: Vec<String> = behind_heard.lock().unwrap().iter().filter(|h| h.starts_with("GET /o/")).cloned().collect();
+        let distinct: std::collections::BTreeSet<_> = asked.iter().collect();
+        assert!(asked.len() <= distinct.len() + 1, "what it landed before it stopped is kept: {asked:?}");
+        for (repository, manifest) in [("acme/later", &later), ("acme/now", &now)] {
+            tensorfs_core::checkpoint_root::check_source(bench.publisher.store(), repository, manifest).unwrap();
+        }
+        let _ = fs::remove_dir_all(&bench.root);
+    }
+
+    /// A call needing the checkpoint a hint is downloading takes it over at full speed rather
+    /// than waiting behind it, and shows its bytes done of the whole, what the hint landed
+    /// included; the hint then finds it here and moves nothing more.
+    #[test]
+    fn a_call_takes_over_the_download_a_hint_started() {
+        let bench = Bench::new();
+        let later = checkpoint(&bench.source, 40, 3);
+        // Two doors to the one checkpoint tell the hint's object asks from the call's.
+        let (hint_hub, named, hint_heard) = bench.hub("acme/later", &later, 50);
+        let (call_hub, _, call_heard) = bench.hub("acme/later", &later, 50);
+        let objects = |heard| count(heard, "GET /o/");
+        let seen = Mutex::new(Vec::new());
+        let pull = Pull { streams: Some(1), behind: true, ..Pull::default() };
+        std::thread::scope(|scope| {
+            let hint = scope.spawn(|| bench.publisher.ensure(&bench.service, &hint_hub, &named, &pull, &|_, _| ()));
+            while objects(&hint_heard) < 3 && !hint.is_finished() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            bench.publisher.download(&bench.service, &call_hub, named.clone(), "", &|done, total| {
+                seen.lock().unwrap().push((done, total))
+            })
+            .unwrap();
+            let hinted = objects(&hint_heard);
+            assert!(objects(&call_heard) + hinted >= 40 && hinted <= 6, "the call fetched the rest: {hinted} by the hint");
+            hint.join().unwrap().unwrap();
+            assert_eq!(objects(&hint_heard), hinted, "the hint moved nothing after the call");
+        });
+        let seen = seen.into_inner().unwrap();
+        let total = seen.last().unwrap().1;
+        assert_eq!(seen.last(), Some(&(total, total)));
+        assert!(seen.iter().any(|&(done, all)| all == total && done > 0 && done < total), "{seen:?}");
+        let _ = fs::remove_dir_all(&bench.root);
     }
 }

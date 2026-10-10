@@ -43,6 +43,8 @@ struct Served {
     package: Option<Package>,
     origin: String,
     heard: Arc<Mutex<Vec<String>>>,
+    /// How long each object answer takes, as a slow link's would.
+    pace: std::time::Duration,
 }
 
 /// What a request was heard as: `METHOD path`, its closure ref and lane, and `+credential`
@@ -50,6 +52,11 @@ struct Served {
 pub type Heard = Arc<Mutex<Vec<String>>>;
 
 pub fn serve(store: &Store, model: Model, package: Option<Package>) -> (String, Heard) {
+    paced(store, model, package, std::time::Duration::ZERO)
+}
+
+/// `serve`, each object answering after `pace`.
+pub fn paced(store: &Store, model: Model, package: Option<Package>, pace: std::time::Duration) -> (String, Heard) {
     let document = store.read_manifest(&model.manifest).unwrap();
     let walked = tensorfs_core::checkpoint::walk_cozytensors(store, &document).unwrap();
     let objects: Vec<ObjectRef> =
@@ -70,6 +77,7 @@ pub fn serve(store: &Store, model: Model, package: Option<Package>) -> (String, 
         package,
         origin: format!("http://127.0.0.1:{port}"),
         heard: heard.clone(),
+        pace,
     });
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -211,7 +219,10 @@ async fn answer(State(served): State<Arc<Served>>, method: Method, uri: Uri, hea
             json(json!({"expires_at_unix": now + 600, "server_time_unix": now, "urls": urls}))
         }
         (Method::GET, p) if p.starts_with("/o/") => match served.bytes.get(&p[3..]) {
-            Some(bytes) => ranged(bytes, &headers),
+            Some(bytes) => {
+                tokio::time::sleep(served.pace).await;
+                ranged(bytes, &headers)
+            }
             None => absent(),
         },
         _ => absent(),

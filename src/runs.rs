@@ -617,10 +617,10 @@ impl Runs {
             &spec,
             &spec.entrypoint,
             choices,
-            Box::new({
+            Some(Box::new({
                 let observe = observe.clone();
                 move |stage: &str, done: u64, total: u64| observe(stage, done, total)
-            }),
+            })),
         )?;
         let interface: Value = serde_json::from_slice(&installation.interface)
             .map_err(|_| refused("package_interface_invalid", "held interface is corrupt"))?;
@@ -754,7 +754,7 @@ impl Runs {
                 spec,
                 entrypoint,
                 choices,
-                Box::new(move |stage: &str, done: u64, total: u64| report(stage, done, total)),
+                Some(Box::new(move |stage: &str, done: u64, total: u64| report(stage, done, total))),
             )?;
             if item.level > Level::Installed && !declares(&installation, &item.entrypoint)? {
                 return Err(refused(
@@ -801,6 +801,7 @@ impl Runs {
 
     /// The run's installation and model plan: through the Hub when it needs one (a release,
     /// or held code declaring models), else held code with the operator's configured grants.
+    /// Unobserved, it is a hint's: its downloads go behind the ones calls wait on.
     #[allow(clippy::too_many_arguments)]
     fn resolve(
         &self,
@@ -811,7 +812,7 @@ impl Runs {
         spec: &Spec,
         entrypoint: &str,
         choices: &[domain::ModelChoice],
-        observe: crate::published::Observer,
+        observe: Option<crate::published::Observer>,
     ) -> Result<(Installation, Option<crate::gpu_service::GpuPlan>), Refused> {
         let needs_hub = held
             .as_ref()
@@ -978,7 +979,8 @@ impl Runs {
     }
 
     /// `model_prefetch`: an acknowledged hint about a future child call. TensorD resolves
-    /// its models and asks the GPU pool to prewarm a Runtime construction when admitted.
+    /// its models, downloading behind every download a call waits on, and asks the GPU pool
+    /// to prewarm a Runtime construction when admitted.
     pub fn prefetch(
         self: &Arc<Self>, parent: &Execution, application: &str, entrypoint: &str,
         passed: Vec<domain::ModelChoice>,
@@ -1000,7 +1002,7 @@ impl Runs {
                         None => None,
                     };
                     let (hub, models) = (spec.hub.clone(), spec.models.clone());
-                    runs.resolve(&actor, held, None, hub, &spec, &spec.entrypoint, &models, Box::new(|_, _, _| ()))
+                    runs.resolve(&actor, held, None, hub, &spec, &spec.entrypoint, &models, None)
                 })();
             match prepared {
                 Ok((installation, Some(plan))) => {
