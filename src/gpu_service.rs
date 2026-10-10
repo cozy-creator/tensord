@@ -1448,8 +1448,8 @@ impl GpuPool {
         match &placed {
             None if hosts.is_empty() => waiting.fill(true),
             None => hosts.iter().for_each(|device| waiting[*device] = true),
-            Some((device, _)) if !hosts.is_empty() && !hosts.contains(device) => {
-                crate::memory::note(serde_json::json!({"event": "replica", "plan": plan.id,
+            Some((device, _)) if !hosts.contains(device) => {
+                crate::memory::note(serde_json::json!({"event": "place", "plan": plan.id,
                     "gpu": self.devices[*device].entry, "running_on": hosts.iter()
                         .map(|d| &self.devices[*d].entry).collect::<Vec<_>>()}));
             }
@@ -1538,7 +1538,7 @@ impl GpuPool {
             .create(true)
             .append(true)
             .open(self.root.join("invokes.jsonl"))
-            .and_then(|mut file| writeln!(file, "{line}"));
+            .and_then(|mut file| file.write_all(format!("{line}\n").as_bytes()));
         if let Err(error) = written {
             eprintln!("invokes.jsonl: {error}");
         }
@@ -1599,7 +1599,7 @@ impl GpuPool {
             .create(true)
             .append(true)
             .open(self.root.join("prewarm.jsonl"))
-            .and_then(|mut file| writeln!(file, "{line}"));
+            .and_then(|mut file| file.write_all(format!("{line}\n").as_bytes()));
         if let Err(error) = written {
             eprintln!("prewarm.jsonl: {error}");
         }
@@ -1827,7 +1827,7 @@ impl GpuPool {
             .create(true)
             .append(true)
             .open(self.root.join("kernel-boot.jsonl"))
-            .and_then(|mut file| writeln!(file, "{line}"));
+            .and_then(|mut file| file.write_all(format!("{line}\n").as_bytes()));
         if let Err(error) = written {
             eprintln!("kernel-boot.jsonl: {error}");
         }

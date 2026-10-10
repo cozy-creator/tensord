@@ -39,8 +39,8 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   startup fence or an active GPU record this machine run does not supervise. CPU dispatch continues.
 - Placement (`GpuPool::place`): a group takes the first K GPUs. A one-GPU call takes, in order, a
   free GPU with its plan's idle executor; a free GPU where its learned want fits beside the tenants
-  there without evicting any (a replica when the plan runs elsewhere too: `memory: {"event":
-  "replica"}`); or, when the plan runs nowhere, the first free GPU. Otherwise it waits, and the GPUs
+  there without evicting any (a replica when the plan runs elsewhere too); or, when the plan runs
+  nowhere, the first free GPU. A new executor's GPU is logged as `memory: {"event": "place"}`. Otherwise it waits, and the GPUs
   it waits for are not taken afresh by later requests in that pass (its family may still borrow).
   A GPU that never ran the plan first copies its learned facts from one that did. Replicas share
   the host tier's layouts and are ordinary tenants of their GPU's memory policy. `loads.jsonl` and
