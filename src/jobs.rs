@@ -81,6 +81,14 @@ struct Parent {
 }
 
 impl Parent {
+    /// The bytes done of the download the child call `request` is in now, of its total.
+    fn child_bytes(&self, engine: &Engine, request: &str) -> Option<(u64, u64)> {
+        let child = self.calls.lock().unwrap().by_index.values().find(|c| c.request == request)?.child.clone();
+        let progress: Value = serde_json::from_str(&engine.get(&child).ok()?.progress?).ok()?;
+        let total = progress["bytes_total"].as_u64().filter(|total| *total > 0)?;
+        Some((progress["bytes_done"].as_u64()?.min(total), total))
+    }
+
     fn callable(&self, frame: &Frame) -> Result<&(String, String), (&'static str, String)> {
         self.callables
             .get(&(frame.module.clone(), frame.export.clone()))
@@ -1142,6 +1150,11 @@ impl Services for Seam<'_> {
                 payload[name] = value;
             }
         }
+        // A child's stage the job relays (the Runtime relays no bytes) carries its download's.
+        let child = self.job.filter(|_| !frame.call_request.is_empty());
+        if let Some((done, total)) = child.and_then(|(_, parent)| parent.child_bytes(self.engine, &frame.call_request)) {
+            (payload["bytes_done"], payload["bytes_total"]) = (done.into(), total.into());
+        }
         let _ = self
             .engine
             .observe_progress(self.id, self.completed, payload.to_string());
@@ -1767,6 +1780,8 @@ fn weights_current(engine: Arc<Engine>, record: &Execution) -> Arc<dyn Fn() -> b
 
 #[cfg(test)]
 mod prefetch_tests;
+#[cfg(test)]
+mod progress_tests;
 
 #[cfg(test)]
 mod exact_tests {
