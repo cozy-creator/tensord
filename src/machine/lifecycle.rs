@@ -23,6 +23,10 @@ struct IdleState {
     deadline_ms: i64,
     released: bool,
     work_observed: bool,
+    /// Known use whose ledger write failed. Hold release and retry; accepted history
+    /// recovers a crash before this pending write succeeds.
+    #[serde(skip)]
+    work_pending: bool,
     unknown: bool,
     /// An update is activating: no new work is admitted until it exits or fails.
     #[serde(skip)]
@@ -99,7 +103,9 @@ impl Lifecycle {
 
     fn due(state: &(IdleState, i64), now: i64) -> bool {
         state.0.released
-            || (!state.0.work_observed && now >= state.0.deadline_ms.max(state.1))
+            || (!state.0.work_observed
+                && !state.0.work_pending
+                && now >= state.0.deadline_ms.max(state.1))
     }
 
     pub fn admit(self: &Arc<Self>) -> Result<Admission, Status> {
@@ -137,8 +143,10 @@ impl Lifecycle {
         if state.0.work_observed {
             return Ok(());
         }
+        state.0.work_pending = true;
         let mut used = state.0.clone();
         used.work_observed = true;
+        used.work_pending = false;
         self.save(&used)?;
         state.0 = used;
         Ok(())
@@ -154,12 +162,14 @@ impl Lifecycle {
         }
         if busy {
             state.1 = state.1.max(now + IDLE_GRACE_MS);
+            state.0.work_pending |= !state.0.work_observed;
         }
         let target = state.0.deadline_ms.max(state.1);
-        if target - state.0.deadline_ms >= IDLE_GRACE_MS / 2 || busy && !state.0.work_observed {
+        if target - state.0.deadline_ms >= IDLE_GRACE_MS / 2 || state.0.work_pending {
             let mut observed = state.0.clone();
             observed.deadline_ms = target;
-            observed.work_observed |= busy;
+            observed.work_observed |= state.0.work_pending;
+            observed.work_pending = false;
             self.save(&observed)?;
             state.0 = observed;
         }
@@ -185,12 +195,12 @@ impl Lifecycle {
             ));
         }
         if let Some(seen) = id.and_then(|id| state.0.keepalives.get(id)) {
-            return Ok((seen[0], if state.0.work_observed { 0 } else { seen[1] }));
+            return Ok((seen[0], if state.0.work_observed || state.0.work_pending { 0 } else { seen[1] }));
         }
         if state.0.keepalives.len() >= 256 {
             state.0.keepalives.clear();
         }
-        let deadline = if state.0.work_observed { 0 } else { now + IDLE_GRACE_MS };
+        let deadline = if state.0.work_observed || state.0.work_pending { 0 } else { now + IDLE_GRACE_MS };
         if let Some(id) = id {
             state.0.keepalives.insert(id.to_owned(), [now, deadline]);
         }
@@ -209,7 +219,7 @@ impl Lifecycle {
     /// Only unused rentals release automatically. A committed release remains irreversible.
     pub fn releases(&self) -> bool {
         let state = self.state.lock().unwrap();
-        self.rental && (state.0.released || !state.0.work_observed)
+        self.rental && (state.0.released || (!state.0.work_observed && !state.0.work_pending))
     }
 
     pub fn deadline_ms(&self) -> i64 {
@@ -219,6 +229,17 @@ impl Lifecycle {
 
     pub fn released(&self) -> bool {
         self.state.lock().unwrap().0.released
+    }
+
+    /// Unknown activity blocks a new release, but cannot undo committed cleanup.
+    fn observe_before_release(&self, busy: impl FnOnce() -> io::Result<bool>) -> io::Result<()> {
+        if self.released() {
+            return Ok(());
+        }
+        if self.state.lock().unwrap().0.work_pending {
+            self.work()?;
+        }
+        self.observe(busy()?).map(|_| ())
     }
 
     /// Takes the release once the deadline passed and nothing holds it. Irreversible.
@@ -284,17 +305,10 @@ pub async fn release_when_idle(
 ) {
     let mut next_ask = 0;
     loop {
-        let active = match busy() {
-            Ok(active) => active,
-            Err(error) => {
-                // Uncertainty holds this check; it is not proof of application use.
-                eprintln!("cozy-machine: cannot observe rental activity: {error}");
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                continue;
-            }
-        };
-        if let Err(error) = lifecycle.observe(active) {
-            eprintln!("cozy-machine: idle ledger: {error}");
+        if let Err(error) = lifecycle.observe_before_release(&busy) {
+            eprintln!("cozy-machine: cannot observe rental activity: {error}");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
         }
         let now = now_ms();
         if now >= lifecycle.deadline_ms() && now >= next_ask {
@@ -348,6 +362,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unreadable_activity_holds_only_before_release_is_committed() {
+        let dir = std::env::temp_dir().join(format!("release-uncertainty-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lifecycle = Lifecycle::open(dir.join("idle.json"), true, true).unwrap();
+        let unreadable = || Err(io::Error::other("activity unavailable"));
+        assert!(lifecycle.observe_before_release(unreadable).is_err());
+        assert!(lifecycle.releases(), "uncertainty did not mark application use");
+        lifecycle.state.lock().unwrap().0.deadline_ms = 1;
+        assert!(lifecycle.claim().unwrap());
+        assert!(lifecycle.observe_before_release(unreadable).is_ok());
+        assert!(lifecycle.claim().unwrap(), "committed release still retries cleanup");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn used_transition_retries_after_a_failed_durable_write() {
         let dir = std::env::temp_dir().join(format!("used-write-failure-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -355,14 +384,20 @@ mod tests {
         let lifecycle = Lifecycle::open(path.clone(), true, true).unwrap();
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
-        assert!(lifecycle.work().is_err());
-        assert!(lifecycle.releases(), "failed persistence did not commit used state");
-        assert!(lifecycle.observe(true).is_err());
-        assert!(lifecycle.releases());
+        let admission = lifecycle.admit().unwrap();
+        assert!(admission.work().is_err());
+        drop(admission);
+        lifecycle.state.lock().unwrap().0.deadline_ms = 1;
+        assert!(!lifecycle.state.lock().unwrap().0.work_observed);
+        assert!(!lifecycle.releases(), "known pending use holds release");
+        assert!(!lifecycle.claim().unwrap());
+        assert!(lifecycle.observe(false).is_err(), "idle still retries pending use");
+        assert!(!lifecycle.claim().unwrap());
         std::fs::remove_dir(&path).unwrap();
-        lifecycle.work().unwrap();
+        lifecycle.observe(false).unwrap();
         let restarted = Lifecycle::open(path, true, false).unwrap();
         assert!(!restarted.releases());
+        assert!(!restarted.claim().unwrap());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
