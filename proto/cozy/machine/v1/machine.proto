@@ -308,7 +308,7 @@ message StatusFrame {
   string version = 3;               // this machine's release
   repeated string capabilities = 4;
   bytes receipt = 5;                // the sealed readiness envelope; empty until sealed
-  int64 idle_deadline_unix_ms = 6;  // a rental's release, 15 min after its last job; 0: never
+  int64 idle_deadline_unix_ms = 6;  // an idle rental's release, 15 min after its last job; 0: none (a job is queued or running, or it never releases)
   repeated RunState runs = 7;       // the caller's live runs
   string phase = 8;                 // booting, ready, releasing
   string platform = 9;              // os/arch
