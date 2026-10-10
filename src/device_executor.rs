@@ -682,6 +682,8 @@ pub struct Frame {
     pub overall_fraction: Option<f64>,
     pub step_ms: Option<f64>,
     pub advance: u64,
+    /// `progress`: the child call whose stage a job relays.
+    pub call_request: String,
     /// PrepareRequest: the request's normalized features (its shape).
     pub features: BTreeMap<String, Value>,
     /// `device_tier`: fds that follow the frame, one per chunk of `regions`.
