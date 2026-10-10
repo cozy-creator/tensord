@@ -925,6 +925,9 @@ impl GpuPool {
         plan: &GpuPlan,
         sessions: &mut BTreeMap<String, Session>,
     ) -> io::Result<&'static str> {
+        if !sessions.get(&plan.id).is_some_and(|session| session.loaded) {
+            return Ok("its model construction is not loaded");
+        }
         let level = self.levels.lock().unwrap().get(&plan.id).map(|(_, level)| *level);
         if level == Some(Level::Gpu) {
             return Ok("mapped");
@@ -1530,9 +1533,10 @@ impl GpuPool {
         sessions: &mut BTreeMap<String, Session>,
         member: bool,
     ) -> io::Result<&'static str> {
-        if sessions.contains_key(&plan.id) {
+        if sessions.get(&plan.id).is_some_and(|session| session.loaded) {
             return Ok("already loaded");
         }
+        let cold = !sessions.contains_key(&plan.id);
         let lane = self.lane(plan.degree)?;
         let mut load_caps = vec![];
         for (index, device) in lane.iter().enumerate() {
@@ -1555,17 +1559,22 @@ impl GpuPool {
             return Ok("host_memory: no host room beside the warm set and what this host's other programs used recently");
         }
         if !member {
-            load_caps = self.decide(&plan.id, plan.degree, true, sessions)?;
+            load_caps = self.decide(&plan.id, plan.degree, cold, sessions)?;
         }
-        for device in lane {
-            device
-                .memory
-                .with(|gpu| gpu.starting(&plan.id, gpu.spawn_need(&plan.id)));
-        }
-        let mut session = self.new_session(engine, held, &plan, |birth, _| {
-            self.first().with(|gpu| gpu.spawned(&plan.id, birth.pid));
-            Ok(())
-        })?;
+        let mut session = match sessions.remove(&plan.id) {
+            Some(session) => session, // Canceled preflight: retain its in-flight builder.
+            None => {
+                for device in lane {
+                    device
+                        .memory
+                        .with(|gpu| gpu.starting(&plan.id, gpu.spawn_need(&plan.id)));
+                }
+                self.new_session(engine, held, &plan, |birth, _| {
+                    self.first().with(|gpu| gpu.spawned(&plan.id, birth.pid));
+                    Ok(())
+                })?
+            }
+        };
         match self.call(
             engine,
             "",
