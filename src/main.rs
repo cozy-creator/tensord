@@ -374,9 +374,10 @@ fn start_api(
 ) -> io::Result<()> {
     use cozy_machine::{api, machine_api::NativeBackend};
     sdk.client_wheel = wheel.clone();
-    let (pair, uv): (Vec<PathBuf>, _) = (
+    let (pair, uv, seed_cache): (Vec<PathBuf>, _, _) = (
         sdk.requirements.iter().map(PathBuf::from).collect(),
         sdk.uv.clone(),
+        sdk.seed_cache.clone(),
     );
     let store = owner.lock().unwrap().store();
     let mut backend = NativeBackend::new(service.clone(), identity.authority.clone(), store.clone());
@@ -394,6 +395,7 @@ fn start_api(
             staging_root: root.join("package-staging"),
             sdk: pair,
             uv: uv.clone(),
+            seed_cache,
         }),
         (Some(_), None) => {
             return Err(io::Error::other(

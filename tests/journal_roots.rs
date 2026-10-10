@@ -80,6 +80,7 @@ fn open(root: &Path, tools: &Tools) -> Machine {
             staging_root: root.join("staging"),
             sdk: vec![],
             uv: "uv".into(),
+            seed_cache: None,
         },
         store.clone(),
     );

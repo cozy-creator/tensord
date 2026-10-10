@@ -173,6 +173,7 @@ fn same_filename_activation_installs_new_runtime_and_retains_old_generation() {
                 staging_root: root.join("staging"),
                 sdk: sdk.requirements.iter().map(PathBuf::from).collect(),
                 uv: "uv".into(),
+                seed_cache: None,
             },
             store.clone(),
         )

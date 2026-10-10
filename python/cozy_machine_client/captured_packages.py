@@ -41,6 +41,24 @@ def installed_description(distribution: str, interpreter: Path) -> msgspec.Raw:
     return in_environment(interpreter, DescribeInstalled(distribution, str(interpreter)), DESCRIPTION_DECODER).interface
 
 
+#: Under symlinks (an image's seeded cache) the code the Runtime describes (an App's wheel, the
+#: SDK, the runner client) is copied into the environment: its static reader refuses metadata
+#: and sources linked from elsewhere. Only the locked dependencies are linked.
+COPY = ("--link-mode", "copy") if os.environ.get("UV_LINK_MODE") == "symlink" else ()
+
+
+def linked_applications(interpreter: Path) -> list[str]:
+    """Installed distributions that declare an App and were linked, not copied: the Runtime's
+    static reader describes only copied ones (a callee package among the locked dependencies)."""
+    names = []
+    for site in interpreter.parents[1].glob("lib/python*/site-packages"):
+        for metadata in site.glob("*.dist-info"):
+            entries = metadata / "entry_points.txt"
+            if entries.is_symlink() and "[cozy.application]" in entries.read_text():
+                names.append(metadata.name.removesuffix(".dist-info").rpartition("-")[0])
+    return names
+
+
 def inventory(interpreter: Path) -> list[Dependency]:
     return msgspec.json.decode(subprocess.check_output(["uv", "pip", "list", "--python", str(interpreter), "--format", "json"]), type=list[Dependency])
 
@@ -54,7 +72,7 @@ def machine_sdk(interpreter: Path, sdk: list[Path], capture) -> str:
     kept = interpreter.parents[2] / "sdk-constraints.txt"
     kept.write_text("".join(f"{row.name}=={row.version}\n" for row in inventory(interpreter)
                             if canonicalize_name(row.name) not in pair))
-    step = subprocess.run(["uv", "pip", "install", "--python", str(interpreter), "-c", str(kept), *map(str, sdk)],
+    step = subprocess.run(["uv", "pip", "install", *COPY, "--python", str(interpreter), "-c", str(kept), *map(str, sdk)],
                           stderr=subprocess.PIPE, text=True)
     sys.stderr.write(step.stderr)
     if step.returncode == 0:
@@ -120,20 +138,24 @@ def install_captured(*, project: Path | None, wheels: list[Path], requirements: 
             if frozen:
                 # UV_PROJECT_ENVIRONMENT is a standard destination configuration value.
                 environment = {**os.environ, "UV_PROJECT_ENVIRONMENT": str(root / "env")}
-                subprocess.run(["uv", "sync", "--frozen", "--no-dev", "--no-editable", "--no-python-downloads",
+                subprocess.run(["uv", "sync", *COPY, "--frozen", "--no-dev", "--no-editable", "--no-python-downloads",
                                 "--project", str(source), "--python", python], env=environment, check=True)
             elif requirements and requirements.stat().st_size:
-                # uv owns hashed requirements parsing and standard download integrity.
+                # uv owns hashed requirements parsing and standard download integrity. The locked
+                # dependencies link as the machine says (an image's seeded cache: symlinks).
                 command = ["uv", "pip", "install", "--python", str(interpreter), "--require-hashes", "-r", str(requirements)]
                 if wheels:
                     command += ["--find-links", str(wheels[0].parent)]
                 subprocess.run(command, check=True)
+                linked = linked_applications(interpreter) if COPY else []
+                if linked:
+                    subprocess.run([*command, *COPY, "--no-deps", *(f"--reinstall-package={name}" for name in linked)], check=True)
                 if wheels:
-                    subprocess.run(["uv", "pip", "install", "--python", str(interpreter), "--no-deps", *map(str,wheels)], check=True)
+                    subprocess.run(["uv", "pip", "install", *COPY, "--python", str(interpreter), "--no-deps", *map(str,wheels)], check=True)
             elif project:
-                subprocess.run(["uv", "pip", "install", "--python", str(interpreter), str(project), *map(str,wheels)], check=True)
+                subprocess.run(["uv", "pip", "install", *COPY, "--python", str(interpreter), str(project), *map(str,wheels)], check=True)
             else:
-                subprocess.run(["uv", "pip", "install", "--python", str(interpreter), *map(str,wheels)], check=True)
+                subprocess.run(["uv", "pip", "install", *COPY, "--python", str(interpreter), *map(str,wheels)], check=True)
 
         capture()
         fallback = machine_sdk(interpreter, sdk, capture) if sdk else ""
@@ -142,7 +164,7 @@ def install_captured(*, project: Path | None, wheels: list[Path], requirements: 
         constraints.write_text("".join(f"{row.name}=={row.version}\n" for row in locked))
         # Runner dependencies may be added only without changing a single already
         # selected package/SDK version. uv reports any conflict with declared bounds.
-        subprocess.run(["uv", "pip", "install", "--python", str(interpreter), "-c", str(constraints), str(client_wheel)], check=True)
+        subprocess.run(["uv", "pip", "install", *COPY, "--python", str(interpreter), "-c", str(constraints), str(client_wheel)], check=True)
         after = {canonicalize_name(row.name): row.version for row in inventory(interpreter)}
         if any(after.get(canonicalize_name(row.name)) != row.version for row in locked):
             raise PackageError("package_lock_changed", "runner installation changed the captured dependency closure")
