@@ -33,9 +33,6 @@ pub struct Invocation {
     /// A child run's parent (its execution id): children end with it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub parent: String,
-    /// A warm-up (`kind: warm`): preparation alone, never a job a rental works on.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub warm: bool,
 }
 
 /// One file input: the declared field path, its exact bytes (sha256 and length, held in the
@@ -1604,18 +1601,17 @@ impl Journal {
     }
 
     /// Accepted history remains evidence of use even after every execution is terminal.
-    /// Whether a job (any run but a warm-up) is queued or running, and when the last one
-    /// stopped (ended, or paused): `since` or later. A record changed since `since` is the only
-    /// one that can have stopped after it, so each sample reads only what changed.
+    /// Whether a job (any run asked of this machine: a call, a job, a warm-up, an upload) is
+    /// queued or running, and when the last one stopped (ended, or paused): `since` or later.
+    /// A record changed since `since` is the only one that can have stopped after it, so each
+    /// sample reads only what changed.
     pub fn jobs(&self, since: i64) -> io::Result<(bool, i64)> {
         self.connection
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM executions WHERE state IN ('queued','starting','running')
-                   AND json_extract(invocation,'$.warm') IS NULL),
+                "SELECT EXISTS(SELECT 1 FROM executions WHERE state IN ('queued','starting','running')),
                  (SELECT MAX(CASE state WHEN 'paused' THEN updated_ms
                    ELSE json_extract(record,'$.finished_at_ms') END) FROM executions
-                   WHERE updated_ms>=?1 AND state IN ('completed','failed','canceled','paused')
-                   AND json_extract(invocation,'$.warm') IS NULL)",
+                   WHERE updated_ms>=?1 AND state IN ('completed','failed','canceled','paused'))",
                 [since],
                 |row| Ok((row.get(0)?, row.get::<_, Option<i64>>(1)?.unwrap_or(0).max(since))),
             )

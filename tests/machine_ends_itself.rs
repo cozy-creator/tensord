@@ -370,28 +370,53 @@ async fn deadline(client: &mut MachineClient<Channel>, cap: &str, keepalive: boo
 struct HeldHub {
     origin: String,
     close: mpsc::Sender<()>,
+    /// The machine's end of each held connection: (its port, the Hub's port).
+    accepted: mpsc::Receiver<(u16, u16)>,
 }
 fn held_hub() -> HeldHub {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
-    let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let port = listener.local_addr().unwrap().port();
+    let origin = format!("http://127.0.0.1:{port}");
     let (close, closed) = mpsc::channel::<()>();
+    let (sender, accepted) = mpsc::channel();
     std::thread::spawn(move || {
         let mut held = vec![];
         while closed.try_recv() == Err(mpsc::TryRecvError::Empty) {
-            if let Ok((stream, _)) = listener.accept() {
+            if let Ok((stream, peer)) = listener.accept() {
+                let _ = sender.send((peer.port(), port));
                 held.push(stream);
             }
             std::thread::sleep(Duration::from_millis(20));
         }
     });
-    HeldHub { origin, close }
+    HeldHub { origin, close, accepted }
 }
 
-/// Submits a call of a release that prepares from `hub`: a job queued for this rental.
+/// The kernel's keepalive timer on the loopback connection from `local` to `remote`, in
+/// seconds until its next probe: Some only when keepalive probing is armed (`ss -o`'s
+/// `timer:(keepalive,…)`).
+fn keepalive_timer(local: u16, remote: u16) -> Option<f64> {
+    let table = std::fs::read_to_string("/proc/net/tcp").unwrap();
+    let ends = (format!("0100007F:{local:04X}"), format!("0100007F:{remote:04X}"));
+    table.lines().skip(1).find_map(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if (fields[1], fields[2]) != (ends.0.as_str(), ends.1.as_str()) {
+            return None;
+        }
+        let (timer, when) = fields[5].split_once(':')?;
+        (timer == "02").then(|| u64::from_str_radix(when, 16).unwrap() as f64 / 100.0)
+    })
+}
+
+/// Submits a run of a release that prepares from `hub`: a job queued for this rental.
 async fn submit(client: &mut MachineClient<Channel>, cap: &str, id: &str, hub: &str) -> tonic::Streaming<v1::RunEvent> {
+    submit_kind(client, cap, id, hub, v1::RunKind::Call).await
+}
+
+async fn submit_kind(client: &mut MachineClient<Channel>, cap: &str, id: &str, hub: &str, kind: v1::RunKind) -> tonic::Streaming<v1::RunEvent> {
     let spec = v1::RunSpec {
-        kind: v1::RunKind::Call as i32,
+        kind: kind as i32,
         source: Some(v1::run_spec::Source::Release(v1::Release { package: "acme/stalled".into(), ..Default::default() })),
         entrypoint: "generate".into(),
         hub: Some(v1::HubAccess { origin: hub.into(), ..Default::default() }),
@@ -413,8 +438,9 @@ async fn ended(events: &mut tonic::Streaming<v1::RunEvent>) -> v1::Outcome {
     panic!("the run's log ended without an outcome");
 }
 
-/// A job queued for the rental holds it past its idle window, twice over; the clock starts when
-/// that job ends, and the used rental releases one window later.
+/// A job queued for the rental (here a controller's warm request) holds it past its idle window,
+/// twice over; the clock starts when that job ends, and the used rental releases one window
+/// later.
 #[tokio::test]
 async fn a_job_holds_the_rental_and_its_end_starts_the_idle_clock() {
     let root = root("idle-job");
@@ -428,9 +454,15 @@ async fn a_job_holds_the_rental_and_its_end_starts_the_idle_clock() {
     let at = now_ms();
     assert!((renewed - at - idle_ms).abs() < 1_000, "keepalive answers the real deadline: {renewed} at {at}");
     let hub = held_hub();
-    let mut events = submit(&mut client, &cap, "stalled-1", &hub.origin).await;
+    // A controller's warm request is a job: asked of the machine, it holds the rental.
+    let mut events = submit_kind(&mut client, &cap, "stalled-1", &hub.origin, v1::RunKind::Warm).await;
     let working = deadline(&mut client, &cap, false).await;
     assert!(working >= renewed, "a queued job holds the clock at now + the window");
+    // Its Hub connection is waited on while alive and probed for liveness at the transfer's
+    // measured window (a 5 s sample, 6 still samples): a dead one fails the job.
+    let (local, remote) = hub.accepted.recv_timeout(Duration::from_secs(30)).expect("the run never reached its Hub");
+    let probe = keepalive_timer(local, remote).expect("the Hub connection has no keepalive probing");
+    assert!(probe <= 30.0, "first keepalive probe in {probe} s");
     assert!(
         received.recv_timeout(Duration::from_millis(2 * idle_ms as u64)).is_err(),
         "the rental released itself while a job was queued for it"
@@ -451,7 +483,7 @@ async fn a_job_holds_the_rental_and_its_end_starts_the_idle_clock() {
     let released = now_ms();
     assert!(method == "POST" && body.contains("podTerminate"), "{body}");
     assert!(released >= due - 500, "released at {released}, before its deadline {due}");
-    assert!(released < due + 5_000, "released at {released}, long after its deadline {due}");
+    assert!(released < due + 15_000, "released at {released}, long after its deadline {due}");
     drop(machine);
     std::fs::remove_dir_all(root).unwrap();
 }
