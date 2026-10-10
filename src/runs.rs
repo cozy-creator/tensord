@@ -361,6 +361,7 @@ impl Runs {
             job: spec.job,
             accelerator: false, // known only after the actual installation is prepared
             parent: spec.parent.clone(),
+            warm: spec.warm,
         };
         let (record, new) = self
             .service

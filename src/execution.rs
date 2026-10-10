@@ -516,8 +516,9 @@ impl Engine {
         }
         Ok(records)
     }
-    pub fn has_executions(&self) -> io::Result<bool> {
-        self.journal.lock().unwrap().has_executions()
+    /// See `Journal::jobs`.
+    pub fn jobs(&self, since: i64) -> io::Result<(bool, i64)> {
+        self.journal.lock().unwrap().jobs(since)
     }
     pub fn supervising(&self) -> usize {
         self.owned.lock().unwrap().len()

@@ -386,9 +386,10 @@ impl Updates {
         // A committed terminal outcome may still have cleanup to do. Finish that before a
         // different operation overwrites its status and loses the pending decision's meaning.
         recover_activation(&self.paths).map_err(server)?;
-        // Preparing holds idle release; activation then closes admission.
-        let admitted = self.lifecycle.as_ref().map(|l| l.admit()).transpose()
-            .map_err(|refused| (503, refused.message().to_string()))?;
+        // An update is not a job: a released or activating machine refuses it, and preparing it
+        // never holds the rental's idle release. Activation then closes admission.
+        drop(self.lifecycle.as_ref().map(|l| l.admit()).transpose()
+            .map_err(|refused| (503, refused.message().to_string()))?);
         let mut status = Status {
             operation: request.operation.clone(),
             from: pair_in(&self.paths.sdk()),
@@ -403,7 +404,7 @@ impl Updates {
         std::thread::Builder::new()
             .name("runtime-update".into())
             .spawn(move || {
-                if let Err(error) = updates.run(&request, exit, admitted) {
+                if let Err(error) = updates.run(&request, exit) {
                     if let Err(persist) = updates.set(|s| {
                         if !s.terminal() {
                             s.error = error.to_string();
@@ -428,7 +429,7 @@ impl Updates {
         Ok(())
     }
 
-    fn run(&self, request: &Request, exit: fn(i32), admitted: Option<super::lifecycle::Admission>) -> io::Result<()> {
+    fn run(&self, request: &Request, exit: fn(i32)) -> io::Result<()> {
         self.set(|s| s.enter("preparing"))?;
         let sdk = self.paths.engine.join("sdk");
         fs::create_dir_all(&sdk)?;
@@ -466,7 +467,6 @@ impl Updates {
         // No new work is admitted from here; work admitted before drains first.
         let _activation = self.lifecycle.as_ref().map(|l| l.activate()).transpose()
             .map_err(|refused| io::Error::other(refused.message().to_string()))?;
-        drop(admitted);
         if !(self.idle)() {
             self.set(|s| s.enter("waiting_activation"))?;
             while !(self.idle)() {
@@ -815,7 +815,7 @@ mod tests {
         fs::create_dir_all(&paths.image_wheels).unwrap();
         wheel(&paths.image_wheels, "cozy_runtime", "0.1.0", None);
         wheel(&paths.image_wheels, "tensorfs", "0.1.0", None);
-        let lifecycle = super::super::lifecycle::Lifecycle::open(root.join("idle.json"), false, true).unwrap();
+        let lifecycle = super::super::lifecycle::Lifecycle::open(root.join("idle.json"), false, true, super::super::lifecycle::IDLE_GRACE_MS).unwrap();
         let earlier = lifecycle.admit().unwrap();
         let drained = lifecycle.clone();
         let idle = Box::new(move || drained.admitted() == 0);

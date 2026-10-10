@@ -208,7 +208,7 @@ fn service_cmdline(parent: u32) -> String {
         .split_whitespace()
         .filter_map(|pid| std::fs::read(format!("/proc/{pid}/cmdline")).ok())
         .map(|raw| String::from_utf8_lossy(&raw).replace('\0', " "))
-        .find(|line| line.contains("cozy-machine"))
+        .find(|line| line.contains("cozy-machine") || line.contains("agent/current"))
         .unwrap_or_default()
 }
 

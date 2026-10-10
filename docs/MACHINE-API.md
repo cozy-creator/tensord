@@ -75,9 +75,9 @@ otherwise): its root stops, started children run to their end, unstarted ones wa
 shows `paused`. Resume replays the root, whose calls find their finished children
 (`DURABLE-EXECUTION.md`); `run_pausing` and `run_not_paused` refuse early or late resumes.
 
-**Activity** (a rental's idle release) is non-terminal runs, preparations and explicit keepalives
-only. Open streams and other calls are not activity: a daemon that holds a stream must not bill
-forever.
+**Activity** (a rental's idle release, `rental-lifetime.md`) is a job queued or running, and an
+explicit keepalive restarts the clock once. Warm-ups, uploads, updates, open streams and other
+calls are not activity: a daemon that holds a stream must not bill forever.
 
 ## Today's 35 rows
 

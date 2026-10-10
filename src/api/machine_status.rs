@@ -145,9 +145,7 @@ async fn frame<B: MachineBackend>(
         .unwrap_or_default();
     let lifecycle = identity.lifecycle.as_ref();
     Ok(v1::StatusFrame {
-        idle_deadline_unix_ms: lifecycle
-            .filter(|l| l.releases())
-            .map_or(0, |l| l.deadline_ms().max(0)),
+        idle_deadline_unix_ms: lifecycle.map_or(0, |l| l.deadline_ms()),
         runs,
         phase: match lifecycle {
             Some(l) if l.released() => "releasing",

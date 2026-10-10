@@ -338,7 +338,7 @@ impl Publisher {
                         job.clone(),
                     );
                     std::thread::spawn(move || {
-                        // A rental is not idle while it installs or downloads for a run.
+                        // An update does not activate while this installs or downloads for a run.
                         let _preparing = service.preparing();
                         let result = this.work(&service, &actor, &request, &worker);
                         worker.set(match result {

@@ -25,6 +25,7 @@ const NAMES: &[&str] = &[
     "COZY_RECORD_OWNER_AUTH_JSON",
     "COZY_AUTHORIZED_KEYS",
     "COZY_SSH_PUBLIC_KEY",
+    "COZY_RENTAL_IDLE_SECONDS",
     super::provider::API_ORIGIN,
     RECEIPT_KEY,
     RECEIPT_KEY_FILE,
@@ -72,6 +73,8 @@ pub struct Grant {
     /// The pod's own provider credential, which ends it when the Hub cannot. Never read from the
     /// environment here: [`super::provider::ProviderSelf::take`] keeps it from everything else.
     pub provider: Option<super::provider::ProviderSelf>,
+    /// How long a rental stays with no job before it releases itself (15 minutes).
+    pub idle_ms: i64,
     pub ignored: Vec<String>,
 }
 
@@ -222,6 +225,11 @@ impl Grant {
                 }
             },
         };
+        let idle_ms = match get("COZY_RENTAL_IDLE_SECONDS").map(str::parse::<u32>) {
+            None => super::lifecycle::IDLE_GRACE_MS,
+            Some(Ok(seconds)) if seconds > 0 => i64::from(seconds) * 1000,
+            Some(_) => return Err(invalid("COZY_RENTAL_IDLE_SECONDS must be a positive number of seconds")),
+        };
         let developer_key = (env.get("WORKER_MODE").map(String::as_str) == Some("development"))
             .then(|| {
                 get("COZY_SSH_PUBLIC_KEY")
@@ -242,6 +250,7 @@ impl Grant {
             receipt_key,
             developer_key,
             provider: None,
+            idle_ms,
             ignored,
         })
     }
