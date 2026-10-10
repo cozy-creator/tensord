@@ -31,6 +31,8 @@ class Generation(msgspec.Struct, frozen=True):
     # The package's own installed files, hashed: what keys its memoized calls across machines.
     source_digest: str = ""
     callees: list[Callee] = []
+    # Empty when this machine's own Runtime/TensorFS pair installed; else why the package's own runs.
+    sdk_fallback: str = ""
 
 
 class ApplicationEntry(msgspec.Struct, frozen=True):

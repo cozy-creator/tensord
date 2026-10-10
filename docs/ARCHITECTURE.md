@@ -124,7 +124,7 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 | Module | Role |
 |---|---|
 | `runner.py`, `runtime_bridge.py`, `execution_protocol.py`, `progress.py` | CPU runner: `Ready` before importing Runtime, then Runtime author `prepare`/`invoke` |
-| `packages.py`, `captured_packages.py`, `package_records.py`, `runtime_describe.py` | Static description and uv generation install (`python -m cozy_machine_client.packages`) |
+| `packages.py`, `captured_packages.py`, `installer.py`, `package_records.py`, `runtime_describe.py` | Static description and uv generation install (`python -m cozy_machine_client.installer`) |
 | `device_codec.py` | Output encoder, embedded into `device_executor.rs` with `include_str!` |
 | `client.py`, `protocol.py`, `linux.py`, `execution_client.py`, `cpu_gate.py` | Private control-socket client and the CPU component gate |
 

@@ -106,7 +106,7 @@ def test_installer_only_helper_uses_locked_sdk_and_static_reader_skips_pth(captu
     python = helper / "bin/python"
     subprocess.run(["uv", "pip", "install", "--python", str(python), str(client), "packaging"], check=True)
     subprocess.run([str(python), "-c", "import importlib.util;assert importlib.util.find_spec('cozy_runtime') is None"], check=True)
-    process = subprocess.run([str(python), "-m", "cozy_machine_client.packages", "install-captured",
+    process = subprocess.run([str(python), "-m", "cozy_machine_client.installer", "install-captured",
         "--project", str(source), "--generations", str(root / "minimal-helper-generations"), "--client-wheel", str(client),
         "--distribution", "cozy-machine-cpu-classifier", "--release", "0.1.0", "--python", "3.12"], check=True, capture_output=True)
     generation = GENERATION_DECODER.decode(process.stdout)

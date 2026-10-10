@@ -6,7 +6,6 @@ it never imports or runs authored modules. Generations are never updated in plac
 """
 from __future__ import annotations
 
-import argparse
 import fcntl
 import os
 import shutil
@@ -78,14 +77,14 @@ def in_environment(interpreter: Path, request: msgspec.Struct, decoder: msgspec.
 
 
 def publish_generation(root: Path, metadata: PackageMetadata, interface: msgspec.Raw,
-                       callees: dict[str, str] | None = None) -> Generation:
+                       callees: dict[str, str] | None = None, sdk_fallback: str = "") -> Generation:
     interpreter = root / "env" / "bin" / "python"
     inventory = subprocess.check_output(["uv", "pip", "list", "--python", str(interpreter), "--format", "json"])
     dependencies = msgspec.json.decode(inventory, type=list[Dependency])
     environment = in_environment(interpreter, DescribeEnvironment(metadata.name, callees or {}), ENVIRONMENT_DECODER)
     generation = Generation(root.name, metadata.name, metadata.version, metadata.application,
                             str(interpreter), dependencies, interface, probe_cpu_bridge(interpreter),
-                            environment.source_digest, environment.callees)
+                            environment.source_digest, environment.callees, sdk_fallback)
     with (root / ".generation.json.new").open("wb") as output:
         output.write(msgspec.json.encode(generation))
         output.flush()
@@ -170,52 +169,3 @@ def install(project: Path, generations: Path, client_wheel: Path, *,
         # This uniquely owned unpublished generation has never been dispatched.
         shutil.rmtree(root)
         raise
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    commands = parser.add_subparsers(dest="command", required=True)
-    static = commands.add_parser("describe")
-    static.add_argument("project", type=Path)
-    setup = commands.add_parser("install")
-    setup.add_argument("project", type=Path)
-    setup.add_argument("--generations", type=Path, required=True)
-    setup.add_argument("--client-wheel", type=Path, required=True)
-    setup.add_argument("--python", default=sys.executable)
-    captured = commands.add_parser("install-captured")
-    captured.add_argument("--project", type=Path)
-    captured.add_argument("--wheel", action="append", type=Path, default=[])
-    captured.add_argument("--requirements", type=Path)
-    captured.add_argument("--distribution", required=True)
-    captured.add_argument("--release", required=True)
-    captured.add_argument("--python-requires", default="")
-    captured.add_argument("--python-version", default="")
-    captured.add_argument("--generations", type=Path, required=True)
-    captured.add_argument("--client-wheel", type=Path, required=True)
-    captured.add_argument("--sdk-wheel", action="append", type=Path, default=[])
-    captured.add_argument("--python", default=sys.executable)
-    captured.add_argument("--callees", default="{}")
-    args = parser.parse_args()
-    if args.command == "install-captured":
-        from .captured_packages import install_captured
-        try:
-            result = install_captured(project=args.project, wheels=args.wheel, requirements=args.requirements,
-                distribution=args.distribution, release=args.release, python_requires=args.python_requires,
-                python_version=args.python_version, generations=args.generations, client_wheel=args.client_wheel, python=args.python,
-                sdk=args.sdk_wheel, callees=msgspec.json.decode(args.callees, type=dict[str, str]))
-        except PackageError as exc:
-            print(msgspec.json.encode(InstallFailed(exc.code, str(exc))).decode())
-            raise SystemExit(1)
-        except subprocess.CalledProcessError as exc:
-            operation = " ".join(map(str, exc.cmd[:3]))
-            print(msgspec.json.encode(InstallFailed("package_dependency_operation_failed", f"{operation} exited {exc.returncode}; its output is in the machine log")).decode())
-            raise SystemExit(1)
-        print(msgspec.json.encode(result).decode())
-        return
-    result = (describe(args.project) if args.command == "describe" else
-              install(args.project, args.generations, args.client_wheel, python=args.python))
-    print(msgspec.json.encode(result).decode())
-
-
-if __name__ == "__main__":
-    main()
