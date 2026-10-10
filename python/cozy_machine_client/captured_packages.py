@@ -45,6 +45,32 @@ def inventory(interpreter: Path) -> list[Dependency]:
     return msgspec.json.decode(subprocess.check_output(["uv", "pip", "list", "--python", str(interpreter), "--format", "json"]), type=list[Dependency])
 
 
+def machine_sdk(interpreter: Path, sdk: list[Path], capture) -> str:
+    """The machine's own Runtime/TensorFS pair over the captured closure, every other selected
+    version constrained, where every installed requirement admits it (uv's check). Else the
+    capture's own pair (a vendored dev Runtime, say) is restored: a package's bounds are never
+    overridden. Returns "" for the machine's pair, else why and what runs instead; never silent."""
+    pair = {canonicalize_name(wheel.name.split("-")[0]) for wheel in sdk}
+    kept = interpreter.parents[2] / "sdk-constraints.txt"
+    kept.write_text("".join(f"{row.name}=={row.version}\n" for row in inventory(interpreter)
+                            if canonicalize_name(row.name) not in pair))
+    step = subprocess.run(["uv", "pip", "install", "--python", str(interpreter), "-c", str(kept), *map(str, sdk)],
+                          stderr=subprocess.PIPE, text=True)
+    sys.stderr.write(step.stderr)
+    if step.returncode == 0:
+        step = subprocess.run(["uv", "pip", "check", "--python", str(interpreter)], capture_output=True, text=True)
+        if step.returncode == 0:
+            return ""
+    reason = [line.strip() for line in ((step.stdout or "") + step.stderr).splitlines()
+              if line.strip() and not line.startswith(("Using Python", "Checked "))][-12:]
+    capture()
+    own = ", ".join(f"{row.name}=={row.version}" for row in inventory(interpreter) if canonicalize_name(row.name) in pair)
+    fallback = (f"this machine's own Runtime and TensorFS did not install ({' '.join(map(str, step.args[:3]))}: "
+                f"{' | '.join(reason)[:2000]}); it runs the package's own {own}")
+    print(fallback, file=sys.stderr)
+    return fallback
+
+
 def install_captured(*, project: Path | None, wheels: list[Path], requirements: Path | None,
                      distribution: str, release: str, python_requires: str, python_version: str,
                      generations: Path, client_wheel: Path, python: str, sdk: list[Path] = (),
@@ -82,16 +108,21 @@ def install_captured(*, project: Path | None, wheels: list[Path], requirements: 
     root.mkdir(); (root / ".hold").touch()
     try:
         interpreter = root / "env" / "bin" / "python"
-        if project and (project / "uv.lock").is_file():
+        frozen = project and (project / "uv.lock").is_file()
+        if frozen:
             source = root / "source"
             shutil.copytree(project, source)
-            # UV_PROJECT_ENVIRONMENT is a standard destination configuration value.
-            environment = {**os.environ, "UV_PROJECT_ENVIRONMENT": str(root / "env")}
-            subprocess.run(["uv", "sync", "--frozen", "--no-dev", "--no-editable", "--no-python-downloads",
-                            "--project", str(source), "--python", python], env=environment, check=True)
         else:
             subprocess.run(["uv", "venv", "--python", python, str(root / "env")], check=True)
-            if requirements and requirements.stat().st_size:
+
+        def capture():
+            """The capture's own selection. Run again, it restores what the machine's pair replaced."""
+            if frozen:
+                # UV_PROJECT_ENVIRONMENT is a standard destination configuration value.
+                environment = {**os.environ, "UV_PROJECT_ENVIRONMENT": str(root / "env")}
+                subprocess.run(["uv", "sync", "--frozen", "--no-dev", "--no-editable", "--no-python-downloads",
+                                "--project", str(source), "--python", python], env=environment, check=True)
+            elif requirements and requirements.stat().st_size:
                 # uv owns hashed requirements parsing and standard download integrity.
                 command = ["uv", "pip", "install", "--python", str(interpreter), "--require-hashes", "-r", str(requirements)]
                 if wheels:
@@ -103,15 +134,9 @@ def install_captured(*, project: Path | None, wheels: list[Path], requirements: 
                 subprocess.run(["uv", "pip", "install", "--python", str(interpreter), str(project), *map(str,wheels)], check=True)
             else:
                 subprocess.run(["uv", "pip", "install", "--python", str(interpreter), *map(str,wheels)], check=True)
-        if sdk:
-            # The machine's own Runtime/TensorFS pair replaces what the capture resolved; every
-            # other locked version stays, and uv reports a conflict with declared bounds.
-            pair = {canonicalize_name(wheel.name.split("-")[0]) for wheel in sdk}
-            kept = root / "sdk-constraints.txt"
-            kept.write_text("".join(f"{row.name}=={row.version}\n" for row in inventory(interpreter)
-                                    if canonicalize_name(row.name) not in pair))
-            subprocess.run(["uv", "pip", "install", "--python", str(interpreter), "-c", str(kept),
-                            *map(str, sdk)], check=True)
+
+        capture()
+        fallback = machine_sdk(interpreter, sdk, capture) if sdk else ""
         locked = inventory(interpreter)
         constraints = root / "captured-constraints.txt"
         constraints.write_text("".join(f"{row.name}=={row.version}\n" for row in locked))
@@ -126,7 +151,7 @@ def install_captured(*, project: Path | None, wheels: list[Path], requirements: 
             conflicts = [line.strip() for line in (check.stdout + check.stderr).splitlines() if "requires" in line or "not installed" in line]
             raise PackageError("package_dependency_conflict", "; ".join(conflicts)[:2000] or f"uv pip check exited {check.returncode}")
         interface = installed_description(metadata.name, interpreter)
-        return publish_generation(root, metadata, interface, callees)
+        return publish_generation(root, metadata, interface, callees, fallback)
     except BaseException:
         shutil.rmtree(root)  # uniquely owned unpublished generation, never dispatched
         raise

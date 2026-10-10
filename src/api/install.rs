@@ -187,7 +187,7 @@ pub fn prepare_uploaded(
         .envs(crate::launch_identity::inherited())
         .env("PATH", helper_path(&config.uv))
         .arg("-m")
-        .arg("cozy_machine_client.packages")
+        .arg("cozy_machine_client.installer")
         .arg("install-captured")
         .arg("--generations")
         .arg(&config.generations)
@@ -237,9 +237,11 @@ pub fn prepare_uploaded(
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(storage)?;
+    let stderr = child.stderr.take().expect("piped installer stderr");
+    let tail = std::thread::spawn(move || forward_tail(stderr));
     let mut stdout = child.stdout.take().expect("piped installer stdout");
     let mut output = Vec::new();
     stdout
@@ -249,6 +251,7 @@ pub fn prepare_uploaded(
         .map_err(storage)?;
     std::io::copy(&mut stdout, &mut std::io::sink()).map_err(storage)?;
     let exited = child.wait().map_err(storage)?;
+    let tail = tail.join().unwrap_or_default();
     if !exited.success() {
         #[derive(Deserialize)]
         #[serde(tag = "kind", rename = "install_failed")]
@@ -256,15 +259,18 @@ pub fn prepare_uploaded(
             code: String,
             detail: String,
         }
-        if let Ok(failure) = serde_json::from_slice::<InstallationFailure>(&output) {
-            let message = format!("{}: {}", failure.code, failure.detail);
-            return Err(if failure.code.ends_with("_unsupported") {
-                Status::unimplemented(message)
-            } else {
-                Status::failed_precondition(message)
-            });
-        }
-        return Err(Status::failed_precondition("package_installation_failed: trusted Python/uv installer did not complete the captured operation"));
+        // A typed reason stands alone; an operation that failed or a helper that crashed is
+        // explained by the helper's own last output lines (uv's words, or a traceback).
+        let failure = serde_json::from_slice::<InstallationFailure>(&output).ok();
+        let message = match &failure {
+            Some(f) if f.code != "package_dependency_operation_failed" => format!("{}: {}", f.code, f.detail),
+            Some(f) => format!("{}: {}: {tail}", f.code, f.detail),
+            None => format!("package_installation_failed: the trusted Python/uv installer stopped ({exited}): {tail}"),
+        };
+        return Err(match failure {
+            Some(f) if f.code.ends_with("_unsupported") => Status::unimplemented(message),
+            _ => Status::failed_precondition(message),
+        });
     }
     if output.len() > 8 << 20 {
         return Err(Status::resource_exhausted(
@@ -330,6 +336,45 @@ fn storage(error: std::io::Error) -> Status {
     ))
 }
 
+/// The helper's stderr, passed on to the machine log as it comes. Returns its last lines,
+/// bounded and with URL credentials masked: what a refusal quotes.
+fn forward_tail(mut stderr: impl Read) -> String {
+    let (mut chunk, mut kept) = ([0u8; 8192], Vec::new());
+    loop {
+        match stderr.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                let _ = std::io::stderr().write_all(&chunk[..n]);
+                kept.extend_from_slice(&chunk[..n]);
+                kept.drain(..kept.len().saturating_sub(4096));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&kept);
+    let lines: Vec<_> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    masked(&lines[lines.len().saturating_sub(12)..].join(" | "))
+}
+
+/// `scheme://user:secret@host` becomes `scheme://***@host`.
+fn masked(text: &str) -> String {
+    let (mut out, mut rest) = (String::new(), text);
+    while let Some(at) = rest.find("://") {
+        let (head, after) = rest.split_at(at + 3);
+        out.push_str(head);
+        let authority = after.find(|c: char| c.is_whitespace() || c == '/').unwrap_or(after.len());
+        rest = match after[..authority].rfind('@') {
+            Some(user) => {
+                out.push_str("***");
+                &after[user..]
+            }
+            None => after,
+        };
+    }
+    out + rest
+}
+
 /// The helper's PATH: the machine's uv's directory first, then the machine's own PATH. The helper
 /// calls `uv` by name, and a machine started with no PATH still installs local packages.
 fn helper_path(uv: &Path) -> std::ffi::OsString {
@@ -349,6 +394,18 @@ fn helper_path(uv: &Path) -> std::ffi::OsString {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_quoted_installer_line_never_carries_url_credentials() {
+        assert_eq!(
+            super::masked("GET https://user:tok@hub.example/simple/ and file:///x/y.whl"),
+            "GET https://***@hub.example/simple/ and file:///x/y.whl"
+        );
+        let tail = super::forward_tail(std::io::Cursor::new(
+            (0..40).map(|i| format!("line {i}\n")).collect::<String>(),
+        ));
+        assert!(tail.starts_with("line 28 | ") && tail.ends_with("line 39"), "{tail}");
+    }
+
     #[test]
     fn the_helper_finds_the_machines_uv_first() {
         let path = super::helper_path(std::path::Path::new("/machine/usr/local/bin/uv"));

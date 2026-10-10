@@ -216,7 +216,10 @@ impl LocalSources {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{path::Path, process::Command};
+    use std::{
+        path::{Path, PathBuf},
+        process::Command,
+    };
     use tensorfs_core::sha256;
 
     fn write(objects: &Objects, actor: &str, bytes: &[u8]) -> Member {
@@ -233,39 +236,28 @@ mod tests {
         }
     }
 
-    /// The real installer from objects the signer wrote; the same manifest reopens it.
-    #[test]
-    fn a_written_local_package_reuses_only_the_same_sdk_environment() {
+    /// A machine with the real installer helper and the client wheel built from this tree.
+    struct Machine {
+        root: PathBuf,
+        service: Arc<Service>,
+        store: Arc<Store>,
+        objects: Arc<Objects>,
+        installer: InstallerConfig,
+    }
+
+    fn machine(name: &str) -> Machine {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let root = std::env::temp_dir().join(format!("cm-local-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("{name}-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
-        let built = Command::new("uv")
-            .current_dir(repo)
-            .args(["build", "--wheel", "--out-dir"])
-            .arg(root.join("client"))
-            .output()
-            .unwrap();
-        assert!(built.status.success());
-        let helper = Command::new("uv")
-            .current_dir(repo)
-            .args([
-                "run",
-                "--locked",
-                "--extra",
-                "test",
-                "python",
-                "-c",
-                "import sys; print(sys.executable)",
-            ])
-            .output()
-            .unwrap();
-        let helper = String::from_utf8(helper.stdout).unwrap().trim().to_string();
+        run(Command::new("uv").current_dir(repo).args(["build", "--wheel", "--out-dir"]).arg(root.join("client")));
+        let helper = run(Command::new("uv").current_dir(repo).args([
+            "run", "--locked", "--extra", "test", "python", "-c", "import sys; print(sys.executable)",
+        ]));
         let client = fs::read_dir(root.join("client"))
             .unwrap()
             .map(|e| e.unwrap().path())
             .find(|p| p.extension().is_some_and(|e| e == "whl"))
             .unwrap();
-
         let state = root.join("state");
         let service = Service::open(&state, &root.join("generations"), 1).unwrap();
         let store = Arc::new(Store::ensure(&state.join("tensorfs")).unwrap());
@@ -281,15 +273,53 @@ mod tests {
             sdk: vec![],
             uv: "uv".into(),
         };
-        let sources = LocalSources::new(objects.clone(), installer.clone(), store.clone());
+        Machine { root, service, store, objects, installer }
+    }
+
+    /// Its stdout, trimmed; a failure names the command and its stderr.
+    fn run(command: &mut Command) -> String {
+        let output = command.output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{command:?}: {stderr}");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn sdk_pair(root: &Path) -> Vec<PathBuf> {
+        let sdk = root.join("sdk");
+        fs::create_dir_all(&sdk).unwrap();
+        SDK_PAIR
+            .iter()
+            .map(|(name, url)| {
+                run(Command::new("curl").args(["-sfL", "-o"]).arg(sdk.join(name)).arg(url));
+                sdk.join(name)
+            })
+            .collect()
+    }
+
+    fn archive(dir: &Path, names: &[&str]) -> Vec<u8> {
         let mut archive = tar::Builder::new(Vec::new());
-        let fixture = repo.join("tests/fixtures/cpu_input");
-        for name in ["pyproject.toml", "package.toml", "cpu_input/__init__.py"] {
-            archive
-                .append_path_with_name(fixture.join(name), name)
-                .unwrap();
+        for name in names {
+            archive.append_path_with_name(dir.join(name), name).unwrap();
         }
-        let source = write(&objects, "alice", &archive.into_inner().unwrap());
+        archive.into_inner().unwrap()
+    }
+
+    fn installed_sdk(python: &Path) -> String {
+        run(Command::new(python).args([
+            "-c",
+            "import importlib.metadata as m; print(m.version('cozy-runtime'), m.version('tensorfs'))",
+        ]))
+    }
+
+    /// The real installer from objects the signer wrote; the same manifest reopens it.
+    #[test]
+    fn a_written_local_package_reuses_only_the_same_sdk_environment() {
+        let Machine { root, service, store, objects, installer } = machine("cm-local");
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let sources = LocalSources::new(objects.clone(), installer.clone(), store.clone());
+        let fixture = repo.join("tests/fixtures/cpu_input");
+        let tree = archive(&fixture, &["pyproject.toml", "package.toml", "cpu_input/__init__.py"]);
+        let source = write(&objects, "alice", &tree);
         let manifest = serde_json::json!({
             "package": "local/cozy-machine-cpu-input",
             "release": "0.1.0",
@@ -319,20 +349,7 @@ mod tests {
         assert_eq!(again.generation, installed.generation);
 
         // With the machine's own SDK pair, a local package runs that pair, not PyPI's newest.
-        let sdk = root.join("sdk");
-        fs::create_dir_all(&sdk).unwrap();
-        let mut pair = vec![];
-        for (name, url) in SDK_PAIR {
-            let path = sdk.join(name);
-            assert!(Command::new("curl")
-                .args(["-sfL", "-o"])
-                .arg(&path)
-                .arg(url)
-                .status()
-                .unwrap()
-                .success());
-            pair.push(path);
-        }
+        let pair = sdk_pair(&root);
         let pinned = LocalSources::new(
             objects.clone(),
             InstallerConfig {
@@ -351,23 +368,112 @@ mod tests {
         assert_eq!(same_sdk.generation, updated.generation);
         // A prior generation remains valid for already accepted work.
         assert!(service.catalog.resolve(&installed.generation).is_ok());
-        let python = service
-            .catalog
-            .resolve(&updated.generation)
-            .unwrap()
-            .record
-            .python
-            .clone();
-        let version = Command::new(python)
-            .args(["-c", "import importlib.metadata as m; print(m.version('cozy-runtime'), m.version('tensorfs'))"])
-            .output()
-            .unwrap();
-        assert_eq!(
-            String::from_utf8(version.stdout).unwrap().trim(),
-            "0.18.101 0.3.92"
-        );
+        let held = service.catalog.resolve(&updated.generation).unwrap();
+        assert_eq!(installed_sdk(&held.record.python), "0.18.101 0.3.92");
+        assert_eq!(held.record.sdk_fallback, "");
         let _ = fs::remove_dir_all(root);
     }
+
+    /// A package pinning a vendored dev Runtime (how unreleased Runtime code is tested; it is
+    /// never published) runs that Runtime where the machine's own pair is refused by its pin, and
+    /// every run says so. Both capture shapes the CLI sends; runs 5252/5274/5276 failed here.
+    #[test]
+    fn a_vendored_dev_runtime_runs_where_its_pin_refuses_the_machine_pair() {
+        let m = machine("cm-vendored");
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let pair = sdk_pair(&m.root);
+        let sources = LocalSources::new(
+            m.objects.clone(),
+            InstallerConfig { sdk: pair.clone(), ..m.installer.clone() },
+            m.store.clone(),
+        );
+        let project = m.root.join("project");
+        let fixture = repo.join("tests/fixtures/cpu_input");
+        fs::create_dir_all(project.join("vendor")).unwrap();
+        fs::create_dir_all(project.join("cpu_input")).unwrap();
+        for name in ["package.toml", "cpu_input/__init__.py"] {
+            fs::copy(fixture.join(name), project.join(name)).unwrap();
+        }
+        // The machine's own Runtime wheel, rebuilt as a developer's local version.
+        let dev = "0.18.101+dev.vendored";
+        run(Command::new(&m.installer.helper_python).args(["-c", REVERSION]).arg(&pair[0]).arg(project.join("vendor")).arg(dev));
+        let vendored = format!("vendor/cozy_runtime-{dev}-cp312-abi3-manylinux_2_28_x86_64.whl");
+        let pyproject = fs::read_to_string(fixture.join("pyproject.toml")).unwrap();
+        fs::write(
+            project.join("pyproject.toml"),
+            pyproject.replace("cozy-runtime>=0.18.99,<0.19", &format!("cozy-runtime=={dev}"))
+                + &format!("\n[tool.uv.sources]\ncozy-runtime = {{ path = \"{vendored}\" }}\n"),
+        )
+        .unwrap();
+        run(Command::new("uv").args(["lock", "--python", "3.12", "--project"]).arg(&project));
+        let manifest = |extra: serde_json::Value| {
+            let mut manifest = serde_json::json!({"package": "local/cozy-machine-cpu-input", "release": "0.1.0", "python_version": "3.12"});
+            manifest.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            write(&m.objects, "alice", manifest.to_string().as_bytes()).digest
+        };
+        let member = |name: &str, bytes: &[u8]| {
+            let written = write(&m.objects, "alice", bytes);
+            serde_json::json!({"name": name, "digest": written.digest, "length": written.length})
+        };
+        let files = ["pyproject.toml", "uv.lock", "package.toml", "cpu_input/__init__.py"];
+        // The project tree with its lock and vendor/ wheel.
+        let tree = archive(&project, &[&files[..], &[vendored.as_str()]].concat());
+        let source = manifest(serde_json::json!({"source": member("source.tar", &tree)}));
+        // What `cozy run ./project` sends: the root wheel, the vendored wheel, the hashed rest.
+        let wheels = m.root.join("wheels");
+        run(Command::new("uv").args(["build", "--wheel", "--out-dir"]).arg(&wheels).arg(&project));
+        let requirements = run(Command::new("uv").args([
+            "export", "--frozen", "--no-dev", "--no-emit-project", "--no-emit-package", "cozy-runtime", "--project",
+        ]).arg(&project));
+        let root_wheel = wheels.join("cozy_machine_cpu_input-0.1.0-py3-none-any.whl");
+        let carried = manifest(serde_json::json!({
+            "wheels": [
+                member("cozy_machine_cpu_input-0.1.0-py3-none-any.whl", &fs::read(root_wheel).unwrap()),
+                member(vendored.trim_start_matches("vendor/"), &fs::read(project.join(&vendored)).unwrap()),
+            ],
+            "requirements": member("requirements.txt", requirements.as_bytes()),
+        }));
+        for digest in [source, carried] {
+            let installed = sources.install(&m.service, "alice", &digest).unwrap();
+            let held = m.service.catalog.resolve(&installed.generation).unwrap();
+            let versions = installed_sdk(&held.record.python);
+            assert!(versions.starts_with(&format!("{dev} ")), "{versions}");
+            let why = &held.record.sdk_fallback;
+            assert!(why.contains(&format!("requires `cozy-runtime=={dev}`, but `0.18.101` is installed")), "{why}");
+            assert!(why.ends_with(&format!("it runs the package's own cozy-runtime=={dev}, tensorfs=={}", &versions[dev.len() + 1..])), "{why}");
+        }
+
+        // A refusal carries its reason: a typed one as itself, a failed operation in uv's words.
+        let refused = |digest: &str| sources.install(&m.service, "alice", digest).err().unwrap().message;
+        let absent = manifest(serde_json::json!({"source": member("source.tar", &archive(&project, &files))}));
+        let why = refused(&absent);
+        assert!(why.contains("package_dependency_operation_failed: uv sync --frozen exited") && why.contains("vendor/cozy_runtime-0.18.101"), "{why}");
+        let python = manifest(serde_json::json!({"source": member("source.tar", &tree), "python_requires": ">=4"}));
+        let why = refused(&python);
+        assert!(why.starts_with("package_python_unavailable: configured interpreter does not satisfy"), "{why}");
+        let _ = fs::remove_dir_all(&m.root);
+    }
+
+    /// Rewrites a wheel at another version: what a developer's local Runtime build is.
+    const REVERSION: &str = r#"
+import base64, hashlib, pathlib, sys, zipfile
+source, out, version = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
+name, old = source.name.split("-")[:2]
+rows, target = [], out / source.name.replace(f"-{old}-", f"-{version}-", 1)
+with zipfile.ZipFile(source) as src, zipfile.ZipFile(target, "w") as dst:
+    for item in src.infolist():
+        path, data = item.filename.replace(f"{name}-{old}.", f"{name}-{version}.", 1), src.read(item)
+        if path.endswith(".dist-info/RECORD"):
+            record = path
+            continue
+        if path.endswith(".dist-info/METADATA"):
+            data = data.replace(f"\nVersion: {old}\n".encode(), f"\nVersion: {version}\n".encode(), 1)
+        info = zipfile.ZipInfo(path, item.date_time)
+        info.external_attr, info.compress_type = item.external_attr, zipfile.ZIP_DEFLATED
+        dst.writestr(info, data)
+        rows.append(f"{path},sha256={base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b'=').decode()},{len(data)}\n")
+    dst.writestr(record, "".join(rows) + f"{record},,\n")
+"#;
 
     /// A Runtime/TensorFS pair other than PyPI's newest, standing in for the machine's own.
     const SDK_PAIR: [(&str, &str); 2] = [
