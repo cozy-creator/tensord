@@ -150,8 +150,7 @@ def install_captured(*, project: Path | None, wheels: list[Path], requirements: 
         if check.returncode != 0:
             conflicts = [line.strip() for line in (check.stdout + check.stderr).splitlines() if "requires" in line or "not installed" in line]
             raise PackageError("package_dependency_conflict", "; ".join(conflicts)[:2000] or f"uv pip check exited {check.returncode}")
-        interface = installed_description(metadata.name, interpreter)
-        return publish_generation(root, metadata, interface, callees, fallback)
+        return publish_generation(root, metadata, None, callees, fallback)
     except BaseException:
         shutil.rmtree(root)  # uniquely owned unpublished generation, never dispatched
         raise
