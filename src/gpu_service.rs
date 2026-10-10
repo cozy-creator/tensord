@@ -2654,6 +2654,11 @@ impl GpuPool {
                 "executor_not_ready" | "poisoned_generation"
             )
         {
+            // Canceled while it waited for its attention kernel's compile (Runtime 0.23.4).
+            if prepared.terminal == "canceled" && engine.get(id)?.cancel_actor.is_some() {
+                engine.finish(id, Outcome::Canceled)?;
+                return Ok(true);
+            }
             // A pre-entry refusal leaves the executor Ready; the run ends with its reason.
             let terminal = if prepared.terminal.is_empty() {
                 "refused"
