@@ -2990,28 +2990,9 @@ impl GpuPool {
         }
         // Rank 0 answered, so a follower that ended during the call is the group's first fault.
         let lost = self.lost_followers(start, plan.degree, &session.followers);
-        if !reply.quiescent || !reply.poisoned.is_empty() || !lost.is_empty() {
+        if !reply.ok || !reply.quiescent || !reply.poisoned.is_empty() || !lost.is_empty() {
             // The run ends once the executor is gone; its own reason travels with it, typed.
-            let (code, message) = reply
-                .outcome
-                .as_ref()
-                .filter(|o| !o.code.is_empty())
-                .map(|o| (o.code.clone(), o.message.clone()))
-                .unwrap_or_else(|| ("executor_poisoned".into(), String::new()));
-            let (code, message) = match lost.is_empty() {
-                true => (code, message),
-                false => (
-                    "group_broken".into(),
-                    format!("{lost} during the call, first; then {code}: {message}"),
-                ),
-            };
-            return Err(io::Error::other(Refused {
-                code,
-                detail: format!(
-                    "{message}; the executor did not settle quiescent (poisoned: {})",
-                    reply.poisoned
-                ),
-            }));
+            return Err(io::Error::other(unsettled(&reply, &lost)));
         }
         let outcome = reply
             .outcome
@@ -3573,20 +3554,49 @@ fn ended_with(engine: &Engine, id: &str, error: io::Error, executor: DeviceExecu
 
 fn ending(error: io::Error, executor: DeviceExecutor) -> io::Error {
     match executor.terminate() {
-        Ok(device_executor::Ended {
-            killed: Some(killed),
-            ..
-        }) => match refused(&error) {
-            Some(refusal) => io::Error::other(Refused {
-                code: refusal.code.clone(),
-                detail: format!("{}; {killed}", refusal.detail),
-            }),
-            None if undelivered(&error) => io::Error::other(Undelivered(format!("{error}; {killed}"))),
-            None => io::Error::other(format!("{error}; {killed}")),
-        },
-        Ok(_) => error,
+        Ok(ended) => with_end(error, &ended),
         Err(unproven) => io::Error::other(format!("{error}; executor exit unproven: {unproven}")),
     }
+}
+
+/// A kill's measurement joins the reason, and so does the exit of an executor that ended on
+/// its own mid-command: its signal or exit code is then the only cause there is.
+fn with_end(error: io::Error, ended: &device_executor::Ended) -> io::Error {
+    let why = match (&ended.killed, channel_lost(&error)) {
+        (Some(killed), _) => killed.clone(),
+        (None, true) => format!("the executor ended on its own ({})", ended.status),
+        (None, false) => return error,
+    };
+    match refused(&error) {
+        Some(refusal) => io::Error::other(Refused {
+            code: refusal.code.clone(),
+            detail: format!("{}; {why}", refusal.detail),
+        }),
+        None if undelivered(&error) => io::Error::other(Undelivered(format!("{error}; {why}"))),
+        None => io::Error::other(format!("{error}; {why}")),
+    }
+}
+
+/// Why an invoke ends its executor: the call's outcome, else the executor's own refusal (an
+/// older Runtime answers `ok: false` when the attempt raised outside its handler), never "".
+fn unsettled(reply: &Frame, lost: &str) -> Refused {
+    let (code, message) = match &reply.outcome {
+        Some(o) if !o.code.is_empty() => (o.code.as_str(), o.message.as_str()),
+        _ if !reply.ok && !reply.code.is_empty() => (reply.code.as_str(), reply.detail.as_str()),
+        _ => ("executor_poisoned", "the executor named no reason"),
+    };
+    let (code, message) = match lost.is_empty() {
+        true => (code.to_string(), message.to_string()),
+        false => (
+            "group_broken".into(),
+            format!("{lost} during the call, first; then {code}: {message}"),
+        ),
+    };
+    let detail = match reply.poisoned.as_str() {
+        "" => format!("{message}; the executor did not settle quiescent"),
+        poisoned => format!("{message}; the executor did not settle quiescent (poisoned: {poisoned})"),
+    };
+    Refused { code, detail }
 }
 
 /// Every error ends the run once its executor is gone: FAILED with the reason, or CANCELED
@@ -4256,6 +4266,50 @@ impl Services for Callbacks<'_> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::os::unix::process::ExitStatusExt;
+
+    /// Runs 5313/5318/5319 ended `executor_poisoned: ; the executor did not settle quiescent
+    /// (poisoned: )`: the Runtime's tail re-raised a sticky CUDA fault and answered `ok: false`.
+    #[test]
+    fn an_unsettled_invoke_names_its_reason() {
+        let reason = |reply: serde_json::Value, lost: &str| {
+            let refused = unsettled(&serde_json::from_value(reply).unwrap(), lost);
+            format!("{}: {}", refused.code, refused.detail)
+        };
+        let fault = "AcceleratorError: CUDA error: an illegal memory access was encountered";
+        assert_eq!(
+            reason(json!({"reply": "invoke", "ok": false, "code": "unhandled_exception", "detail": fault}), ""),
+            format!("unhandled_exception: {fault}; the executor did not settle quiescent")
+        );
+        let outcome = json!({"terminal": "failed", "code": "unhandled_exception", "message": format!("{fault} in denoise")});
+        assert_eq!(
+            reason(json!({"ok": true, "quiescent": false, "poisoned": "unhandled_exception in denoise", "outcome": outcome}), ""),
+            format!("unhandled_exception: {fault} in denoise; the executor did not settle quiescent (poisoned: unhandled_exception in denoise)")
+        );
+        assert_eq!(
+            reason(json!({"ok": true, "quiescent": false}), "GPU 1's process 7 ended"),
+            "group_broken: GPU 1's process 7 ended during the call, first; then executor_poisoned: \
+             the executor named no reason; the executor did not settle quiescent"
+        );
+    }
+
+    #[test]
+    fn an_executor_that_ended_on_its_own_names_its_exit() {
+        let ended = |status: i32| device_executor::Ended {
+            status: std::process::ExitStatus::from_raw(status),
+            killed: None,
+            stragglers: 0,
+        };
+        let eof = || io::Error::new(io::ErrorKind::UnexpectedEof, "stock executor EOF before reply");
+        let error = with_end(eof(), &ended(libc::SIGSEGV));
+        assert_eq!(
+            error.to_string(),
+            "stock executor EOF before reply; the executor ended on its own (signal: 11 (SIGSEGV))"
+        );
+        // An executor ended by the machine after a refusal adds nothing to the refusal.
+        let refusal = || io::Error::other(Refused { code: "x".into(), detail: "y".into() });
+        assert_eq!(with_end(refusal(), &ended(libc::SIGKILL)).to_string(), "x: y");
+    }
 
     #[test]
     fn the_image_boot_runs_machine_kernels_from_the_executors_runtime_wheel() {
