@@ -55,7 +55,6 @@ def package_name(found: importlib.metadata.Distribution, packages: dict[str, str
         if (expected is not None and origin(url) == expected
                 and len(path) == 7 and path[1:3] == ["v1", "index"]
                 and path[3] and "/" not in path[3]
-                and (path[4] == "files" or
-                     normalized(path[4]) == name and path[5] and "/" not in path[4])):
+                and normalized(path[4]) == name and path[5] and "/" not in path[4]):
             return f"{path[3]}/{name}"
     return f"local/{name}"

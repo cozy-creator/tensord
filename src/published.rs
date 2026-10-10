@@ -1690,7 +1690,7 @@ fn stage_of(progress: &Progress) -> String {
 }
 
 /// The package each lock row the run's Hub publishes installs, by distribution: the org its
-/// index names (either its digest file door or release-qualified wheel route). Those rows install from
+/// index names (`/v1/index/<org>/<package>/<release>/<wheel>`). Those rows install from
 /// local files (`hub_files`), so an installed callee's own provenance no longer names the
 /// Hub; without this the environment's describer called a Hub-published callee
 /// `local/<name>`, and the run's model choices addressed to `<org>/<name>/...` never reached
@@ -1704,7 +1704,6 @@ fn hub_packages(exact: &str, source: &hub::Source) -> BTreeMap<String, String> {
             let distribution = normalized(file.name.split('-').next()?);
             let parts = path.split('/').collect::<Vec<_>>();
             let org = match parts.as_slice() {
-                ["v1", "index", org, "files", _, _] => *org,
                 ["v1", "index", org, package, release, _]
                     if !release.is_empty() && normalized(package) == distribution => *org,
                 // A release can bundle a third-party wheel (H3's Diffusers); that
@@ -1975,21 +1974,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn both_hub_wheel_routes_preserve_callee_names_without_claiming_bundled_dependencies() {
+    fn current_hub_wheel_route_preserves_callee_names_and_refuses_old_or_bundled_identity() {
         let source = hub::Source::new("https://cozy-e2e-6.ngrok.app", None, vec![], None).unwrap();
         let sha = "61bd8e93a4cb4b56127115dda87aee267008cc0b52bd59321fc12e522f6c3628";
         let row = |url: &str| format!("qwen-image-2 @ {url} --hash=sha256:{sha}\n");
-        for route in [
-            format!("/v1/index/paul/files/{sha}/qwen_image_2-0.3.0-py3-none-any.whl"),
-            "/v1/index/paul/qwen-image-2/0.3.0/qwen_image_2-0.3.0-py3-none-any.whl".into(),
-        ] {
-            let exact = row(&format!("https://cozy-e2e-6.ngrok.app{route}"));
-            assert_eq!(hub_packages(&exact, &source), BTreeMap::from([
-                ("qwen-image-2".into(), "paul/qwen-image-2".into())
-            ]));
-            let other_hub = row(&format!("https://tensorhub.com{route}"));
-            assert!(hub_packages(&other_hub, &source).is_empty());
-        }
+        let route = "/v1/index/paul/qwen-image-2/0.3.0/qwen_image_2-0.3.0-py3-none-any.whl";
+        assert_eq!(hub_packages(&row(&format!("https://cozy-e2e-6.ngrok.app{route}")), &source),
+            BTreeMap::from([("qwen-image-2".into(), "paul/qwen-image-2".into())]));
+        assert!(hub_packages(&row(&format!("https://tensorhub.com{route}")), &source).is_empty());
+        let legacy = format!("https://cozy-e2e-6.ngrok.app/v1/index/paul/files/{sha}/qwen_image_2-0.3.0-py3-none-any.whl");
+        assert!(hub_packages(&row(&legacy), &source).is_empty());
         let bundled = format!("diffusers @ https://cozy-e2e-6.ngrok.app/v1/index/paul/minimax-h3/1.27.1/diffusers-0.41.0.dev0-py3-none-any.whl --hash=sha256:{sha}\n");
         assert!(hub_packages(&bundled, &source).is_empty());
     }
@@ -2061,10 +2055,10 @@ mod tests {
                     }
                     let mut out = stream;
                     let answer = match path.split('/').collect::<Vec<_>>().as_slice() {
-                        ["", "v1", "index", "acme", "files", sha, _] => format!(
-                            "HTTP/1.1 302 Found\r\nLocation: {base}/objects/{sha}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        )
-                        .into_bytes(),
+                        ["", "v1", "index", "acme", _, "1.0", _] => {
+                            let sha = sha256::hex_digest(objects.values().next().expect("fixture wheel"));
+                            format!("HTTP/1.1 302 Found\r\nLocation: {base}/objects/{sha}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes()
+                        },
                         ["", "objects", sha] => {
                             let body = &objects[*sha];
                             let (status, first, last) = match range {
@@ -2125,7 +2119,7 @@ mod tests {
         let publisher = Publisher::new(&root.join("published"), PackageSdk::default(), store).unwrap();
         let pypi = "six @ https://files.pythonhosted.org/packages/six-1.17.0-py2.py3-none-any.whl --hash=sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274";
         let exact = format!(
-            "--index-url https://pypi.org/simple\n{pypi}\nacme-pkg @ {origin}/v1/index/acme/files/{good}/acme_pkg-1.0-py3-none-any.whl --hash=sha256:{good}\n"
+            "--index-url https://pypi.org/simple\n{pypi}\nacme-pkg @ {origin}/v1/index/acme/acme-pkg/1.0/acme_pkg-1.0-py3-none-any.whl --hash=sha256:{good}\n"
         );
         let dir = root.join("generation");
         fs::create_dir_all(&dir).unwrap();
@@ -2158,14 +2152,6 @@ mod tests {
             .env("UV_CACHE_DIR", root.join("uv-cache")).status().unwrap().success());
         let packages = hub_packages(&exact, &source);
         assert_eq!(packages, BTreeMap::from([("acme-pkg".to_string(), "acme/acme-pkg".to_string())]));
-        // The current Hub exports a package/release URL. Its verified bytes are
-        // installed from the same local file, so the lock must restore its name.
-        let release_exact = exact.replace(
-            &format!("/v1/index/acme/files/{good}/"),
-            "/v1/index/acme/acme-pkg/1.0/",
-        );
-        let release_packages = hub_packages(&release_exact, &source);
-        assert_eq!(release_packages, packages);
         let named = |packages: &BTreeMap<String, String>| {
             let script = format!(
                 "import importlib.metadata,json;from cozy_machine_client.distribution import package_name;\
@@ -2177,11 +2163,10 @@ mod tests {
             assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
-        assert_eq!(named(&release_packages), "acme/acme-pkg");
         assert_eq!(named(&packages), "acme/acme-pkg");
         assert_eq!(named(&BTreeMap::new()), "local/acme-pkg", "without the lock's identity");
 
-        let tampered = format!("acme-pkg @ {origin}/v1/index/acme/files/{bad}/acme_pkg-1.0-py3-none-any.whl --hash=sha256:{bad}\n");
+        let tampered = format!("acme-pkg @ {origin}/v1/index/acme/acme-pkg/1.0/acme_pkg-1.0-py3-none-any.whl --hash=sha256:{bad}\n");
         let other = root.join("tampered");
         fs::create_dir_all(&other).unwrap();
         let (code, why) = publisher.hub_files(&tampered, &source, &other, &Job::default()).unwrap_err();
@@ -2203,7 +2188,7 @@ mod tests {
         let source = hub::Source::new(&origin, None, vec![], None).unwrap();
         let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
         let publisher = Publisher::new(&root.join("published"), PackageSdk::default(), store).unwrap();
-        let exact = format!("acme-data @ {origin}/v1/index/acme/files/{sha}/acme_data-1.0-py3-none-any.whl --hash=sha256:{sha}\n");
+        let exact = format!("acme-data @ {origin}/v1/index/acme/acme-data/1.0/acme_data-1.0-py3-none-any.whl --hash=sha256:{sha}\n");
         let began = Instant::now();
         publisher.hub_files(&exact, &source, &root.join("generation"), &Job::default()).unwrap();
         let took = began.elapsed();

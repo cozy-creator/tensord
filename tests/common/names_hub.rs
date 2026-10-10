@@ -138,7 +138,7 @@ async fn answer(State(served): State<Arc<Served>>, method: Method, uri: Uri, hea
                 "python_version": "3.12"}))
         }
         (Method::GET, p) if p == format!("{release_path}/locked-requirements") => {
-            // Rows at the Hub's file door, as it renders them: `/v1/index/<org>/files/<sha256>/<wheel>`.
+            // Rows at the Hub's file door, as it renders them: `/v1/index/<org>/<package>/<release>/<wheel>`.
             let package = package.unwrap();
             let (org, _) = package.name.split_once('/').unwrap();
             let lock: String = std::iter::once((&package.wheel, &package.bytes))
@@ -146,7 +146,8 @@ async fn answer(State(served): State<Arc<Served>>, method: Method, uri: Uri, hea
                 .map(|(wheel, bytes)| {
                     let sha = tensorfs_core::sha256::hex_digest(bytes);
                     let distribution = wheel.split('-').next().unwrap().replace('_', "-");
-                    format!("{distribution} @ {}/v1/index/{org}/files/{sha}/{wheel} --hash=sha256:{sha}\n", served.origin)
+                    let release = wheel.split('-').nth(1).unwrap();
+                    format!("{distribution} @ {}/v1/index/{org}/{distribution}/{release}/{wheel} --hash=sha256:{sha}\n", served.origin)
                 })
                 .collect::<String>()
                 + &package.pypi;
