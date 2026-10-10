@@ -1151,8 +1151,8 @@ impl Services for Seam<'_> {
             }
         }
         // A child's stage the job relays (the Runtime relays no bytes) carries its download's.
-        let child = self.job.filter(|_| !frame.call_request.is_empty());
-        if let Some((done, total)) = child.and_then(|(_, parent)| parent.child_bytes(self.engine, &frame.call_request)) {
+        let call = frame.call_request.as_deref().filter(|call| !call.is_empty());
+        if let Some((done, total)) = self.job.zip(call).and_then(|((_, parent), call)| parent.child_bytes(self.engine, call)) {
             (payload["bytes_done"], payload["bytes_total"]) = (done.into(), total.into());
         }
         let _ = self
