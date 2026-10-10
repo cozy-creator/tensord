@@ -10,6 +10,11 @@ from cozy_machine_client.distribution import package_name
 @pytest.mark.parametrize("url,expected", [
     ("https://hub/v1/index/first/files/abc/cpu_memo.whl", "first/cpu-memo"),
     ("https://hub/v1/index/second/files/def/cpu_memo.whl", "second/cpu-memo"),
+    ("https://hub/v1/index/first/cpu-memo/1.0/cpu_memo-1.0-py3-none-any.whl", "first/cpu-memo"),
+    ("https://hub/v1/index/second/CPU_Memo/1.0/cpu_memo-1.0-py3-none-any.whl", "second/cpu-memo"),
+    ("https://hub/v1/index/first/parent-package/1.0/cpu_memo-1.0-py3-none-any.whl", "local/cpu-memo"),
+    ("https://hub/v1/index/first/cpu-memo//cpu_memo-1.0-py3-none-any.whl", "local/cpu-memo"),
+    ("https://hub:444/v1/index/first/cpu-memo/1.0/cpu_memo-1.0-py3-none-any.whl", "local/cpu-memo"),
     ("https://pypi.org/packages/cpu_memo.whl", "local/cpu-memo"),
     ("file:///wheels/cpu_memo.whl", "local/cpu-memo"),
     ("https://hub:444/v1/index/first/files/abc/cpu_memo.whl", "local/cpu-memo"),

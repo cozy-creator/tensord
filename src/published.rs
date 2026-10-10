@@ -1690,7 +1690,7 @@ fn stage_of(progress: &Progress) -> String {
 }
 
 /// The package each lock row the run's Hub publishes installs, by distribution: the org its
-/// index names (`<origin>/v1/index/<org>/files/<sha256>/<wheel>`). Those rows install from
+/// index names (either its digest file door or release-qualified wheel route). Those rows install from
 /// local files (`hub_files`), so an installed callee's own provenance no longer names the
 /// Hub; without this the environment's describer called a Hub-published callee
 /// `local/<name>`, and the run's model choices addressed to `<org>/<name>/...` never reached
@@ -1701,10 +1701,16 @@ fn hub_packages(exact: &str, source: &hub::Source) -> BTreeMap<String, String> {
         .filter_map(|line| {
             let file = hub_file(line, source)?;
             let path = file.url.split_once("://")?.1.split_once('/')?.1;
-            let ["v1", "index", org, "files", _, _] = path.split('/').collect::<Vec<_>>()[..] else {
-                return None;
-            };
             let distribution = normalized(file.name.split('-').next()?);
+            let parts = path.split('/').collect::<Vec<_>>();
+            let org = match parts.as_slice() {
+                ["v1", "index", org, "files", _, _] => *org,
+                ["v1", "index", org, package, release, _]
+                    if !release.is_empty() && normalized(package) == distribution => *org,
+                // A release can bundle a third-party wheel (H3's Diffusers); that
+                // does not make the bundled distribution a package in this org.
+                _ => return None,
+            };
             (!org.is_empty()).then(|| (distribution.clone(), format!("{org}/{distribution}")))
         })
         .collect()
@@ -1968,6 +1974,26 @@ fn split_lock(lock: &str, name: &str, release: &str, own_sdk: bool) -> Result<Lo
 mod tests {
     use super::*;
 
+    #[test]
+    fn both_hub_wheel_routes_preserve_callee_names_without_claiming_bundled_dependencies() {
+        let source = hub::Source::new("https://cozy-e2e-6.ngrok.app", None, vec![], None).unwrap();
+        let sha = "61bd8e93a4cb4b56127115dda87aee267008cc0b52bd59321fc12e522f6c3628";
+        let row = |url: &str| format!("qwen-image-2 @ {url} --hash=sha256:{sha}\n");
+        for route in [
+            format!("/v1/index/paul/files/{sha}/qwen_image_2-0.3.0-py3-none-any.whl"),
+            "/v1/index/paul/qwen-image-2/0.3.0/qwen_image_2-0.3.0-py3-none-any.whl".into(),
+        ] {
+            let exact = row(&format!("https://cozy-e2e-6.ngrok.app{route}"));
+            assert_eq!(hub_packages(&exact, &source), BTreeMap::from([
+                ("qwen-image-2".into(), "paul/qwen-image-2".into())
+            ]));
+            let other_hub = row(&format!("https://tensorhub.com{route}"));
+            assert!(hub_packages(&other_hub, &source).is_empty());
+        }
+        let bundled = format!("diffusers @ https://cozy-e2e-6.ngrok.app/v1/index/paul/minimax-h3/1.27.1/diffusers-0.41.0.dev0-py3-none-any.whl --hash=sha256:{sha}\n");
+        assert!(hub_packages(&bundled, &source).is_empty());
+    }
+
     /// A wheel with nothing but its metadata: `name` `version`, requiring `requires`.
     fn tiny_wheel(dir: &Path, name: &str, version: &str, requires: &[&str]) -> PathBuf {
         use std::io::Write;
@@ -2132,6 +2158,14 @@ mod tests {
             .env("UV_CACHE_DIR", root.join("uv-cache")).status().unwrap().success());
         let packages = hub_packages(&exact, &source);
         assert_eq!(packages, BTreeMap::from([("acme-pkg".to_string(), "acme/acme-pkg".to_string())]));
+        // The current Hub exports a package/release URL. Its verified bytes are
+        // installed from the same local file, so the lock must restore its name.
+        let release_exact = exact.replace(
+            &format!("/v1/index/acme/files/{good}/"),
+            "/v1/index/acme/acme-pkg/1.0/",
+        );
+        let release_packages = hub_packages(&release_exact, &source);
+        assert_eq!(release_packages, packages);
         let named = |packages: &BTreeMap<String, String>| {
             let script = format!(
                 "import importlib.metadata,json;from cozy_machine_client.distribution import package_name;\
@@ -2143,6 +2177,7 @@ mod tests {
             assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
+        assert_eq!(named(&release_packages), "acme/acme-pkg");
         assert_eq!(named(&packages), "acme/acme-pkg");
         assert_eq!(named(&BTreeMap::new()), "local/acme-pkg", "without the lock's identity");
 
