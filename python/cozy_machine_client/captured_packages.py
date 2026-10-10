@@ -138,8 +138,18 @@ def install_captured(*, project: Path | None, wheels: list[Path], requirements: 
             if frozen:
                 # UV_PROJECT_ENVIRONMENT is a standard destination configuration value.
                 environment = {**os.environ, "UV_PROJECT_ENVIRONMENT": str(root / "env")}
-                subprocess.run(["uv", "sync", *COPY, "--frozen", "--no-dev", "--no-editable", "--no-python-downloads",
-                                "--project", str(source), "--python", python], env=environment, check=True)
+                sync = ["uv", "sync", "--frozen", "--no-dev", "--no-editable", "--no-python-downloads",
+                        "--project", str(source), "--python", python]
+                if COPY:
+                    # The locked dependencies link; then the project itself, and any App among
+                    # them (a callee the lock holds by path), is copied.
+                    subprocess.run([*sync, "--no-install-project"], env=environment, check=True)
+                    subprocess.run([*sync, *COPY], env=environment, check=True)
+                    linked = linked_applications(interpreter)
+                    if linked:
+                        subprocess.run([*sync, *COPY, *(f"--reinstall-package={name}" for name in linked)], env=environment, check=True)
+                else:
+                    subprocess.run(sync, env=environment, check=True)
             elif requirements and requirements.stat().st_size:
                 # uv owns hashed requirements parsing and standard download integrity. The locked
                 # dependencies link as the machine says (an image's seeded cache: symlinks).
