@@ -113,10 +113,7 @@ fn a_group_start_spawns_sealed_followers_and_teardown_leaves_none() {
         sealed.get("NCCL_NVLS_ENABLE").map(String::as_str),
         Some("0")
     );
-    assert_eq!(
-        sealed.get("NCCL_P2P_LEVEL").map(String::as_str),
-        Some("NVL")
-    );
+    assert_eq!(sealed.get("NCCL_P2P_LEVEL").map(String::as_str), Some(""));
     // Watch the leader's group while it forms: every member, and the seal each one runs under.
     let birth = executor.birth.clone();
     let done = Arc::new(AtomicBool::new(false));
@@ -154,7 +151,7 @@ fn a_group_start_spawns_sealed_followers_and_teardown_leaves_none() {
             Some("0,1")
         );
         assert_eq!(env.get("NCCL_NVLS_ENABLE").map(String::as_str), Some("0"));
-        assert_eq!(env.get("NCCL_P2P_LEVEL").map(String::as_str), Some("NVL"));
+        assert_eq!(env.get("NCCL_P2P_LEVEL"), None);
     }
     let leader = executor.birth.clone();
     let followers: Vec<ProcessBirth> = seen.values().map(|(birth, _)| birth.clone()).collect();
@@ -262,7 +259,7 @@ fn a_forked_rank_zero_takes_the_group_seal_and_spawns_its_follower() {
     );
     assert_eq!(
         child.hello.sealed.get("NCCL_P2P_LEVEL").map(String::as_str),
-        Some("NVL")
+        Some("")
     );
     let leader = child.birth.clone();
     let done = Arc::new(AtomicBool::new(false));

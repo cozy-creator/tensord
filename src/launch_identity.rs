@@ -332,9 +332,10 @@ impl Seal {
             ),
             ("FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED".into(), "1".into()),
         ]);
+        // NVLink SHARP needs a privilege containers lack. The peer route is the Runtime's: it
+        // measures the group's links and sets NCCL's P2P level before the group forms.
         if self.group {
             imposed.insert("NCCL_NVLS_ENABLE".into(), "0".into());
-            imposed.insert("NCCL_P2P_LEVEL".into(), "NVL".into());
         }
         imposed
     }
