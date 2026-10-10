@@ -1930,7 +1930,6 @@ mod v1_api {
         let (digest, callees) = cozy_machine::published::describe_environment(
             python.to_str().unwrap(),
             "cozy-machine-cpu-caller",
-            "",
             &Default::default(),
         ).unwrap();
         assert!(digest.starts_with("sha256:"), "{digest}");

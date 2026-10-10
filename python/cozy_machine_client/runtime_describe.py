@@ -21,7 +21,7 @@ class Undescribed(Exception):
         super().__init__(detail)
 
 
-def environment(root: str, packages: dict[str, str], hub_origin: str) -> DescribedEnvironment:
+def environment(root: str, packages: dict[str, str]) -> DescribedEnvironment:
     """This environment's root digest and every other installed App, described statically.
     An App the reader refuses fails the description: left out, its callers would call its
     raw function instead of the package."""
@@ -39,7 +39,7 @@ def environment(root: str, packages: dict[str, str], hub_origin: str) -> Describ
                               f"installed package {name} {distribution.version} cannot be described: {exc}") from exc
         callees.append(Callee(name, distribution.version, applications[0].value,
                               msgspec.Raw(msgspec.json.encode(document)), record_digest(distribution),
-                              package_name(distribution, packages, hub_origin)))
+                              package_name(distribution, packages)))
     runtime = found.get("cozy-runtime")
     if runtime is not None and hasattr(static_interface, "build_builtin"):
         # The Runtime's own operations (quantize, prepare_model) are an App every environment
@@ -55,7 +55,7 @@ def main():
     request = msgspec.json.decode(sys.stdin.buffer.read(), type=Describe | DescribeInstalled | DescribeEnvironment)
     try:
         if isinstance(request, DescribeEnvironment):
-            reply = environment(request.root, request.packages, request.hub_origin)
+            reply = environment(request.root, request.packages)
         else:
             document = (static_interface.build_installed(request.distribution, environment_python=Path(request.environment_python))
                         if isinstance(request, DescribeInstalled) else

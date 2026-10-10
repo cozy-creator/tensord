@@ -37,9 +37,9 @@ calls use the callee's source digest.
 
 A local-source manifest may carry an optional `callees` map from normalized distribution names
 to package identities. It may carry a source archive, or an immutable root wheel together with
-dependency wheels. Without an explicit mapping, an installed wheel's standard `direct_url.json`
-names its Hub package through `/v1/index/<org>/files/…` on the preparation's known Hub origin;
-unknown and foreign origins stay local. Older records without a package identity also read as
+dependency wheels. A published release's map is its lock: every row its Hub publishes is
+`<release org>/<row name>` (a Hub lock pins only its own org). A wheel's URL never names a
+package; anything unmapped, and older records without a package identity, read as
 `local/<normalized-distribution>`. Description
 reads metadata and AST inside the environment without importing package code.
 
