@@ -589,7 +589,7 @@ fn cancellation_retries_released_root_cleanup_before_acknowledging_the_binding()
     .unwrap();
     // Real native dispose commits Released, then fails to unlink its original root path.
     assert!(derived::dispose(&f.owner.store, &f.owner.meta, &transaction).is_err());
-    engine.cancel(&record.id, "owner").unwrap();
+    engine.cancel(&running.id, "owner").unwrap();
     assert!(jobs.sweep_canceled_outputs(&engine).is_err());
     assert_eq!(
         engine
@@ -612,7 +612,7 @@ fn cancellation_retries_released_root_cleanup_before_acknowledging_the_binding()
     child.kill().unwrap();
     child.wait().unwrap();
     engine
-        .finish(&record.id, crate::journal::Outcome::Canceled)
+        .finish(&running.id, crate::journal::Outcome::Canceled)
         .unwrap();
     drop(jobs);
     drop(service);
