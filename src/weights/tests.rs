@@ -532,15 +532,6 @@ fn cancellation_retries_released_root_cleanup_before_acknowledging_the_binding()
     let service = Service::open(&f.root.join("state"), &f.root.join("generations"), 1).unwrap();
     let jobs = Jobs::configure(&service, f.owner.store.clone(), None).unwrap();
     let engine = service.engine.clone();
-    let record = engine
-        .submit(
-            "cleanup-retry",
-            Invocation {
-                job: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
     let mut child = Command::new("/bin/cat")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -548,6 +539,9 @@ fn cancellation_retries_released_root_cleanup_before_acknowledging_the_binding()
         .unwrap();
     let running = engine
         .with_journal(|j| {
+            // This fixture supplies its own process. Publish its complete running state
+            // atomically so Service cannot dispatch the empty-generation record first.
+            let record = j.accept("cleanup-retry", Invocation { job: true, ..Default::default() })?;
             assert!(j.claim(&record.id)?);
             j.register_process(&record.id, process_birth(child.id())?)?;
             j.running(&record.id, None)
