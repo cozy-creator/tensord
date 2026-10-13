@@ -44,8 +44,8 @@ and Comfy ddim_uniform matches within4.77e-6 while normal/simple differ3.5863.
 Unproved configs refuse a match; they are not filled from remembered defaults.
 
 `native-source/` is an authored CPU package for supported model metadata custody:
-ordinary `cozy package install ./native-source`, then
-`cozy run local/codex-memory-metadata/metadata source.model=paul/sdxl@1.0.0
+ordinary `cozy package install ./native-source --editable`, then
+`cozy run local/codex-memory-metadata/metadata model.source=paul/sdxl@1.0.0
 --rental=OWNED --await --json`. It calls `ctx.tensorfs_source(source).inspect()`
 under the admitted model capability and returns exact source/config hashes and
 native tensor/part geometry. It constructs no model, opens no Store, and is not

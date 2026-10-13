@@ -1,6 +1,3 @@
-# /// script
-# dependencies = ["cozy-runtime", "msgspec"]
-# ///
 """Read only admitted native source metadata; no model construction or Store open."""
 
 import hashlib
@@ -11,12 +8,22 @@ from cozy_runtime.author import App, Context, invocable
 from cozy_runtime.derive.quantization import QuantizationSource
 
 
+class ConfigRow(msgspec.Struct, frozen=True):
+    name: str
+    json: str
+    sha256: str
+
+
+class ComponentRow(msgspec.Struct, frozen=True):
+    name: str
+    tensors: int
+
+
 class Metadata(msgspec.Struct, frozen=True):
     manifest: str
     manifest_length: int
-    configs_json: dict[str, str]
-    configs_sha256: dict[str, str]
-    component_tensors: dict[str, int]
+    configs: list[ConfigRow]
+    components: list[ComponentRow]
     geometry_json: str
 
 
@@ -44,12 +51,11 @@ async def metadata(ctx: Context, *, source: QuantizationSource) -> Metadata:
         return Metadata(
             actual.source.manifest,
             actual.source.length,
-            {name: data.decode("utf-8") for name, data in actual.configs.items()},
-            {
-                name: hashlib.sha256(data).hexdigest()
+            [
+                ConfigRow(name, data.decode("utf-8"), hashlib.sha256(data).hexdigest())
                 for name, data in actual.configs.items()
-            },
-            {name: len(rows) for name, rows in actual.components.items()},
+            ],
+            [ComponentRow(name, len(rows)) for name, rows in actual.components.items()],
             json.dumps(rows, sort_keys=True, separators=(",", ":")),
         )
 
