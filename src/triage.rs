@@ -15,6 +15,9 @@ use tensorfs_core::sha256;
 /// `TriageBundleRef.length` is bounded at 1 MiB by the protocol; fields are capped well below.
 const MAX_TRACEBACK: usize = 256 << 10;
 const MAX_TEXT: usize = 16 << 10;
+/// Enough executor stderr to hold a crash's faulthandler stacks past the extension-module list
+/// Python prints after them.
+pub const MAX_STDERR: u64 = 64 << 10;
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct TriageRef {
@@ -49,8 +52,13 @@ fn capped(text: &str, limit: usize) -> &str {
     &text[start..]
 }
 
-/// Write the bundle under `root/triage/` and return the reference the terminal carries.
-pub fn write(root: &Path, facts: &Facts) -> io::Result<TriageRef> {
+/// Write the bundle under `root/triage/` and return the reference the terminal carries; it
+/// names this TensorD and, once an executor said hello, the Runtime and TensorFS it ran.
+pub fn write(
+    root: &Path,
+    facts: &Facts,
+    executor: Option<&crate::journal::ExecutorFacts>,
+) -> io::Result<TriageRef> {
     let subject_id = format!("trb-{}", &uuid::Uuid::new_v4().simple().to_string()[..24]);
     let bundle = json!({
         "format": "cozy.machine.triage/1",
@@ -64,7 +72,12 @@ pub fn write(root: &Path, facts: &Facts) -> io::Result<TriageRef> {
             "message": capped(facts.message, MAX_TEXT),
             "traceback": capped(facts.traceback, MAX_TRACEBACK),
         },
-        "executor": {"pid": facts.executor_pid, "stderr_tail": capped(facts.stderr_tail, MAX_TEXT)},
+        "executor": {"pid": facts.executor_pid, "stderr_tail": capped(facts.stderr_tail, MAX_STDERR as usize)},
+        "software": {
+            "tensord": env!("CARGO_PKG_VERSION"),
+            "runtime": executor.map(|e| e.runtime_version.as_str()),
+            "tensorfs": executor.map(|e| e.tensorfs_version.as_str()),
+        },
     });
     let bytes = serde_json_canonicalizer::to_vec(&bundle).map_err(io::Error::other)?;
     let directory = root.join("triage");

@@ -1786,9 +1786,10 @@ impl DeviceExecutor {
     pub fn begin_request(&mut self) {
         self.log_from = fs::metadata(self.root.join("stderr.log")).map_or(0, |m| m.len());
     }
-    /// The end of the stderr of the request it serves (its whole life before the first).
+    /// The end of the stderr of the request it serves (its whole life before the first), as
+    /// much as its triage bundle keeps.
     pub fn stderr_tail(&self) -> String {
-        crate::process::tail_from(&self.root.join("stderr.log"), self.log_from)
+        crate::process::tail_from(&self.root.join("stderr.log"), self.log_from, crate::triage::MAX_STDERR)
     }
     pub fn cancellation(&self) -> Cancellation {
         Cancellation {

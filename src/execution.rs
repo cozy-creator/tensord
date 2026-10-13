@@ -998,7 +998,8 @@ impl Engine {
     /// Write and bind a failed attempt's triage bundle before the run settles. A failure to
     /// keep it is reported, never fatal to the settlement.
     pub fn record_triage(&self, id: &str, facts: &crate::triage::Facts) {
-        let result = crate::triage::write(&self.root, facts)
+        let executor = self.get(id).ok().and_then(|record| record.executor);
+        let result = crate::triage::write(&self.root, facts, executor.as_ref())
             .and_then(|triage| self.journal.lock().unwrap().bind_triage(id, &triage));
         if let Err(error) = result {
             eprintln!("execution {id}: triage bundle not kept: {error}");
@@ -1242,7 +1243,11 @@ impl Engine {
                 message: reason,
                 traceback: "",
                 executor_pid: pid,
-                stderr_tail: &crate::process::tail(&logs.join(format!("{id}.stderr.log"))),
+                stderr_tail: &crate::process::tail_from(
+                    &logs.join(format!("{id}.stderr.log")),
+                    0,
+                    crate::triage::MAX_STDERR,
+                ),
             },
         );
     }

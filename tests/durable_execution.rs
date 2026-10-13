@@ -957,7 +957,8 @@ def infer(inputs, output_root, canceled, progress):
     if inputs['mode']=='wedge':
         import threading;threading.Event().wait()
     if inputs['mode']=='crash':
-        import os,sys;sys.stderr.write('crashing on purpose\n');sys.stderr.flush();os._exit(3)
+        # Like faulthandler: the crash's stack, then Python's long extension-module list.
+        import os,sys;sys.stderr.write('crashing on purpose\nExtension modules: '+', '.join(f'ext{i}._core' for i in range(400))+'\n');sys.stderr.flush();os._exit(3)
     if inputs['mode']=='progress':
         while not Path(inputs['advance']).exists() and not canceled.wait(0.01):pass
         for units in range(2,258):progress(units)
@@ -1127,11 +1128,10 @@ fn a_failed_cpu_run_keeps_a_triage_bundle_with_the_runner_stderr() {
     assert_eq!(reference.length, bytes.len() as u64);
     let bundle: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(bundle["terminal"]["code"], "runner_ended");
-    assert!(bundle["executor"]["stderr_tail"]
-        .as_str()
-        .unwrap()
-        .contains("crashing on purpose"));
+    let stderr = bundle["executor"]["stderr_tail"].as_str().unwrap();
+    assert!(stderr.contains("crashing on purpose"), "{bundle}");
     assert!(bundle["executor"]["pid"].as_u64().unwrap() > 0);
+    assert_eq!(bundle["software"]["tensord"], env!("CARGO_PKG_VERSION"));
 }
 
 #[test]

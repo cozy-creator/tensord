@@ -634,18 +634,20 @@ pub fn transient(error: &io::Error) -> bool {
 
 /// The last bytes of a log, for a failure reason.
 pub fn tail(path: &std::path::Path) -> String {
-    tail_from(path, 0)
+    tail_from(path, 0, MESSAGE_TAIL)
 }
 
-/// [`tail`], of what was written at or after byte `from` only.
-pub fn tail_from(path: &std::path::Path, from: u64) -> String {
-    const TAIL: u64 = 2048;
+/// The stderr a failure message quotes; a triage bundle keeps [`crate::triage::MAX_STDERR`].
+pub const MESSAGE_TAIL: u64 = 2 << 10;
+
+/// The last `limit` bytes written at or after byte `from`.
+pub fn tail_from(path: &std::path::Path, from: u64, limit: u64) -> String {
     let Ok(mut file) = File::open(path) else {
         return String::new();
     };
     use std::io::{Read, Seek};
     let length = file.metadata().map(|m| m.len()).unwrap_or(0);
-    let _ = file.seek(io::SeekFrom::Start(length.saturating_sub(TAIL).max(from)));
+    let _ = file.seek(io::SeekFrom::Start(length.saturating_sub(limit).max(from)));
     let mut bytes = Vec::new();
     let _ = file.read_to_end(&mut bytes);
     String::from_utf8_lossy(&bytes).trim().to_string()
