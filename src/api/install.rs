@@ -287,12 +287,12 @@ fn publish(config: &InstallerConfig, mut command: Command) -> Result<PreparedGen
             detail: String,
         }
         // A typed reason stands alone; an operation that failed or a helper that crashed is
-        // explained by the helper's own last output lines (uv's words, or a traceback).
+        // explained by the helper's own output, under it (uv's words, or a traceback).
         let failure = serde_json::from_slice::<InstallationFailure>(&output).ok();
         let message = match &failure {
             Some(f) if f.code != "package_dependency_operation_failed" => format!("{}: {}", f.code, f.detail),
-            Some(f) => format!("{}: {}: {tail}", f.code, f.detail),
-            None => format!("package_installation_failed: the trusted Python/uv installer stopped ({exited}): {tail}"),
+            Some(f) => format!("{}: {}:\n{tail}", f.code, f.detail),
+            None => format!("package_installation_failed: the trusted Python/uv installer stopped ({exited}):\n{tail}"),
         };
         return Err(match failure {
             Some(f) if f.code.ends_with("_unsupported") => Status::unimplemented(message),
@@ -363,9 +363,11 @@ fn storage(error: std::io::Error) -> Status {
     ))
 }
 
-/// The helper's stderr, passed on to the machine log as it comes. Returns its last lines,
-/// bounded and with URL credentials masked: what a refusal quotes.
+/// The helper's stderr, passed on to the machine log as it comes. Returns what a refusal
+/// quotes of it ([`stderr_tail`]).
 fn forward_tail(mut stderr: impl Read) -> String {
+    // One byte past the bound tells `stderr_tail` the stream was cut.
+    let keep = crate::triage::MAX_STDERR as usize + 1;
     let (mut chunk, mut kept) = ([0u8; 8192], Vec::new());
     loop {
         match stderr.read(&mut chunk) {
@@ -373,15 +375,26 @@ fn forward_tail(mut stderr: impl Read) -> String {
             Ok(n) => {
                 let _ = std::io::stderr().write_all(&chunk[..n]);
                 kept.extend_from_slice(&chunk[..n]);
-                kept.drain(..kept.len().saturating_sub(4096));
+                kept.drain(..kept.len().saturating_sub(keep));
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => break,
         }
     }
-    let text = String::from_utf8_lossy(&kept);
-    let lines: Vec<_> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-    masked(&lines[lines.len().saturating_sub(12)..].join(" | "))
+    stderr_tail(&kept)
+}
+
+/// An installer's stderr as a refusal quotes it: its last [`crate::triage::MAX_STDERR`] bytes
+/// from a line start, URL credentials masked. uv explains a failed resolution over many lines.
+pub(crate) fn stderr_tail(stderr: &[u8]) -> String {
+    let start = stderr.len().saturating_sub(crate::triage::MAX_STDERR as usize);
+    let mut tail = &stderr[start..];
+    if start > 0 {
+        if let Some(line) = tail.iter().position(|&b| b == b'\n') {
+            tail = &tail[line + 1..];
+        }
+    }
+    masked(String::from_utf8_lossy(tail).trim())
 }
 
 /// `scheme://user:secret@host` becomes `scheme://***@host`.
@@ -427,10 +440,35 @@ mod tests {
             super::masked("GET https://user:tok@hub.example/simple/ and file:///x/y.whl"),
             "GET https://***@hub.example/simple/ and file:///x/y.whl"
         );
-        let tail = super::forward_tail(std::io::Cursor::new(
-            (0..40).map(|i| format!("line {i}\n")).collect::<String>(),
-        ));
-        assert!(tail.starts_with("line 28 | ") && tail.ends_with("line 39"), "{tail}");
+    }
+
+    /// A failed install quotes the installer's stderr whole up to a 64 KiB tail from a line
+    /// start, never just its last 12 lines: uv's explanation starts well before its last line.
+    #[test]
+    fn a_failed_install_quotes_the_installers_stderr_tail() {
+        let config = super::InstallerConfig {
+            helper_python: "python3".into(),
+            python: "3.12".into(),
+            generations: std::env::temp_dir(),
+            client_wheel: Default::default(),
+            staging_root: std::env::temp_dir(),
+            sdk: vec![],
+            uv: "uv".into(),
+            seed_cache: None,
+        };
+        let mut helper = std::process::Command::new("sh");
+        helper.args(["-c", r#"echo '{"kind":"install_failed","code":"package_dependency_operation_failed","detail":"uv pip install"}'
+            i=0; while [ $i -lt 40 ]; do echo "  uv line $i https://user:tok@hub.example/simple" >&2; i=$((i+1)); done; exit 1"#]);
+        let refused = super::publish(&config, helper).err().expect("the helper failed");
+        let message = refused.message();
+        assert!(message.starts_with("package_dependency_operation_failed: uv pip install:\nuv line 0 "), "{message}");
+        assert!(message.ends_with("uv line 39 https://***@hub.example/simple") && message.lines().count() == 41, "{message}");
+
+        // Past the bound: whole lines only, so a cut never starts inside a URL's credentials.
+        let line = "x".repeat(99) + "\n";
+        let tail = super::forward_tail(std::io::Cursor::new(format!("head https://u:secret@h/{}", line.repeat(1000))));
+        assert!(tail.len() <= crate::triage::MAX_STDERR as usize && tail.lines().all(|l| l.len() == 99), "{}", &tail[..120]);
+        assert_eq!(tail.lines().count(), crate::triage::MAX_STDERR as usize / 100);
     }
 
     #[test]

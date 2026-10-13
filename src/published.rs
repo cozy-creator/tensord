@@ -1227,21 +1227,12 @@ impl Publisher {
         if output.status.success() {
             return Ok(());
         }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let tail: String = stderr
-            .chars()
-            .rev()
-            .take(2000)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
         Err((
             "package_installation_uv_failed",
             format!(
-                "uv {}: {}",
+                "uv {}:\n{}",
                 args[..2.min(args.len())].join(" "),
-                tail.trim()
+                crate::api::install::stderr_tail(&output.stderr)
             ),
         ))
     }
