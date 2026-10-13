@@ -280,7 +280,8 @@ mod tests {
         // A (older, in CPU start-up) asked for GPU work and needs every GPU: B may not bind
         // the free half. A root that never asks (a CPU-only job) keeps no place.
         assert!(gpus.pending().is_empty());
-        (gpus.want(2), gpus.want(3));
+        gpus.want(2);
+        gpus.want(3);
         assert_eq!(gpus.pending(), [(2, 4), (3, 2)]);
         assert_eq!(gpus.claim(2, 4, &mut claims), Some(1));
         assert!(matches!(gpus.lane(3, &mut claims), Lane::Waiting { behind: Some(2), .. }));
