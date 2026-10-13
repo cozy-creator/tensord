@@ -3087,6 +3087,11 @@ impl GpuPool {
         // Rank 0 answered, so a follower that ended during the call is the group's first fault.
         let lost = self.lost_followers(start, plan.degree, &session.followers);
         if !reply.ok || !reply.quiescent || !reply.poisoned.is_empty() || !lost.is_empty() {
+            // The author's failure keeps its traceback and origin in triage; the executor's
+            // end would record only "executor_ended".
+            if let Some(outcome) = reply.outcome.as_ref().filter(|o| !o.traceback.is_empty()) {
+                keep_triage(engine, id, &session.executor, outcome);
+            }
             // The run ends once the executor is gone; its own reason travels with it, typed.
             return Err(io::Error::other(unsettled(&reply, &lost)));
         }
