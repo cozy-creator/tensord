@@ -2285,9 +2285,16 @@ pub fn read_frame(stream: &mut std::os::unix::net::UnixStream) -> io::Result<Opt
     }
     let mut bytes = vec![0; size];
     stream.read_exact(&mut bytes)?;
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(io::Error::other)
+    decode_frame(&bytes).map(Some)
+}
+
+/// Every field of a frame is optional, and the Runtime spells an absent one as null as often as
+/// it leaves it out (`call_request`, run 5257): a null field reads as absent.
+fn decode_frame(bytes: &[u8]) -> io::Result<Frame> {
+    let mut fields: serde_json::Map<String, Value> =
+        serde_json::from_slice(bytes).map_err(io::Error::other)?;
+    fields.retain(|_, value| !value.is_null());
+    serde_json::from_value(Value::Object(fields)).map_err(io::Error::other)
 }
 pub fn write_answer(
     stream: &mut std::os::unix::net::UnixStream,
@@ -2323,6 +2330,26 @@ fn scan(value: &Value) -> io::Result<()> {
 #[cfg(test)]
 mod codec_tests {
     use super::*;
+
+    /// A null in any optional field reads as its absence: a string, a flattened hello field,
+    /// a count, a flag, a kind or a list (the Runtime's `None`).
+    #[test]
+    fn a_null_field_reads_as_absent() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "event": "request", "kind": "publish", "seq": 4, "output": "image", "label": null,
+            "asset_ref": null, "media_type": null, "digest": null, "code": null, "detail": null,
+            "traceback": null, "poisoned": null, "stage": null, "runtime_version": null,
+            "call_request": null, "size_bytes": null, "ok": null, "parts": null, "attribution": null,
+        }))
+        .unwrap();
+        let (mut runtime, mut machine) = std::os::unix::net::UnixStream::pair().unwrap();
+        runtime.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
+        runtime.write_all(&body).unwrap();
+        let frame = read_frame(&mut machine).unwrap().unwrap();
+        assert_eq!((frame.kind, frame.seq, frame.output.as_str()), (Kind::Publish, 4, "image"));
+        assert!(frame.label.is_empty() && frame.code.is_empty() && frame.hello.runtime_version.is_empty());
+        assert!(frame.call_request.is_none() && frame.size_bytes == 0 && frame.parts.is_empty());
+    }
 
     #[test]
     fn plane_facts_this_machine_does_not_read_reach_its_records() {
