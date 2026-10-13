@@ -209,6 +209,8 @@ pub struct Publisher {
     /// Checkpoints a run started on part of: the rest downloads behind it (`complete_behind`).
     remainders: Mutex<HashMap<String, Remainder>>,
     lanes: Lanes,
+    /// One maker per source: a second asker waits, then finds it held (runs 5393/5394).
+    making: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 /// Downloads a call waits on run at once, at full speed. One none waits on (a hint's, a
@@ -301,6 +303,7 @@ impl Publisher {
             fetching: Mutex::new(HashMap::new()),
             remainders: Mutex::new(HashMap::new()),
             lanes: Lanes::default(),
+            making: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -499,7 +502,19 @@ impl Publisher {
     /// A provider source made into a local model (`make_source`) in its lane (`Lanes`).
     fn make(&self, source: &str, profiles: &[String], providers: &Providers, behind: bool,
         progress: &(dyn Fn(&str, u64, u64) + Sync)) -> Result<tensorfs_core::source_model::Made, Failure> {
-        self.lanes.run(behind, |stop| make_source(&self.store, source, profiles, providers, stop, progress))
+        let mut sorted = profiles.to_vec();
+        sorted.sort();
+        let key = json!([source, sorted]).to_string();
+        let gate = self.making.lock().unwrap().entry(key.clone()).or_default().clone();
+        let made = {
+            let _one = gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.lanes.run(behind, |stop| make_source(&self.store, source, profiles, providers, stop, progress))
+        };
+        let mut making = self.making.lock().unwrap();
+        if Arc::strong_count(&gate) == 2 {
+            making.remove(&key);
+        }
+        made
     }
 
     /// One resolved checkpoint downloaded (`ensure_with`) in its lane (`Lanes`), under what no
@@ -2523,6 +2538,26 @@ mod tests {
             .source_grant(&installation, "generate.models.unet", &choice, &Providers::default(), &job)
             .unwrap();
         assert_eq!(again.manifest, grant.manifest);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Two runs making one source at once both get it, downloaded once: the second waits for
+    /// the first instead of refusing STORE_BUSY (run 5394). Real huggingface.co.
+    #[test]
+    #[ignore = "real network: huggingface.co"]
+    fn concurrent_makers_of_one_source_share_it() {
+        let root = std::env::temp_dir().join(format!("cm-source-{}", uuid::Uuid::new_v4()));
+        let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
+        let publisher = Publisher::new(&root.join("published"), Default::default(), store).unwrap();
+        let source = "hf://hf-internal-testing/tiny-sdxl-pipe@20594cbc343cfcfe447af5c87cdaf6c436b453f2/unet/diffusion_pytorch_model.safetensors";
+        let make = || publisher.make_source(source, &[], &Providers::default(), &|_, _, _| {}).unwrap();
+        let (a, b) = std::thread::scope(|scope| {
+            let a = scope.spawn(make);
+            let b = scope.spawn(make);
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        assert_eq!(a.manifest, b.manifest);
+        assert!(publisher.making.lock().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 
