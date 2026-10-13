@@ -1,1 +1,1 @@
-{"owner":"/root","purpose":"Deliver TensorD 0.5.20 GPU workflow reservations with TensorFS 0.7.4","branch":"delivery/tensord-0.5.20-20261012","base_sha":"8aad0591"}
+{"owner":"/root (Claude Opus root-fifo-allocations agent)","purpose":"Slurm-FIFO root GPU allocations: one allocation table, root-ordered dispatch, grant/wait/release run events","branch":"feat/root-fifo-allocations-20261013","base_sha":"8462747"}

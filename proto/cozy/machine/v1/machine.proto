@@ -195,7 +195,16 @@ message RunEvent {
     LogLine log = 6;
     Outcome outcome = 7;
     Call call = 9;
+    GpuAllocation gpu = 10;
   }
+}
+// A root run's GPU allocation changed: `grant` binds its lane, `wait` queues it behind
+// `behind` (a run id), `release` ends its lane (Context.release_gpus() or its exit).
+message GpuAllocation {
+  string state = 1;
+  repeated uint32 gpus = 2;  // the lane, as machine GPU indices
+  uint32 width = 3;
+  string behind = 4;
 }
 message RunState {
   string id = 1;

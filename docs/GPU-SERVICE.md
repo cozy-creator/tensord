@@ -31,19 +31,20 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   within the machine envelope. `RunSpec.gpus > 0` requests that exact degree and refuses an
   unsupported count. Model lanes/checkpoint overrides never change it; weight ladders fit
   within the selected group. Busy GPUs cause queuing, not a smaller group.
-- A job with an explicit GPU count reserves that subset until `Context.release_gpus()` or exit. CPU job code stays
-  deviceless; nested GPU calls borrow the exact group and cannot spread concurrent siblings
-  onto the remaining GPUs. Unsupported child operations fail rather than reduce the count.
-- A CPU workflow without an explicit count reserves the machine envelope lazily, when its
-  first GPU child starts. Its serving calls still use their package-supported widths. Keeping
-  the envelope between calls prevents another workflow from alternating long-form segments
-  and avoids deadlocking workflows that start with one-GPU references before multi-GPU video.
-  CPU preparation and downloads remain concurrent. Standalone calls keep per-call placement.
-- `Context.release_gpus()` releases a deviceless workflow's reservation before final CPU
-  encoding or uploads. In-flight calls retain their own slots; subsequent calls must acquire
-  a reservation again. Only the owning root releases that workflow claim; nested CPU jobs
-  cannot surrender an ancestor's future work. An inline accelerator job retains its GPU
-  until its executor exits.
+- Allocations (`gpu_allocation.rs`), as Slurm's: a root job (a request with no parent) holds a
+  contiguous lane, `--gpus` wide or as wide as the widest group its environment's models run on
+  here (an accelerator job's own GPU at least). It is registered when the root dispatches and
+  bound when its first GPU step is ready; its steps (child calls, any depth) run only inside it,
+  one call per GPU. It ends at `Context.release_gpus()` (CPU roots only; in-flight calls keep
+  their GPUs until they return) or the root executor's exit. A standalone call is its own root
+  for the call's duration. Children carry `root` and accelerator `family`, stamped at acceptance.
+- Order: ready runs dispatch by (root acceptance, id). From its first child call or prefetch
+  until it binds (its CPU start-up), and while a step waits, an older root claims the lane it
+  needs for the pass; a younger root or standalone call binds only GPUs no older root claims. A
+  root that never asks (a CPU-only job) keeps no place. A released root's next step queues at
+  its original place and never preempts. Each `grant`/`wait`/`release` is a `gpu` entry in the
+  root's log (`RunEvent.gpu`). Preparing roots (model downloads) claim nothing yet.
+- An accelerator job keeps one GPU of its root's lane for its life; only its family calls there.
 - The `GpuPlan` id hashes {actor, generation, entrypoint, slots, degree}. It is journaled as a
   `Preparation`, and `submit` records `preparation_id`.
 - An empty `installation_id` binds a `published-<hash>` installation from `packages`.
@@ -52,13 +53,13 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
 
 - One call slot per GPU: a call takes every slot of its lane. GPU dispatch is fenced only by a
   startup fence or an active GPU record this machine run does not supervise. CPU dispatch continues.
-- Placement (`GpuPool::place`): a group takes a free contiguous lane of K GPUs. A one-GPU call takes, in order, a
-  free GPU with its plan's idle executor; a free GPU where its learned want fits beside the tenants
-  there without evicting any (a replica when the plan runs elsewhere too; a plan with nothing
-  learned fits only a GPU that holds nothing); or, when the plan runs nowhere or its family holds a GPU, the first free or
-  borrowed one. Otherwise it waits, and later requests in that pass do not take the GPUs it waits
-  for afresh, except a family that holds a slot (the waiter may wait on it). Prefetches yield to
-  queued requests. A GPU that never ran the plan first copies its learned facts from one that did.
+- Placement (`GpuPool::place`), inside the root's lane (else on unallocated, unclaimed GPUs): a
+  group takes a free contiguous lane of K GPUs. A one-GPU call takes, in order, a free GPU with
+  its plan's idle executor; a free GPU where its learned want fits beside the tenants there
+  without evicting any (a replica when the plan runs elsewhere too; a plan with nothing learned
+  fits only a GPU that holds nothing); or, when the plan runs nowhere or inside its root's lane,
+  any free one. A waiting standalone call claims the GPUs it waits for. A prefetch loads only
+  inside its root's bound lane, after that root's queued requests, and ends at its release. A GPU that never ran the plan first copies its learned facts from one that did.
   Replicas share the host tier's layouts and are ordinary tenants of their GPU's memory policy. A
   new executor's GPU is logged as `memory: {"event": "place"}`; `loads.jsonl` and `invokes.jsonl`
   name each line's `gpus`.

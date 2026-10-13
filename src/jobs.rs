@@ -1,5 +1,5 @@
-//! Jobs and their child runs. Accelerator jobs retain their device allocation; deviceless
-//! workflows retain a family scheduling reservation from their first GPU child until release.
+//! Jobs and their child runs. A root job's executor holds its GPU allocation (`gpu_allocation`)
+//! until exit or `Context.release_gpus()`; an accelerator job also keeps its own GPU.
 //! Each call it makes to one of its package's invocables arrives on the seam (`child_call`)
 //! and becomes a run of its own, `<parent>/<call_index>`, under the parent's signer: same
 //! records, dispatched like any run, canceled with the parent. A child's result and files
@@ -17,6 +17,7 @@ use crate::{
         ExecutorConfig, Frame, Kind, Services,
     },
     execution::Engine,
+    gpu_allocation::Claims,
     gpu_service::{
         command_ok, keep_triage, output_bindings, record_measurements, settle, stage_inputs,
         WakeOnExit,
@@ -221,23 +222,35 @@ impl Jobs {
                 .is_none_or(|s| s.preparation_id.is_empty())
     }
 
+    /// Start `record`, or leave it queued (false). A root job registers its allocation; an
+    /// accelerator job also needs its GPU.
     pub fn dispatch(
         self: &Arc<Self>,
         engine: &Arc<Engine>,
         record: &Execution,
         held: HeldGeneration,
-        waiting: &[bool],
+        claims: &mut Claims,
     ) -> io::Result<bool> {
-        let allocation = if record.invocation.accelerator || (record.invocation.job && record.invocation.gpus > 0) {
-            let pool = self.service.upgrade().and_then(|s| s.gpu())
-                .ok_or_else(|| io::Error::other("accelerator_job_unavailable: no configured GPU"))?;
-            let Some(allocation) = pool.job_allocation(engine, record, waiting)? else { return Ok(false); };
-            Some(allocation)
-        } else { None };
+        let pool = self.service.upgrade().and_then(|s| s.gpu());
+        let root = pool.as_ref().filter(|_| record.invocation.job && record.invocation.parent.is_empty()).and_then(|pool| {
+            let width = match record.invocation.gpus {
+                0 => held.record.widest_group(pool.width()) as usize,
+                gpus => gpus as usize,
+            };
+            pool.root(engine, record, width)
+        });
+        let allocation = match (record.invocation.accelerator, &pool) {
+            (true, None) => return Err(io::Error::other("accelerator_job_unavailable: no configured GPU")),
+            (true, Some(pool)) => match pool.job_allocation(engine, record, claims)? {
+                Some(allocation) => Some(allocation),
+                None => return Ok(false),
+            },
+            (false, _) => None,
+        };
         let (jobs, job) = (self.clone(), record.invocation.job);
         engine.dispatch_managed(&record.id, move |engine, id| {
             let result = match job {
-                true => jobs.job(&engine, &id, held, allocation),
+                true => jobs.job(&engine, &id, held, allocation, root),
                 false => jobs.call(&engine, &id, held),
             };
             let settled = match &result {
@@ -258,6 +271,7 @@ impl Jobs {
         id: &str,
         held: &HeldGeneration,
         allocation: Option<crate::gpu_service::JobAllocation>,
+        root_allocation: Option<crate::gpu_service::RootAllocation>,
     ) -> io::Result<Option<DeviceExecutor>> {
         if let Some(gpu) = &allocation { gpu.prepare()?; }
         // Reclamation may have waited for a serving descendant to finish.
@@ -317,13 +331,11 @@ impl Jobs {
             )
         })?;
         executor.retain_until_exit(directory);
-        let family = crate::gpu_reservation::workflow(&pending, |id| engine.get(id))?;
-        let workflow_pool = (pending.invocation.job && !pending.invocation.accelerator && family.as_deref() == Some(id))
-            .then(|| self.service.upgrade().and_then(|service| service.gpu())).flatten();
-        if let Some(pool) = workflow_pool {
-            executor.retain_until_exit(pool.workflow(&pending, allocation));
-        } else if let Some(allocation) = allocation {
+        if let Some(allocation) = allocation {
             executor.retain_until_exit(allocation);
+        }
+        if let Some(root_allocation) = root_allocation {
+            executor.retain_until_exit(root_allocation);
         }
         executor.retain_until_exit(WakeOnExit(Arc::downgrade(engine)));
         let facts = ExecutorFacts {
@@ -374,9 +386,10 @@ impl Jobs {
         id: &str,
         held: HeldGeneration,
         allocation: Option<crate::gpu_service::JobAllocation>,
+        root: Option<crate::gpu_service::RootAllocation>,
     ) -> io::Result<()> {
         let record = engine.get(id)?;
-        let Some(mut executor) = self.launch(engine, id, &held, allocation)? else {
+        let Some(mut executor) = self.launch(engine, id, &held, allocation, root)? else {
             return Ok(());
         };
         let (interface, application, document) =
@@ -510,7 +523,7 @@ impl Jobs {
         held: HeldGeneration,
     ) -> io::Result<()> {
         let record = engine.get(id)?;
-        let Some(mut executor) = self.launch(engine, id, &held, None)? else {
+        let Some(mut executor) = self.launch(engine, id, &held, None, None)? else {
             return Ok(());
         };
         let (interface, application, document) =
@@ -855,6 +868,9 @@ impl Jobs {
                 ),
                 code => (code, refusal.message),
             })?;
+        if let Some(pool) = service.gpu() {
+            pool.want(job.root_seq());
+        }
         // A pausing job starts nothing new; a resumed one's held call goes on.
         let engine = &service.engine;
         let held = match Self::holding(engine, &parent.id) {
@@ -1055,11 +1071,11 @@ impl Jobs {
                 let service = self.service.upgrade()
                     .ok_or_else(|| io::Error::other("the machine is stopping"))?;
                 let record = service.engine.get(&parent.id)?;
-                // An inline accelerator handler cannot give up its actual device safely.
-                if !record.invocation.accelerator {
+                // Only a CPU root ends its lane: an accelerator job cannot give up its own
+                // device safely, and a nested job cannot end its root's future GPU work.
+                if record.invocation.parent.is_empty() && !record.invocation.accelerator {
                     if let Some(pool) = service.gpu() {
-                        // A nested CPU job cannot surrender its ancestor's future GPU work.
-                        pool.release_workflow(&record.id);
+                        pool.release(&service.engine, record.root_seq());
                     }
                 }
                 Ok(Answer::ok(frame.seq))
@@ -1089,6 +1105,9 @@ impl Jobs {
         ))?;
         let job = service.engine.get(&parent.id)
             .map_err(|error| ("child_call_refused", error.to_string()))?;
+        if let Some(pool) = service.gpu() {
+            pool.want(job.root_seq());
+        }
         runs.prefetch(&job, application, entrypoint, choices)
             .map_err(|error| (error.code, error.message))?;
         Ok(Answer::ok(frame.seq))
@@ -1860,7 +1879,7 @@ mod exact_tests {
     }
 
     #[test]
-    fn gpu_release_frame_releases_a_live_cpu_roots_reservation() {
+    fn only_a_cpu_root_releases_its_gpu_lane() {
         let root = std::env::temp_dir().join(format!("cm-release-{}", uuid::Uuid::new_v4()));
         let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
         let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
@@ -1868,18 +1887,16 @@ mod exact_tests {
         let pool = crate::gpu_service::GpuPool::new(&root.join("gpu"), config, store.clone()).unwrap();
         service.configure_gpu(pool.clone()).unwrap();
         let jobs = Jobs::configure(&service, store, None).unwrap();
-        let job = service.engine.submit("root", crate::journal::Invocation {
-            job: true, gpus: 1, ..Default::default()
+        let submit = |key: &str, parent: &str| service.engine.submit(key, crate::journal::Invocation {
+            job: true, parent: parent.into(), ..Default::default()
         }).unwrap();
-        let next = service.engine.submit("next", crate::journal::Invocation {
-            job: true, gpus: 1, ..Default::default()
-        }).unwrap();
-        let allocation = pool.job_allocation(&service.engine, &job, &[]).unwrap().unwrap();
-        let owner = pool.workflow(&job, Some(allocation));
-        assert!(pool.job_allocation(&service.engine, &next, &[]).unwrap().is_none());
-        let nested = service.engine.submit("nested", crate::journal::Invocation {
-            job: true, parent: job.id.clone(), ..Default::default()
-        }).unwrap();
+        let (job, next) = (submit("root", ""), submit("next", ""));
+        let (_owner, _next_owner) = (pool.root(&service.engine, &job, 1).unwrap(), pool.root(&service.engine, &next, 1).unwrap());
+        let lane = |record: &Execution| pool.root_lane(&service.engine, record.root_seq(), &mut [None]);
+        assert!(lane(&job).is_some());
+        assert!(lane(&next).is_none());
+        let nested = submit("nested", &job.id);
+        assert_eq!(nested.root_seq(), job.root_seq(), "a child is stamped with its root at acceptance");
         let mut parent = Parent {
             id: nested.id, request: "root".into(), actor: "alice".into(), spool: root.clone(),
             callables: Default::default(), pure: false, pure_callables: Default::default(),
@@ -1887,14 +1904,11 @@ mod exact_tests {
         };
         let release = Frame { kind: Kind::GpuRelease, seq: 7, ..Default::default() };
         assert!(jobs.seam(&parent, &release).unwrap().0.ok);
-        assert!(pool.job_allocation(&service.engine, &next, &[]).unwrap().is_none(),
-            "a nested CPU child must not release its ancestor's reservation");
+        assert!(lane(&next).is_none(), "a nested job must not release its root's lane");
         parent.id = job.id;
         let (answer, file) = jobs.seam(&parent, &release).unwrap();
         assert!(answer.ok && file.is_none());
-        assert!(pool.job_allocation(&service.engine, &next, &[]).unwrap().is_some(),
-            "the CPU root is still alive but its release must unblock the next workflow");
-        drop(owner);
+        assert!(lane(&next).is_some(), "the live root's release lets the next root bind");
         pool.stop().unwrap();
         fs::remove_dir_all(root).unwrap();
     }

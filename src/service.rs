@@ -3,7 +3,7 @@ use crate::{
     catalog::Catalog,
     execution::{process_ended, Engine},
     gpu_service::{GpuPool, KeptMember, Level, Member},
-    journal::{Execution, ProcessBirth, State, SubmissionContext},
+    journal::{Execution, ProcessBirth, SubmissionContext},
 };
 use serde_json::Value;
 use std::{
@@ -423,6 +423,8 @@ impl Service {
             }
         }
     }
+    /// One pass over the ready runs, by root acceptance (Slurm FIFO): an older root, ready or
+    /// still in its CPU start-up, keeps the GPUs it needs (`claims`) from younger ones.
     fn dispatch_ready(&self) -> io::Result<()> {
         let stopped = self.stopped.lock().unwrap();
         if *stopped {
@@ -432,7 +434,7 @@ impl Service {
         // pretend they are free merely because it has no local supervisor.
         let active = self.engine.active(usize::MAX)?;
         let is_gpu = |record: &Execution| {
-            record.invocation.accelerator || (record.invocation.job && record.invocation.gpus > 0) || record
+            record.invocation.accelerator || record
                 .submission
                 .as_ref()
                 .is_some_and(|s| !s.preparation_id.is_empty())
@@ -441,8 +443,10 @@ impl Service {
         // alive holds devices nobody here can name, so it fences them all.
         let gpu_fenced = self.gpu_startup_fences() != 0
             || active.iter().any(|r| is_gpu(r) && !self.engine.owns(&r.id));
-        // GPUs an earlier queued request waits for: a later one does not take them first.
-        let mut waiting = vec![false; self.gpu().map_or(0, |gpu| gpu.width())];
+        let gpu = self.gpu();
+        let mut claims = vec![None; gpu.as_ref().map_or(0, |gpu| gpu.width())];
+        // Started roots not bound to a lane yet: each keeps its place ahead of younger runs.
+        let mut pending = gpu.as_ref().map(|gpu| gpu.pending()).unwrap_or_default().into_iter().peekable();
         // A job mostly waits on its children; only they take CPU room.
         let mut room = self.parallelism.saturating_sub(
             active
@@ -452,78 +456,69 @@ impl Service {
         );
         let jobs = self.jobs.lock().unwrap().clone();
         // A queued job needs no room, so with jobs every ready record is looked at.
-        if room == 0 && (gpu_fenced || self.gpu().is_none()) && jobs.is_none() {
+        if room == 0 && (gpu_fenced || gpu.is_none()) && jobs.is_none() {
             return Ok(());
         }
-        let mut cursor = 0;
-        loop {
-            let page = self.engine.ready_after(cursor, 256)?;
-            if page.is_empty() {
-                break;
+        for record in self.engine.ready()? {
+            let root = record.root_seq();
+            while let Some((older, width)) = pending.next_if(|(seq, _)| *seq <= root) {
+                if let (Some(gpu), true) = (&gpu, older < root) {
+                    gpu.claim(older, width, &mut claims);
+                }
             }
-            for record in page {
-                cursor = record.id.parse().map_err(io::Error::other)?;
-                if record.state != State::Queued || record.waiting_reason.is_some() {
-                    continue;
-                }
-                let held = match self.catalog.resolve(&record.invocation.generation) {
-                    Ok(held) => held,
-                    Err(error) => {
-                        self.engine.fail_unstarted(&record.id, "environment_unavailable",
-                            format!("held generation unavailable: {error}"))?;
-                        continue;
-                    }
-                };
-                if !held.record.owns(&record.invocation.module, &record.invocation.package) {
+            let held = match self.catalog.resolve(&record.invocation.generation) {
+                Ok(held) => held,
+                Err(error) => {
                     self.engine.fail_unstarted(&record.id, "environment_unavailable",
-                        "held package identity differs from accepted invocation")?;
+                        format!("held generation unavailable: {error}"))?;
                     continue;
                 }
-                if crate::jobs::Jobs::takes(&record) {
-                    let Some(jobs) = &jobs else {
-                        self.engine.fail_unstarted(&record.id, "capability_unavailable",
-                            "CPU execution is not configured on this machine")?;
-                        continue;
-                    };
-                    if record.invocation.job {
-                        let accelerator = record.invocation.accelerator || record.invocation.gpus > 0;
-                        if accelerator && gpu_fenced {
-                            continue;
-                        }
-                        if !jobs.dispatch(&self.engine, &record, held, &waiting)? && accelerator {
-                            waiting.iter_mut().take(record.invocation.gpus.max(1) as usize).for_each(|w| *w = true);
-                        }
-                    } else if room > 0 && jobs.dispatch(&self.engine, &record, held, &waiting)? {
-                        room -= 1;
+            };
+            if !held.record.owns(&record.invocation.module, &record.invocation.package) {
+                self.engine.fail_unstarted(&record.id, "environment_unavailable",
+                    "held package identity differs from accepted invocation")?;
+                continue;
+            }
+            if crate::jobs::Jobs::takes(&record) {
+                let Some(jobs) = &jobs else {
+                    self.engine.fail_unstarted(&record.id, "capability_unavailable",
+                        "CPU execution is not configured on this machine")?;
+                    continue;
+                };
+                if record.invocation.job {
+                    if !(record.invocation.accelerator && gpu_fenced) {
+                        jobs.dispatch(&self.engine, &record, held, &mut claims)?;
                     }
-                } else if let Some(context) = record
-                    .submission
-                    .as_ref()
-                    .filter(|s| !s.preparation_id.is_empty())
-                {
-                    if gpu_fenced {
-                        continue;
-                    }
-                    let Some(gpu) = self.gpu() else {
-                        self.engine.fail_unstarted(&record.id, "capability_unavailable",
-                            "GPU execution is not configured on this machine")?;
-                        continue;
-                    };
-                    let preparation = self
-                        .engine
-                        .preparation(&context.actor, &context.preparation_id)?
-                        .ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "accepted GPU preparation is absent",
-                            )
-                        })?;
-                    let held = held.application(&record.invocation.module)?;
-                    gpu.dispatch(&self.engine, &record, held, gpu.plan(&preparation)?, &mut waiting)?;
+                } else if room > 0 && jobs.dispatch(&self.engine, &record, held, &mut claims)? {
+                    room -= 1;
                 }
-                if room == 0 && jobs.is_none() && (gpu_fenced || waiting.iter().all(|w| *w)) {
-                    return Ok(());
+            } else if let Some(context) = record
+                .submission
+                .as_ref()
+                .filter(|s| !s.preparation_id.is_empty())
+            {
+                if gpu_fenced {
+                    continue;
                 }
+                let Some(gpu) = &gpu else {
+                    self.engine.fail_unstarted(&record.id, "capability_unavailable",
+                        "GPU execution is not configured on this machine")?;
+                    continue;
+                };
+                let preparation = self
+                    .engine
+                    .preparation(&context.actor, &context.preparation_id)?
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "accepted GPU preparation is absent",
+                        )
+                    })?;
+                let held = held.application(&record.invocation.module)?;
+                gpu.dispatch(&self.engine, &record, held, gpu.plan(&preparation)?, &mut claims)?;
+            }
+            if room == 0 && jobs.is_none() && (gpu_fenced || claims.iter().all(Option::is_some)) {
+                return Ok(());
             }
         }
         Ok(())

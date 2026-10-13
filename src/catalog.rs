@@ -65,6 +65,18 @@ impl Generation {
         })
     }
 
+    /// The widest GPU group any model entrypoint of this environment (its own App's or a
+    /// callee's) runs on `available` GPUs: the width of a workflow's allocation. 0: none.
+    pub fn widest_group(&self, available: usize) -> u32 {
+        std::iter::once(&self.interface)
+            .chain(self.callees.iter().map(|callee| &callee.interface))
+            .filter_map(|interface| interface.get("entrypoints")?.as_array())
+            .flatten()
+            .filter_map(|entry| entry.get("models")?.as_array().filter(|models| !models.is_empty()))
+            .filter_map(|models| crate::gpu_service::group_degree(models, 0, available).ok())
+            .max()
+            .unwrap_or(0)
+    }
     /// The package an application of this environment belongs to (the root's or a callee's),
     /// its release and its interface.
     pub fn app(&self, application: &str) -> Option<(&str, &str, &serde_json::Value)> {

@@ -470,10 +470,18 @@ impl Log {
                     )
                 }),
             }),
-            "log" => v1::run_event::Event::Log(v1::LogLine {
-                level: body["level"].as_str().unwrap_or("info").into(),
-                text: body["text"].as_str().unwrap_or_default().into(),
-            }),
+            "log" => match body.get("gpu") {
+                Some(gpu) => v1::run_event::Event::Gpu(v1::GpuAllocation {
+                    state: gpu["state"].as_str().unwrap_or_default().into(),
+                    gpus: gpu["gpus"].as_array().into_iter().flatten().filter_map(|g| g.as_u64()).map(|g| g as u32).collect(),
+                    width: gpu["width"].as_u64().unwrap_or_default() as u32,
+                    behind: gpu["behind"].as_str().unwrap_or_default().into(),
+                }),
+                None => v1::run_event::Event::Log(v1::LogLine {
+                    level: body["level"].as_str().unwrap_or("info").into(),
+                    text: body["text"].as_str().unwrap_or_default().into(),
+                }),
+            },
             "product" => {
                 let product = event.product?;
                 let list = product.op == domain::RunProductOp::Append as i32;

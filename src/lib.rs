@@ -8,7 +8,7 @@ pub mod child_launcher;
 pub mod device_executor;
 pub mod execution;
 mod failure_upgrade;
-mod gpu_reservation;
+mod gpu_allocation;
 pub mod gpu_service;
 pub mod held_models;
 pub mod host_memory;

@@ -372,6 +372,7 @@ impl Runs {
             job: spec.job,
             accelerator: false, // known only after the actual installation is prepared
             parent: spec.parent.clone(),
+            ..Default::default() // root and family: stamped at acceptance
         };
         let (record, new) = self
             .service
@@ -1112,11 +1113,8 @@ impl Runs {
         let Some(gpu) = self.service.gpu() else {
             return Ok(());
         };
-        let family = crate::gpu_reservation::family(parent, |id| self.service.engine.get(id))?;
-        let workflow = crate::gpu_reservation::workflow(parent, |id| self.service.engine.get(id))?;
-        // Downloads can outlast the GPU phase that requested this hint. They may finish,
-        // but the hint must not warm a GPU after that phase has explicitly released it.
-        let phase = gpu.prefetch_phase(workflow.as_deref());
+        // Downloads may outlast the hint's GPU phase; the GPU load waits for its root's lane.
+        let (root, family) = (parent.root_seq(), parent.family().map(String::from));
         let owner = parent.id.clone();
         let (runs, entrypoint) = (self.clone(), entrypoint.to_string());
         let application = application.to_string();
@@ -1134,7 +1132,7 @@ impl Runs {
                 Ok((installation, Some(plan))) => {
                     match runs.service.catalog.resolve(&installation.generation)
                         .and_then(|held| held.application(&application)) {
-                        Ok(held) => gpu.prefetch(&runs.service.engine, held, plan, family.clone(), owner.clone(), phase),
+                        Ok(held) => gpu.prefetch(&runs.service.engine, held, plan, (root, family.clone()), owner.clone()),
                         Err(error) => eprintln!("prefetch of {entrypoint}: {error}"),
                     }
                 }

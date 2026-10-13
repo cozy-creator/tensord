@@ -36,6 +36,12 @@ pub struct Invocation {
     /// A child run's parent (its execution id): children end with it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub parent: String,
+    /// A child run's root: its outermost ancestor, whose acceptance orders its GPU work.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub root: String,
+    /// A child run's outermost accelerator job ancestor, whose GPU its calls may borrow.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub family: String,
 }
 
 /// One file input: the declared field path, its exact bytes (sha256 and length, held in the
@@ -270,6 +276,19 @@ impl CallMemo {
 }
 
 impl Execution {
+    /// Its root run's acceptance order: GPU work queues by it.
+    pub fn root_seq(&self) -> u64 {
+        let root = if self.invocation.root.is_empty() { &self.id } else { &self.invocation.root };
+        root.parse().unwrap_or(u64::MAX)
+    }
+    /// The accelerator job whose GPU its calls borrow: its outermost one, itself included.
+    pub fn family(&self) -> Option<&str> {
+        match (self.invocation.family.as_str(), self.invocation.accelerator) {
+            ("", true) => Some(&self.id),
+            ("", false) => None,
+            (family, _) => Some(family),
+        }
+    }
     /// Its progress is observed: an attempt running, or a run preparing inside itself.
     pub fn observed(&self) -> bool {
         self.state == State::Running
@@ -1326,7 +1345,6 @@ impl Journal {
         memo: CallMemo,
         answer: Option<ResultRecord>,
     ) -> io::Result<Execution> {
-        let encoded_invocation = encoded(&invocation)?;
         self.update_with(
             id,
             None,
@@ -1336,7 +1354,8 @@ impl Journal {
                 {
                     return Ok(false);
                 }
-                record.invocation = invocation;
+                let (root, family) = (std::mem::take(&mut record.invocation.root), std::mem::take(&mut record.invocation.family));
+                record.invocation = Invocation { root, family, ..invocation };
                 if let Some(submission) = record.submission.as_mut() {
                     submission.preparation_id = preparation.into();
                 }
@@ -1353,7 +1372,7 @@ impl Journal {
             |tx, record| {
                 tx.execute(
                     "UPDATE executions SET invocation=?1 WHERE id=?2",
-                    params![encoded_invocation, record.id],
+                    params![encoded(&record.invocation)?, record.id],
                 )
                 .map_err(db_error)?;
                 Ok(())
@@ -1480,11 +1499,19 @@ pub const PREPARING: &str = "preparing";
 fn insert(
     tx: &rusqlite::Transaction<'_>,
     key: &str,
-    invocation: Invocation,
+    mut invocation: Invocation,
     context: Option<SubmissionContext>,
     boot: &str,
     waiting: Option<&str>,
 ) -> io::Result<Execution> {
+    if !invocation.parent.is_empty() {
+        let parent: String = tx
+            .query_row("SELECT record FROM executions WHERE id=?1", [&invocation.parent], |row| row.get(0))
+            .map_err(db_error)?;
+        let parent: Execution = serde_json::from_str(&parent).map_err(db_error)?;
+        invocation.root = parent.root_seq().to_string();
+        invocation.family = parent.family().unwrap_or_default().into();
+    }
     let objects: Vec<_> = invocation
         .inputs
         .iter()
@@ -1768,20 +1795,11 @@ impl Journal {
         self.selected("SELECT record FROM executions WHERE state IN ('starting','running') ORDER BY id LIMIT ?1", limit)
     }
 
-    pub fn ready(&self, limit: usize) -> io::Result<Vec<Execution>> {
-        self.selected("SELECT record FROM executions WHERE state='queued' AND json_extract(record,'$.waiting_reason') IS NULL ORDER BY id LIMIT ?1", limit)
-    }
-
-    pub fn ready_after(&self, after: u64, limit: usize) -> io::Result<Vec<Execution>> {
-        let mut statement = self.connection.prepare("SELECT record FROM executions WHERE id>?1 AND state='queued' AND json_extract(record,'$.waiting_reason') IS NULL ORDER BY id LIMIT ?2").map_err(db_error)?;
+    /// Every run ready to dispatch, by its root's acceptance, then its own.
+    pub fn ready(&self) -> io::Result<Vec<Execution>> {
+        let mut statement = self.connection.prepare("SELECT record FROM executions WHERE state='queued' AND json_extract(record,'$.waiting_reason') IS NULL ORDER BY CAST(COALESCE(NULLIF(json_extract(record,'$.invocation.root'),''),id) AS INTEGER), id").map_err(db_error)?;
         let records = statement
-            .query_map(
-                params![
-                    after.min(i64::MAX as u64) as i64,
-                    limit.min(i64::MAX as usize) as i64
-                ],
-                |row| row.get::<_, String>(0),
-            )
+            .query_map([], |row| row.get::<_, String>(0))
             .map_err(db_error)?;
         records
             .map(|record| record.map_err(db_error))
@@ -1957,14 +1975,11 @@ impl Journal {
     /// A call of the run applied its attention pin: the pin is the root run's, whichever call
     /// holds the attention sites.
     pub fn apply_attention(&mut self, id: &str) -> io::Result<()> {
-        let mut root = self.get(id)?;
-        while !root.invocation.parent.is_empty() {
-            root = self.get(&root.invocation.parent)?;
-        }
+        let root = self.get(id)?.root_seq().to_string();
         self.connection
             .execute(
                 "INSERT OR IGNORE INTO attention_applied(execution) VALUES(?1)",
-                [&root.id],
+                [&root],
             )
             .map_err(db_error)?;
         Ok(())

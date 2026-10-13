@@ -613,7 +613,7 @@ async fn cancellation_wins_while_the_real_run_acceptance_waits_on_store_custody(
     assert!(record.canceled_before_acceptance);
     assert_eq!(record.attempt, 0);
     assert!(record.process.is_none() && record.invocation.generation.is_empty());
-    assert!(server.service.engine.ready(10).unwrap().is_empty());
+    assert!(server.service.engine.ready().unwrap().is_empty());
     server.stop().await;
 }
 

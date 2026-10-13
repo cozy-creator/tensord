@@ -352,6 +352,15 @@ impl Engine {
         self.notify_activity();
         Ok(sequence)
     }
+    /// A root's GPU allocation changed: a `gpu` entry in its log (`gpu_service::note_gpus`).
+    pub fn append_gpu(&self, id: &str, entry: &serde_json::Value) -> io::Result<u64> {
+        let line = serde_json::to_vec(entry)?;
+        let progress = self.progress.lock().unwrap();
+        let sequence = self.journal.lock().unwrap().append_log(id, progress.get(id), &line)?;
+        drop(progress);
+        self.notify_activity();
+        Ok(sequence)
+    }
     /// A call of the run applied its attention pin (its executor said so).
     pub fn apply_attention(&self, id: &str) -> io::Result<()> {
         self.journal.lock().unwrap().apply_attention(id)
@@ -542,12 +551,9 @@ impl Engine {
         Ok(record)
     }
 
-    pub fn ready(&self, limit: usize) -> io::Result<Vec<Execution>> {
-        self.select(|journal| journal.ready(limit))
-    }
-
-    pub fn ready_after(&self, after: u64, limit: usize) -> io::Result<Vec<Execution>> {
-        self.journal.lock().unwrap().ready_after(after, limit)
+    /// Every run ready to dispatch, by its root's acceptance, then its own.
+    pub fn ready(&self) -> io::Result<Vec<Execution>> {
+        self.journal.lock().unwrap().ready()
     }
     pub(crate) fn gpu_births_after(
         &self,
@@ -1616,6 +1622,30 @@ pub(crate) fn open_artifact(root: &Path, path: &Path) -> io::Result<File> {
 mod tests {
     use super::*;
     use std::{sync::mpsc, time::Duration};
+
+    /// Slurm FIFO: an older root's step queued later dispatches before a younger root's
+    /// step queued earlier; each child carries its root and accelerator family.
+    #[test]
+    fn ready_runs_queue_by_their_roots_acceptance() {
+        let root = std::env::temp_dir().join(format!("cm-ready-{}", uuid::Uuid::new_v4()));
+        let engine = Engine::open(&root).unwrap();
+        let submit = |key: &str, parent: &str, accelerator| engine.submit(key, Invocation {
+            job: true, accelerator, parent: parent.into(), ..Default::default()
+        }).unwrap();
+        let (older, younger) = (submit("older", "", false), submit("younger", "", false));
+        for root in [&older, &younger] {
+            assert!(engine.dispatch_managed(&root.id, |_, _| Ok(())).unwrap());
+        }
+        let younger_step = submit("younger/1", &younger.id, false);
+        let job = submit("older/1", &older.id, true);
+        let nested = submit("older/1/1", &job.id, false);
+        let order: Vec<_> = engine.ready().unwrap().into_iter().map(|r| r.id).collect();
+        assert_eq!(order, [job.id.clone(), nested.id.clone(), younger_step.id.clone()]);
+        assert_eq!((nested.root_seq(), nested.family()), (older.root_seq(), Some(job.id.as_str())));
+        assert_eq!((younger_step.root_seq(), younger_step.family()), (younger.root_seq(), None));
+        drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn a_resumed_run_is_not_dispatched_until_its_stopped_attempt_has_ended() {

@@ -263,7 +263,7 @@ fn completion_wakes_owner_scheduler_to_dispatch_next_queued_package() {
         .engine
         .submit("queued-next", fixture.invocation("infer"))
         .unwrap();
-    assert_eq!(fixture.engine.ready(8).unwrap()[0].id, next.id);
+    assert_eq!(fixture.engine.ready().unwrap()[0].id, next.id);
     assert_eq!(fixture.engine.active(8).unwrap()[0].id, first);
     assert_eq!(fixture.engine.nonterminal(1).unwrap().len(), 1);
     let observed = fixture.engine.activity_epoch();
@@ -283,7 +283,7 @@ fn completion_wakes_owner_scheduler_to_dispatch_next_queued_package() {
             if !engine.get(&first_for_scheduler).unwrap().state.terminal() {
                 continue;
             }
-            let ready = engine.ready(1).unwrap();
+            let ready = engine.ready().unwrap();
             assert_eq!(ready.len(), 1);
             assert!(engine.dispatch(&ready[0].id, config).unwrap());
             sent.send(epoch).unwrap();
@@ -301,7 +301,7 @@ fn completion_wakes_owner_scheduler_to_dispatch_next_queued_package() {
     );
     assert_eq!(fixture.engine.get(&first).unwrap().state, State::Completed);
     assert!(fixture.engine.nonterminal(8).unwrap().is_empty());
-    assert!(fixture.engine.ready(8).unwrap().is_empty());
+    assert!(fixture.engine.ready().unwrap().is_empty());
     assert_eq!(fixture.engine.list().unwrap().len(), 2);
 }
 
@@ -1095,7 +1095,7 @@ fn a_newer_or_damaged_row_never_hides_the_rest_of_the_journal() {
         .any(|r| r.id == kept.id && r.state == State::Queued));
     let unknown = listed.iter().find(|r| r.id == newer.id).unwrap();
     assert_eq!(unknown.state, State::Unknown);
-    assert!(!journal.ready(16).unwrap().iter().any(|r| r.id == newer.id));
+    assert!(!journal.ready().unwrap().iter().any(|r| r.id == newer.id));
     // A newer machine's state is never overwritten by this one.
     let mut journal = journal;
     assert!(journal.cancel(&newer.id, "actor-a").is_err());
