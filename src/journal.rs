@@ -589,13 +589,31 @@ impl Journal {
     pub fn bound_generations(&self) -> io::Result<std::collections::HashSet<String>> {
         let mut statement = self
             .connection
-            .prepare("SELECT DISTINCT json_extract(record,'$.generation') FROM installations")
+            .prepare("SELECT DISTINCT json_extract(record,'$.generation') FROM installations
+                UNION SELECT json_extract(invocation,'$.generation') FROM executions
+                WHERE state NOT IN ('completed','failed','canceled')")
             .map_err(db_error)?;
         let rows = statement
             .query_map([], |row| row.get::<_, Option<String>>(0))
             .map_err(db_error)?;
         rows.filter_map(|row| row.map_err(db_error).transpose())
             .collect()
+    }
+
+    /// Reads consumed preparation references without dropping unreadable execution rows.
+    /// Unknown/newer execution states are custody obligations too.
+    pub fn unfinished_preparations(&self) -> io::Result<Vec<Preparation>> {
+        let mut statement = self.connection.prepare(
+            "SELECT p.record FROM executions e LEFT JOIN preparations p
+             ON p.actor=json_extract(e.record,'$.submission.actor')
+             AND p.id=json_extract(e.record,'$.submission.preparation_id')
+             WHERE e.state NOT IN ('completed','failed','canceled')
+             AND COALESCE(json_extract(e.record,'$.submission.preparation_id'),'')!=''").map_err(db_error)?;
+        let rows = statement.query_map([], |row| row.get::<_,Option<String>>(0)).map_err(db_error)?;
+        rows.map(|row| {
+            let record = row.map_err(db_error)?.ok_or_else(|| db_error("unfinished run's preparation is absent"))?;
+            serde_json::from_str(&record).map_err(db_error)
+        }).collect()
     }
 
     pub fn installations(&self, actor: &str) -> io::Result<Vec<Installation>> {

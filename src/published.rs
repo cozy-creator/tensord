@@ -345,10 +345,9 @@ impl Publisher {
             message: e.0,
         })?;
         let _fetching = self.fetch(vec![manifest.to_string()]);
-        let keep = match service.gpu() {
-            Some(gpu) => self.protected(service, &gpu),
-            None => self.fetching.lock().unwrap().keys().cloned().collect(),
-        };
+        let (keep, _gc) = self.keep_for_work(service, service.gpu().as_deref()).map_err(|e| Refused {
+            code: "store_roots_unavailable", message: e.to_string(),
+        })?;
         ensure(&self.store, &catalog, repository, manifest, &keep, bytes)
             .map_err(|(code, message)| Refused { code, message })
     }
@@ -369,44 +368,48 @@ impl Publisher {
     /// Neither evicts what live executors read, unfinished runs prepared, or preparations
     /// are fetching. Returns (views removed, bytes collected).
     pub fn reclaim(&self, service: &Service) -> io::Result<(usize, u64)> {
-        let keep = match service.gpu() {
-            Some(gpu) => self.protected(service, &gpu),
-            None => self.fetching.lock().unwrap().keys().cloned().collect(),
-        };
-        let pressure = crate::reclaim::Disk::measure(self.store.root())?.pressure();
-        let views = crate::adapter_views::evict(&self.store, &keep, pressure)?;
+        let keep = self.protected(service, service.gpu().as_deref())?;
+        // Thin local views expire by TTL; pressure cannot assume their shared weights
+        // are releasable bytes. TensorFS plans its managed model roots independently.
+        let views = crate::adapter_views::evict(&self.store, &keep, false)?;
+        let expired = tensorfs_core::gc::collect_idle(self.store.root(), &keep, crate::reclaim::TTL).map_err(io::Error::other)?;
         let relief =
             tensorfs_core::ensure::relieve(&self.store, &keep).map_err(io::Error::other)?;
         if let Some(unable) = relief.unable {
             eprintln!("store relief: a GC tier could not run: {unable}");
         }
-        Ok((views, relief.collected_bytes))
+        Ok((views, relief.collected_bytes + expired.reclaimed_bytes))
     }
 
     /// What a download's GC must never evict: what live executors read, every unfinished
     /// run's prepared models, and what preparations are fetching (this one's included).
-    fn protected(&self, service: &Service, gpu: &GpuPool) -> Vec<String> {
-        let mut keep = gpu.serving();
+    fn protected(&self, service: &Service, gpu: Option<&GpuPool>) -> io::Result<Vec<String>> {
+        let mut keep = gpu.map(GpuPool::serving).unwrap_or_default();
         keep.extend(self.fetching.lock().unwrap().keys().cloned());
-        for record in service.engine.nonterminal(usize::MAX).unwrap_or_default() {
-            let Some(submission) = record
-                .submission
-                .filter(|s| !s.preparation_id.is_empty())
-            else {
-                continue;
-            };
-            if let Ok(Some(preparation)) = service
-                .engine
-                .preparation(&submission.actor, &submission.preparation_id)
-            {
-                if let Ok(plan) = gpu.plan(&preparation) {
-                    keep.extend(plan.selections().into_iter().map(|s| s.manifest));
-                }
+        for preparation in service.engine.with_journal(|j| j.unfinished_preparations())? {
+            let plan: GpuPlan = serde_json::from_slice(&preparation.document).map_err(io::Error::other)?;
+            if plan.id != preparation.id || plan.installation != preparation.installation {
+                return Err(io::Error::other("GPU preparation differs from owned journal binding"));
             }
+            keep.extend(plan.selections().into_iter().map(|s| s.manifest));
         }
         keep.sort();
         keep.dedup();
-        keep
+        Ok(keep)
+    }
+
+    /// A private custody metadata error removes GC authority, not download authority.
+    /// Existing native writer exclusion prevents any cache GC while fitting work proceeds.
+    /// If work needs reclamation, admission reports the actual capacity/custody blockage.
+    fn keep_for_work(&self, service: &Service, gpu: Option<&GpuPool>) -> io::Result<(Vec<String>, Option<tensorfs_core::catalog::WriterGuard>)> {
+        match self.protected(service, gpu) {
+            Ok(keep) => Ok((keep, None)),
+            Err(error) => {
+                eprintln!("store roots unavailable; preserving all caches during preparation: {error}");
+                let guard = tensorfs_core::catalog::WriterGuard::acquire(self.store.root()).map_err(io::Error::other)?;
+                Ok((Vec::new(), Some(guard)))
+            }
+        }
     }
 
     fn alias(&self, request: &Request) -> String {
@@ -1071,7 +1074,7 @@ impl Publisher {
             });
         }
         let _fetching = self.fetch(grants.iter().map(|g| g.manifest.clone()).collect());
-        let keep = self.protected(service, gpu);
+        let (keep, _gc) = self.keep_for_work(service, Some(gpu)).map_err(io_failure)?;
         let mut fetched = std::collections::BTreeSet::new();
         for grant in &grants {
             if !fetched.insert(grant.manifest.clone()) || grant.repository.starts_with("local/") {
