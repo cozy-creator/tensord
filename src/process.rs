@@ -491,11 +491,7 @@ impl Drop for Watching {
 /// measured wedge, then reap it. The sample period is the meter's cadence, not a deadline.
 /// Then its scope: whatever outlived it (a `setsid` daemon) is killed and counted, and the
 /// scope is removed.
-pub fn reap(
-    exact: &Exact,
-    child: Option<&mut Child>,
-    liveness: Liveness,
-) -> io::Result<Reaped> {
+pub fn reap(exact: &Exact, child: Option<&mut Child>, liveness: Liveness) -> io::Result<Reaped> {
     let floor = liveness.floor();
     let mut pace = Pace::default();
     let mut killed = None;

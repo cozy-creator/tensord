@@ -98,8 +98,14 @@ impl Default for Progress {
 }
 impl Job {
     fn set(&self, progress: Progress) {
-        if let (Some(observe), Progress::Preparing { stage, moved, total }) =
-            (&self.observer, &progress)
+        if let (
+            Some(observe),
+            Progress::Preparing {
+                stage,
+                moved,
+                total,
+            },
+        ) = (&self.observer, &progress)
         {
             observe(stage, *moved, *total);
         }
@@ -202,7 +208,9 @@ impl Publisher {
                         progress: Mutex::new(Progress::Preparing {
                             stage: match &request.installed {
                                 Some(installed) => format!("preparing {}", installed.package),
-                                None => format!("preparing {}@{}", request.package, request.release),
+                                None => {
+                                    format!("preparing {}@{}", request.package, request.release)
+                                }
                             },
                             moved: 0,
                             total: 0,
@@ -284,13 +292,19 @@ impl Publisher {
                 format!("{path} names a source and a catalog checkpoint"),
             ));
         }
-        let made = make_source(&self.store, &choice.source, &choice.profiles, providers, &|stage, moved, total| {
-            job.set(Progress::Preparing {
-                stage: format!("{stage} for {path}"),
-                moved,
-                total,
-            })
-        })?;
+        let made = make_source(
+            &self.store,
+            &choice.source,
+            &choice.profiles,
+            providers,
+            &|stage, moved, total| {
+                job.set(Progress::Preparing {
+                    stage: format!("{stage} for {path}"),
+                    moved,
+                    total,
+                })
+            },
+        )?;
         let manifest = self
             .store
             .read_manifest(&made.manifest)
@@ -389,9 +403,7 @@ impl Publisher {
         let mut keep = gpu.serving();
         keep.extend(self.fetching.lock().unwrap().keys().cloned());
         for record in service.engine.nonterminal(usize::MAX).unwrap_or_default() {
-            let Some(submission) = record
-                .submission
-                .filter(|s| !s.preparation_id.is_empty())
+            let Some(submission) = record.submission.filter(|s| !s.preparation_id.is_empty())
             else {
                 continue;
             };
@@ -945,7 +957,13 @@ impl Publisher {
                 .cloned()
                 .unwrap_or_default();
             if !choice.source.is_empty() {
-                grants.push(self.source_grant(installation, &path, &choice, &request.providers, job)?);
+                grants.push(self.source_grant(
+                    installation,
+                    &path,
+                    &choice,
+                    &request.providers,
+                    job,
+                )?);
                 continue;
             }
             let (model, release, lane, manifest) = if let Some(reference) =
@@ -980,10 +998,20 @@ impl Publisher {
                     .as_ref()
                     .and_then(|b| b.get("bindings"))
                     .and_then(Value::as_array)
-                    .and_then(|rows| rows.iter().find(|row| row.get("slot").and_then(Value::as_str) == Some(path.as_str())))
+                    .and_then(|rows| {
+                        rows.iter().find(|row| {
+                            row.get("slot").and_then(Value::as_str) == Some(path.as_str())
+                        })
+                    })
                     .cloned()
                     .or_else(|| authored(slot))
-                    .ok_or(("model_binding_absent", format!("{} binds no model to {path}; bind one with `cozy package bind`", installation.package)))?;
+                    .ok_or((
+                        "model_binding_absent",
+                        format!(
+                            "{} binds no model to {path}; bind one with `cozy package bind`",
+                            installation.package
+                        ),
+                    ))?;
                 let mut model = row
                     .get("model")
                     .and_then(Value::as_str)
@@ -1081,7 +1109,14 @@ impl Publisher {
                 "downloading {}@{} {}",
                 grant.repository, grant.release, grant.lane
             ));
-            ensure(&self.store, catalog, &grant.repository, &grant.manifest, &keep, &|d, t| job.bytes(d, t))?;
+            ensure(
+                &self.store,
+                catalog,
+                &grant.repository,
+                &grant.manifest,
+                &keep,
+                &|d, t| job.bytes(d, t),
+            )?;
         }
         for grant in &mut grants {
             let parameter = grant
@@ -1095,7 +1130,15 @@ impl Publisher {
                 .iter()
                 .find(|c| c.parameter == grant.slot || c.parameter == parameter)
             {
-                apply_adapters(&self.store, catalog, choice, grant, &keep, &request.providers, job)?;
+                apply_adapters(
+                    &self.store,
+                    catalog,
+                    choice,
+                    grant,
+                    &keep,
+                    &request.providers,
+                    job,
+                )?;
             }
         }
         job.stage(format!("preparing {}", request.package));
@@ -1186,7 +1229,8 @@ fn ensure(
     let refspec = format!("{repository}@{manifest}");
     let mut keep = keep.to_vec();
     keep.push(manifest.to_string());
-    let on_event = |event: &tensorfs_core::ensure::Event| bytes(event.bytes_done, event.bytes_total);
+    let on_event =
+        |event: &tensorfs_core::ensure::Event| bytes(event.bytes_done, event.bytes_total);
     let mut request = tensorfs_core::ensure::Request::new(
         store,
         catalog.origin(),
@@ -1340,17 +1384,25 @@ fn apply_adapters(
     for adapter in &choice.adapters {
         let manifest = if adapter.source.is_empty() {
             let (repository, manifest) = resolve_adapter(catalog, adapter)?;
-            ensure(store, catalog, &repository, &manifest, &keep, &|d, t| job.bytes(d, t))?;
+            ensure(store, catalog, &repository, &manifest, &keep, &|d, t| {
+                job.bytes(d, t)
+            })?;
             manifest
         } else {
             // A provider-source LoRA (civitai://, hf://) is made here, normalized at ingest.
-            let made = make_source(store, &adapter.source, &adapter.profiles, providers, &|stage, moved, total| {
-                job.set(Progress::Preparing {
-                    stage: format!("{stage} for an adapter of {}", grant.slot),
-                    moved,
-                    total,
-                })
-            })?;
+            let made = make_source(
+                store,
+                &adapter.source,
+                &adapter.profiles,
+                providers,
+                &|stage, moved, total| {
+                    job.set(Progress::Preparing {
+                        stage: format!("{stage} for an adapter of {}", grant.slot),
+                        moved,
+                        total,
+                    })
+                },
+            )?;
             format!("sha256:{}", made.manifest.sha256)
         };
         keep.push(manifest.clone());
@@ -1670,13 +1722,25 @@ mod tests {
         };
         let job = Job::default();
         let grant = publisher
-            .source_grant(&installation, "generate.models.unet", &choice, &Providers::default(), &job)
+            .source_grant(
+                &installation,
+                "generate.models.unet",
+                &choice,
+                &Providers::default(),
+                &job,
+            )
             .unwrap();
         assert!(grant.repository.starts_with("local/source-"), "{grant:?}");
         assert!(grant.manifest.starts_with("sha256:"));
         assert!(!grant.components.is_empty());
         let again = publisher
-            .source_grant(&installation, "generate.models.unet", &choice, &Providers::default(), &job)
+            .source_grant(
+                &installation,
+                "generate.models.unet",
+                &choice,
+                &Providers::default(),
+                &job,
+            )
             .unwrap();
         assert_eq!(again.manifest, grant.manifest);
         let _ = std::fs::remove_dir_all(root);
@@ -1689,13 +1753,23 @@ mod tests {
     fn a_civitai_lora_adapter_source_becomes_peft_factors() {
         let root = std::env::temp_dir().join(format!("cm-lora-{}", uuid::Uuid::new_v4()));
         let store = Store::ensure(&root.join("tensorfs")).unwrap();
-        let made = make_source(&store, "civitai://145907", &[], &Providers::default(), &|_, _, _| {}).unwrap();
+        let made = make_source(
+            &store,
+            "civitai://145907",
+            &[],
+            &Providers::default(),
+            &|_, _, _| {},
+        )
+        .unwrap();
         assert_eq!(made.profiles, ["sdxl/lora-kohya/1"]);
         let manifest = store.read_manifest(&made.manifest).unwrap();
-        let header = tensorfs_core::checkpoint::load_header(&store, manifest.header().unwrap()).unwrap();
+        let header =
+            tensorfs_core::checkpoint::load_header(&store, manifest.header().unwrap()).unwrap();
         let (component, tensors) = &header.components[0];
         assert_eq!(component, "unet");
-        assert!(tensors.iter().any(|(key, _)| key.ends_with("attn1.to_q.lora_A.weight")));
+        assert!(tensors
+            .iter()
+            .any(|(key, _)| key.ends_with("attn1.to_q.lora_A.weight")));
         let _ = std::fs::remove_dir_all(root);
     }
 }

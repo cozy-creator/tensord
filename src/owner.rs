@@ -375,10 +375,21 @@ mod tests {
     #[test]
     fn the_machines_gc_runs_while_a_layout_is_leased() {
         let root = std::env::temp_dir().join(format!("cm-owner-gc-{}", uuid::Uuid::new_v4()));
-        let owner = Owner::new(&root, &root.join("tensorfs"), 1 << 20, Duration::from_secs(60)).unwrap();
+        let owner = Owner::new(
+            &root,
+            &root.join("tensorfs"),
+            1 << 20,
+            Duration::from_secs(60),
+        )
+        .unwrap();
         let store = owner.lock().unwrap().store();
         let meta = Meta::open(&store).unwrap();
-        let put = |bytes: &[u8]| store.put_stream(&mut &bytes[..], None, &Fault::default()).unwrap().obj;
+        let put = |bytes: &[u8]| {
+            store
+                .put_stream(&mut &bytes[..], None, &Fault::default())
+                .unwrap()
+                .obj
+        };
         let leased = put(b"weights a served layout reads");
         let garbage = put(b"weights nothing references");
         let (lease, _) = read::acquire(&store, &meta, "layout", vec![leased.clone()]).unwrap();

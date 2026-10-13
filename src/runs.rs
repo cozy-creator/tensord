@@ -13,15 +13,18 @@ use crate::{
     service::{Call, Service},
 };
 use serde_json::{json, Value};
-use tensorfs_core::ids::ObjectRef;
 use std::{
     collections::{BTreeMap, HashMap},
     io,
     sync::{Arc, Mutex},
 };
+use tensorfs_core::ids::ObjectRef;
 
 pub enum Source {
-    Release { package: String, release: String },
+    Release {
+        package: String,
+        release: String,
+    },
     /// An installation this machine already holds for the signer.
     Installation(String),
     /// Unpublished code written with Write: its manifest's digest.
@@ -114,7 +117,11 @@ impl Durable {
             owner: context.owner.clone(),
             binding_revision: context.binding_revision.clone(),
             attention_kernel: context.attention_kernel.clone(),
-            models: context.models.iter().map(prost::Message::encode_to_vec).collect(),
+            models: context
+                .models
+                .iter()
+                .map(prost::Message::encode_to_vec)
+                .collect(),
             inputs: context
                 .inputs
                 .iter()
@@ -167,14 +174,24 @@ fn refused(code: &'static str, message: impl Into<String>) -> Refused {
 
 impl Runs {
     /// Accepts the run (or answers the one this id already names) and starts its preparation.
-    pub fn submit(self: &Arc<Self>, actor: &str, id: &str, spec: Spec) -> Result<Execution, Refused> {
+    pub fn submit(
+        self: &Arc<Self>,
+        actor: &str,
+        id: &str,
+        spec: Spec,
+    ) -> Result<Execution, Refused> {
         if !spec.input.is_object() {
             return Err(refused(
                 "invalid_request",
                 "the payload is a JSON object of the function's parameters",
             ));
         }
-        let unwritten = |input: &str| refused("input_unwritten", format!("input {input} was not written to this machine"));
+        let unwritten = |input: &str| {
+            refused(
+                "input_unwritten",
+                format!("input {input} was not written to this machine"),
+            )
+        };
         for input in &spec.inputs {
             let path = match self.objects.path(actor, &input.digest)? {
                 Some((path, length)) if length == input.length => path,
@@ -184,14 +201,35 @@ impl Runs {
                 continue;
             }
             // A tree's files were written too: each its manifest names.
-            let manifest: Value = serde_json::from_slice(&std::fs::read(path)?)
-                .map_err(|_| refused("invalid_request", format!("input tree {} has no readable manifest", input.input_id)))?;
+            let manifest: Value = serde_json::from_slice(&std::fs::read(path)?).map_err(|_| {
+                refused(
+                    "invalid_request",
+                    format!("input tree {} has no readable manifest", input.input_id),
+                )
+            })?;
             for entry in manifest["entries"].as_array().into_iter().flatten() {
-                let (Some(sha), Some(length)) = (entry["blob"]["sha256"].as_str(), entry["blob"]["length"].as_u64()) else {
-                    return Err(refused("invalid_request", format!("input tree {} names a file without its blob", input.input_id)));
+                let (Some(sha), Some(length)) = (
+                    entry["blob"]["sha256"].as_str(),
+                    entry["blob"]["length"].as_u64(),
+                ) else {
+                    return Err(refused(
+                        "invalid_request",
+                        format!(
+                            "input tree {} names a file without its blob",
+                            input.input_id
+                        ),
+                    ));
                 };
-                if self.objects.path(actor, &format!("sha256:{sha}"))?.is_none_or(|(_, held)| held != length) {
-                    return Err(unwritten(&format!("{}/{}", input.input_id, entry["path"].as_str().unwrap_or_default())));
+                if self
+                    .objects
+                    .path(actor, &format!("sha256:{sha}"))?
+                    .is_none_or(|(_, held)| held != length)
+                {
+                    return Err(unwritten(&format!(
+                        "{}/{}",
+                        input.input_id,
+                        entry["path"].as_str().unwrap_or_default()
+                    )));
                 }
             }
         }
@@ -275,24 +313,36 @@ impl Runs {
     ) -> Result<Vec<Value>, Refused> {
         let destination = spec.weights_destination.trim_start_matches("model://");
         if !destination.is_empty() && spec.models.len() != 1 {
-            return Err(refused("invalid_request", "a weights destination takes one model"));
+            return Err(refused(
+                "invalid_request",
+                "a weights destination takes one model",
+            ));
         }
         if spec.models.is_empty() {
             return Ok(vec![]);
         }
-        let publisher = self.publisher.as_ref().ok_or_else(|| {
-            refused("capability_unavailable", "this machine prepares no models")
-        })?;
+        let publisher = self
+            .publisher
+            .as_ref()
+            .ok_or_else(|| refused("capability_unavailable", "this machine prepares no models"))?;
         let hub = spec.hub.clone().or_else(|| self.own_hub.clone());
         let hub_access = || {
             hub.as_ref().ok_or_else(|| {
-                refused("hub_access_absent", "this needs the run's Hub access, and it carries none")
+                refused(
+                    "hub_access_absent",
+                    "this needs the run's Hub access, and it carries none",
+                )
             })
         };
         let mut models = vec![];
         for choice in &spec.models {
             let (manifest, mut row) = if !choice.source.is_empty() {
-                let made = publisher.make_source(&choice.source, &choice.profiles, &spec.providers, observe)?;
+                let made = publisher.make_source(
+                    &choice.source,
+                    &choice.profiles,
+                    &spec.providers,
+                    observe,
+                )?;
                 let row = json!({"parameter": choice.parameter, "source": choice.source,
                     "resolved": made.resolved, "profiles": made.profiles,
                     "repository": made.repository, "manifest": made.manifest.id()});
@@ -301,24 +351,41 @@ impl Runs {
                 let digest = choice.manifest.as_ref().ok_or_else(|| {
                     refused(
                         "invalid_request",
-                        format!("model choice {:?} names no exact manifest or provider source", choice.parameter),
+                        format!(
+                            "model choice {:?} names no exact manifest or provider source",
+                            choice.parameter
+                        ),
                     )
                 })?;
                 let sha256 = tensorfs_core::sha256::hex(&digest.digest);
                 let manifest = format!("sha256:{sha256}");
                 if !choice.repository.is_empty() {
                     let stage = format!("downloading {}", choice.repository);
-                    publisher.download(&self.service, hub_access()?, &choice.repository, &manifest, &|done, total| {
-                        observe(&stage, done, total)
-                    })?;
+                    publisher.download(
+                        &self.service,
+                        hub_access()?,
+                        &choice.repository,
+                        &manifest,
+                        &|done, total| observe(&stage, done, total),
+                    )?;
                 }
                 // No repository: a checkpoint this machine already holds (a run's output).
-                let length = std::fs::metadata(publisher.store().manifest_path(&sha256)).map_err(|_| {
-                    refused("checkpoint_absent", format!("this machine holds no checkpoint {manifest}"))
-                })?;
+                let length =
+                    std::fs::metadata(publisher.store().manifest_path(&sha256)).map_err(|_| {
+                        refused(
+                            "checkpoint_absent",
+                            format!("this machine holds no checkpoint {manifest}"),
+                        )
+                    })?;
                 let row = json!({"parameter": choice.parameter,
                     "repository": choice.repository, "manifest": manifest});
-                (ObjectRef { sha256, length: length.len() }, row)
+                (
+                    ObjectRef {
+                        sha256,
+                        length: length.len(),
+                    },
+                    row,
+                )
             };
             if !destination.is_empty() {
                 if spec.publication.is_empty() {
@@ -334,18 +401,19 @@ impl Runs {
                     &tensorfs_core::sha256::hex_digest(format!("{actor}\0{id}").as_bytes())[..40]
                 );
                 let stage = format!("uploading to {destination}");
-                let published = tensorfs_core::transport::publish(&tensorfs_core::transport::Publication {
-                    store: publisher.store(),
-                    hub: publishing.origin(),
-                    destination,
-                    manifest: &manifest,
-                    operation: &operation,
-                    credential: &publishing,
-                    policy: publishing.policy(),
-                    progress: &|done, total| observe(&stage, done, total),
-                    streams: 8,
-                })
-                .map_err(|e| refused("weights_publication_failed", e.to_string()))?;
+                let published =
+                    tensorfs_core::transport::publish(&tensorfs_core::transport::Publication {
+                        store: publisher.store(),
+                        hub: publishing.origin(),
+                        destination,
+                        manifest: &manifest,
+                        operation: &operation,
+                        credential: &publishing,
+                        policy: publishing.policy(),
+                        progress: &|done, total| observe(&stage, done, total),
+                        streams: 8,
+                    })
+                    .map_err(|e| refused("weights_publication_failed", e.to_string()))?;
                 row["published"] = json!({"destination": destination,
                     "checkpoint": published.checkpoint, "converged": published.converged});
             }
@@ -363,7 +431,10 @@ impl Runs {
         let last = std::sync::Mutex::new((String::new(), std::time::Instant::now()));
         let observe = Arc::new(move |stage: &str, done: u64, total: u64| {
             let mut last = last.lock().unwrap();
-            if last.0 == stage && last.1.elapsed() < std::time::Duration::from_millis(250) && done < total {
+            if last.0 == stage
+                && last.1.elapsed() < std::time::Duration::from_millis(250)
+                && done < total
+            {
                 return;
             }
             *last = (stage.to_string(), std::time::Instant::now());
@@ -371,15 +442,16 @@ impl Runs {
             let _ = engine.observe_progress(&run, 0, detail.to_string());
         });
         observe("preparing", 0, 0);
-        let warm_result = |installed: Value, models: Vec<Value>| -> Result<Option<ResultRecord>, Refused> {
-            let mut value = installed;
-            value["models"] = Value::Array(models);
-            Ok(Some(ResultRecord {
-                value,
-                artifacts: vec![],
-                asset_bindings: vec![],
-            }))
-        };
+        let warm_result =
+            |installed: Value, models: Vec<Value>| -> Result<Option<ResultRecord>, Refused> {
+                let mut value = installed;
+                value["models"] = Value::Array(models);
+                Ok(Some(ResultRecord {
+                    value,
+                    artifacts: vec![],
+                    asset_bindings: vec![],
+                }))
+            };
         if let Source::Models = spec.source {
             let models = self.warm_models(actor, id, &spec, &*observe)?;
             return warm_result(json!({}), models);
@@ -402,7 +474,10 @@ impl Runs {
             Source::Local(digest) => {
                 observe("installing the local package", 0, 0);
                 let local = self.local.as_ref().ok_or_else(|| {
-                    refused("capability_unavailable", "this machine installs no local packages")
+                    refused(
+                        "capability_unavailable",
+                        "this machine installs no local packages",
+                    )
                 })?;
                 Some(local.install(&self.service, actor, digest)?)
             }
@@ -412,7 +487,11 @@ impl Runs {
             _ => None,
         };
         // A job's choices address its callables; its children resolve them.
-        let choices = if spec.job || install_only { &[][..] } else { &spec.models[..] };
+        let choices = if spec.job || install_only {
+            &[][..]
+        } else {
+            &spec.models[..]
+        };
         let hub = spec.hub.clone().or_else(|| self.own_hub.clone());
         let (installation, plan) = self.resolve(
             actor,
@@ -432,19 +511,30 @@ impl Runs {
             true => ("jobs", "job"),
             false => ("entrypoints", "entrypoint"),
         };
-        let declared = interface[rows]
-            .as_array()
-            .is_some_and(|rows| rows.iter().any(|row| row["name"] == spec.entrypoint.as_str()));
+        let declared = interface[rows].as_array().is_some_and(|rows| {
+            rows.iter()
+                .any(|row| row["name"] == spec.entrypoint.as_str())
+        });
         if !declared && !install_only {
             return Err(refused(
                 "invalid_entrypoint",
-                format!("{} declares no {noun} {:?}", installation.package, spec.entrypoint),
+                format!(
+                    "{} declares no {noun} {:?}",
+                    installation.package, spec.entrypoint
+                ),
             ));
         }
         if spec.job {
             // A bare parameter, or `<job>.models.<parameter>`, is the job's own model input.
-            for choice in spec.models.iter().filter(|c| !own_input(c, &spec.entrypoint)) {
-                let callable = choice.parameter.split_once(".models.").map(|(name, _)| name);
+            for choice in spec
+                .models
+                .iter()
+                .filter(|c| !own_input(c, &spec.entrypoint))
+            {
+                let callable = choice
+                    .parameter
+                    .split_once(".models.")
+                    .map(|(name, _)| name);
                 let declared = interface["entrypoints"].as_array().is_some_and(|rows| {
                     rows.iter()
                         .any(|row| Some(row["name"].as_str().unwrap_or_default()) == callable)
@@ -466,7 +556,8 @@ impl Runs {
                 true => self.warm_models(actor, id, &spec, &*observe)?,
                 false => vec![],
             };
-            let installed = json!({"package": installation.package, "release": installation.release});
+            let installed =
+                json!({"package": installation.package, "release": installation.release});
             return warm_result(installed, models);
         }
         if spec.job {
@@ -500,7 +591,9 @@ impl Runs {
                 job: spec.job,
                 parent: spec.parent,
             },
-            plan.as_ref().map(|plan| plan.id.as_str()).unwrap_or_default(),
+            plan.as_ref()
+                .map(|plan| plan.id.as_str())
+                .unwrap_or_default(),
         )?;
         Ok(None)
     }
@@ -565,13 +658,23 @@ impl Runs {
         input: Value,
         inputs: Vec<InputFile>,
     ) -> Result<Execution, Refused> {
-        let actor = parent.submission.as_ref().map(|s| s.actor.clone()).unwrap_or_default();
+        let actor = parent
+            .submission
+            .as_ref()
+            .map(|s| s.actor.clone())
+            .unwrap_or_default();
         // An earlier attempt's call is already its run (a resumed job): nothing prepares.
         match self.service.engine.get_public(&actor, request) {
             Ok(existing) => {
-                let same = existing.submission.as_ref().map(|s| s.invocation_digest.as_str());
+                let same = existing
+                    .submission
+                    .as_ref()
+                    .map(|s| s.invocation_digest.as_str());
                 if same != Some(intent) {
-                    return Err(refused("run_id_conflict", "this run id already names another run spec"));
+                    return Err(refused(
+                        "run_id_conflict",
+                        "this run id already names another run spec",
+                    ));
                 }
                 return Ok(existing);
             }
@@ -599,7 +702,10 @@ impl Runs {
                     .engine
                     .with_journal(|journal| journal.job_context(parent))?
                     .ok_or_else(|| {
-                        refused("child_call_refused", "the job's preparation context is gone")
+                        refused(
+                            "child_call_refused",
+                            "the job's preparation context is gone",
+                        )
                     })?;
                 serde_json::from_slice::<Durable>(&journaled)
                     .map_err(io::Error::other)?
@@ -637,30 +743,49 @@ impl Runs {
         let Some(gpu) = self.service.gpu() else {
             return;
         };
-        let actor = parent.submission.as_ref().map(|s| s.actor.clone()).unwrap_or_default();
+        let actor = parent
+            .submission
+            .as_ref()
+            .map(|s| s.actor.clone())
+            .unwrap_or_default();
         let (runs, parent, entrypoint) = (self.clone(), parent.id.clone(), entrypoint.to_string());
-        let started = std::thread::Builder::new().name("child-prefetch".into()).spawn(move || {
-            let prepared = runs
-                .child_spec(&parent, &entrypoint, json!({}), vec![], "")
-                .and_then(|spec| {
-                    let Source::Installation(alias) = &spec.source else { unreachable!() };
-                    let held = runs.service.engine.installation(&actor, alias)?;
-                    let (hub, models) = (spec.hub.clone(), spec.models.clone());
-                    runs.resolve(&actor, held, None, hub, &spec, &models, Box::new(|_, _, _| ()))
-                });
-            match prepared {
-                Ok((installation, Some(plan))) => {
-                    match runs.service.catalog.resolve(&installation.generation) {
-                        Ok(held) => gpu.prefetch(&runs.service.engine, held, plan),
-                        Err(error) => eprintln!("prefetch of {entrypoint}: {error}"),
+        let started = std::thread::Builder::new()
+            .name("child-prefetch".into())
+            .spawn(move || {
+                let prepared = runs
+                    .child_spec(&parent, &entrypoint, json!({}), vec![], "")
+                    .and_then(|spec| {
+                        let Source::Installation(alias) = &spec.source else {
+                            unreachable!()
+                        };
+                        let held = runs.service.engine.installation(&actor, alias)?;
+                        let (hub, models) = (spec.hub.clone(), spec.models.clone());
+                        runs.resolve(
+                            &actor,
+                            held,
+                            None,
+                            hub,
+                            &spec,
+                            &models,
+                            Box::new(|_, _, _| ()),
+                        )
+                    });
+                match prepared {
+                    Ok((installation, Some(plan))) => {
+                        match runs.service.catalog.resolve(&installation.generation) {
+                            Ok(held) => gpu.prefetch(&runs.service.engine, held, plan),
+                            Err(error) => eprintln!("prefetch of {entrypoint}: {error}"),
+                        }
+                    }
+                    Ok(_) => (),
+                    Err(refusal) => {
+                        eprintln!(
+                            "prefetch of {entrypoint}: {}: {}",
+                            refusal.code, refusal.message
+                        )
                     }
                 }
-                Ok(_) => (),
-                Err(refusal) => {
-                    eprintln!("prefetch of {entrypoint}: {}: {}", refusal.code, refusal.message)
-                }
-            }
-        });
+            });
         if let Err(error) = started {
             eprintln!("prefetch of a child: {error}");
         }
@@ -671,7 +796,11 @@ impl Runs {
     pub fn job_weights(&self, id: &str) -> io::Result<Option<JobWeights>> {
         let context = match self.jobs.lock().unwrap().get(id).cloned() {
             Some(context) => context,
-            None => match self.service.engine.with_journal(|journal| journal.job_context(id))? {
+            None => match self
+                .service
+                .engine
+                .with_journal(|journal| journal.job_context(id))?
+            {
                 Some(journaled) => serde_json::from_slice::<Durable>(&journaled)
                     .map_err(io::Error::other)?
                     .context()?,
@@ -709,20 +838,29 @@ impl Runs {
     ) -> Result<BTreeMap<String, (String, ObjectRef)>, Refused> {
         let declared = interface["jobs"]
             .as_array()
-            .and_then(|rows| rows.iter().find(|row| row["name"] == spec.entrypoint.as_str()))
+            .and_then(|rows| {
+                rows.iter()
+                    .find(|row| row["name"] == spec.entrypoint.as_str())
+            })
             .and_then(|row| row["models"].as_array().cloned())
             .unwrap_or_default();
         let mut inputs = BTreeMap::new();
         for row in declared {
             let path = row["path"].as_str().unwrap_or_default();
-            let parameter = path.rsplit_once(".models.").map_or(path, |(_, p)| p).to_string();
+            let parameter = path
+                .rsplit_once(".models.")
+                .map_or(path, |(_, p)| p)
+                .to_string();
             let class = row["class"].as_str().unwrap_or_default().to_string();
             let choice = spec
                 .models
                 .iter()
                 .find(|c| c.parameter == parameter || c.parameter == path)
                 .ok_or_else(|| {
-                    refused("model_input_absent", format!("the job's model input {parameter:?} is not chosen"))
+                    refused(
+                        "model_input_absent",
+                        format!("the job's model input {parameter:?} is not chosen"),
+                    )
                 })?;
             let publisher = self.publisher.as_ref().ok_or_else(|| {
                 refused("capability_unavailable", "this machine prepares no models")
@@ -743,9 +881,13 @@ impl Runs {
                     refused("hub_access_absent", "a Hub model downloads with the run's Hub access, and this run carries none")
                 })?;
                 let stage = format!("downloading {}", choice.repository);
-                publisher.download(&self.service, hub, &choice.repository, &manifest, &|done, total| {
-                    observe(&stage, done, total)
-                })?;
+                publisher.download(
+                    &self.service,
+                    hub,
+                    &choice.repository,
+                    &manifest,
+                    &|done, total| observe(&stage, done, total),
+                )?;
                 let sha256 = manifest.trim_start_matches("sha256:").to_string();
                 let length = std::fs::metadata(publisher.store().manifest_path(&sha256))?.len();
                 ObjectRef { sha256, length }
@@ -811,7 +953,9 @@ mod tests {
 
     fn write(objects: &Objects, actor: &str, bytes: &[u8]) -> (String, u64) {
         let digest = format!("sha256:{}", sha256::hex_digest(bytes));
-        let mut writer = objects.begin(actor, &digest, bytes.len() as u64, 0).unwrap();
+        let mut writer = objects
+            .begin(actor, &digest, bytes.len() as u64, 0)
+            .unwrap();
         writer.append(bytes).unwrap();
         writer.finish().unwrap();
         (digest, bytes.len() as u64)
@@ -865,7 +1009,15 @@ mod tests {
             .success());
         let helper = Command::new("uv")
             .current_dir(repo)
-            .args(["run", "--locked", "--extra", "test", "python", "-c", "import sys; print(sys.executable)"])
+            .args([
+                "run",
+                "--locked",
+                "--extra",
+                "test",
+                "python",
+                "-c",
+                "import sys; print(sys.executable)",
+            ])
             .output()
             .unwrap();
         let client = fs::read_dir(root.join("client"))
@@ -876,8 +1028,9 @@ mod tests {
         let state = root.join("state");
         let service = Service::open(&state, &root.join("generations"), 1).unwrap();
         let store = Arc::new(Store::ensure(&state.join("tensorfs")).unwrap());
-        let objects =
-            Arc::new(Objects::new(&root.join("writes"), store.clone(), service.engine.clone()).unwrap());
+        let objects = Arc::new(
+            Objects::new(&root.join("writes"), store.clone(), service.engine.clone()).unwrap(),
+        );
         let local = LocalSources::new(
             objects.clone(),
             InstallerConfig {
@@ -902,8 +1055,14 @@ mod tests {
         crate::jobs::Jobs::configure(&service, store.clone(), Some(&runs)).unwrap();
         let mut archive = tar::Builder::new(Vec::new());
         let fixture = repo.join("tests/fixtures/cpu_lifecycle");
-        for name in ["pyproject.toml", "package.toml", "cpu_lifecycle/__init__.py"] {
-            archive.append_path_with_name(fixture.join(name), name).unwrap();
+        for name in [
+            "pyproject.toml",
+            "package.toml",
+            "cpu_lifecycle/__init__.py",
+        ] {
+            archive
+                .append_path_with_name(fixture.join(name), name)
+                .unwrap();
         }
         let (source, length) = write(&objects, "alice", &archive.into_inner().unwrap());
         let manifest = json!({"package": "local/cozy-machine-cpu-lifecycle", "release": "0.1.0",
@@ -911,10 +1070,17 @@ mod tests {
         let (manifest, _) = write(&objects, "alice", manifest.to_string().as_bytes());
 
         let accepted = runs
-            .submit("alice", "run-1", spec(Source::Local(manifest.clone()), false, "d1"))
+            .submit(
+                "alice",
+                "run-1",
+                spec(Source::Local(manifest.clone()), false, "d1"),
+            )
             .unwrap();
         assert_eq!(accepted.state, State::Queued);
-        assert_eq!(accepted.waiting_reason.as_deref(), Some(crate::journal::PREPARING));
+        assert_eq!(
+            accepted.waiting_reason.as_deref(),
+            Some(crate::journal::PREPARING)
+        );
         let done = settled(&service.engine, &accepted.id);
         assert_eq!(done.state, State::Completed, "{:?}", done.failure);
         assert_eq!(done.result.unwrap().value["steps"], 2);
@@ -922,22 +1088,37 @@ mod tests {
 
         // The id is idempotent on its spec; another spec under it is refused.
         let again = runs
-            .submit("alice", "run-1", spec(Source::Local(manifest.clone()), false, "d1"))
+            .submit(
+                "alice",
+                "run-1",
+                spec(Source::Local(manifest.clone()), false, "d1"),
+            )
             .unwrap();
         assert_eq!(again.id, accepted.id);
         let conflict = runs
-            .submit("alice", "run-1", spec(Source::Local(manifest.clone()), false, "d2"))
+            .submit(
+                "alice",
+                "run-1",
+                spec(Source::Local(manifest.clone()), false, "d2"),
+            )
             .err()
             .unwrap();
         assert_eq!(conflict.code, "run_id_conflict");
 
         // A warm run prepares (the held installation) and succeeds without running.
         let warm = runs
-            .submit("alice", "warm-1", spec(Source::Local(manifest.clone()), true, "w1"))
+            .submit(
+                "alice",
+                "warm-1",
+                spec(Source::Local(manifest.clone()), true, "w1"),
+            )
             .unwrap();
         let warm = settled(&service.engine, &warm.id);
         assert_eq!(warm.state, State::Completed, "{:?}", warm.failure);
-        assert_eq!(warm.result.unwrap().value["package"], "local/cozy-machine-cpu-lifecycle");
+        assert_eq!(
+            warm.result.unwrap().value["package"],
+            "local/cozy-machine-cpu-lifecycle"
+        );
 
         // Another signer cannot run code it did not write.
         let theirs = runs
@@ -990,7 +1171,11 @@ mod tests {
         };
         let id = {
             let engine = Engine::open(&root).unwrap();
-            engine.accept_run("alice", "run-1", "d", draft).unwrap().0.id
+            engine
+                .accept_run("alice", "run-1", "d", draft)
+                .unwrap()
+                .0
+                .id
         };
         let record = Engine::open(&root).unwrap().get(&id).unwrap();
         assert_eq!(record.state, State::Failed);

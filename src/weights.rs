@@ -104,18 +104,23 @@ impl Weights {
         let answered = match frame.operation.as_str() {
             "source" => self.source(grant, frame).map(|(a, f)| (a, Some(f), None)),
             "output" => self.output(grant, frame).map(|(a, f)| (a, Some(f), None)),
-            "adopt" => self.adopt(grant, frame).map(|(a, adopted)| (a, None, Some(adopted))),
-            other => Err(("weights_writer_refused", format!("unknown weights operation {other:?}"))),
+            "adopt" => self
+                .adopt(grant, frame)
+                .map(|(a, adopted)| (a, None, Some(adopted))),
+            other => Err((
+                "weights_writer_refused",
+                format!("unknown weights operation {other:?}"),
+            )),
         };
-        answered.unwrap_or_else(|(code, detail)| (Answer::refused(frame.seq, code, detail), None, None))
+        answered
+            .unwrap_or_else(|(code, detail)| (Answer::refused(frame.seq, code, detail), None, None))
     }
 
     fn source(&self, grant: &Grant, frame: &Frame) -> Result<(Answer, File), Refusal> {
-        let length = grant
-            .sources
-            .get(&frame.manifest)
-            .copied()
-            .ok_or(("weights_source_ungranted", "source is outside the invocation".to_string()))?;
+        let length = grant.sources.get(&frame.manifest).copied().ok_or((
+            "weights_source_ungranted",
+            "source is outside the invocation".to_string(),
+        ))?;
         let source = reference(&frame.manifest, length)?;
         let (client, server) = UnixStream::pair().map_err(io_refusal)?;
         let (store, meta, current) = (self.store.clone(), self.meta.clone(), grant.current.clone());
@@ -123,7 +128,8 @@ impl Weights {
             .name("weights-source".into())
             .spawn(move || {
                 let check = move || current_or_refuse(&*current);
-                if let Err(refusal) = channel::serve_source(&store, &meta, &source, server, &check) {
+                if let Err(refusal) = channel::serve_source(&store, &meta, &source, server, &check)
+                {
                     eprintln!("weights source {}: {}", source.id(), refusal.detail);
                 }
             })
@@ -140,19 +146,28 @@ impl Weights {
             format!("{slot:?} is not a declared weights output"),
         ))?;
         if !(grant.current)() {
-            return Err(("weights_writer_closed", "output attempt is not running".into()));
+            return Err((
+                "weights_writer_closed",
+                "output attempt is not running".into(),
+            ));
         }
         let raw = exchange(&grant.spool, slot, "derivation", frame.length)?;
         let mut declaration = channel::declaration_from_arguments(&raw).map_err(tfs)?;
         if declaration.max_new_bytes != bound {
-            return Err(("weights_writer_ungranted", "output exceeds invocation grant".into()));
+            return Err((
+                "weights_writer_ungranted",
+                "output exceeds invocation grant".into(),
+            ));
         }
         if declaration
             .sources
             .iter()
             .any(|s| grant.sources.get(&s.manifest.id()) != Some(&s.manifest.length))
         {
-            return Err(("weights_source_ungranted", "source is outside invocation grant".into()));
+            return Err((
+                "weights_source_ungranted",
+                "source is outside invocation grant".into(),
+            ));
         }
         // The output's work is its run, its slot and what it declares: a resumed attempt that
         // declares the same resumes the same transaction.
@@ -160,7 +175,11 @@ impl Weights {
         let identity = format!("{}\0{}\0{slot}\0{work}", grant.actor, grant.run);
         let transaction = format!("sha256:{}", sha256::hex_digest(identity.as_bytes()));
         declaration.work_fingerprint = Some(format!("sha256:{work}"));
-        grant.opened.lock().unwrap().insert(transaction.clone(), slot.clone());
+        grant
+            .opened
+            .lock()
+            .unwrap()
+            .insert(transaction.clone(), slot.clone());
         let (client, server) = UnixStream::pair().map_err(io_refusal)?;
         let hooks_current = grant.current.clone();
         let (store, meta) = (self.store.clone(), self.meta.clone());
@@ -172,8 +191,15 @@ impl Weights {
         let writer = match committed {
             Some(_) => None,
             None => Some(
-                channel::Writer::begin(&store, meta.clone(), &transaction, session(), declaration, None)
-                    .map_err(tfs)?,
+                channel::Writer::begin(
+                    &store,
+                    meta.clone(),
+                    &transaction,
+                    session(),
+                    declaration,
+                    None,
+                )
+                .map_err(tfs)?,
             ),
         };
         std::thread::Builder::new()
@@ -186,7 +212,9 @@ impl Weights {
                     record_receipt: &|_: &derived::ReceiptFacts| (),
                 };
                 let served = match (&writer, &committed) {
-                    (Some(writer), _) => channel::serve_derived(writer, server, &operation, &output, None, &hooks),
+                    (Some(writer), _) => {
+                        channel::serve_derived(writer, server, &operation, &output, None, &hooks)
+                    }
                     (None, Some(receipt)) => channel::serve_derived_replay(receipt, server, &hooks),
                     (None, None) => Ok(()),
                 };
@@ -202,19 +230,36 @@ impl Weights {
 
     fn adopt(&self, grant: &Grant, frame: &Frame) -> Result<(Answer, Adopted), Refusal> {
         let slot = &frame.output_slot;
-        let opened = grant.opened.lock().unwrap().get(&frame.transaction).cloned();
+        let opened = grant
+            .opened
+            .lock()
+            .unwrap()
+            .get(&frame.transaction)
+            .cloned();
         if opened.as_ref() != Some(slot) {
-            return Err(("weights_receipt_mismatch", "receipt has no opened output".into()));
+            return Err((
+                "weights_receipt_mismatch",
+                "receipt has no opened output".into(),
+            ));
         }
         let relayed = exchange(&grant.spool, slot, "native-receipt", frame.length)?;
-        let receipt = match derived::lookup(&self.store, &self.meta, &frame.transaction).map_err(tfs)? {
-            derived::Lookup::Committed(result) => result.receipt().clone(),
-            _ => return Err(("weights_receipt_mismatch", "the output is not committed".into())),
-        };
+        let receipt =
+            match derived::lookup(&self.store, &self.meta, &frame.transaction).map_err(tfs)? {
+                derived::Lookup::Committed(result) => result.receipt().clone(),
+                _ => {
+                    return Err((
+                        "weights_receipt_mismatch",
+                        "the output is not committed".into(),
+                    ))
+                }
+            };
         let facts = tensorfs_core::canon::write(&receipt.to_value());
         let relayed = tensorfs_core::canon::parse(&relayed, EXCHANGE_MAX as usize).map_err(tfs)?;
         if relayed != receipt.to_value() {
-            return Err(("weights_receipt_mismatch", "receipt differs from native custody".into()));
+            return Err((
+                "weights_receipt_mismatch",
+                "receipt differs from native custody".into(),
+            ));
         }
         // The output stays reachable in its own local repository, whatever happens to the run.
         let name = format!(
@@ -249,7 +294,13 @@ impl Weights {
     }
 
     /// One adopted output into its destination, under the run's publication authorization.
-    fn publish(&self, grant: &Grant, destination: &Destination, slot: &str, manifest: &ObjectRef) -> Result<(), Refusal> {
+    fn publish(
+        &self,
+        grant: &Grant,
+        destination: &Destination,
+        slot: &str,
+        manifest: &ObjectRef,
+    ) -> Result<(), Refusal> {
         let publishing = hub::Publishing::new(&destination.hub, &destination.publication)
             .map_err(|e| ("publication_unauthorized", e.0))?;
         let operation = format!(
@@ -276,16 +327,27 @@ impl Weights {
 fn exchange(spool: &Path, slot: &str, kind: &str, length: u64) -> Result<Vec<u8>, Refusal> {
     let valid = !slot.is_empty()
         && slot.len() <= 64
-        && slot.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        && slot
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
     if !valid || length > EXCHANGE_MAX {
-        return Err(("weights_host_identity", "weights exchange identity is invalid".into()));
+        return Err((
+            "weights_host_identity",
+            "weights exchange identity is invalid".into(),
+        ));
     }
     let path = spool.join(format!("weights-{slot}-{kind}.canonical"));
     let mut file = File::open(&path).map_err(io_refusal)?;
     let mut bytes = Vec::with_capacity(length as usize);
-    file.by_ref().take(length + 1).read_to_end(&mut bytes).map_err(io_refusal)?;
+    file.by_ref()
+        .take(length + 1)
+        .read_to_end(&mut bytes)
+        .map_err(io_refusal)?;
     if bytes.len() as u64 != length {
-        return Err(("weights_writer_length", "writer bytes differ from their declared length".into()));
+        return Err((
+            "weights_writer_length",
+            "writer bytes differ from their declared length".into(),
+        ));
     }
     Ok(bytes)
 }
@@ -317,7 +379,10 @@ fn current_or_refuse(current: &(dyn Fn() -> bool + Send + Sync)) -> tensorfs_cor
 }
 
 fn tfs(refusal: tensorfs_core::err::Refusal) -> Refusal {
-    ("weights_writer_refused", format!("{}: {}", refusal.code.as_str(), refusal.detail))
+    (
+        "weights_writer_refused",
+        format!("{}: {}", refusal.code.as_str(), refusal.detail),
+    )
 }
 
 fn io_refusal(error: io::Error) -> Refusal {

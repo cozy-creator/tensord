@@ -51,10 +51,7 @@ impl Machine {
             fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         };
-        write(
-            "keys.json",
-            serde_json::json!({ "keys": keys }),
-        );
+        write("keys.json", serde_json::json!({ "keys": keys }));
         write(
             "readiness.json",
             serde_json::json!({"key_b64url":URL_SAFE_NO_PAD.encode([7u8; 32])}),
@@ -1294,28 +1291,47 @@ mod v1_api {
                         .as_array()
                         .unwrap()
                         .iter()
-                        .map(|row| row.get("object_id").unwrap_or(row).as_str().unwrap().to_string())
+                        .map(|row| {
+                            row.get("object_id")
+                                .unwrap_or(row)
+                                .as_str()
+                                .unwrap()
+                                .to_string()
+                        })
                         .collect()
                 };
                 let mut held = held.lock().unwrap();
                 let path = uri.path().to_string();
                 if let Some(hex) = path.strip_prefix("/upload/") {
                     let id = format!("sha256:{hex}");
-                    assert_eq!(id, format!("sha256:{}", tensorfs_core::sha256::hex_digest(&body)));
+                    assert_eq!(
+                        id,
+                        format!("sha256:{}", tensorfs_core::sha256::hex_digest(&body))
+                    );
                     held.uploaded.insert(id, body.to_vec());
                     return StatusCode::OK.into_response();
                 }
                 if header("x-cozy-execution-access") != EXECUTION_ACCESS {
                     held.refused += 1;
-                    return (StatusCode::UNAUTHORIZED, r#"{"error":{"code":"auth.refused","message":"no sender"}}"#).into_response();
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        r#"{"error":{"code":"auth.refused","message":"no sender"}}"#,
+                    )
+                        .into_response();
                 }
                 if path.starts_with("/v1/worker/machine-authorizations/grant-1/token") {
                     held.renewals += 1;
-                    return json(serde_json::json!({"token": bearer, "expires_at": "2099-01-01T00:00:00Z"}));
+                    return json(
+                        serde_json::json!({"token": bearer, "expires_at": "2099-01-01T00:00:00Z"}),
+                    );
                 }
                 if header("authorization") != format!("Bearer {bearer}") {
                     held.refused += 1;
-                    return (StatusCode::UNAUTHORIZED, r#"{"error":{"code":"auth.refused","message":"no bearer"}}"#).into_response();
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        r#"{"error":{"code":"auth.refused","message":"no bearer"}}"#,
+                    )
+                        .into_response();
                 }
                 let publication = "/v1/models/acme/tiny/publications/";
                 match (method, path.as_str()) {
@@ -1357,7 +1373,9 @@ mod v1_api {
                 }
             }
         };
-        let router = axum::Router::new().fallback(answer).with_state(held.clone());
+        let router = axum::Router::new()
+            .fallback(answer)
+            .with_state(held.clone());
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         (origin, held)
     }
@@ -1374,7 +1392,13 @@ mod v1_api {
             action: MACHINE.into(),
             ..Default::default()
         });
-        let manifest = write_package(&mut client, &all, "cpu_weights", "local/cozy-machine-cpu-weights").await;
+        let manifest = write_package(
+            &mut client,
+            &all,
+            "cpu_weights",
+            "local/cozy-machine-cpu-weights",
+        )
+        .await;
         let job = v1::RunSpec {
             kind: v1::RunKind::Job as i32,
             source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
@@ -1388,9 +1412,15 @@ mod v1_api {
             after: 0,
             spec: Some(spec),
         };
-        let events = collect(client.run(authorized(run("weights", job), &all)).await.unwrap().into_inner())
-            .await
-            .unwrap();
+        let events = collect(
+            client
+                .run(authorized(run("weights", job), &all))
+                .await
+                .unwrap()
+                .into_inner(),
+        )
+        .await
+        .unwrap();
         let done = outcome(&events);
         assert_eq!(done.status, "succeeded", "{done:?}");
         let written = done
@@ -1400,7 +1430,10 @@ mod v1_api {
             .unwrap_or_else(|| panic!("{done:?}"));
         assert_eq!(written.media_type, "application/vnd.cozy.model-manifest");
         let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
-        assert!(result.to_string().contains(&written.digest), "{result} names {written:?}");
+        assert!(
+            result.to_string().contains(&written.digest),
+            "{result} names {written:?}"
+        );
         let held = tensorfs_core::store::Store::open(&machine.store()).unwrap();
         let reference = tensorfs_core::ids::ObjectRef {
             sha256: written.digest.trim_start_matches("sha256:").into(),
@@ -1427,13 +1460,22 @@ mod v1_api {
             owner: "alice".into(),
             ..Default::default()
         };
-        let events = collect(client.run(authorized(run("upload", upload), &all)).await.unwrap().into_inner())
-            .await
-            .unwrap();
+        let events = collect(
+            client
+                .run(authorized(run("upload", upload), &all))
+                .await
+                .unwrap()
+                .into_inner(),
+        )
+        .await
+        .unwrap();
         let done = outcome(&events);
         assert_eq!(done.status, "succeeded", "{done:?}");
         let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
-        assert_eq!(result["models"][0]["published"]["checkpoint"], written.digest, "{result}");
+        assert_eq!(
+            result["models"][0]["published"]["checkpoint"], written.digest,
+            "{result}"
+        );
         let held = hub.lock().unwrap();
         assert_eq!(held.finalized.as_deref(), Some(written.digest.as_str()));
         assert_eq!(held.refused, 0);
@@ -1476,9 +1518,15 @@ mod v1_api {
             after: 0,
             spec: Some(spec),
         };
-        let events = collect(client.run(authorized(request, &all)).await.unwrap().into_inner())
-            .await
-            .unwrap();
+        let events = collect(
+            client
+                .run(authorized(request, &all))
+                .await
+                .unwrap()
+                .into_inner(),
+        )
+        .await
+        .unwrap();
         let done = outcome(&events);
         assert_eq!(done.status, "succeeded", "{done:?}");
         let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
@@ -1507,20 +1555,31 @@ mod v1_api {
             action: MACHINE.into(),
             ..Default::default()
         });
-        let manifest = write_package(&mut client, &all, "cpu_tree", "local/cozy-machine-cpu-tree").await;
+        let manifest =
+            write_package(&mut client, &all, "cpu_tree", "local/cozy-machine-cpu-tree").await;
         let files: [(&str, &[u8]); 2] = [("a.txt", b"alpha"), ("nested/b.bin", b"\x00\x01beta")];
         let mut entries = vec![];
         for (path, body) in files {
             let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(body));
             let length = body.len() as u64;
-            assert_eq!(write(&mut client, &all, &digest, length, 0, body).await.unwrap(), length);
+            assert_eq!(
+                write(&mut client, &all, &digest, length, 0, body)
+                    .await
+                    .unwrap(),
+                length
+            );
             entries.push(serde_json::json!({"kind": "file", "path": path,
                 "blob": {"sha256": digest.trim_start_matches("sha256:"), "length": length}}));
         }
         let tree = serde_json::to_vec(&serde_json::json!({"entries": entries})).unwrap();
         let tree_digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&tree));
         let size = tree.len() as u64;
-        assert_eq!(write(&mut client, &all, &tree_digest, size, 0, &tree).await.unwrap(), size);
+        assert_eq!(
+            write(&mut client, &all, &tree_digest, size, 0, &tree)
+                .await
+                .unwrap(),
+            size
+        );
         let spec = v1::RunSpec {
             kind: v1::RunKind::Job as i32,
             source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
@@ -1542,13 +1601,23 @@ mod v1_api {
             after: 0,
             spec: Some(spec),
         };
-        let events = collect(client.run(authorized(request, &all)).await.unwrap().into_inner())
-            .await
-            .unwrap();
+        let events = collect(
+            client
+                .run(authorized(request, &all))
+                .await
+                .unwrap()
+                .into_inner(),
+        )
+        .await
+        .unwrap();
         let done = outcome(&events);
         assert_eq!(done.status, "succeeded", "{done:?}");
         let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
-        assert_eq!(result["files"], serde_json::json!(["a.txt", "nested/b.bin"]), "{result}");
+        assert_eq!(
+            result["files"],
+            serde_json::json!(["a.txt", "nested/b.bin"]),
+            "{result}"
+        );
         let mut whole = b"alpha".to_vec();
         whole.extend_from_slice(b"\x00\x01beta");
         assert_eq!(result["sha256"], tensorfs_core::sha256::hex_digest(&whole));
@@ -1864,7 +1933,10 @@ mod v1_api {
             assert_eq!(child.status, "succeeded", "{child:?}");
             // A call's measurements name the process that executed it.
             let measured: serde_json::Value = serde_json::from_slice(&child.measurements).unwrap();
-            assert!(measured["execution"]["ranks"][0]["pid"].as_u64() > Some(0), "{measured}");
+            assert!(
+                measured["execution"]["ranks"][0]["pid"].as_u64() > Some(0),
+                "{measured}"
+            );
         }
 
         // A canceled job ends its running child with it.
@@ -2025,7 +2097,10 @@ mod v1_api {
             if let Some(state) = seen.as_ref().filter(|s| s.state == wanted) {
                 return state.clone();
             }
-            assert!(Instant::now() < deadline, "{id} never showed {wanted}: {seen:?}");
+            assert!(
+                Instant::now() < deadline,
+                "{id} never showed {wanted}: {seen:?}"
+            );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
@@ -2115,18 +2190,27 @@ mod v1_api {
             .await
             .unwrap()
             .into_inner();
-        assert!(["running", "paused"].contains(&paused.state.as_str()), "{paused:?}");
+        assert!(
+            ["running", "paused"].contains(&paused.state.as_str()),
+            "{paused:?}"
+        );
         let rest = until(&mut client, &all, "film", "paused").await;
         assert_eq!(rest.attempt, 1);
         // A call does not pause, and a job still pausing does not resume.
         let call = client.control(control(v1::Action::Pause, "film/1")).await;
-        assert_eq!(call.err().and_then(code).as_deref(), Some("pause_unsupported"));
+        assert_eq!(
+            call.err().and_then(code).as_deref(),
+            Some("pause_unsupported")
+        );
 
         // The started segment runs to its end; the unstarted one never starts while paused.
         let second = until(&mut client, &all, "film/1", "succeeded").await;
         assert_eq!(second.attempt, 1);
         assert!(snapshot(&mut client, &all, "film/2").await.is_none());
-        assert_eq!(snapshot(&mut client, &all, "film").await.unwrap().state, "paused");
+        assert_eq!(
+            snapshot(&mut client, &all, "film").await.unwrap().state,
+            "paused"
+        );
         let scratch = machine
             .root
             .join("state/cpu/scratch")
@@ -2143,7 +2227,10 @@ mod v1_api {
         machine.child = child;
         machine.address = address;
         let mut client = self::client(&machine).await;
-        assert_eq!(snapshot(&mut client, &all, "film").await.unwrap().state, "paused");
+        assert_eq!(
+            snapshot(&mut client, &all, "film").await.unwrap().state,
+            "paused"
+        );
         assert!(scratch.join("checkpoints/long_form/film-0").exists());
 
         let resumed = client
@@ -2151,7 +2238,10 @@ mod v1_api {
             .await
             .unwrap()
             .into_inner();
-        assert!(["queued", "running"].contains(&resumed.state.as_str()), "{resumed:?}");
+        assert!(
+            ["queued", "running"].contains(&resumed.state.as_str()),
+            "{resumed:?}"
+        );
         let events = collect(
             client
                 .run(authorized(
@@ -2174,7 +2264,11 @@ mod v1_api {
         // Two attempts counted in the run's scratch; the first attempt had declared the first
         // segment's checkpoint (it stopped while the second ran), so that declaration replayed.
         assert_eq!(
-            (result["segments"].as_u64(), result["attempts"].as_u64(), result["replayed"].as_u64()),
+            (
+                result["segments"].as_u64(),
+                result["attempts"].as_u64(),
+                result["replayed"].as_u64()
+            ),
             (Some(3), Some(2), Some(1)),
             "{result}"
         );
@@ -2192,7 +2286,11 @@ mod v1_api {
             let child = snapshot(&mut client, &all, &format!("film/{index}"))
                 .await
                 .unwrap();
-            assert_eq!((child.state.as_str(), child.attempt), ("succeeded", 1), "{child:?}");
+            assert_eq!(
+                (child.state.as_str(), child.attempt),
+                ("succeeded", 1),
+                "{child:?}"
+            );
         }
         let seen = tensorfs_core::sha256::hex_digest(&reference);
         let (mut film, mut context) = (String::new(), String::new());
@@ -2228,7 +2326,11 @@ mod v1_api {
             .collect();
         assert_eq!(
             labels,
-            ["Video (segments 1-1)", "Video (segments 1-2)", "Video (segments 1-3)"]
+            [
+                "Video (segments 1-1)",
+                "Video (segments 1-2)",
+                "Video (segments 1-3)"
+            ]
         );
         // Nor do its list items: each segment is one item of `parts`, in order.
         let parts: Vec<_> = events
@@ -2242,10 +2344,17 @@ mod v1_api {
             .collect();
         assert_eq!(
             parts,
-            [(1, "Segment 1".into()), (2, "Segment 2".into()), (3, "Segment 3".into())]
+            [
+                (1, "Segment 1".into()),
+                (2, "Segment 2".into()),
+                (3, "Segment 3".into())
+            ]
         );
         let again = client.control(control(v1::Action::Resume, "film")).await;
-        assert_eq!(again.err().and_then(code).as_deref(), Some("run_not_paused"));
+        assert_eq!(
+            again.err().and_then(code).as_deref(),
+            Some("run_not_paused")
+        );
 
         // A paused job's cancel ends it and every unfinished child, started ones too.
         let mut dropped = spec.clone();
@@ -2264,9 +2373,18 @@ mod v1_api {
             .await
             .unwrap();
         until(&mut client, &all, "dropped/0", "running").await;
-        client.control(control(v1::Action::Pause, "dropped")).await.unwrap();
+        client
+            .control(control(v1::Action::Pause, "dropped"))
+            .await
+            .unwrap();
         until(&mut client, &all, "dropped", "paused").await;
-        assert_eq!(snapshot(&mut client, &all, "dropped/0").await.unwrap().state, "running");
+        assert_eq!(
+            snapshot(&mut client, &all, "dropped/0")
+                .await
+                .unwrap()
+                .state,
+            "running"
+        );
         let canceled = client
             .control(control(v1::Action::Cancel, "dropped"))
             .await

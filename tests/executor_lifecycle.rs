@@ -330,12 +330,22 @@ fn retained_executors_killed_while_idle_lose_their_channel_before_any_handler() 
             let (mut executor, root, _) = launch(&generation, &hold);
             let reply = invoke(&mut executor, &root, "first", "steps", steps.clone()).unwrap();
             assert_eq!(terminal(&reply), "succeeded", "cycle {cycle}: {reply:?}");
-            Exact::open(&executor.birth).unwrap().unwrap().kill().unwrap();
+            Exact::open(&executor.birth)
+                .unwrap()
+                .unwrap()
+                .kill()
+                .unwrap();
             std::thread::sleep(Duration::from_secs(1));
             let error = invoke(&mut executor, &root, "next", "steps", steps.clone()).unwrap_err();
-            assert!(cozy_machine::device_executor::channel_lost(&error), "cycle {cycle}: {error}");
+            assert!(
+                cozy_machine::device_executor::channel_lost(&error),
+                "cycle {cycle}: {error}"
+            );
             eprintln!("cycle {cycle}: {:?}: {error}", error.kind());
-            assert_eq!(executor.terminate().unwrap().status.signal(), Some(libc::SIGKILL));
+            assert_eq!(
+                executor.terminate().unwrap().status.signal(),
+                Some(libc::SIGKILL)
+            );
             fs::remove_dir_all(root).unwrap();
         }
     }
@@ -352,7 +362,10 @@ fn a_setsid_descendant_is_killed_with_its_executor_scope() {
             .split(|b| *b == 0)
             .any(|entry| entry.starts_with(b"COZY_EXECUTOR_SCOPE=lifecycle-"));
         // A delegated cgroup where the host has one, else the token its descendants inherit.
-        assert!(member.contains("cozy-executor-lifecycle-") != token, "{member}");
+        assert!(
+            member.contains("cozy-executor-lifecycle-") != token,
+            "{member}"
+        );
         eprintln!("scope: {}", if token { "token" } else { "cgroup" });
         let reply = invoke(&mut executor, &root, "daemon", "daemon", json!({})).unwrap();
         assert_eq!(terminal(&reply), "succeeded", "{reply:?}");
@@ -363,8 +376,15 @@ fn a_setsid_descendant_is_killed_with_its_executor_scope() {
         let daemon = cozy_machine::process::process_birth(pid).unwrap();
         // Its own session: a process-group kill would miss it.
         let session = |pid: u32| {
-            fs::read_to_string(format!("/proc/{pid}/stat")).unwrap().rsplit_once(") ").unwrap().1
-                .split_whitespace().nth(3).unwrap().to_string()
+            fs::read_to_string(format!("/proc/{pid}/stat"))
+                .unwrap()
+                .rsplit_once(") ")
+                .unwrap()
+                .1
+                .split_whitespace()
+                .nth(3)
+                .unwrap()
+                .to_string()
         };
         assert_ne!(session(pid), session(executor.birth.pid));
         let ended = executor.terminate().unwrap();

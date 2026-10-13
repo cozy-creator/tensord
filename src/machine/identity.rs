@@ -35,10 +35,7 @@ pub fn hold(layout: &Layout) -> io::Result<()> {
     lock.try_lock_exclusive().map_err(|_| {
         io::Error::new(
             io::ErrorKind::AlreadyExists,
-            format!(
-                "another machine owns the root {}",
-                layout.root.display()
-            ),
+            format!("another machine owns the root {}", layout.root.display()),
         )
     })?;
     // Held by this parent and the service it forks; never by an executor (close-on-exec).

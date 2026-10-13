@@ -2,7 +2,9 @@
 //! `run A.json B.json ...` runs each config's executor in turn in one process: with
 //! `host_tier`, their weights come from one machine host tier that outlives each executor.
 use cozy_machine::device_executor;
-use cozy_machine::host_tier::{HalfOfHeadroom, HostGrant, HostTier, HostTierConfig, SealedRequest, TierLimit};
+use cozy_machine::host_tier::{
+    HalfOfHeadroom, HostGrant, HostTier, HostTierConfig, SealedRequest, TierLimit,
+};
 use cozy_machine::model_sources::{ModelSources, SelectedManifest};
 
 use device_executor::{
@@ -76,8 +78,12 @@ impl Services for Turns {
     ) -> io::Result<(Answer, Option<File>)> {
         let mut answer = Answer::unavailable(frame.seq);
         if let (Kind::SealedPrefetch, Some((tier, peer, grants))) = (frame.kind, &self.host) {
-            let plans = descriptor.ok_or_else(|| io::Error::other("sealed prefetch omitted its plans"))?;
-            let request = SealedRequest { sha256: &frame.sha256, length: frame.length };
+            let plans =
+                descriptor.ok_or_else(|| io::Error::other("sealed prefetch omitted its plans"))?;
+            let request = SealedRequest {
+                sha256: &frame.sha256,
+                length: frame.length,
+            };
             if let Err(error) = tier.prefetch(*peer, grants, request, plans) {
                 answer.detail = error.to_string();
             } else {
@@ -97,9 +103,13 @@ impl Services for Turns {
             return Ok((answer, Some(file)));
         }
         if let (Kind::SealedTier, Some((tier, peer, grants))) = (frame.kind, &self.host) {
-            let plan = descriptor.ok_or_else(|| io::Error::other("sealed tier omitted its plan"))?;
+            let plan =
+                descriptor.ok_or_else(|| io::Error::other("sealed tier omitted its plan"))?;
             let started = Instant::now();
-            let request = SealedRequest { sha256: &frame.sha256, length: frame.length };
+            let request = SealedRequest {
+                sha256: &frame.sha256,
+                length: frame.length,
+            };
             let granted = match tier.seal(*peer, grants, request, plan) {
                 Ok(granted) => granted,
                 Err(error) => {
@@ -177,13 +187,29 @@ fn run() -> io::Result<()> {
     for path in paths {
         let config: Pilot = serde_json::from_slice(&fs::read(&path)?)?;
         if config.host_tier && tier.is_none() {
-            let store = Arc::new(tensorfs_core::store::Store::open(std::path::Path::new(&config.binding.store)).map_err(io::Error::other)?);
-            let plans = Some(config.root.parent().unwrap_or(&config.root).join("host-plans"));
+            let store = Arc::new(
+                tensorfs_core::store::Store::open(std::path::Path::new(&config.binding.store))
+                    .map_err(io::Error::other)?,
+            );
+            let plans = Some(
+                config
+                    .root
+                    .parent()
+                    .unwrap_or(&config.root)
+                    .join("host-plans"),
+            );
             let limit: Box<dyn TierLimit> = match config.host_tier_limit_bytes {
                 Some(bytes) => Box::new(FixedLimit(bytes)),
                 None => Box::new(HalfOfHeadroom),
             };
-            tier = Some(HostTier::new(store, HostTierConfig { plans, ..HostTierConfig::default() }, limit)?);
+            tier = Some(HostTier::new(
+                store,
+                HostTierConfig {
+                    plans,
+                    ..HostTierConfig::default()
+                },
+                limit,
+            )?);
         }
         pilot(&action, config, tier.as_ref())?;
     }
@@ -303,7 +329,11 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
             })
             .collect::<io::Result<Vec<_>>>()?;
         tier.prepare(grants.clone());
-        turns.host = Some((tier.clone(), tier.register_peer(executor.observer_pidfd()?), grants));
+        turns.host = Some((
+            tier.clone(),
+            tier.register_peer(executor.observer_pidfd()?),
+            grants,
+        ));
         turns.sources = Some(sources);
     }
     let disk_before = disk_read_bytes();
@@ -360,7 +390,10 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
         "machine_disk_read_bytes": disk_read_bytes() - disk_before,
         "machine_fds": fd_count()?,
     });
-    fs::write(config.root.join("load-machine.json"), serde_json::to_vec_pretty(&machine)?)?;
+    fs::write(
+        config.root.join("load-machine.json"),
+        serde_json::to_vec_pretty(&machine)?,
+    )?;
     if !loaded.ok {
         return Err(io::Error::other(format!(
             "load: {} {}",
@@ -375,7 +408,11 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
         let budget = executor.command(
             &DeviceCommand::Budget {
                 vram_bytes: config.plane_budget_bytes,
-                pinned_bytes: if at_load { -1 } else { config.pinned_budget_bytes },
+                pinned_bytes: if at_load {
+                    -1
+                } else {
+                    config.pinned_budget_bytes
+                },
                 cap_bytes: None,
             },
             &mut turns,
@@ -490,7 +527,10 @@ fn pilot(action: &str, config: Pilot, tier: Option<&Arc<HostTier>>) -> io::Resul
 fn disk_read_bytes() -> u64 {
     fs::read_to_string("/proc/self/io")
         .ok()
-        .and_then(|s| s.lines().find_map(|l| l.strip_prefix("read_bytes: ")?.trim().parse().ok()))
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("read_bytes: ")?.trim().parse().ok())
+        })
         .unwrap_or(0)
 }
 

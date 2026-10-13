@@ -817,7 +817,10 @@ fn a_pause_holds_unstarted_work_and_a_resume_starts_a_fresh_attempt() {
     };
     // Unstarted: it rests at once, across a restart, and no dispatcher claims it.
     let queued = journal.accept("queued", job()).unwrap().id;
-    assert_eq!(journal.pause(&queued, "owner", false).unwrap().state, State::Paused);
+    assert_eq!(
+        journal.pause(&queued, "owner", false).unwrap().state,
+        State::Paused
+    );
     drop(journal);
     let mut journal = Journal::open(&state).unwrap();
     assert!(!journal.claim(&queued).unwrap());
@@ -836,14 +839,27 @@ fn a_pause_holds_unstarted_work_and_a_resume_starts_a_fresh_attempt() {
         .unwrap();
     journal.running(&queued, None).unwrap();
     // A child's hold leaves started work running; a job's pause marks it for its stop.
-    assert!(journal.pause(&queued, "owner", true).unwrap().pause_actor.is_none());
+    assert!(journal
+        .pause(&queued, "owner", true)
+        .unwrap()
+        .pause_actor
+        .is_none());
     let pausing = journal.pause(&queued, "owner", false).unwrap();
-    assert_eq!((pausing.state, pausing.pause_actor.as_deref()), (State::Running, Some("owner")));
-    assert!(journal.resume(&queued).unwrap().pause_actor.is_some(), "still pausing");
+    assert_eq!(
+        (pausing.state, pausing.pause_actor.as_deref()),
+        (State::Running, Some("owner"))
+    );
+    assert!(
+        journal.resume(&queued).unwrap().pause_actor.is_some(),
+        "still pausing"
+    );
     drop(executor.stdin.take());
     executor.wait().unwrap();
     let paused = journal.finish(&queued, journal::Outcome::Paused).unwrap();
-    assert_eq!((paused.state, paused.process.is_none()), (State::Paused, true));
+    assert_eq!(
+        (paused.state, paused.process.is_none()),
+        (State::Paused, true)
+    );
     assert_eq!(paused.finished_at_ms, 0);
     journal.resume(&queued).unwrap();
     assert!(journal.claim(&queued).unwrap());
@@ -854,18 +870,29 @@ fn a_pause_holds_unstarted_work_and_a_resume_starts_a_fresh_attempt() {
     assert!(journal.claim(&queued).unwrap());
     journal.pause(&queued, "owner", false).unwrap();
     assert_eq!(
-        journal.defer_unstarted(&queued, "spawn".into()).unwrap().state,
+        journal
+            .defer_unstarted(&queued, "spawn".into())
+            .unwrap()
+            .state,
         State::Paused
     );
-    assert_eq!(journal.cancel(&queued, "owner").unwrap().state, State::Canceled);
+    assert_eq!(
+        journal.cancel(&queued, "owner").unwrap().state,
+        State::Canceled
+    );
 
     // Preparing: it rests once prepared, never dispatchable in between.
     let child = Invocation {
         parent: queued.clone(),
         ..fixture.invocation("infer")
     };
-    let (preparing, _) = journal.accept_run("alice", "job/0", "d", child.clone()).unwrap();
-    assert_eq!(journal.pause(&preparing.id, "alice", true).unwrap().state, State::Queued);
+    let (preparing, _) = journal
+        .accept_run("alice", "job/0", "d", child.clone())
+        .unwrap();
+    assert_eq!(
+        journal.pause(&preparing.id, "alice", true).unwrap().state,
+        State::Queued
+    );
     let ready = journal.bind_prepared(&preparing.id, child, "").unwrap();
     assert_eq!(ready.state, State::Paused);
     assert_eq!(journal.children(&queued).unwrap().len(), 1);
@@ -1200,8 +1227,14 @@ fn age(path: &std::path::Path, days: u64) {
 fn a_failed_cpu_run_keeps_a_triage_bundle_with_the_runner_stderr() {
     let fixture = Fixture::new();
     // The package ends its runner in the middle of the run: a lifecycle failure.
-    let record = fixture.engine.submit("crash", fixture.invocation("crash")).unwrap();
-    assert!(fixture.engine.dispatch(&record.id, fixture.config()).unwrap());
+    let record = fixture
+        .engine
+        .submit("crash", fixture.invocation("crash"))
+        .unwrap();
+    assert!(fixture
+        .engine
+        .dispatch(&record.id, fixture.config())
+        .unwrap());
     let failed = fixture.wait(&record.id, |record| record.state.terminal());
     assert_eq!(failed.state, State::Failed, "{failed:?}");
     let (reference, bytes) = fixture.engine.triage(&record.id).unwrap().unwrap();
@@ -1222,7 +1255,11 @@ fn caches_expire_but_held_named_and_uncollected_work_stays() {
     // Two completed runs: one collected by its client, one not.
     let collected = fixture.submit("infer");
     fixture.wait(&collected, |record| record.state.terminal());
-    let owed = fixture.engine.submit("owed", fixture.invocation("infer")).unwrap().id;
+    let owed = fixture
+        .engine
+        .submit("owed", fixture.invocation("infer"))
+        .unwrap()
+        .id;
     assert!(fixture.engine.dispatch(&owed, fixture.config()).unwrap());
     fixture.wait(&owed, |record| record.state.terminal());
     fixture.engine.acknowledge_collection(&collected).unwrap();
@@ -1231,7 +1268,11 @@ fn caches_expire_but_held_named_and_uncollected_work_stays() {
         age(&state.join("results").join(id), 8);
     }
     // A crash leftover spool of a settled run, and one of a queued run.
-    let queued = fixture.engine.submit("queued", fixture.invocation("infer")).unwrap().id;
+    let queued = fixture
+        .engine
+        .submit("queued", fixture.invocation("infer"))
+        .unwrap()
+        .id;
     for id in [&collected, &queued] {
         fs::create_dir_all(state.join("staging").join(id)).unwrap();
     }
@@ -1265,7 +1306,11 @@ fn caches_expire_but_held_named_and_uncollected_work_stays() {
         busy: std::collections::HashSet::from(["u2".to_string()]),
     };
     let swept = reclaim::sweep(&fixture.engine, &catalog, &bound, Some(&caches)).unwrap();
-    assert_eq!((swept.staging, swept.results, swept.generations), (1, 1, 1), "{swept:?}");
+    assert_eq!(
+        (swept.staging, swept.results, swept.generations),
+        (1, 1, 1),
+        "{swept:?}"
+    );
     // Kernels go only under storage pressure, least recently used first, never a live
     // executor's namespace.
     let pressure = reclaim::Disk::measure(&fixture.root).unwrap().pressure();

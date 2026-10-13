@@ -217,8 +217,11 @@ impl NativeBackend {
                 .ok_or_else(|| Status::data_loss("held installation interface absent"))?;
             let interface: Value = serde_json::from_slice(&held.interface)
                 .map_err(|_| Status::data_loss("held installation interface corrupt"))?;
-            let declaration =
-                entrypoint(&interface, &record.invocation.entrypoint, record.invocation.job)?;
+            let declaration = entrypoint(
+                &interface,
+                &record.invocation.entrypoint,
+                record.invocation.job,
+            )?;
             schema_digest =
                 Some(identity(declaration.get("result").ok_or_else(|| {
                     Status::failed_precondition("result schema absent")
@@ -737,8 +740,7 @@ impl MachineBackend for NativeBackend {
                 .execution
                 .ok_or_else(|| Status::invalid_argument("execution query absent"))?,
         )?;
-        if request.attempt_ordinal != 0 && request.attempt_ordinal != record.attempt.max(1) as u64
-        {
+        if request.attempt_ordinal != 0 && request.attempt_ordinal != record.attempt.max(1) as u64 {
             return Err(Status::not_found("this machine keeps one attempt per run"));
         }
         let (triage, bytes) = self
@@ -796,7 +798,11 @@ impl MachineBackend for NativeBackend {
         if held.is_none() {
             return Err(Status::not_found("this signer wrote no such object"));
         }
-        Ok(self.store.open_verified(sha256).map_err(storage)?.into_file())
+        Ok(self
+            .store
+            .open_verified(sha256)
+            .map_err(storage)?
+            .into_file())
     }
     fn list_packages(
         &self,
@@ -1313,7 +1319,10 @@ impl MachineBackend for NativeBackend {
         let actor = actor_id(actor);
         let jobs = self.service.jobs();
         let typed = |refused: crate::objects::Refused| {
-            refusal(refused.code, &format!("{}: {}", refused.code, refused.message))
+            refusal(
+                refused.code,
+                &format!("{}: {}", refused.code, refused.message),
+            )
         };
         let changed = match pb::MachineExecutionAction::try_from(request.action) {
             Ok(pb::MachineExecutionAction::Cancel) => {
@@ -2280,229 +2289,233 @@ print(json.dumps({"identity": generation.identity}))
     }
     impl Fixture {
         fn start(entrypoint: &'static str, input: impl FnOnce(&Path) -> Value) -> Self {
-        let scratch =
-            Scratch(std::env::temp_dir().join(format!("cm-products-{}", uuid::Uuid::new_v4())));
-        let root = scratch.0.clone();
-        std::fs::create_dir_all(&root).unwrap();
-        let identity = install_fixture(&root);
-        let state = root.join("state");
-        let service = Service::open(&state, &root.join("generations"), 1).unwrap();
-        assert!(
-            service.stop().unwrap(),
-            "this test dispatches the run itself"
-        );
-        let engine = service.engine.clone();
-        let store = Arc::new(Store::ensure(&state.join("tensorfs")).unwrap());
-        let signer = ed25519_dalek::SigningKey::from_bytes(&[41; 32]);
-        let machine = MachineIdentity::ephemeral(
-            "products".into(),
-            vec![signer.verifying_key()],
-            vec![7; 32],
-        )
-        .unwrap();
-        let actor = VerifiedActor {
-            public_key: signer.verifying_key().to_bytes(),
-        };
-        let backend = NativeBackend::new(
-            service.clone(),
-            machine.authority.clone(),
-            store.clone(),
-            WorkspaceUploads::open(&state.join("uploads"), store.clone()).unwrap(),
-        );
-        let held = service.catalog.resolve(&identity).unwrap();
-        engine
-            .bind_installation(Installation {
-                actor: actor_id(actor),
-                alias: "fixture".into(),
-                generation: identity.clone(),
-                package: held.record.package.clone(),
-                release: held.record.version.clone(),
-                interface: serde_json::to_vec(&held.record.interface).unwrap(),
-            })
-            .unwrap();
-        let digest = format!("sha256:{}", "a".repeat(64));
-        let record = engine
-            .submit_public(
-                SubmissionContext {
-                    actor: actor_id(actor),
-                    request_id: "request-1".into(),
-                    submission_id: "submission-1".into(),
-                    expected_workspace_id: engine.workspace_id(),
-                    capture_digest: digest.clone(),
-                    invocation_digest: digest.clone(),
-                    payload_digest: digest,
-                    ..Default::default()
-                },
-                Invocation {
-                    package: held.record.package.clone(),
-                    generation: identity,
-                    module: held.record.application.clone(),
-                    entrypoint: entrypoint.into(),
-                    input: input(&root),
-                    attention_kernel: String::new(),
-                    inputs: vec![],
-                    ..Default::default()
-                },
+            let scratch =
+                Scratch(std::env::temp_dir().join(format!("cm-products-{}", uuid::Uuid::new_v4())));
+            let root = scratch.0.clone();
+            std::fs::create_dir_all(&root).unwrap();
+            let identity = install_fixture(&root);
+            let state = root.join("state");
+            let service = Service::open(&state, &root.join("generations"), 1).unwrap();
+            assert!(
+                service.stop().unwrap(),
+                "this test dispatches the run itself"
+            );
+            let engine = service.engine.clone();
+            let store = Arc::new(Store::ensure(&state.join("tensorfs")).unwrap());
+            let signer = ed25519_dalek::SigningKey::from_bytes(&[41; 32]);
+            let machine = MachineIdentity::ephemeral(
+                "products".into(),
+                vec![signer.verifying_key()],
+                vec![7; 32],
             )
             .unwrap();
-        let executor_root = root.join("executor");
-        let task_store = store.clone();
-        let failure = Arc::new(Mutex::new(None::<String>));
-        let failed = failure.clone();
-        assert!(engine
-            .dispatch_managed(&record.id, move |engine, id| {
-                let result = (|| -> io::Result<()> {
-                    std::fs::create_dir(&executor_root)?;
-                    let mut executor = DeviceExecutor::spawn_observed(
-                        ExecutorConfig {
-                            python: held.record.python.clone(),
-                            root: executor_root.clone(),
-                            socket: executor_root.join("e.sock"),
-                            environment: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
-                            // No device is visible (empty devices): this package never imports torch.
-                            seal: {
-                                let mut seal = crate::launch_identity::Seal::prepare(
-                                    &executor_root,
-                                    None,
-                                    "products",
-                                    &held.record.identity,
-                                    "",
-                                )?;
-                                seal.threads = 1;
-                                seal
+            let actor = VerifiedActor {
+                public_key: signer.verifying_key().to_bytes(),
+            };
+            let backend = NativeBackend::new(
+                service.clone(),
+                machine.authority.clone(),
+                store.clone(),
+                WorkspaceUploads::open(&state.join("uploads"), store.clone()).unwrap(),
+            );
+            let held = service.catalog.resolve(&identity).unwrap();
+            engine
+                .bind_installation(Installation {
+                    actor: actor_id(actor),
+                    alias: "fixture".into(),
+                    generation: identity.clone(),
+                    package: held.record.package.clone(),
+                    release: held.record.version.clone(),
+                    interface: serde_json::to_vec(&held.record.interface).unwrap(),
+                })
+                .unwrap();
+            let digest = format!("sha256:{}", "a".repeat(64));
+            let record = engine
+                .submit_public(
+                    SubmissionContext {
+                        actor: actor_id(actor),
+                        request_id: "request-1".into(),
+                        submission_id: "submission-1".into(),
+                        expected_workspace_id: engine.workspace_id(),
+                        capture_digest: digest.clone(),
+                        invocation_digest: digest.clone(),
+                        payload_digest: digest,
+                        ..Default::default()
+                    },
+                    Invocation {
+                        package: held.record.package.clone(),
+                        generation: identity,
+                        module: held.record.application.clone(),
+                        entrypoint: entrypoint.into(),
+                        input: input(&root),
+                        attention_kernel: String::new(),
+                        inputs: vec![],
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let executor_root = root.join("executor");
+            let task_store = store.clone();
+            let failure = Arc::new(Mutex::new(None::<String>));
+            let failed = failure.clone();
+            assert!(engine
+                .dispatch_managed(&record.id, move |engine, id| {
+                    let result = (|| -> io::Result<()> {
+                        std::fs::create_dir(&executor_root)?;
+                        let mut executor = DeviceExecutor::spawn_observed(
+                            ExecutorConfig {
+                                python: held.record.python.clone(),
+                                root: executor_root.clone(),
+                                socket: executor_root.join("e.sock"),
+                                environment: BTreeMap::from([(
+                                    "PATH".into(),
+                                    "/usr/bin:/bin".into(),
+                                )]),
+                                // No device is visible (empty devices): this package never imports torch.
+                                seal: {
+                                    let mut seal = crate::launch_identity::Seal::prepare(
+                                        &executor_root,
+                                        None,
+                                        "products",
+                                        &held.record.identity,
+                                        "",
+                                    )?;
+                                    seal.threads = 1;
+                                    seal
+                                },
+                                generation_hold: Some(held.retention()),
+                                identity: None,
+                                cgroup_namespace: None,
                             },
-                            generation_hold: Some(held.retention()),
-                            identity: None,
-                            cgroup_namespace: None,
-                        },
-                        |birth, cancel| {
-                            let (cancel, request) = (cancel.clone(), id.clone());
-                            engine.register_managed(
-                                &id,
-                                birth.clone(),
-                                Arc::new(move || cancel.cancel(&request)),
-                            )
-                        },
-                    )?;
-                    assert!(!executor.hello.torch_loaded);
-                    assert!(engine.authorize_managed(&id, None)?);
-                    let interface = executor_root.join("package-interface.json");
-                    std::fs::write(&interface, serde_json::to_vec(&held.record.interface)?)?;
-                    command(
-                        &mut executor,
-                        &DeviceCommand::Start {
-                            devices: String::new(),
-                            application: held.record.application.clone(),
-                            package_interface: interface.clone(),
-                            sequence_parallel_degree: 1,
-                            import_only: false,
-                        },
-                    )?;
-                    command(
-                        &mut executor,
-                        &DeviceCommand::Load {
-                            construction: "fixture".into(),
-                            devices: String::new(),
-                            sequence_parallel_degree: 1,
-                            binding: Box::new(Binding {
+                            |birth, cancel| {
+                                let (cancel, request) = (cancel.clone(), id.clone());
+                                engine.register_managed(
+                                    &id,
+                                    birth.clone(),
+                                    Arc::new(move || cancel.cancel(&request)),
+                                )
+                            },
+                        )?;
+                        assert!(!executor.hello.torch_loaded);
+                        assert!(engine.authorize_managed(&id, None)?);
+                        let interface = executor_root.join("package-interface.json");
+                        std::fs::write(&interface, serde_json::to_vec(&held.record.interface)?)?;
+                        command(
+                            &mut executor,
+                            &DeviceCommand::Start {
+                                devices: String::new(),
                                 application: held.record.application.clone(),
-                                package_interface: interface.display().to_string(),
-                                ..Binding::default()
-                            }),
-                            budgets: Budgets::default(),
-                            models: Vec::new(),
-                            authorized_device_limit_bytes: None,
-                            attention_pin: String::new(),
-                            stages: false,
-                            device_weights: false,
-                            cap_bytes: None,
-                            sealed_tiers: false,
-                            model_sources: false,
-                            pinned_bytes: None,
-                        },
-                    )?;
-                    command(
-                        &mut executor,
-                        &DeviceCommand::Activate {
-                            construction: "fixture".into(),
-                        },
-                    )?;
-                    let record = engine.get(&id)?;
-                    command(
-                        &mut executor,
-                        &DeviceCommand::PrepareRequest {
-                            request_id: id.clone(),
-                            construction: "fixture".into(),
-                            entrypoint: entrypoint.into(),
-                            payload: record.invocation.input,
-                            attention_kernel: String::new(),
-                            input_metadata: Default::default(),
-                        },
-                    )?;
-                    let spool = engine.staging(&id)?;
-                    let reply = executor.command(
-                        &DeviceCommand::Invoke {
-                            request_id: id.clone(),
-                            construction: "fixture".into(),
-                            entrypoint: entrypoint.into(),
-                            spool: spool.clone(),
-                            deadline_s: None,
-                            attention_kernel: String::new(),
-                            plane_budget_bytes: -1,
-                            stages: false,
-                            cap_bytes: None,
-                            inputs: Default::default(),
-                            trees: Default::default(),
-                            floor_bytes: None,
-                            activation_bytes: Default::default(),
-                            device_weights: None,
-                        },
-                        &mut Publisher {
-                            store: &task_store,
-                            engine: &engine,
-                            id: &id,
-                            spool: spool.clone(),
-                        },
-                    )?;
-                    if let Some(outcome) =
-                        reply.outcome.as_ref().filter(|o| o.terminal != "succeeded")
-                    {
-                        crate::gpu_service::keep_triage(&engine, &id, &executor, outcome);
-                        let failure = crate::journal::Failure::executor(
-                            &outcome.terminal,
-                            &outcome.origin,
-                            &outcome.code,
-                            &outcome.message,
-                        );
-                        engine.finish(&id, crate::journal::Outcome::Failed(failure.encode()))?;
-                        return executor.shutdown();
+                                package_interface: interface.clone(),
+                                sequence_parallel_degree: 1,
+                                import_only: false,
+                            },
+                        )?;
+                        command(
+                            &mut executor,
+                            &DeviceCommand::Load {
+                                construction: "fixture".into(),
+                                devices: String::new(),
+                                sequence_parallel_degree: 1,
+                                binding: Box::new(Binding {
+                                    application: held.record.application.clone(),
+                                    package_interface: interface.display().to_string(),
+                                    ..Binding::default()
+                                }),
+                                budgets: Budgets::default(),
+                                models: Vec::new(),
+                                authorized_device_limit_bytes: None,
+                                attention_pin: String::new(),
+                                stages: false,
+                                device_weights: false,
+                                cap_bytes: None,
+                                sealed_tiers: false,
+                                model_sources: false,
+                                pinned_bytes: None,
+                            },
+                        )?;
+                        command(
+                            &mut executor,
+                            &DeviceCommand::Activate {
+                                construction: "fixture".into(),
+                            },
+                        )?;
+                        let record = engine.get(&id)?;
+                        command(
+                            &mut executor,
+                            &DeviceCommand::PrepareRequest {
+                                request_id: id.clone(),
+                                construction: "fixture".into(),
+                                entrypoint: entrypoint.into(),
+                                payload: record.invocation.input,
+                                attention_kernel: String::new(),
+                                input_metadata: Default::default(),
+                            },
+                        )?;
+                        let spool = engine.staging(&id)?;
+                        let reply = executor.command(
+                            &DeviceCommand::Invoke {
+                                request_id: id.clone(),
+                                construction: "fixture".into(),
+                                entrypoint: entrypoint.into(),
+                                spool: spool.clone(),
+                                deadline_s: None,
+                                attention_kernel: String::new(),
+                                plane_budget_bytes: -1,
+                                stages: false,
+                                cap_bytes: None,
+                                inputs: Default::default(),
+                                trees: Default::default(),
+                                floor_bytes: None,
+                                activation_bytes: Default::default(),
+                                device_weights: None,
+                            },
+                            &mut Publisher {
+                                store: &task_store,
+                                engine: &engine,
+                                id: &id,
+                                spool: spool.clone(),
+                            },
+                        )?;
+                        if let Some(outcome) =
+                            reply.outcome.as_ref().filter(|o| o.terminal != "succeeded")
+                        {
+                            crate::gpu_service::keep_triage(&engine, &id, &executor, outcome);
+                            let failure = crate::journal::Failure::executor(
+                                &outcome.terminal,
+                                &outcome.origin,
+                                &outcome.code,
+                                &outcome.message,
+                            );
+                            engine
+                                .finish(&id, crate::journal::Outcome::Failed(failure.encode()))?;
+                            return executor.shutdown();
+                        }
+                        let (value, bindings) =
+                            device_executor::postprocess(&executor.codec(), &spool, &reply)?;
+                        engine.managed_result(
+                            &id,
+                            &spool,
+                            value,
+                            crate::gpu_service::output_bindings(bindings)?,
+                        )?;
+                        executor.shutdown()
+                    })();
+                    if let Err(error) = &result {
+                        *failed.lock().unwrap() = Some(error.to_string());
                     }
-                    let (value, bindings) =
-                        device_executor::postprocess(&executor.codec(), &spool, &reply)?;
-                    engine.managed_result(
-                        &id,
-                        &spool,
-                        value,
-                        crate::gpu_service::output_bindings(bindings)?,
-                    )?;
-                    executor.shutdown()
-                })();
-                if let Err(error) = &result {
-                    *failed.lock().unwrap() = Some(error.to_string());
-                }
-                result
-            })
-            .unwrap());
-        Self {
-            root,
-            engine,
-            backend,
-            actor,
-            failure,
-            // Harness bound on a broken run only; the product never kills by elapsed time.
-            until: std::time::Instant::now() + Duration::from_secs(300),
-            _scratch: scratch,
-        }
+                    result
+                })
+                .unwrap());
+            Self {
+                root,
+                engine,
+                backend,
+                actor,
+                failure,
+                // Harness bound on a broken run only; the product never kills by elapsed time.
+                until: std::time::Instant::now() + Duration::from_secs(300),
+                _scratch: scratch,
+            }
         }
         fn check(&self) {
             assert!(
@@ -2510,7 +2523,10 @@ print(json.dumps({"identity": generation.identity}))
                 "run failed: {:?}",
                 self.failure.lock().unwrap()
             );
-            assert!(std::time::Instant::now() < self.until, "run made no progress");
+            assert!(
+                std::time::Instant::now() < self.until,
+                "run made no progress"
+            );
         }
         fn query(&self, after: u64) -> pb::MachineExecutionEventsQuery {
             pb::MachineExecutionEventsQuery {
@@ -2673,11 +2689,17 @@ print(json.dumps({"identity": generation.identity}))
         assert_eq!(named["length"], json!(reference.length));
         assert_eq!(
             named["write_receipt_digest"],
-            json!(format!("sha256:{}", sha256::hex(&reference.write_receipt_digest)))
+            json!(format!(
+                "sha256:{}",
+                sha256::hex(&reference.write_receipt_digest)
+            ))
         );
         let bundle: Value = serde_json::from_slice(&triage.bundle_canonical_bytes).unwrap();
         let traceback = bundle["terminal"]["traceback"].as_str().unwrap();
-        assert!(traceback.contains("ValueError") && traceback.contains("boom from the fixture"), "{bundle}");
+        assert!(
+            traceback.contains("ValueError") && traceback.contains("boom from the fixture"),
+            "{bundle}"
+        );
         assert_eq!(bundle["request_id"], "request-1");
         assert!(bundle["executor"]["pid"].as_u64().unwrap() > 0);
         // A later attempt ordinal names no bundle on this machine.

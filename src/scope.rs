@@ -158,7 +158,9 @@ impl Scope {
             Backend::Cgroup { relative, inode } => count(&Self::path(relative, *inode)?),
             Backend::Tree { token } => {
                 let rows = census()?;
-                Ok(members(&rows, |t| t == token).filter(|row| row.alive).count())
+                Ok(members(&rows, |t| t == token)
+                    .filter(|row| row.alive)
+                    .count())
             }
         }
     }
@@ -210,7 +212,9 @@ impl Scope {
                 let stragglers = end_members(|t| t == token)?;
                 LIVE.lock().unwrap().remove(token);
                 // Anything of this machine's that no live scope claims goes now too.
-                let namespace = token.rsplit_once('-').map_or("", |(namespace, _)| namespace);
+                let namespace = token
+                    .rsplit_once('-')
+                    .map_or("", |(namespace, _)| namespace);
                 Ok(stragglers + end_members(unclaimed(namespace))?)
             }
         }
@@ -307,7 +311,11 @@ fn census() -> io::Result<Vec<Row>> {
     let own = std::process::id();
     let mut rows = Vec::new();
     for entry in fs::read_dir("/proc")? {
-        let Some(pid) = entry?.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+        let Some(pid) = entry?
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
             continue;
         };
         if pid == own || pid == 1 {
@@ -333,7 +341,9 @@ fn census() -> io::Result<Vec<Row>> {
             .flatten()
             .and_then(|environ| {
                 environ.split(|b| *b == 0).find_map(|entry| {
-                    let value = entry.strip_prefix(TOKEN_ENV.as_bytes())?.strip_prefix(b"=")?;
+                    let value = entry
+                        .strip_prefix(TOKEN_ENV.as_bytes())?
+                        .strip_prefix(b"=")?;
                     String::from_utf8(value.to_vec()).ok()
                 })
             });
@@ -431,7 +441,10 @@ mod tests {
     fn detach(scope: &Scope) -> u32 {
         let mut command = Command::new("/bin/sh");
         command
-            .args(["-c", "read go; setsid sleep 1000 </dev/null >/dev/null 2>&1 & echo $!"])
+            .args([
+                "-c",
+                "read go; setsid sleep 1000 </dev/null >/dev/null 2>&1 & echo $!",
+            ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped());
         if let Some((name, value)) = scope.environment() {
@@ -441,7 +454,12 @@ mod tests {
         scope.adopt(leader.id()).unwrap();
         leader.stdin.take().unwrap().write_all(b"go\n").unwrap();
         let mut daemon = String::new();
-        leader.stdout.take().unwrap().read_to_string(&mut daemon).unwrap();
+        leader
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut daemon)
+            .unwrap();
         assert!(leader.wait().unwrap().success());
         daemon.trim().parse().unwrap()
     }

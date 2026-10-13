@@ -1738,10 +1738,12 @@ impl DeviceExecutor {
         }
         write_frame(&mut self.stream, &value)?;
         loop {
-            let frame = read_frame(&mut self.stream)?
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::UnexpectedEof, "stock executor EOF before reply")
-                })?;
+            let frame = read_frame(&mut self.stream)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "stock executor EOF before reply",
+                )
+            })?;
             watch.frame();
             match frame.event {
                 Some(Event::Progress) => services.progress(&frame),

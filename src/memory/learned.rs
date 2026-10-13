@@ -275,7 +275,7 @@ mod tests {
         let estimate = learned.shape("h3", "assets=1,frames=384,steps=8").unwrap();
         assert_eq!(estimate.methods["base_model.sample_ref2va_turbo"], 384);
         assert_eq!(estimate.peak, 107); // ceil(100 * 384 / 362)
-        // More steps alone: tokens are equal, so the estimate is the measurement's own size.
+                                        // More steps alone: tokens are equal, so the estimate is the measurement's own size.
         let steps = learned.shape("h3", "assets=1,frames=362,steps=30").unwrap();
         assert_eq!((steps.peak, steps.estimated_from.unwrap().1), (100, 1.0));
         // A smaller shape takes the measurement itself, never a scaled-down estimate.

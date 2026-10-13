@@ -104,7 +104,11 @@ fn kernel_entries(caches: &KernelCaches) -> Vec<PathBuf> {
         {
             continue;
         }
-        for child in fs::read_dir(namespace.path()).into_iter().flatten().flatten() {
+        for child in fs::read_dir(namespace.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
             let name = child.file_name();
             if matches!(name.to_str(), Some("triton" | "flash-attn4")) {
                 entries.extend(
@@ -119,7 +123,10 @@ fn kernel_entries(caches: &KernelCaches) -> Vec<PathBuf> {
             }
         }
     }
-    let mut dated: Vec<_> = entries.into_iter().map(|path| (last_use(&path), path)).collect();
+    let mut dated: Vec<_> = entries
+        .into_iter()
+        .map(|path| (last_use(&path), path))
+        .collect();
     dated.sort();
     dated.into_iter().map(|(_, path)| path).collect()
 }
@@ -127,7 +134,11 @@ fn kernel_entries(caches: &KernelCaches) -> Vec<PathBuf> {
 fn older_than(path: &Path, age: Duration) -> bool {
     fs::metadata(path)
         .and_then(|m| m.modified())
-        .is_ok_and(|modified| SystemTime::now().duration_since(modified).is_ok_and(|a| a > age))
+        .is_ok_and(|modified| {
+            SystemTime::now()
+                .duration_since(modified)
+                .is_ok_and(|a| a > age)
+        })
 }
 
 fn remove(path: &Path) -> bool {
@@ -174,7 +185,9 @@ pub fn sweep(
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             let id = name.split('.').next().unwrap_or_default();
-            let settled = engine.get(id).map_or(true, |record| record.state.terminal());
+            let settled = engine
+                .get(id)
+                .map_or(true, |record| record.state.terminal());
             if settled && (pressure || older_than(&entry.path(), TTL)) && remove(&entry.path()) {
                 swept.logs += 1;
             }
@@ -209,7 +222,9 @@ pub fn sweep(
             if name.starts_with(".collect-") {
                 return true; // an interrupted collection
             }
-            name.len() == 32 && name.bytes().all(|b| b.is_ascii_hexdigit()) && !bound.contains(&name)
+            name.len() == 32
+                && name.bytes().all(|b| b.is_ascii_hexdigit())
+                && !bound.contains(&name)
         })
         .collect();
     // Least recently used first: a resolve touches `.hold`.

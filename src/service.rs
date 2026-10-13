@@ -122,7 +122,12 @@ impl Service {
         service.reclaim();
         // Keep queued and paused runs' generations alive, including a prior boot's.
         let paused = service.engine.paused(usize::MAX)?;
-        for record in service.engine.nonterminal(usize::MAX)?.into_iter().chain(paused) {
+        for record in service
+            .engine
+            .nonterminal(usize::MAX)?
+            .into_iter()
+            .chain(paused)
+        {
             if let Ok(held) = service.catalog.resolve(&record.invocation.generation) {
                 service
                     .retained

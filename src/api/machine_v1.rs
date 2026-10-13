@@ -162,7 +162,10 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<crate::runs::Spec, Status> {
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |since| since.as_secs() as i64);
             if hub.expires_at != 0 && hub.expires_at <= now {
-                return Err(refused("hub_access_expired", "the run's Hub access has expired"));
+                return Err(refused(
+                    "hub_access_expired",
+                    "the run's Hub access has expired",
+                ));
             }
             Some(crate::hub::Source {
                 origin: hub.origin.trim_end_matches('/').to_string(),

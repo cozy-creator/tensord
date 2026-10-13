@@ -354,7 +354,9 @@ impl Gpu {
 
     /// Per-method activation growth learned for `plan`'s next shape: the executor's seeds.
     pub fn seeds(&self, plan: &str) -> BTreeMap<String, u64> {
-        self.shape(plan).map(|shape| shape.methods).unwrap_or_default()
+        self.shape(plan)
+            .map(|shape| shape.methods)
+            .unwrap_or_default()
     }
 
     /// What was learned for `plan`'s next shape, measured or estimated (`estimated_from`).
@@ -920,7 +922,10 @@ mod tests {
             processes: None,
         };
         assert!(gpu.room("anima", &s) < gpu.physical_cap("anima", &s));
-        assert_eq!(gpu.physical_cap("anima", &s), GIB / 2 + 2 * GIB - HEADLESS_FLOOR);
+        assert_eq!(
+            gpu.physical_cap("anima", &s),
+            GIB / 2 + 2 * GIB - HEADLESS_FLOOR
+        );
     }
 
     #[test]

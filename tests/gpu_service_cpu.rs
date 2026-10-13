@@ -91,7 +91,13 @@ fn restart_ends_a_retained_gpu_birth_before_admitting_gpu_work() {
     fs::remove_dir_all(root).unwrap();
 }
 
-fn complete(journal: &mut Journal, n: usize, generation: &str, birth: ProcessBirth, preparation: &str) {
+fn complete(
+    journal: &mut Journal,
+    n: usize,
+    generation: &str,
+    birth: ProcessBirth,
+    preparation: &str,
+) {
     let context = SubmissionContext {
         actor: "actor".into(),
         request_id: format!("request-{n}"),
@@ -141,7 +147,10 @@ fn restart_ends_processes_left_in_earlier_executor_scopes() {
     // A daemon an earlier executor left behind, in its own session inside its scope.
     let mut command = Command::new("/bin/sh");
     command
-        .args(["-c", "read go; setsid sleep 1000 </dev/null >/dev/null 2>&1 & echo $!"])
+        .args([
+            "-c",
+            "read go; setsid sleep 1000 </dev/null >/dev/null 2>&1 & echo $!",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped());
     if let Some((name, value)) = scope.environment() {
@@ -151,12 +160,19 @@ fn restart_ends_processes_left_in_earlier_executor_scopes() {
     scope.adopt(leader.id()).unwrap();
     leader.stdin.take().unwrap().write_all(b"go\n").unwrap();
     let mut daemon = String::new();
-    leader.stdout.take().unwrap().read_to_string(&mut daemon).unwrap();
+    leader
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut daemon)
+        .unwrap();
     assert!(leader.wait().unwrap().success());
     let daemon = cozy_machine::process::process_birth(daemon.trim().parse().unwrap()).unwrap();
     assert_eq!(scope.processes().unwrap(), 1);
     // That machine is gone: nothing in this process claims the scope any more.
-    let cgroup = scope.cgroup_relative().map(|relative| format!("/sys/fs/cgroup{relative}"));
+    let cgroup = scope
+        .cgroup_relative()
+        .map(|relative| format!("/sys/fs/cgroup{relative}"));
     drop(scope);
     let service = Service::open(&state, &root.join("generations"), 1).unwrap();
     assert!(cozy_machine::process::process_ended(&daemon).unwrap());

@@ -3,8 +3,8 @@
 use crate::{
     catalog::HeldGeneration,
     device_executor::{
-        self, channel_lost, Answer, Binding, Budgets, Cancellation, DeviceCommand,
-        DeviceExecutor, ExecutorConfig, Forked, Frame, Group, Kind, ModelLoad, Services,
+        self, channel_lost, Answer, Binding, Budgets, Cancellation, DeviceCommand, DeviceExecutor,
+        ExecutorConfig, Forked, Frame, Group, Kind, ModelLoad, Services,
     },
     execution::{process_ended, Engine},
     host_tier::{HostGrant, HostTier, HostTierConfig, SealedRequest},
@@ -753,7 +753,9 @@ impl GpuPool {
             }
             // Hub-resolved grants already carry a slot's adapters (as its adapter view);
             // configured cached authority has no resolution step to apply them.
-            if (!choice.source.is_empty() || !choice.profiles.is_empty() || !choice.adapters.is_empty())
+            if (!choice.source.is_empty()
+                || !choice.profiles.is_empty()
+                || !choice.adapters.is_empty())
                 && resolved.is_empty()
             {
                 return Err(io::Error::new(
@@ -1751,8 +1753,8 @@ impl GpuPool {
                 Err(error) => return Err(ended_with(engine, id, error, session.executor)),
             }
         }; // the rest of the ended session (sources, grants) goes here
-        // Never started: once that exit is observed, this dispatch runs it on a fresh executor
-        // (cold, so a second loss is FAILED). An unproven exit stays charged.
+           // Never started: once that exit is observed, this dispatch runs it on a fresh executor
+           // (cold, so a second loss is FAILED). An unproven exit stays charged.
         if !undelivered(&error) {
             return Err(error);
         }
@@ -1847,10 +1849,11 @@ impl GpuPool {
         }
         let selections = plan.selections();
         let id = self.serving.next.fetch_add(1, Ordering::Relaxed);
-        self.serving.held.lock().unwrap().insert(
-            id,
-            selections.iter().map(|s| s.manifest.clone()).collect(),
-        );
+        self.serving
+            .held
+            .lock()
+            .unwrap()
+            .insert(id, selections.iter().map(|s| s.manifest.clone()).collect());
         let serving = ServingHold {
             serving: self.serving.clone(),
             id,
@@ -2746,7 +2749,9 @@ fn ending(error: io::Error, executor: DeviceExecutor) -> io::Error {
                 code: refusal.code.clone(),
                 detail: format!("{}; {killed}", refusal.detail),
             }),
-            None if undelivered(&error) => io::Error::other(Undelivered(format!("{error}; {killed}"))),
+            None if undelivered(&error) => {
+                io::Error::other(Undelivered(format!("{error}; {killed}")))
+            }
             None => io::Error::other(format!("{error}; {killed}")),
         },
         Ok(_) => error,
@@ -2870,8 +2875,12 @@ pub(crate) fn stage_inputs(
             let manifest = held_bytes(store, &input.digest, input.length)?;
             materialize_tree(store, identity, &manifest, &local)?;
             // A payload names a tree by its field's ref or by its manifest digest.
-            staged.trees.insert(input.digest.clone(), (local.clone(), input.digest.clone()));
-            staged.trees.insert(input.input_id.clone(), (local, input.digest.clone()));
+            staged
+                .trees
+                .insert(input.digest.clone(), (local.clone(), input.digest.clone()));
+            staged
+                .trees
+                .insert(input.input_id.clone(), (local, input.digest.clone()));
             continue;
         }
         copy_held(store, identity, &input.digest, input.length, &local)?;
@@ -2895,7 +2904,10 @@ fn copy_held(
     local: &Path,
 ) -> io::Result<()> {
     let sha = digest.strip_prefix("sha256:").unwrap_or(digest);
-    let mut source = store.open_verified(sha).map_err(io::Error::other)?.into_file();
+    let mut source = store
+        .open_verified(sha)
+        .map_err(io::Error::other)?
+        .into_file();
     let mut copy = std::os::unix::fs::OpenOptionsExt::mode(
         fs::OpenOptions::new().write(true).create_new(true),
         0o444,
@@ -2924,7 +2936,10 @@ fn held_bytes(store: &Store, digest: &str, length: u64) -> io::Result<Vec<u8>> {
         .take(length + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 != length {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "a tree manifest changed length"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "a tree manifest changed length",
+        ));
     }
     Ok(bytes)
 }
@@ -2936,9 +2951,13 @@ fn materialize_tree(
     manifest: &[u8],
     root: &Path,
 ) -> io::Result<()> {
-    let invalid = |why: &str| io::Error::new(io::ErrorKind::InvalidData, format!("tree manifest: {why}"));
-    let document: serde_json::Value = serde_json::from_slice(manifest).map_err(|_| invalid("not JSON"))?;
-    let entries = document["entries"].as_array().ok_or_else(|| invalid("no entries"))?;
+    let invalid =
+        |why: &str| io::Error::new(io::ErrorKind::InvalidData, format!("tree manifest: {why}"));
+    let document: serde_json::Value =
+        serde_json::from_slice(manifest).map_err(|_| invalid("not JSON"))?;
+    let entries = document["entries"]
+        .as_array()
+        .ok_or_else(|| invalid("no entries"))?;
     fs::create_dir(root)?;
     for entry in entries {
         let (Some("file"), Some(path), Some(sha), Some(length)) = (
@@ -2950,7 +2969,9 @@ fn materialize_tree(
             return Err(invalid("an entry is not a file with a blob"));
         };
         let relative = Path::new(path);
-        let local = relative.components().all(|c| matches!(c, std::path::Component::Normal(_)));
+        let local = relative
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)));
         if !local || path.contains(['\\', '\0']) {
             return Err(invalid("a path leaves its tree"));
         }
@@ -3095,7 +3116,9 @@ impl std::fmt::Display for Undelivered {
 }
 impl std::error::Error for Undelivered {}
 fn undelivered(error: &io::Error) -> bool {
-    error.get_ref().is_some_and(|inner| inner.is::<Undelivered>())
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<Undelivered>())
 }
 
 fn refused(error: &io::Error) -> Option<&Refused> {
@@ -3126,7 +3149,6 @@ pub(crate) fn record_measurements(engine: &Engine, id: &str, reply: &Frame) {
         eprintln!("run {id}: measurements not kept: {error}");
     }
 }
-
 
 pub(crate) fn command_ok(frame: Frame) -> io::Result<Frame> {
     if frame.ok {

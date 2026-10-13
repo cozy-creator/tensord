@@ -151,7 +151,12 @@ fn run_machine(
     let engine = layout.engine();
     identity.store = Some(layout.store.clone());
     let generations = engine.join("generations");
-    let owner = Owner::new(&engine, &layout.store, 16 * 1024 * 1024, Duration::from_secs(300))?;
+    let owner = Owner::new(
+        &engine,
+        &layout.store,
+        16 * 1024 * 1024,
+        Duration::from_secs(300),
+    )?;
     let service = cozy_machine::service::Service::open(&engine, &generations, 1)?;
     let paths = cozy_machine::machine::update::Paths::new(&engine, &layout.root);
     let updates = {
@@ -232,7 +237,8 @@ fn run_machine(
     if let Some(port) = grant.media_port {
         identity.media = Some(std::net::TcpListener::bind((grant.listen_host, port))?);
     }
-    identity.webrtc = cozy_machine::machine::media::listen(&layout.state, grant.webrtc_port, !rental)?;
+    identity.webrtc =
+        cozy_machine::machine::media::listen(&layout.state, grant.webrtc_port, !rental)?;
     // The client this binary embeds, and the installer helper over it (made once per client).
     let uv = cozy_machine::machine::client::uv(&layout.root);
     let wheel = cozy_machine::machine::client::wheel(&engine)?;

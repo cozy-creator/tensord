@@ -9,6 +9,7 @@
 //! each call it makes again finds its child by index and intent, finished children answer
 //! with their results, held ones go on. The run's scratch and checkpoint declarations persist
 //! across attempts; the self-managing sweep removes the scratch once the run has ended.
+use crate::objects::Refused;
 use crate::{
     catalog::HeldGeneration,
     device_executor::{
@@ -26,7 +27,6 @@ use crate::{
     service::Service,
 };
 use serde_json::{json, Value};
-use crate::objects::Refused;
 use std::{
     collections::{BTreeMap, HashMap},
     fs::{self, File},
@@ -124,8 +124,18 @@ impl Jobs {
                 let home = root.join("home");
                 fs::create_dir_all(&home)?;
                 let home = home.to_string_lossy().into_owned();
-                let minimal = [("PATH", "/usr/local/bin:/usr/bin:/bin"), ("LANG", "C.UTF-8"), ("HOME", &home)];
-                (minimal.into_iter().map(|(k, v)| (k.into(), v.into())).collect(), None)
+                let minimal = [
+                    ("PATH", "/usr/local/bin:/usr/bin:/bin"),
+                    ("LANG", "C.UTF-8"),
+                    ("HOME", &home),
+                ];
+                (
+                    minimal
+                        .into_iter()
+                        .map(|(k, v)| (k.into(), v.into()))
+                        .collect(),
+                    None,
+                )
             }
         };
         let jobs = Self::new(&root, store, environment, identity, service, runs)?;
@@ -294,7 +304,12 @@ impl Jobs {
         let interface = self.interface(&executor, &held)?;
         let spool = self.spool(&executor, id)?;
         let scratch = self.scratch(id)?;
-        let inputs = stage_inputs(&self.store, self.identity, &spool, &record.invocation.inputs)?;
+        let inputs = stage_inputs(
+            &self.store,
+            self.identity,
+            &spool,
+            &record.invocation.inputs,
+        )?;
         let (call_interfaces, callables) = own_invocables(&held.record.interface, &interface);
         let parent = Arc::new(Parent {
             id: id.into(),
@@ -318,7 +333,8 @@ impl Jobs {
             .insert(id.into(), parent.clone());
         let (waiting, journal) = (parent.clone(), engine.clone());
         executor.waits = Some(Arc::new(move || waiting.unfinished(&journal)));
-        let (grant, models) = self.weights_grant(engine, &record, &held.record.interface, &spool)?;
+        let (grant, models) =
+            self.weights_grant(engine, &record, &held.record.interface, &spool)?;
         let mut services = Seam {
             engine,
             id,
@@ -366,30 +382,54 @@ impl Jobs {
             Some(runs) => runs.job_weights(&record.id)?,
             None => None,
         };
-        let (inputs, destination) = context.map_or_else(Default::default, |c| (c.inputs, c.destination));
+        let (inputs, destination) =
+            context.map_or_else(Default::default, |c| (c.inputs, c.destination));
         let models = inputs
             .iter()
             .map(|(parameter, (class, manifest))| {
-                (parameter.clone(), json!({"class": class, "manifest": manifest.id(), "length": manifest.length}))
+                (
+                    parameter.clone(),
+                    json!({"class": class, "manifest": manifest.id(), "length": manifest.length}),
+                )
             })
             .collect();
         let sources = inputs.values().map(|(_, m)| (m.id(), m.length)).collect();
         let outputs = interface["jobs"]
             .as_array()
-            .and_then(|rows| rows.iter().find(|row| row["name"] == record.invocation.entrypoint.as_str()))
+            .and_then(|rows| {
+                rows.iter()
+                    .find(|row| row["name"] == record.invocation.entrypoint.as_str())
+            })
             .and_then(|row| row["weights_outputs"].as_array())
             .into_iter()
             .flatten()
-            .filter_map(|row| Some((row["output_id"].as_str()?.to_string(), row["max_bytes"].as_u64()?)))
+            .filter_map(|row| {
+                Some((
+                    row["output_id"].as_str()?.to_string(),
+                    row["max_bytes"].as_u64()?,
+                ))
+            })
             .collect();
-        let actor = record.submission.as_ref().map(|s| s.actor.clone()).unwrap_or_default();
+        let actor = record
+            .submission
+            .as_ref()
+            .map(|s| s.actor.clone())
+            .unwrap_or_default();
         let (journal, run) = (engine.clone(), record.id.clone());
         let current = Arc::new(move || {
-            journal
-                .get(&run)
-                .is_ok_and(|r| r.state == State::Running && r.cancel_actor.is_none() && r.pause_actor.is_none())
+            journal.get(&run).is_ok_and(|r| {
+                r.state == State::Running && r.cancel_actor.is_none() && r.pause_actor.is_none()
+            })
         });
-        let grant = crate::weights::Grant::new(&actor, &record.id, spool, sources, outputs, destination, current);
+        let grant = crate::weights::Grant::new(
+            &actor,
+            &record.id,
+            spool,
+            sources,
+            outputs,
+            destination,
+            current,
+        );
         Ok((grant, models))
     }
 
@@ -565,7 +605,10 @@ impl Jobs {
             false => engine.cancel(&child.id, actor),
         };
         if let Err(error) = stopped {
-            eprintln!("child run {} of {} remains: {error}", child.id, child.invocation.parent);
+            eprintln!(
+                "child run {} of {} remains: {error}",
+                child.id, child.invocation.parent
+            );
         }
     }
 
@@ -589,7 +632,11 @@ impl Jobs {
         let Some(service) = self.service.upgrade() else {
             return;
         };
-        if service.engine.get(id).is_ok_and(|r| r.state == State::Queued) {
+        if service
+            .engine
+            .get(id)
+            .is_ok_and(|r| r.state == State::Queued)
+        {
             return;
         }
         self.stop_children(id);
@@ -826,7 +873,10 @@ impl Jobs {
             .service
             .upgrade()
             .ok_or(("child_call_refused", "machine is stopping".into()))?;
-        let attempt = service.engine.get(&parent.id).map_or(0, |record| record.attempt);
+        let attempt = service
+            .engine
+            .get(&parent.id)
+            .map_or(0, |record| record.attempt);
         let (receipt, replayed) = service
             .engine
             .declare_checkpoint(
@@ -978,7 +1028,12 @@ impl Services for Seam<'_> {
                 };
                 let (mut answer, channel, adopted) = weights.answer(grant, frame);
                 if let Some(adopted) = adopted {
-                    if let Err(error) = crate::products::record_manifest(self.engine, self.id, &adopted.output, &adopted.manifest) {
+                    if let Err(error) = crate::products::record_manifest(
+                        self.engine,
+                        self.id,
+                        &adopted.output,
+                        &adopted.manifest,
+                    ) {
                         answer = Answer::refused(frame.seq, "publish_refused", error.to_string());
                     }
                 }
@@ -1019,9 +1074,10 @@ fn conclude(
         }
         // A journaled cancel ends it CANCELED, however it stopped (a job may first see its
         // child canceled with it); a pause's stop leaves it PAUSED.
-        terminal if engine.get(id).is_ok_and(|r| {
-            r.cancel_actor.is_some() || (terminal == "canceled" && r.pause_actor.is_some())
-        }) =>
+        terminal
+            if engine.get(id).is_ok_and(|r| {
+                r.cancel_actor.is_some() || (terminal == "canceled" && r.pause_actor.is_some())
+            }) =>
         {
             engine.finish_stopped(id)?;
         }
@@ -1208,7 +1264,6 @@ fn grant(
     let canonical = serde_json_canonicalizer::to_string(&value).map_err(io::Error::other)?;
     Ok((canonical, grants))
 }
-
 
 /// One byte to every running job's nudge socket each time anything moved: its calls re-poll.
 fn nudge(jobs: Weak<Jobs>, engine: Arc<Engine>) {

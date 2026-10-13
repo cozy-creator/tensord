@@ -360,7 +360,12 @@ fn commit(
 /// A job's adopted weights output as a product of its run's log: its bytes are the output's
 /// manifest (`weights::MANIFEST_MEDIA`), held in the machine's store; a resumed attempt that
 /// adopts the same manifest adds nothing.
-pub fn record_manifest(engine: &Engine, id: &str, output: &str, manifest: &tensorfs_core::ids::ObjectRef) -> io::Result<u64> {
+pub fn record_manifest(
+    engine: &Engine,
+    id: &str,
+    output: &str,
+    manifest: &tensorfs_core::ids::ObjectRef,
+) -> io::Result<u64> {
     let content = pb::Ref {
         digest: unhex(&manifest.sha256)?,
         length: manifest.length,
