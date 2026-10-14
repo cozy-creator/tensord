@@ -4,7 +4,8 @@
 //! bundles TensorD also replaces the service binary (the stable parent runs it). The
 //! previous pair and binary stay installed; a candidate that never proves readiness is rolled
 //! back by the parent. Boot id, leaf, journal and outputs are kept. A cancel ends an update
-//! that has not begun activating (`canceled`); a pair the machine already runs is unchanged.
+//! that has not begun activating (`canceled`); a pair the machine already runs is unchanged:
+//! the same version, or for a wheel file the same bytes (sha256), never just the same version.
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -24,6 +25,11 @@ const MAX_WHEEL_BYTES: u64 = 256 << 20;
 pub struct Pair {
     pub runtime: String,
     pub tensorfs: String,
+    /// Each wheel's content digest (hex sha256), in an update's from/to only.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub runtime_sha256: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tensorfs_sha256: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -276,7 +282,7 @@ impl Updates {
         if !matches!(status.state.as_str(), "starting" | "succeeded") {
             return Err(invalid("cannot commit an update before software publication finished"));
         }
-        status.to = pair_in(&self.paths.sdk());
+        status.to = identified(&self.paths.sdk())?;
         status.error.clear();
         status.enter("succeeded");
         self.commit_status(status)
@@ -427,7 +433,7 @@ impl Updates {
             .map_err(|refused| (503, refused.message().to_string()))?);
         let mut status = Status {
             operation: request.operation.clone(),
-            from: pair_in(&self.paths.sdk()),
+            from: identified(&self.paths.sdk()).map_err(server)?,
             pinned: request.pin.unwrap_or(false),
             ..Status::default()
         };
@@ -475,11 +481,18 @@ impl Updates {
     }
 
     fn run(&self, request: &Request, exit: fn(i32)) -> io::Result<()> {
-        let from = pair_in(&self.paths.sdk());
-        let running = |choice: &Option<Choice>, version: &str| {
-            choice.as_ref().is_none_or(|c| c.file.is_empty() && c.version == version)
+        let from = identified(&self.paths.sdk())?;
+        // A named wheel file is compared by its bytes: a rebuilt wheel at the running version
+        // is installed, the very wheel the machine runs is not.
+        let running = |choice: &Option<Choice>, version: &str, sha256: &str| {
+            choice.as_ref().is_none_or(|c| match c.file.is_empty() {
+                true => c.version == version,
+                false => c.sha256 == sha256,
+            })
         };
-        if running(&request.runtime, &from.runtime) && running(&request.tensorfs, &from.tensorfs) {
+        if running(&request.runtime, &from.runtime, &from.runtime_sha256)
+            && running(&request.tensorfs, &from.tensorfs, &from.tensorfs_sha256)
+        {
             // Nothing to install: the machine already runs this pair.
             return self.set(|s| {
                 s.to = from.clone();
@@ -571,7 +584,7 @@ impl Updates {
             }
         }
         fs::File::open(candidate)?.sync_all()?;
-        let to = pair_in(candidate);
+        let to = identified(candidate)?;
         self.set(|s| s.to = to.clone())?;
         // No new work is admitted from here; work admitted before drains first.
         let activation = self.lifecycle.as_ref().map(|l| l.activate()).transpose()
@@ -723,6 +736,20 @@ pub fn pair_in(dir: &Path) -> Pair {
         }
     }
     pair
+}
+
+/// The pair with each wheel's content digest: what an update compares and reports.
+fn identified(dir: &Path) -> io::Result<Pair> {
+    let mut pair = pair_in(dir);
+    for (distribution, _, path) in wheels(dir) {
+        let mut hash = Sha256::new();
+        io::copy(&mut fs::File::open(path)?, &mut hash)?;
+        match distribution.as_str() {
+            "cozy_runtime" => pair.runtime_sha256 = hex(&hash.finalize()),
+            _ => pair.tensorfs_sha256 = hex(&hash.finalize()),
+        }
+    }
+    Ok(pair)
 }
 
 fn previous_link(link: &Path) -> io::Result<Option<PathBuf>> {
@@ -1180,9 +1207,9 @@ mod tests {
         let transaction = Activation::prepare();
         rollback_pending(&transaction.paths, "fixture").unwrap();
         let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None, None).unwrap();
-        let candidate = wheel(&transaction.root, "cozy_runtime", "0.3.0", None);
         let original = fs::read_dir(&transaction.old).unwrap().count();
-        for id in [".", ".."] {
+        for (id, version) in [(".", "0.3.0"), ("..", "0.3.1")] {
+            let candidate = wheel(&transaction.root, "cozy_runtime", version, None);
             let request = update_request(&updates, id, &candidate);
             updates.request(request, |code| assert_eq!(code, REPLACE_EXIT)).unwrap();
             state(&updates, id, "starting");
@@ -1214,12 +1241,39 @@ mod tests {
         updates.request(request, |_| panic!("invalid candidate activated")).unwrap();
         state(&updates, "B", "failed");
         assert_eq!(fs::read_link(transaction.paths.current_sdk_link()).unwrap(), selected);
+        // Retrying A names the wheel the machine runs: unchanged, its generation kept.
         let request = update_request(&updates, "A", &candidate);
-        updates.request(request, |code| assert_eq!(code, REPLACE_EXIT)).unwrap();
-        state(&updates, "A", "starting");
-        updates.commit().unwrap();
+        updates.request(request, |_| panic!("the running wheel restarted the service")).unwrap();
+        state(&updates, "A", "succeeded");
         assert_eq!(fs::read(&selected_wheel).unwrap(), bytes);
-        assert_ne!(fs::read_link(transaction.paths.current_sdk_link()).unwrap(), selected);
+        assert_eq!(fs::read_link(transaction.paths.current_sdk_link()).unwrap(), selected);
+    }
+
+    /// A named wheel at the running version installs when its bytes differ; the very wheel the
+    /// machine runs installs nothing. The result's from/to say which, by content.
+    #[test]
+    fn a_named_wheel_is_compared_by_its_bytes_not_its_version() {
+        let transaction = Activation::prepare();
+        rollback_pending(&transaction.paths, "fixture").unwrap();
+        let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None, None).unwrap();
+        let rebuilt = transaction.root.join("rebuilt");
+        fs::create_dir_all(&rebuilt).unwrap();
+        let candidate = wheel(&rebuilt, "cozy_runtime", "0.1.0", Some(b"rebuilt"));
+        let request = update_request(&updates, "rebuilt", &candidate);
+        updates.request(request, |code| assert_eq!(code, REPLACE_EXIT)).unwrap();
+        state(&updates, "rebuilt", "starting");
+        updates.commit().unwrap();
+        let installed = updates.update("rebuilt").unwrap();
+        assert_eq!((installed.from.runtime.as_str(), installed.to.runtime.as_str()), ("0.1.0", "0.1.0"));
+        assert_ne!(installed.from, installed.to, "a rebuilt wheel at the running version reads unchanged");
+        assert_eq!(installed.to.runtime_sha256, hex(&Sha256::digest(fs::read(&candidate).unwrap())));
+        assert_eq!(installed.from.tensorfs_sha256, installed.to.tensorfs_sha256);
+        let request = update_request(&updates, "again", &candidate);
+        updates.request(request, |_| panic!("the running wheel restarted the service")).unwrap();
+        state(&updates, "again", "succeeded");
+        let again = updates.update("again").unwrap();
+        assert_eq!(again.from, again.to);
+        assert_eq!(again.to, installed.to);
     }
 
     #[test]

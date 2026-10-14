@@ -291,8 +291,7 @@ fn observation_error(update: &Update) -> Option<Status> {
 
 fn step_event(update: &Update, step: &crate::machine::update::Step) -> v1::run_event::Event {
     let outcome = |status: &str, code: &str| {
-        let pair = |p: &crate::machine::update::Pair| serde_json::json!({"runtime": p.runtime, "tensorfs": p.tensorfs});
-        let result = serde_json::json!({"from": pair(&update.from), "to": pair(&update.to)});
+        let result = serde_json::json!({"from": update.from, "to": update.to});
         v1::run_event::Event::Outcome(v1::Outcome {
             status: status.into(),
             reason: (!code.is_empty()).then(|| v1::Reason {

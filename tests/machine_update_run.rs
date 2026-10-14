@@ -231,10 +231,14 @@ async fn an_update_run_activates_in_place_and_a_failing_candidate_ends_failed() 
     let (tensorfs, tensorfs_bytes) = wheel("tensorfs", "0.3.94", None);
     let broken = b"#!/bin/sh\n[ \"$1\" = version ] && echo '{\"name\":\"tensord\"}' && exit 0\nexit 3\n";
     let (failing, failing_bytes) = wheel("cozy_runtime", "0.18.104", Some(broken));
-    let (runtime_digest, tensorfs_digest, failing_digest) = (
+    // The running version rebuilt: other bytes (trailing data an ELF ignores), the same label.
+    let rebuilt_machine = [this_machine.as_slice(), b"\0rebuilt"].concat();
+    let (rebuilt, rebuilt_bytes) = wheel("cozy_runtime", "0.18.103", Some(&rebuilt_machine));
+    let (runtime_digest, tensorfs_digest, failing_digest, rebuilt_digest) = (
         hold(&root, &runtime_bytes),
         hold(&root, &tensorfs_bytes),
         hold(&root, &failing_bytes),
+        hold(&root, &rebuilt_bytes),
     );
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -278,10 +282,8 @@ async fn an_update_run_activates_in_place_and_a_failing_candidate_ends_failed() 
     let done = outcome(&log);
     assert_eq!(done.status, "succeeded", "{log:?}");
     let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
-    assert_eq!(
-        result["to"],
-        serde_json::json!({"runtime": "0.18.103", "tensorfs": "0.3.94"})
-    );
+    assert_eq!((result["to"]["runtime"].as_str(), result["to"]["tensorfs"].as_str()), (Some("0.18.103"), Some("0.3.94")));
+    assert_eq!(result["to"]["runtime_sha256"], runtime_digest.trim_start_matches("sha256:"));
     let stages: Vec<_> = log
         .iter()
         .filter_map(|e| match &e.event {
@@ -339,6 +341,27 @@ async fn an_update_run_activates_in_place_and_a_failing_candidate_ends_failed() 
         machine.0.try_wait().unwrap().is_none(),
         "the machine keeps running after a rollback"
     );
+
+    // A wheel rebuilt at the running version is installed: compared by bytes, never by label.
+    // The very wheel the machine runs then installs nothing.
+    let stages = |log: &[v1::RunEvent]| -> Vec<String> {
+        log.iter()
+            .filter_map(|e| match &e.event {
+                Some(v1::run_event::Event::Progress(p)) => Some(p.stage.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    for (id, installs) in [("up-3", true), ("up-4", false)] {
+        let log = update(&root, port, id, Some(spec((&rebuilt, &rebuilt_digest), (&tensorfs, &tensorfs_digest)))).await;
+        let done = outcome(&log);
+        assert_eq!(done.status, "succeeded", "{log:?}");
+        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        assert_eq!((result["from"]["runtime"].as_str(), result["to"]["runtime"].as_str()), (Some("0.18.103"), Some("0.18.103")));
+        assert_eq!(result["to"]["runtime_sha256"], rebuilt_digest.trim_start_matches("sha256:"));
+        assert_eq!(result["from"] != result["to"], installs, "{id}: {result}");
+        assert_eq!(stages(&log).contains(&"starting".to_string()), installs, "{id}: {log:?}");
+    }
 
     // Stopped and launched again: `cozy machine stop` / `start` on this computer (a persistent
     // machine), then a rental's pod restarted. Each launch proves itself under a new key, which
