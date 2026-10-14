@@ -197,14 +197,14 @@ impl Catalog {
         found.into_iter().map(|(_, held)| held).collect()
     }
 }
-/// A job's own execution device: its declared `accelerator`, which nothing infers.
-pub fn job_accelerator(package: &str, row: &serde_json::Value) -> Result<bool, (&'static str, String)> {
+/// Whether a job holds this machine's GPU: `accelerator=True` requires one, False runs on CPU, and
+/// an undeclared job takes the GPU when the machine has one, else runs on CPU.
+pub fn job_gpu(row: &serde_json::Value, gpu: bool) -> Result<bool, (&'static str, &'static str)> {
     match row.get("accelerator") {
+        None | Some(serde_json::Value::Null) => Ok(gpu),
+        Some(serde_json::Value::Bool(true)) if !gpu => Err(("accelerator_job_unavailable", "this job requires a configured GPU")),
         Some(serde_json::Value::Bool(value)) => Ok(*value),
-        None | Some(serde_json::Value::Null) => Err(("job_accelerator_undeclared", format!(
-            "{package} job {} declares no accelerator; republish it with app.job(accelerator=...)",
-            row["name"].as_str().unwrap_or_default()))),
-        _ => Err(("package_interface_invalid", "job accelerator declaration must be boolean".into())),
+        _ => Err(("package_interface_invalid", "job accelerator declaration must be boolean")),
     }
 }
 impl HeldGeneration {
@@ -223,11 +223,11 @@ impl HeldGeneration {
         held.record.source_digest = callee.source_digest.clone();
         Ok(held)
     }
-    pub fn accelerator_job(&self, application: &str, name: &str) -> io::Result<bool> {
-        let (package, _, interface) = self.record.app(application).ok_or_else(|| invalid("this environment holds no such application"))?;
+    pub fn accelerator_job(&self, application: &str, name: &str, gpu: bool) -> io::Result<bool> {
+        let (_, _, interface) = self.record.app(application).ok_or_else(|| invalid("this environment holds no such application"))?;
         let row = interface["jobs"].as_array().and_then(|rows| rows.iter().find(|row| row["name"].as_str() == Some(name)))
             .ok_or_else(|| invalid("this application declares no such job"))?;
-        job_accelerator(package, row).map_err(|(code, detail)| invalid(&format!("{code}: {detail}")))
+        job_gpu(row, gpu).map_err(|(code, detail)| invalid(&format!("{code}: {detail}")))
     }
     pub fn retention(&self) -> Arc<File> {
         self.hold.clone()
@@ -304,13 +304,16 @@ mod accelerator_tests {
                 }],
             },
         };
-        assert!(!held.accelerator_job("root:app", "work").unwrap());
-        let undeclared = held.accelerator_job("", "undeclared").unwrap_err().to_string();
-        assert_eq!(undeclared, "job_accelerator_undeclared: local/root job undeclared declares no accelerator; republish it with app.job(accelerator=...)");
-        assert!(held.accelerator_job("", "absent").is_err());
-        assert!(held.accelerator_job("child:app", "work").unwrap());
-        assert!(held.accelerator_job("child:app", "broken").is_err());
-        assert!(held.accelerator_job("other:app", "work").is_err());
+        for gpu in [true, false] {
+            assert!(!held.accelerator_job("root:app", "work", gpu).unwrap());
+            assert_eq!(held.accelerator_job("", "undeclared", gpu).unwrap(), gpu);
+            assert!(held.accelerator_job("", "absent", gpu).is_err());
+            assert!(held.accelerator_job("child:app", "broken", gpu).is_err());
+            assert!(held.accelerator_job("other:app", "work", gpu).is_err());
+        }
+        assert!(held.accelerator_job("child:app", "work", true).unwrap());
+        let refused = held.accelerator_job("child:app", "work", false).unwrap_err().to_string();
+        assert_eq!(refused, "accelerator_job_unavailable: this job requires a configured GPU");
         drop(held);
         fs::remove_file(path).unwrap();
     }

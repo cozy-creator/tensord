@@ -288,16 +288,13 @@ impl Service {
         invocation.gpus = call.gpus;
         invocation.inputs = call.inputs;
         invocation.job = call.job;
-        invocation.accelerator = call.job && held.accelerator_job(&invocation.module, &invocation.entrypoint)?;
+        invocation.accelerator = call.job && held.accelerator_job(&invocation.module, &invocation.entrypoint, self.gpu().is_some())?;
         if invocation.job && invocation.gpus > 0 {
             let available = self.gpu().map_or(0, |gpu| gpu.width());
             if invocation.gpus as usize > available || (invocation.accelerator && invocation.gpus != 1) {
                 return Err(io::Error::new(io::ErrorKind::Unsupported, format!(
                     "gpu_count_unavailable: requested {} GPUs; this machine has {available}, and accelerator job bodies support one", invocation.gpus)));
             }
-        }
-        if invocation.accelerator && self.gpu().is_none() {
-            return Err(io::Error::new(io::ErrorKind::Unsupported, "accelerator_job_unavailable: this job requires a configured GPU"));
         }
         invocation.parent = call.parent;
         let record = self.engine.bind_prepared(id, invocation, preparation, memo, answer)?;

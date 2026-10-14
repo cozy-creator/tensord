@@ -1909,6 +1909,7 @@ mod v1_api {
                 })
                 .collect()
         };
+        // `gallery` declares no accelerator: on this GPU-less machine it runs on CPU.
         let job = v1::RunKind::Job;
         let seeded = run("gallery-1", job, "gallery", paint("heron", Some(9))).await;
         assert_eq!(outcome(&seeded).status, "succeeded", "{seeded:?}");

@@ -697,11 +697,7 @@ impl Runs {
         }
         // A job's device is its declaration; it is checked before any model input downloads.
         if let (true, false, Some(entry)) = (spec.job, spec.warm, declared) {
-            let gpu = crate::catalog::job_accelerator(&installation.package, entry)
-                .map_err(|(code, message)| refused(code, message))?;
-            if gpu && self.service.gpu().is_none() {
-                return Err(refused("accelerator_job_unavailable", "this job requires a configured GPU"));
-            }
+            crate::catalog::job_gpu(entry, self.service.gpu().is_some()).map_err(|(code, message)| refused(code, message))?;
         }
         if spec.job {
             // A bare parameter, or `<job>.models.<parameter>`, is the job's own model input.
