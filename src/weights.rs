@@ -31,11 +31,15 @@ pub const MANIFEST_MEDIA: &str = "application/vnd.cozy.model-manifest";
 const EXCHANGE_MAX: u64 = 64 << 20;
 
 type BindOutput = Arc<dyn Fn(&str, &str) -> io::Result<()> + Send + Sync>;
+/// Makes objects of a source held here in part present, from the Hub it came from.
+pub type Fetch = Arc<dyn Fn(&ObjectRef, &[ObjectRef]) -> Result<(), String> + Send + Sync>;
 
-/// Execution-owner hooks: current attempt authority and durable output association.
+/// Execution-owner hooks: current attempt authority, durable output association and the
+/// sources' fetch.
 pub struct GrantAuthority {
     pub current: Arc<dyn Fn() -> bool + Send + Sync>,
     pub bind_output: BindOutput,
+    pub fetch: Option<Fetch>,
 }
 
 /// Where a job's outputs are published: the repository and its Hub, written under the run's
@@ -60,6 +64,7 @@ pub struct Grant {
     pub current: Arc<dyn Fn() -> bool + Send + Sync>,
     /// Persist the run/output association before any native transaction can begin.
     bind_output: BindOutput,
+    fetch: Option<Fetch>,
     opened: Mutex<BTreeMap<String, String>>,
     /// Publications attempted and not yet in the run's log.
     uploads: Mutex<Vec<Upload>>,
@@ -88,6 +93,7 @@ impl Grant {
         let GrantAuthority {
             current,
             bind_output,
+            fetch,
         } = authority;
         Self {
             actor: actor.into(),
@@ -98,6 +104,7 @@ impl Grant {
             destination,
             current,
             bind_output,
+            fetch,
             opened: Mutex::new(BTreeMap::new()),
             uploads: Mutex::new(Vec::new()),
         }
@@ -160,11 +167,22 @@ impl Weights {
         let source = reference(&frame.manifest, length)?;
         let (client, server) = UnixStream::pair().map_err(io_refusal)?;
         let (store, meta, current) = (self.store.clone(), self.meta.clone(), grant.current.clone());
+        let fetch = grant.fetch.clone();
         std::thread::Builder::new()
             .name("weights-source".into())
             .spawn(move || {
                 let check = move || current_or_refuse(&*current);
-                if let Err(refusal) = channel::serve_source(&store, &meta, &source, server, &check)
+                let fetch = |objects: &[ObjectRef]| match &fetch {
+                    Some(fetch) => fetch(&source, objects).map_err(|detail| tensorfs_core::err::Refusal {
+                        code: tensorfs_core::err::Code::TRANSFER_FAILED,
+                        detail,
+                    }),
+                    None => Err(tensorfs_core::err::Refusal {
+                        code: tensorfs_core::err::Code::OBJECT_ABSENT,
+                        detail: format!("{} is not here and this job names no Hub it came from", objects[0].id()),
+                    }),
+                };
+                if let Err(refusal) = channel::serve_source(&store, &meta, &source, server, &check, &fetch)
                 {
                     eprintln!("weights source {}: {}", source.id(), refusal.detail);
                 }

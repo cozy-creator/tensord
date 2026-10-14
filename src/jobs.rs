@@ -523,7 +523,7 @@ impl Jobs {
             Some(runs) => runs.job_weights(&record.id)?,
             None => None,
         };
-        let (inputs, destination) = context.map_or_else(Default::default, |c| (c.inputs, c.destination));
+        let (inputs, destination, fetch) = context.map_or_else(Default::default, |c| (c.inputs, c.destination, c.fetch));
         let models = inputs
             .iter()
             .map(|(parameter, (class, manifest))| {
@@ -546,7 +546,7 @@ impl Jobs {
             journal.with_journal(|journal| journal.bind_derived_output(&run, attempt, transaction, slot))
         });
         let grant = crate::weights::Grant::new(&actor, &record.id, spool, sources, outputs, destination,
-            crate::weights::GrantAuthority { current, bind_output });
+            crate::weights::GrantAuthority { current, bind_output, fetch });
         Ok((grant, models))
     }
 

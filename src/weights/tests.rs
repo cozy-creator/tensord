@@ -36,6 +36,7 @@ impl Fixture {
             GrantAuthority {
                 current: Arc::new(move || state.load(Ordering::SeqCst)),
                 bind_output: Arc::new(|_, _| Ok(())),
+                fetch: None,
             },
         );
         let plain = tensorfs_core::registry::seeds()

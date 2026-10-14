@@ -12,7 +12,7 @@ use crate::{
     journal::{CallMemo, Execution, Failure, InputFile, Installation, Outcome, Preparation, ResultRecord},
     local_source::LocalSources,
     objects::{Objects, Refused},
-    published::{declares_models, Providers, Publisher, Request},
+    published::{declares_models, Named, Providers, Publisher, Request},
     service::{Call, Service},
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -110,6 +110,9 @@ pub struct JobContext {
     models: Vec<domain::ModelChoice>,
     /// The job's own model inputs, made present: parameter -> (class, manifest).
     inputs: BTreeMap<String, (String, ObjectRef)>,
+    /// The Hub checkpoint each input held here in part is, by manifest: the job's reads fetch
+    /// its absent objects from there.
+    origins: BTreeMap<String, Named>,
     weights_destination: String,
 }
 
@@ -117,6 +120,7 @@ pub struct JobContext {
 pub struct JobWeights {
     pub inputs: BTreeMap<String, (String, ObjectRef)>,
     pub destination: Option<crate::weights::Destination>,
+    pub fetch: Option<crate::weights::Fetch>,
 }
 
 /// A job context's journaled part: everything but its credentials (choices prost-encoded). A
@@ -138,6 +142,9 @@ struct Durable {
     models: Vec<Vec<u8>>,
     #[serde(default)]
     inputs: BTreeMap<String, (String, String, u64)>,
+    /// Manifest -> [repository, release, lane].
+    #[serde(default)]
+    origins: BTreeMap<String, [String; 3]>,
     #[serde(default)]
     weights_destination: String,
 }
@@ -169,6 +176,11 @@ impl Durable {
                 .iter()
                 .map(|(p, (class, m))| (p.clone(), (class.clone(), m.sha256.clone(), m.length)))
                 .collect(),
+            origins: context
+                .origins
+                .iter()
+                .map(|(m, n)| (m.clone(), [n.repository.clone(), n.release.clone(), n.lane.clone()]))
+                .collect(),
             weights_destination: context.weights_destination.clone(),
         }
     }
@@ -197,6 +209,13 @@ impl Durable {
                 .inputs
                 .into_iter()
                 .map(|(p, (class, sha256, length))| (p, (class, ObjectRef { sha256, length })))
+                .collect(),
+            origins: self
+                .origins
+                .into_iter()
+                .map(|(manifest, [repository, release, lane])| {
+                    (manifest.clone(), Named { repository, release, lane, manifest })
+                })
                 .collect(),
             weights_destination: self.weights_destination,
         })
@@ -496,7 +515,7 @@ impl Runs {
                 let named = crate::published::choose(choice, &choice.parameter, (&gpu, width))
                     .map_err(|(code, message)| refused(code, message))?;
                 let stage = format!("downloading {}", choice.repository);
-                let named = publisher.download(&self.service, hub_access()?, named, &spec.catalog_revision, stop, &|done, total| {
+                let named = publisher.download(&self.service, hub_access()?, named, &spec.catalog_revision, false, stop, &|done, total| {
                     observe(&stage, done, total)
                 })?;
                 let sha256 = named.manifest.trim_start_matches("sha256:").to_string();
@@ -742,9 +761,9 @@ impl Runs {
         // Its children prepare with its context (a served call's too); a job's is journaled,
         // for its resume.
         if answer.is_none() {
-            let inputs = match spec.job {
+            let (inputs, origins) = match spec.job {
                 true => self.job_inputs(&spec, &installation.package, &interface, hub.as_ref(), &*observe, &stoppable.stop)?,
-                false => BTreeMap::new(),
+                false => Default::default(),
             };
             let context = JobContext {
                 installation: installation.alias.clone(),
@@ -757,6 +776,7 @@ impl Runs {
                 gpus: spec.gpus,
                 models: spec.models.clone(),
                 inputs,
+                origins,
                 weights_destination: spec.weights_destination.clone(),
             };
             if spec.job {
@@ -1203,14 +1223,27 @@ impl Runs {
                 ))
             }
         };
+        let fetch = match (&self.publisher, context.hub.clone().or_else(|| self.own_hub.clone())) {
+            (Some(publisher), Some(hub)) if !context.origins.is_empty() => {
+                let (publisher, service, origins) = (publisher.clone(), self.service.clone(), context.origins);
+                Some(Arc::new(move |manifest: &ObjectRef, objects: &[ObjectRef]| {
+                    let named = origins.get(&manifest.id()).ok_or("this source names no Hub checkpoint")?;
+                    publisher.fetch_part(&service, &hub, named, objects).map_err(|(code, message)| format!("{code}: {message}"))
+                }) as crate::weights::Fetch)
+            }
+            _ => None,
+        };
         Ok(Some(JobWeights {
             inputs: context.inputs,
             destination,
+            fetch,
         }))
     }
 
     /// The job's own model inputs (`<job>.models.<parameter>`), each made present here: a
-    /// Hub checkpoint downloaded by its exact manifest, a provider source made.
+    /// Hub checkpoint by its structure alone (what the job reads it fetches as it reads, and
+    /// the Hub keeps the rest: its origin, by manifest), a provider source made.
+    #[allow(clippy::type_complexity)]
     fn job_inputs(
         &self,
         spec: &Spec,
@@ -1219,13 +1252,13 @@ impl Runs {
         hub: Option<&hub::Source>,
         observe: &(dyn Fn(&str, u64, u64) + Sync),
         stop: &PullCancellation,
-    ) -> Result<BTreeMap<String, (String, ObjectRef)>, Refused> {
+    ) -> Result<(BTreeMap<String, (String, ObjectRef)>, BTreeMap<String, Named>), Refused> {
         let declared = interface["jobs"]
             .as_array()
             .and_then(|rows| rows.iter().find(|row| row["name"] == spec.entrypoint.as_str()))
             .and_then(|row| row["models"].as_array().cloned())
             .unwrap_or_default();
-        let mut inputs = BTreeMap::new();
+        let (mut inputs, mut origins) = (BTreeMap::new(), BTreeMap::new());
         for row in declared {
             let path = row["path"].as_str().unwrap_or_default();
             let parameter = path.rsplit_once(".models.").map_or(path, |(_, p)| p).to_string();
@@ -1271,16 +1304,17 @@ impl Runs {
                     refused("hub_access_absent", "a Hub model downloads with the run's Hub access, and this run carries none")
                 })?;
                 let stage = format!("downloading {}", named.repository);
-                let named = publisher.download(&self.service, hub, named, &spec.catalog_revision, Some(stop), &|done, total| {
+                let named = publisher.download(&self.service, hub, named, &spec.catalog_revision, true, Some(stop), &|done, total| {
                     observe(&stage, done, total)
                 })?;
                 let sha256 = named.manifest.trim_start_matches("sha256:").to_string();
                 let length = std::fs::metadata(publisher.store().manifest_path(&sha256))?.len();
+                origins.insert(named.manifest.clone(), named);
                 ObjectRef { sha256, length }
             };
             inputs.insert(parameter, (class, manifest));
         }
-        Ok(inputs)
+        Ok((inputs, origins))
     }
 
     pub fn end_job(&self, id: &str) {
@@ -1355,6 +1389,7 @@ mod tests {
             gpus: 0,
             models: vec![],
             inputs: BTreeMap::from([("model".into(), ("Model".into(), model.repeat(64), 1))]),
+            origins: BTreeMap::new(),
             weights_destination: String::new(),
         };
         let bind = |id: &str, context: &[u8]| {
@@ -1769,7 +1804,7 @@ mod tests {
         let mut spec = spec(Source::Models, false, "d");
         (spec.job, spec.entrypoint) = (true, "compute".into());
         spec.input = json!({"source": artifact(&held), "factor": 2});
-        let inputs = runs.job_inputs(&spec, "local/job", &interface, None, &|_, _, _| (), &PullCancellation::default()).unwrap();
+        let (inputs, _) = runs.job_inputs(&spec, "local/job", &interface, None, &|_, _, _| (), &PullCancellation::default()).unwrap();
         assert_eq!(inputs["source"], ("Source".to_string(), ObjectRef { sha256: held, length: 8 }));
         spec.input = json!({"source": artifact(&"cd".repeat(32)), "factor": 2});
         let absent = runs.job_inputs(&spec, "local/job", &interface, None, &|_, _, _| (), &PullCancellation::default()).unwrap_err();
@@ -1845,7 +1880,7 @@ mod tests {
                 domain::ModelChoice { parameter:"second/callee/render.models.network".into(),repository:"second/chosen".into(),..Default::default() },
                 domain::ModelChoice { parameter:"render.models.absent".into(),repository:"second/nowhere".into(),..Default::default() },
             ],
-            inputs:Default::default(),weights_destination:String::new(),
+            inputs:Default::default(),origins:Default::default(),weights_destination:String::new(),
         });
         let child = runs.child_spec("alice","7","callee:app","render",json!({}),vec![],"child",&[]).unwrap();
         assert_eq!(child.gpus, 2);
@@ -1898,7 +1933,7 @@ mod tests {
             installation: "pkg".into(), hub: None, providers: Default::default(), owner: "alice".into(),
             catalog_revision: String::new(), application: String::new(),
             attention_kernel: String::new(), gpus: 0, models: vec![],
-            inputs: Default::default(), weights_destination: String::new(),
+            inputs: Default::default(), origins: Default::default(), weights_destination: String::new(),
         });
         let child = |name: &str| runs.child_spec("alice", "7", "", name, json!({}), vec![], "d", &[]);
         assert!(child("leaf-job").unwrap().job);

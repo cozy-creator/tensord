@@ -564,14 +564,18 @@ impl Publisher {
         Ok(resolved)
     }
 
-    /// A Hub checkpoint resolved and downloaded into the store (a warm run's or a job's model
-    /// choice), held from eviction while it downloads; answers what the Hub named.
+    /// A Hub checkpoint resolved and downloaded into the store (a warm run's model choice),
+    /// held from eviction while it downloads; answers what the Hub named. In `part` (a job's
+    /// model input) only its structure lands: the job's reads fetch the rest they need
+    /// (`fetch_part`), and the Hub keeps what they never read.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn download(
         &self,
         service: &Service,
         source: &hub::Source,
         named: Named,
         revision: &str,
+        part: bool,
         stop: Option<&PullCancellation>,
         bytes: &(dyn Fn(u64, u64) + Sync),
     ) -> Result<Named, Refused> {
@@ -586,9 +590,17 @@ impl Publisher {
             }
         }
         let _fetching = self.fetch(vec![named.manifest.clone()]);
-        let pull = Pull { stop: stop.cloned(), ..Pull::default() };
+        let pull = Pull { part, stop: stop.cloned(), ..Pull::default() };
         self.ensure(service, source, &named, &pull, bytes).map_err(failed)?;
         Ok(named)
+    }
+
+    /// Objects of a checkpoint held here in part (`download` in part), fetched from its Hub as a
+    /// job reads them.
+    pub(crate) fn fetch_part(&self, service: &Service, source: &hub::Source, named: &Named,
+        objects: &[ObjectRef]) -> Result<(), Failure> {
+        let pull = Pull { part: true, objects: objects.to_vec(), ..Pull::default() };
+        self.ensure(service, source, named, &pull, &|_, _| ()).map(drop)
     }
 
     /// Downloads the rest of every checkpoint `run`'s preparation took part of, once the run
@@ -1494,6 +1506,10 @@ fn make_source(
 #[derive(Default)]
 struct Pull {
     components: Vec<String>,
+    /// Part objects beside `components`.
+    objects: Vec<ObjectRef>,
+    /// Part of the checkpoint (its structure, `components` and `objects`), never the whole.
+    part: bool,
     streams: Option<usize>,
     behind: bool,
     stop: Option<PullCancellation>,
@@ -1538,13 +1554,15 @@ fn ensure_with(
         let (code, message) = refused("model_download_failed", e);
         catalog.reason(code, message)
     };
-    if !pull.components.is_empty() {
-        request.components = &pull.components;
+    if pull.part || !pull.components.is_empty() {
+        (request.components, request.objects) = (&pull.components, &pull.objects);
         match tensorfs_core::ensure::ensure_part(&request) {
             Ok((_, hold)) => return Ok(Some(hold)),
             // A component the slot declares that this checkpoint lacks: the whole of it, as
             // for a slot that declares none.
-            Err(e) if e.code == tensorfs_core::err::Code::NOT_CONTAINED => request.components = &[],
+            Err(e) if e.code == tensorfs_core::err::Code::NOT_CONTAINED && !pull.part => {
+                (request.components, request.objects) = (&[], &[]);
+            }
             Err(e) => return Err(refusal(e)),
         }
     }
@@ -2654,6 +2672,61 @@ mod tests {
         heard.lock().unwrap().iter().filter(|h| h.starts_with(asked)).count()
     }
 
+    /// A job's Hub model input lands as its structure alone. Its reads over the job's source
+    /// channel fetch the objects they reach, once; the Hub keeps the rest.
+    #[test]
+    fn a_job_reads_its_model_input_in_part_through_its_source_channel() {
+        use std::io::{Read, Write};
+        let bench = Bench::new();
+        let manifest = checkpoint(&bench.source, 20, 4);
+        let (hub, named, heard) = bench.hub("acme/source", &manifest, 0);
+        let objects = || count(&heard, "GET /o/");
+        let named = bench.publisher.download(&bench.service, &hub, named, "", true, None, &|_, _| ()).unwrap();
+        let structure = objects();
+        assert!(structure <= 2, "{structure} objects for the manifest and header");
+        let weights = crate::weights::Weights::new(Arc::new(Store::open(bench.publisher.store().root()).unwrap())).unwrap();
+        let (publisher, service) = (bench.publisher.clone(), bench.service.clone());
+        let fetch: crate::weights::Fetch = Arc::new(move |_, wanted| {
+            publisher.fetch_part(&service, &hub, &named, wanted).map_err(|(code, message)| format!("{code}: {message}"))
+        });
+        let grant = crate::weights::Grant::new("owner", "run", &bench.root, [(manifest.id(), manifest.length)].into(),
+            BTreeMap::new(), None, crate::weights::GrantAuthority {
+                current: Arc::new(|| true), bind_output: Arc::new(|_, _| Ok(())), fetch: Some(fetch) });
+        let frame = crate::device_executor::Frame { operation: "source".into(), manifest: manifest.id(), ..Default::default() };
+        let (answer, channel, _) = weights.answer(&grant, &frame);
+        assert!(answer.ok, "{}", answer.detail);
+        let mut channel = std::os::unix::net::UnixStream::from(std::os::fd::OwnedFd::from(channel.unwrap()));
+        let mut read = |key: &str| -> Vec<u8> {
+            let request = json!({"op": "read", "manifest": manifest.id(), "manifest_length": manifest.length,
+                "component": "model", "key": key, "role": "value", "offset": 0, "length": 32768});
+            let body = serde_json::to_vec(&request).unwrap();
+            channel.write_all(&[0]).unwrap();
+            channel.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
+            channel.write_all(&body).unwrap();
+            let mut data = vec![];
+            let frame = |channel: &mut std::os::unix::net::UnixStream| {
+                let mut head = [0; 5];
+                channel.read_exact(&mut head).unwrap();
+                let mut body = vec![0; u32::from_be_bytes(head[1..].try_into().unwrap()) as usize];
+                channel.read_exact(&mut body).unwrap();
+                (head[0], body)
+            };
+            let (kind, reply) = frame(&mut channel);
+            assert_eq!((kind, serde_json::from_slice::<Value>(&reply).unwrap()), (0, json!({"result": 32768})));
+            while data.len() < 32768 {
+                data.extend(frame(&mut channel).1);
+            }
+            data
+        };
+        let first = read("w007");
+        assert_eq!(first[4..8], [7, 4, 0, 0]);
+        assert_eq!(objects(), structure + 1);
+        assert_eq!(read("w007"), first);
+        assert_eq!(read("w011")[4..8], [11, 4, 0, 0]);
+        assert_eq!(objects(), structure + 2, "each object once; the other 18 stay at the Hub");
+        let _ = fs::remove_dir_all(&bench.root);
+    }
+
     /// Over a real link a download no call waits on (a hint's, a remainder) stops while one a
     /// call waits on runs, and starts again once it ends, keeping what it landed.
     #[test]
@@ -2670,7 +2743,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(5));
             }
             let before = objects(&behind_heard);
-            bench.publisher.download(&bench.service, &waited_hub, waited, "", None, &|_, _| ()).unwrap();
+            bench.publisher.download(&bench.service, &waited_hub, waited, "", false, None, &|_, _| ()).unwrap();
             let during = objects(&behind_heard) - before;
             // Alongside, it would have asked for ~12 more objects in the 300 ms the call took.
             assert!(during <= 2, "{during} objects moved behind a download a call waited on");
@@ -2704,7 +2777,7 @@ mod tests {
             while objects(&hint_heard) < 3 && !hint.is_finished() {
                 std::thread::sleep(Duration::from_millis(5));
             }
-            bench.publisher.download(&bench.service, &call_hub, named.clone(), "", None, &|done, total| {
+            bench.publisher.download(&bench.service, &call_hub, named.clone(), "", false, None, &|done, total| {
                 seen.lock().unwrap().push((done, total))
             })
             .unwrap();
