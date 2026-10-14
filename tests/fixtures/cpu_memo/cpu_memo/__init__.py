@@ -49,7 +49,7 @@ async def survey(ctx: Context, payload: Survey) -> Surveyed:
 
 
 app.entrypoint(measure)
-app.job(survey)
+app.job(survey, accelerator=False)
 
 
 @invocable()
@@ -64,7 +64,7 @@ async def restricted(ctx: Context, *, payload: Probe) -> Measured:
     return Measured(square=payload.value * payload.value)
 
 
-app.job(nested)
+app.job(nested, accelerator=False)
 app.entrypoint(restricted, internal=True)
 
 
@@ -117,7 +117,7 @@ async def produce(ctx: Context) -> ModelArtifact:
         return ctx.adopt_model(output.commit())
 
 
-app.job(produce, weights=(WeightsOutput("model", max_new_bytes=65536),))
+app.job(produce, weights=(WeightsOutput("model", max_new_bytes=65536),), accelerator=False)
 
 
 class Noted(msgspec.Struct):
@@ -133,4 +133,4 @@ async def note(ctx: Context, *, payload: Probe, out: Outputs) -> Noted:
     return Noted(out.save_bytes(f"note {payload.value}".encode(), media_type="text/plain"), payload.value)
 
 
-app.job(note)
+app.job(note, accelerator=False)

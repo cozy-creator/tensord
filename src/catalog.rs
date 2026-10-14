@@ -197,6 +197,16 @@ impl Catalog {
         found.into_iter().map(|(_, held)| held).collect()
     }
 }
+/// A job's own execution device: its declared `accelerator`, which nothing infers.
+pub fn job_accelerator(package: &str, row: &serde_json::Value) -> Result<bool, (&'static str, String)> {
+    match row.get("accelerator") {
+        Some(serde_json::Value::Bool(value)) => Ok(*value),
+        None | Some(serde_json::Value::Null) => Err(("job_accelerator_undeclared", format!(
+            "{package} job {} declares no accelerator; republish it with app.job(accelerator=...)",
+            row["name"].as_str().unwrap_or_default()))),
+        _ => Err(("package_interface_invalid", "job accelerator declaration must be boolean".into())),
+    }
+}
 impl HeldGeneration {
     /// One App's executor view, with the environment and lifetime hold unchanged.
     pub fn application(&self, application: &str) -> io::Result<Self> {
@@ -214,13 +224,10 @@ impl HeldGeneration {
         Ok(held)
     }
     pub fn accelerator_job(&self, application: &str, name: &str) -> io::Result<bool> {
-        let (_, _, interface) = self.record.app(application).ok_or_else(|| invalid("this environment holds no such application"))?;
-        let declaration = interface["jobs"].as_array().and_then(|rows| rows.iter().find(|row| row["name"].as_str() == Some(name)));
-        match declaration.and_then(|row| row.get("accelerator")) {
-            None | Some(serde_json::Value::Null) => Ok(false),
-            Some(serde_json::Value::Bool(value)) => Ok(*value),
-            _ => Err(invalid("job accelerator declaration must be boolean")),
-        }
+        let (package, _, interface) = self.record.app(application).ok_or_else(|| invalid("this environment holds no such application"))?;
+        let row = interface["jobs"].as_array().and_then(|rows| rows.iter().find(|row| row["name"].as_str() == Some(name)))
+            .ok_or_else(|| invalid("this application declares no such job"))?;
+        job_accelerator(package, row).map_err(|(code, detail)| invalid(&format!("{code}: {detail}")))
     }
     pub fn retention(&self) -> Arc<File> {
         self.hold.clone()
@@ -289,7 +296,7 @@ mod accelerator_tests {
                 identity: "a".repeat(32), package: "local/root".into(), version: "1".into(),
                 application: "root:app".into(), python: "/usr/bin/python3".into(), dependencies: vec![],
                 cpu_bridge: String::new(), source_digest: String::new(), sdk_fallback: String::new(),
-                interface: json!({"jobs":[{"name":"work","accelerator":false},{"name":"legacy"}]}),
+                interface: json!({"jobs":[{"name":"work","accelerator":false},{"name":"undeclared"}]}),
                 callees: vec![Callee {
                     distribution: "child".into(), version: "1".into(), application: "child:app".into(),
                     package: "local/child".into(), source_digest: String::new(),
@@ -298,7 +305,9 @@ mod accelerator_tests {
             },
         };
         assert!(!held.accelerator_job("root:app", "work").unwrap());
-        assert!(!held.accelerator_job("", "legacy").unwrap());
+        let undeclared = held.accelerator_job("", "undeclared").unwrap_err().to_string();
+        assert_eq!(undeclared, "job_accelerator_undeclared: local/root job undeclared declares no accelerator; republish it with app.job(accelerator=...)");
+        assert!(held.accelerator_job("", "absent").is_err());
         assert!(held.accelerator_job("child:app", "work").unwrap());
         assert!(held.accelerator_job("child:app", "broken").is_err());
         assert!(held.accelerator_job("other:app", "work").is_err());

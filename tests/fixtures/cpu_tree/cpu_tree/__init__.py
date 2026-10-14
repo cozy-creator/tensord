@@ -87,6 +87,6 @@ async def descriptors(ctx: Context, payload: Nothing) -> Descriptors:
 
 app.job(count, accelerator=False)
 app.job(descriptors, accelerator=False)
-app.job(bundle)
-app.job(inspect)
-app.job(survey)
+app.job(bundle, accelerator=False)
+app.job(inspect, accelerator=False)
+app.job(survey, accelerator=False)

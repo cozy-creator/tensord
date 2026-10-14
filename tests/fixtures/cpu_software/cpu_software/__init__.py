@@ -19,4 +19,4 @@ async def compute(payload: Input) -> Output:
     return Output(payload.value * 2, __version__)
 
 
-app.job(compute)
+app.job(compute, accelerator=False)

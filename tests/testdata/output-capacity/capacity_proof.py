@@ -45,7 +45,7 @@ def retained(ctx: Context, out: Outputs) -> Result:
     return Result(out.save_tree(directory))
 
 
-@app.job
+@app.job(accelerator=False)
 def job(payload: Request, ctx: Context, out: Outputs) -> Result:
     return retained(ctx, out)
 

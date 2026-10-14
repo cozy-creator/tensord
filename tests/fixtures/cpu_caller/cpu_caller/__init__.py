@@ -31,7 +31,7 @@ async def relay(ctx: Context, payload: Relay, tel: Telemetry) -> Relayed:
     return Relayed(squares=squares, greeting=greeted.text)
 
 
-app.job(relay)
+app.job(relay, accelerator=False)
 
 
 async def relay_served(ctx: Context, payload: Relay) -> Relayed:
@@ -49,7 +49,7 @@ async def relay_nested(ctx: Context, payload: Relay) -> Relayed:
     return Relayed(squares=squares)
 
 
-app.job(relay_nested)
+app.job(relay_nested, accelerator=False)
 
 
 async def relay_restricted(ctx: Context, payload: Relay) -> Relayed:
@@ -57,7 +57,7 @@ async def relay_restricted(ctx: Context, payload: Relay) -> Relayed:
     return Relayed(squares=[result.square])
 
 
-app.job(relay_restricted)
+app.job(relay_restricted, accelerator=False)
 
 
 class Sitting(msgspec.Struct):
@@ -79,7 +79,7 @@ async def portrait(ctx: Context, payload: Sitting, out: Outputs) -> Portraits:
     return Portraits(references)
 
 
-app.job(portrait, emits_media=True)
+app.job(portrait, emits_media=True, accelerator=False)
 
 
 class Requantize(msgspec.Struct):
@@ -98,7 +98,7 @@ async def requantize(ctx: Context, payload: Requantize) -> Requantized:
     return Requantized(source.manifest.digest, result.manifest.digest)
 
 
-app.job(requantize)
+app.job(requantize, accelerator=False)
 
 
 class Notes(msgspec.Struct):
@@ -110,4 +110,4 @@ async def annotate(ctx: Context, payload: Relay) -> Notes:
     return Notes([(await note(payload=Probe(value, payload.counter))).file for value in payload.values])
 
 
-app.job(annotate)
+app.job(annotate, accelerator=False)
