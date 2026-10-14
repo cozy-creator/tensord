@@ -520,6 +520,11 @@ pub struct PlaneFacts {
     pub h2d_bytes: Option<u64>,
     pub h2d_gbps: Option<f64>,
     pub disk_copy_bytes: Option<u64>,
+    /// Of `h2d_bytes`, copied from the page cache, and through staging buffers (host memory
+    /// this process could not page-lock); `register_failed` counts the page locks refused.
+    pub mapped_copy_bytes: Option<u64>,
+    pub bounce_copy_bytes: Option<u64>,
+    pub register_failed: Option<u64>,
     pub disk_read_bytes: Option<u64>,
     /// RAM of the machine's sealed layouts the executor maps (the machine's, not its own).
     pub sealed_bytes: Option<u64>,
@@ -569,6 +574,7 @@ pub struct Metrics {
     pub device_lease_ms: Option<f64>,
     pub d2h_wait_ms: Option<f64>,
     pub peak_vram_bytes: Option<i64>,
+    pub peak_reserved_bytes: Option<i64>,
     pub activation_peak_bytes: Option<i64>,
     pub activation_peaks: BTreeMap<String, i64>,
     pub allocated_at_start_bytes: Option<i64>,
@@ -577,6 +583,17 @@ pub struct Metrics {
     pub started_unix: Option<f64>,
     pub gpu_count: Option<u32>,
     pub shape_cell: Option<String>,
+}
+/// The device memory a stage could not have (`ResidencyRefusal`): what it needed at once and
+/// what the GPU could give at the finest grain.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Shortfall {
+    pub resource: String,
+    pub needed_bytes: i64,
+    pub available_bytes: i64,
+    /// The stage method that asked.
+    pub request_shape: String,
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -677,6 +694,7 @@ pub struct Frame {
     /// A group's followers' own plane facts, rank 1 first (None: not stated yet).
     pub rank_planes: Vec<Option<PlaneFacts>>,
     pub metrics: Option<Metrics>,
+    pub shortfall: Option<Shortfall>,
     pub stage: String,
     pub position: Option<u64>,
     pub total: Option<u64>,
@@ -2342,12 +2360,12 @@ mod codec_tests {
     #[test]
     fn plane_facts_this_machine_does_not_read_reach_its_records() {
         let facts: PlaneFacts = serde_json::from_value(serde_json::json!({
-            "h2d_bytes": 7, "bounce_copy_bytes": 5, "plan_inputs": {"budget": 42}
+            "h2d_bytes": 7, "host_gbps": 5, "plan_inputs": {"budget": 42}
         }))
         .unwrap();
         assert_eq!(facts.h2d_bytes, Some(7));
         let written = serde_json::to_value(&facts).unwrap();
-        assert_eq!(written["bounce_copy_bytes"], 5);
+        assert_eq!(written["host_gbps"], 5);
         assert_eq!(written["plan_inputs"]["budget"], 42);
     }
 

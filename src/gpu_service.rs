@@ -333,8 +333,9 @@ struct Session {
     launch: Launch,
     /// It has served a call: its next one is not its first.
     invoked: bool,
-    /// Regions its plane had evicted when its last call ended (a running total).
-    evictions: u64,
+    /// Its plane's running counts when its last call ended: a call's memory record counts
+    /// from them.
+    counted: device_executor::PlaneFacts,
     /// Why its weights come from the store, not the sealed host tier (an older SDK).
     unsealed: Option<String>,
 }
@@ -618,6 +619,7 @@ fn gpu_request_queued(engine: &Engine, root: Option<u64>) -> bool {
 impl GpuPool {
     pub fn new(root: &Path, config: GpuConfig, store: Arc<Store>) -> io::Result<Arc<Self>> {
         fs::create_dir_all(root)?;
+        crate::memory::log_into(store.root().join("logs"));
         if let Some(identity) = config.identity {
             identity.traverse(root)?;
             identity.traverse(
@@ -2660,7 +2662,7 @@ impl GpuPool {
             sharing: false,
             launch,
             invoked: false,
-            evictions: 0,
+            counted: Default::default(),
             unsealed,
         })
     }
@@ -2975,7 +2977,7 @@ impl GpuPool {
             .and_then(|learned| learned.estimated_from)
         {
             crate::memory::note(serde_json::json!({"event": "estimate", "plan": plan.id,
-                "shape": shape, "from": from, "ratio": ratio}));
+                "run": id, "shape": shape, "from": from, "ratio": ratio}));
         }
         let spool = if let Some(identity) = self.config.identity {
             // Keep Journal/results/admin paths private to the core. A separate peer-owned
@@ -3064,17 +3066,19 @@ impl GpuPool {
         let mapped = reply
             .plane
             .as_ref()
-            .filter(|_| plan.degree == 1 && evictions == Some(session.evictions))
+            .filter(|_| plan.degree == 1 && evictions == Some(session.counted.evictions.unwrap_or(0)))
             .and_then(|p| {
                 let own = u64::try_from(p.committed_bytes?).ok()?;
                 Some(own + p.shared_bytes.and_then(|b| u64::try_from(b).ok()).unwrap_or(0))
             })
             .filter(|bytes| *bytes > 0);
-        session.evictions = evictions.unwrap_or(session.evictions);
         self.learn(&plan.id, self.lane(start, plan.degree).unwrap_or_default(),
             &shape, &reply, session.executor.birth.pid, mapped);
         self.record_invoke(&plan.id, &lane, first, invoked.elapsed(), &reply);
-        record_measurements(engine, id, &reply);
+        record_measurements(engine, id, &reply, &session.counted);
+        if let Some(plane) = &reply.plane {
+            session.counted = plane.clone();
+        }
         if reply.attention_applied {
             if let Err(error) = engine.apply_attention(id) {
                 eprintln!("run {id}: applied attention pin not recorded: {error}");
@@ -3091,21 +3095,6 @@ impl GpuPool {
         self.observe(&plan.id, start, plan.degree, facts, &reply.rank_planes, Some(true));
         // Every executor's weights are the tier's: none pins memory of its own.
         self.host_ledger.private(&session_key(&plan.id, start), None);
-        if let Some(plane) = &reply.plane {
-            crate::memory::note(
-                serde_json::json!({"event": "call", "plan": plan.id, "id": id, "degree": plan.degree,
-                "cap": cap, "cap_bytes": plane.cap_bytes, "process": plane.process_bytes,
-                "context": plane.context_bytes, "committed": plane.committed_bytes,
-                "activation": plane.activation_peak_bytes, "oom_retries": plane.oom_retries,
-                "alloc_retries": plane.alloc_retries, "cache_releases": plane.cache_releases,
-                "paged_out": plane.paged_out,
-                "evictions": plane.evictions, "h2d_bytes": plane.h2d_bytes,
-                "rank_process": reply.rank_planes.iter()
-                    .map(|r| r.as_ref().map(|r| r.process_bytes)).collect::<Vec<_>>(),
-                "rank_cap": reply.rank_planes.iter()
-                    .map(|r| r.as_ref().map(|r| r.cap_bytes)).collect::<Vec<_>>()}),
-            );
-        }
         // Rank 0 answered, so a follower that ended during the call is the group's first fault.
         let lost = self.lost_followers(start, plan.degree, &session.followers);
         if !reply.ok || !reply.quiescent || !reply.poisoned.is_empty() || !lost.is_empty() {
@@ -4067,7 +4056,9 @@ fn refused(error: &io::Error) -> Option<&Refused> {
 /// What the call's executor measured, kept as the run's (`run show`): its stage and step
 /// tracks, its ranks' execution records, and its attention observations (the kernels that
 /// served, Sol's dense and sparse calls).
-pub(crate) fn record_measurements(engine: &Engine, id: &str, reply: &Frame) {
+/// `since`: the executor's plane counts at its previous call (its memory record counts from
+/// them).
+pub(crate) fn record_measurements(engine: &Engine, id: &str, reply: &Frame, since: &device_executor::PlaneFacts) {
     let attention: Vec<&serde_json::Value> = reply
         .observations
         .as_array()
@@ -4081,7 +4072,8 @@ pub(crate) fn record_measurements(engine: &Engine, id: &str, reply: &Frame) {
         .collect();
     let software = engine.get(id).ok().and_then(|run| run.executor.map(|executor| executor.software(run.attempt)));
     let measurements = serde_json::json!({"attribution": reply.attribution, "software": software,
-        "execution": reply.execution, "observations": attention});
+        "execution": reply.execution, "observations": attention,
+        "memory": crate::memory::call::CallMemory::of(reply, since)});
     let recorded = serde_json::to_vec(&measurements)
         .map_err(io::Error::other)
         .and_then(|bytes| engine.with_journal(|journal| journal.record_measurements(id, &bytes)));

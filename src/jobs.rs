@@ -1250,7 +1250,7 @@ fn conclude(
     spool: &Path,
     reply: Frame,
 ) -> io::Result<()> {
-    record_measurements(engine, id, &reply);
+    record_measurements(engine, id, &reply, &Default::default());
     let outcome = reply
         .outcome
         .as_ref()

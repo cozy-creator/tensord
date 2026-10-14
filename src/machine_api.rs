@@ -584,17 +584,16 @@ impl MachineBackend for NativeBackend {
         _: VerifiedActor,
         request: domain::MachineLogQuery,
     ) -> Result<Vec<u8>, Status> {
-        if request.log != domain::MachineLog::TensorfsTransport as i32 {
-            return Err(Status::not_found(format!(
-                "this machine keeps no log {}",
-                request.log
-            )));
-        }
-        // TensorFS appends here and rotates to one older file.
+        // TensorFS and TensorD's memory notes append here, each rotating to one older file.
+        let name = match domain::MachineLog::try_from(request.log) {
+            Ok(domain::MachineLog::TensorfsTransport) => "transport.log",
+            Ok(domain::MachineLog::Memory) => "memory.log",
+            _ => return Err(Status::not_found(format!("this machine keeps no log {}", request.log))),
+        };
         let logs = self.store.root().join("logs");
         let mut data = vec![];
-        for name in ["transport.log.1", "transport.log"] {
-            match std::fs::read(logs.join(name)) {
+        for name in [format!("{name}.1"), name.into()] {
+            match std::fs::read(logs.join(&name)) {
                 Ok(kept) => data.extend(kept),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(Status::internal(format!("read {name}: {error}"))),

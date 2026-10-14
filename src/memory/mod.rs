@@ -1,6 +1,7 @@
 //! The one owner of every GPU memory decision (PLAN decision 3, design rust-machine.md §2.1–2.2).
 //! `policy` decides from samples and executor facts; `nvml` samples on its own thread; this
 //! module joins them and keeps the floor while a call runs.
+pub mod call;
 pub mod host;
 pub mod learned;
 pub mod nvml;
@@ -9,13 +10,20 @@ pub mod policy;
 use policy::{Decision, Facts, Gpu, Holding, Round, Sample, Step};
 use serde::Deserialize;
 use std::{
-    fs::{File, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{self, Write},
     os::unix::fs::FileExt,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+/// Past this the memory log rotates to `memory.log.1`, so it holds at most twice this.
+const ROTATE_BYTES: u64 = 4 << 20;
+
+/// The directory `note` appends `memory.log` in: the store's `logs`, beside TensorFS's
+/// transport log, read by `cozy machine logs --memory` and `cozy rental logs --memory`.
+static LOG: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// Budget-cell `wanted` at or below this asks for a process cap of `CAP - wanted` bytes
 /// (Runtime `budget_cell.CAP`, `process_cap/1`).
@@ -51,8 +59,27 @@ fn now_ms() -> u128 {
         .unwrap_or(0)
 }
 
+pub fn log_into(dir: PathBuf) {
+    *LOG.lock().unwrap() = Some(dir);
+}
+
+/// One memory decision, a line of the machine's memory log; stderr before `log_into`.
 pub(crate) fn note(event: serde_json::Value) {
-    eprintln!("memory: {event}");
+    let dir = LOG.lock().unwrap();
+    let Some(dir) = dir.as_ref() else {
+        return eprintln!("memory: {event}");
+    };
+    let path = dir.join("memory.log");
+    if fs::metadata(&path).is_ok_and(|meta| meta.len() > ROTATE_BYTES) {
+        let _ = fs::rename(&path, dir.join("memory.log.1"));
+    }
+    let line = format!("{:.3} {event}\n", now_ms() as f64 / 1e3);
+    let written = fs::create_dir_all(dir)
+        .and_then(|_| OpenOptions::new().create(true).append(true).open(&path))
+        .and_then(|mut file| file.write_all(line.as_bytes()));
+    if let Err(error) = written {
+        eprintln!("memory: {event} ({}: {error})", path.display());
+    }
 }
 
 /// One GPU's ledger, sampler and floor watchdog. Without NVML nothing is decided here and

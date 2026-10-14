@@ -66,8 +66,13 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   any free one. A waiting standalone call claims the GPUs it waits for. A prefetch loads only
   inside its root's bound lane, after queued requests of that root and older ones, and ends at its release. A GPU that never ran the plan first copies its learned facts from one that did.
   Replicas share the host tier's layouts and are ordinary tenants of their GPU's memory policy. A
-  new executor's GPU is logged as `memory: {"event": "place"}`; `loads.jsonl` and `invokes.jsonl`
-  name each line's `gpus`.
+  new executor's GPU is logged as `{"event": "place"}` in the memory log; `loads.jsonl` and
+  `invokes.jsonl` name each line's `gpus`.
+- Memory decisions (floor caps, placements, sheds, admissions, estimates) are lines of the store's
+  `logs/memory.log` (rotated once past 4 MiB), machine log `memory` (`cozy machine logs --memory`,
+  `cozy rental logs <r> --memory`). Each call's own memory is the run's `memory` measurements
+  (`cozy run show`): torch's peaks, the process at the end, and what the plane paged since the
+  executor's previous call.
 - A memory step on a GPU runs under that GPU's call slot; host pressure ends idle executors only on
   GPUs no call holds. A resumed accelerator job prepares its GPU once no family call runs there.
 - Host admission counts executors admitted and not yet loaded. Pinned budgets are shared over every

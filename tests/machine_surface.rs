@@ -274,10 +274,10 @@ mod v1_api {
         Ok((meta, data))
     }
 
-    /// Read returns the store's transport log, its rotated part first, or a tail from a line
-    /// start; only a machine capability reads it.
+    /// Read returns the store's transport and memory logs, each's rotated part first, or a tail
+    /// from a line start; only a machine capability reads them.
     #[tokio::test]
-    async fn read_returns_the_stores_transport_log_with_rotation_and_tail() {
+    async fn read_returns_the_stores_logs_with_rotation_and_tail() {
         let machine = Machine::start().await;
         let mut client = client(&machine).await;
         let owner = cap(Grant { action: MACHINE.into(), ..Default::default() });
@@ -286,23 +286,24 @@ mod v1_api {
             tail,
             ..Default::default()
         };
-        let transport = |tail| log("tensorfs-transport", tail);
-        assert!(read(&mut client, &owner, transport(0)).await.unwrap().1.is_empty());
         let logs = machine.store().join("logs");
-        fs::create_dir_all(&logs).unwrap();
-        fs::write(logs.join("transport.log.1"), "1.000 pull a 1 old\n").unwrap();
-        let current: String = (0..3000).map(|n| format!("{n}.000 hedge object-{n} 4096 grant\n")).collect();
-        fs::write(logs.join("transport.log"), &current).unwrap();
-        let (_, whole) = read(&mut client, &owner, transport(0)).await.unwrap();
-        assert_eq!(whole, format!("1.000 pull a 1 old\n{current}").into_bytes());
-        let (_, tail) = read(&mut client, &owner, transport(100)).await.unwrap();
-        let tail = String::from_utf8(tail).unwrap();
-        assert!(tail.len() <= 100 && tail.ends_with("2999.000 hedge object-2999 4096 grant\n"));
-        assert!(current.ends_with(&tail) && current.as_bytes()[current.len() - tail.len() - 1] == b'\n');
+        for (name, file) in [("tensorfs-transport", "transport.log"), ("memory", "memory.log")] {
+            assert!(read(&mut client, &owner, log(name, 0)).await.unwrap().1.is_empty());
+            fs::create_dir_all(&logs).unwrap();
+            fs::write(logs.join(format!("{file}.1")), "1.000 pull a 1 old\n").unwrap();
+            let current: String = (0..3000).map(|n| format!("{n}.000 hedge object-{n} 4096 grant\n")).collect();
+            fs::write(logs.join(file), &current).unwrap();
+            let (_, whole) = read(&mut client, &owner, log(name, 0)).await.unwrap();
+            assert_eq!(whole, format!("1.000 pull a 1 old\n{current}").into_bytes());
+            let (_, tail) = read(&mut client, &owner, log(name, 100)).await.unwrap();
+            let tail = String::from_utf8(tail).unwrap();
+            assert!(tail.len() <= 100 && tail.ends_with("2999.000 hedge object-2999 4096 grant\n"));
+            assert!(current.ends_with(&tail) && current.as_bytes()[current.len() - tail.len() - 1] == b'\n');
+            let run = cap(Grant { run: "1".into(), ..Default::default() });
+            assert_eq!(read(&mut client, &run, log(name, 0)).await.unwrap_err().code(), tonic::Code::PermissionDenied);
+        }
         let unknown = read(&mut client, &owner, log("other", 0)).await.unwrap_err();
         assert_eq!(unknown.code(), tonic::Code::NotFound);
-        let run = cap(Grant { run: "1".into(), ..Default::default() });
-        assert_eq!(read(&mut client, &run, transport(0)).await.unwrap_err().code(), tonic::Code::PermissionDenied);
     }
 
     #[tokio::test]

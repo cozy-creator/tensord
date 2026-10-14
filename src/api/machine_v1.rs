@@ -796,6 +796,7 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
                 caller.machine()?;
                 let log = match name.as_str() {
                     "tensorfs-transport" => domain::MachineLog::TensorfsTransport,
+                    "memory" => domain::MachineLog::Memory,
                     _ => {
                         return Err(Status::not_found(format!(
                             "this machine keeps no log {name}"
