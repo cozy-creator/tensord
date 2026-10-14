@@ -167,21 +167,11 @@ impl Weights {
         let source = reference(&frame.manifest, length)?;
         let (client, server) = UnixStream::pair().map_err(io_refusal)?;
         let (store, meta, current) = (self.store.clone(), self.meta.clone(), grant.current.clone());
-        let fetch = grant.fetch.clone();
+        let fetch = fetching(grant.fetch.clone());
         std::thread::Builder::new()
             .name("weights-source".into())
             .spawn(move || {
                 let check = move || current_or_refuse(&*current);
-                let fetch = |objects: &[ObjectRef]| match &fetch {
-                    Some(fetch) => fetch(&source, objects).map_err(|detail| tensorfs_core::err::Refusal {
-                        code: tensorfs_core::err::Code::TRANSFER_FAILED,
-                        detail,
-                    }),
-                    None => Err(tensorfs_core::err::Refusal {
-                        code: tensorfs_core::err::Code::OBJECT_ABSENT,
-                        detail: format!("{} is not here and this job names no Hub it came from", objects[0].id()),
-                    }),
-                };
                 if let Err(refusal) = channel::serve_source(&store, &meta, &source, server, &check, &fetch)
                 {
                     eprintln!("weights source {}: {}", source.id(), refusal.detail);
@@ -236,7 +226,7 @@ impl Weights {
             .unwrap()
             .insert(transaction.clone(), slot.clone());
         let (client, server) = UnixStream::pair().map_err(io_refusal)?;
-        let hooks_current = grant.current.clone();
+        let (hooks_current, fetch) = (grant.current.clone(), fetching(grant.fetch.clone()));
         let (store, meta) = (self.store.clone(), self.meta.clone());
         let (operation, output) = (grant.run.clone(), slot.clone());
         let committed = match derived::lookup(&store, &meta, &transaction).map_err(tfs)? {
@@ -258,6 +248,7 @@ impl Weights {
                     check_current: &check,
                     record_checkpoint: &|_: &tensorfs_core::jcs::Json| (),
                     record_receipt: &|_: &derived::ReceiptFacts| (),
+                    fetch: &fetch,
                 };
                 let served = match (&writer, &committed) {
                     (Some(writer), _) => {
@@ -501,6 +492,20 @@ impl Weights {
             };
             publishing.reason("weights_publication_failed", message)
         })
+    }
+}
+
+/// A job's fetch as TensorFS's: what its source lacks, from the Hub it came from.
+fn fetching(fetch: Option<Fetch>) -> impl Fn(&ObjectRef, &[ObjectRef]) -> tensorfs_core::err::Result<()> + Sync {
+    move |manifest, objects| match &fetch {
+        Some(fetch) => fetch(manifest, objects).map_err(|detail| tensorfs_core::err::Refusal {
+            code: tensorfs_core::err::Code::TRANSFER_FAILED,
+            detail,
+        }),
+        None => Err(tensorfs_core::err::Refusal {
+            code: tensorfs_core::err::Code::OBJECT_ABSENT,
+            detail: format!("{} of {} is not here and this job names no Hub it came from", objects[0].id(), manifest.id()),
+        }),
     }
 }
 
