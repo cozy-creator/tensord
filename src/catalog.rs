@@ -73,7 +73,7 @@ impl Generation {
             .filter_map(|interface| interface.get("entrypoints")?.as_array())
             .flatten()
             .filter_map(|entry| entry.get("models")?.as_array().filter(|models| !models.is_empty()))
-            .filter_map(|models| crate::gpu_service::group_degree(models, 0, available).ok())
+            .map(|models| crate::gpu_service::group_degree(models, 0, available))
             .max()
             .unwrap_or(0)
     }

@@ -195,13 +195,14 @@ impl GpuPlan {
     }
 }
 
-/// The widest group every package-code slot declares (`sequence_parallel.degrees`, one always) that fits
-/// `available` GPUs, or `wanted` exactly; Runtime `machine_lanes.widths`.
-pub fn group_degree(
-    models: &[serde_json::Value],
-    wanted: u32,
-    available: usize,
-) -> io::Result<u32> {
+/// The widest group every package-code slot declares (`sequence_parallel.degrees`, one always)
+/// within `available` GPUs and, when one is asked for, `wanted`; Runtime `machine_lanes.widths`.
+/// A count asked for is a cap, never a refusal: a caller's `--gpus 2` gives its one-GPU children one.
+pub fn group_degree(models: &[serde_json::Value], wanted: u32, available: usize) -> u32 {
+    let cap = match wanted {
+        0 => available,
+        wanted => available.min(wanted as usize),
+    };
     let mut common: std::collections::BTreeSet<u32> = (1..=64).collect();
     for model in models {
         let mut declared = std::collections::BTreeSet::from([1u32]);
@@ -213,23 +214,7 @@ pub fn group_degree(
         }
         common = common.intersection(&declared).copied().collect();
     }
-    if wanted > 0 {
-        if !common.contains(&wanted) || wanted as usize > available {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!(
-                    "gpu_count_unavailable: {wanted} GPUs is not a group every model slot declares \
-                     ({common:?}) within this machine's {available}"
-                ),
-            ));
-        }
-        return Ok(wanted);
-    }
-    Ok(common
-        .into_iter()
-        .filter(|d| *d as usize <= available)
-        .max()
-        .unwrap_or(1))
+    common.into_iter().filter(|d| *d as usize <= cap).max().unwrap_or(1)
 }
 
 /// How far a function is prepared on this machine: a warm set member's `level`, and what
@@ -1326,7 +1311,7 @@ impl GpuPool {
                 ));
             }
         }
-        let degree = group_degree(models, degree, self.devices.len())?;
+        let degree = group_degree(models, degree, self.devices.len());
         let mut planned = vec![];
         for (model, (path, parameter)) in models.iter().zip(&slots) {
             let class = model
@@ -4484,17 +4469,18 @@ mod tests {
             json!({"path":"e.models.base_model","sequence_parallel":{"degrees":[2,4,7,8]}}),
             json!({"path":"e.models.turbo_lora","sequence_parallel":{"degrees":[2,4,7,8]}}),
         ];
-        assert_eq!(group_degree(&h3, 0, 1).unwrap(), 1);
-        assert_eq!(group_degree(&h3, 0, 2).unwrap(), 2);
-        assert_eq!(group_degree(&h3, 0, 6).unwrap(), 4);
-        assert_eq!(group_degree(&h3, 1, 4).unwrap(), 1);
-        assert_eq!(group_degree(&h3, 2, 4).unwrap(), 2);
-        let refused = group_degree(&h3, 3, 4).unwrap_err().to_string();
-        assert!(refused.starts_with("gpu_count_unavailable"), "{refused}");
-        assert!(group_degree(&h3, 4, 2).is_err());
+        assert_eq!(group_degree(&h3, 0, 1), 1);
+        assert_eq!(group_degree(&h3, 0, 2), 2);
+        assert_eq!(group_degree(&h3, 0, 6), 4);
+        assert_eq!(group_degree(&h3, 1, 4), 1);
+        assert_eq!(group_degree(&h3, 2, 4), 2);
+        // A count no slot declares, or wider than the machine, caps the group: never a refusal.
+        assert_eq!(group_degree(&h3, 3, 4), 2);
+        assert_eq!(group_degree(&h3, 4, 2), 2);
         // A slot without a declaration runs on one GPU only, so the group is one.
         let mixed = [h3[0].clone(), json!({"path":"e.models.vae"})];
-        assert_eq!(group_degree(&mixed, 0, 4).unwrap(), 1);
+        assert_eq!(group_degree(&mixed, 0, 4), 1);
+        assert_eq!(group_degree(&[json!({"path":"e.models.vae"})], 2, 2), 1);
     }
 
     /// A fresh pool over `width` GPUs NVML does not know (this host's own stay untouched):

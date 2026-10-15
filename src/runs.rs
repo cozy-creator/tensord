@@ -1130,6 +1130,7 @@ impl Runs {
                 })
                 .collect(),
             attention_kernel: context.attention_kernel,
+            // The caller's count caps a child's group; the child's own declaration picks within it.
             gpus: context.gpus,
             hub: context.hub,
             providers: context.providers,

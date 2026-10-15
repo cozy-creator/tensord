@@ -1287,8 +1287,7 @@ impl Publisher {
             ))?;
         let gpu_model = gpu_name(&gpu.config().envelope()[0]);
         let width = gpu.width();
-        let degree = crate::gpu_service::group_degree(&slots, request.gpus, width)
-            .map_err(|e| ("gpu_count_unavailable", e.to_string().trim_start_matches("gpu_count_unavailable: ").into()))?;
+        let degree = crate::gpu_service::group_degree(&slots, request.gpus, width);
         let mut grants = vec![];
         for slot in &slots {
             let path = slot
@@ -2502,7 +2501,7 @@ mod tests {
         let mut pinned = default.clone();
         pinned.manifest = Some(domain::Ref { digest: vec![7; 32], length: 9 });
         for (requested, expected) in [(0, 4), (1, 1), (2, 2), (4, 4)] {
-            let degree = crate::gpu_service::group_degree(std::slice::from_ref(&slot), requested, 4).unwrap();
+            let degree = crate::gpu_service::group_degree(std::slice::from_ref(&slot), requested, 4);
             assert_eq!(degree, expected);
             for choice in [&default, &lane, &pinned] {
                 let named = choose(choice, path, ("NVIDIA H100", degree as usize)).unwrap();
@@ -2511,7 +2510,7 @@ mod tests {
         }
         assert_eq!(choose(&lane, path, ("NVIDIA H100", 2)).unwrap().lane, "bf16");
         assert_eq!(choose(&pinned, path, ("NVIDIA H100", 2)).unwrap().manifest, format!("sha256:{}", "07".repeat(32)));
-        assert!(crate::gpu_service::group_degree(&[slot], 3, 4).is_err());
+        assert_eq!(crate::gpu_service::group_degree(&[slot], 3, 4), 2);
     }
 
     #[test]

@@ -289,7 +289,8 @@ impl Service {
         invocation.inputs = call.inputs;
         invocation.job = call.job;
         invocation.accelerator = call.job && held.accelerator_job(&invocation.module, &invocation.entrypoint, self.gpu().is_some())?;
-        if invocation.job && invocation.gpus > 0 {
+        // A child's count is its caller's cap, never refused here; only a root job's is checked.
+        if invocation.job && call.parent.is_empty() && invocation.gpus > 0 {
             let available = self.gpu().map_or(0, |gpu| gpu.width());
             if invocation.gpus as usize > available || (invocation.accelerator && invocation.gpus != 1) {
                 return Err(io::Error::new(io::ErrorKind::Unsupported, format!(
