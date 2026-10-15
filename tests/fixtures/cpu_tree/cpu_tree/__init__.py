@@ -1,4 +1,4 @@
-"""A job reads one input tree the machine materialized and reports its files; another makes a
+"""A function reads one input tree the machine materialized and reports its files; another makes a
 tree in a child, hands it to a second child as its input and returns it as its own; another
 reports the descriptors its executor holds."""
 from __future__ import annotations
@@ -85,8 +85,8 @@ async def descriptors(ctx: Context, payload: Nothing) -> Descriptors:
     return Descriptors(sorted(targets))
 
 
-app.job(count, accelerator=False)
-app.job(descriptors, accelerator=False)
-app.job(bundle, accelerator=False)
-app.job(inspect, accelerator=False)
-app.job(survey, accelerator=False)
+app.entrypoint(count, accelerator=False)
+app.entrypoint(descriptors, accelerator=False)
+app.entrypoint(bundle, accelerator=False)
+app.entrypoint(inspect, accelerator=False)
+app.entrypoint(survey, accelerator=False)

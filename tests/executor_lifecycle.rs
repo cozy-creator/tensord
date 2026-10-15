@@ -80,6 +80,7 @@ fn launch(generation: &Generation, hold: &File) -> (DeviceExecutor, PathBuf, Sea
             sequence_parallel_degree: 1,
             import_only: false,
             call_interfaces: vec![],
+            constructions: Vec::new(),
         },
         DeviceCommand::Load {
             construction: "lifecycle".into(),
@@ -149,6 +150,8 @@ fn invoke(
             activation_bytes: Default::default(),
             squeezed_bytes: Default::default(),
             device_weights: None,
+            sources: Default::default(),
+            weights: Default::default(),
         },
         &mut Baseline,
     )
@@ -483,6 +486,7 @@ fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
             sequence_parallel_degree: 1,
             import_only: false,
             call_interfaces: vec![],
+            constructions: Vec::new(),
         },
         DeviceCommand::Load {
             construction: "lifecycle".into(),
@@ -552,6 +556,8 @@ fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
                 activation_bytes: Default::default(),
                 squeezed_bytes: Default::default(),
                 device_weights: None,
+                sources: Default::default(),
+                weights: Default::default(),
             },
             &mut Baseline,
         )

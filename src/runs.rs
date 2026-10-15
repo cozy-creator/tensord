@@ -1,7 +1,7 @@
 //! Run sources and preparation inside a run (`cozy.machine.v1` Run). A run is accepted at
 //! once and prepares inside itself: its code installs, its models resolve at the run's Hub and
 //! download, and each stage is the run's progress. The Hub token lives only in memory, for that
-//! preparation (and a job's life, which its children prepare with); a restart before it
+//! preparation and the run's life (its children prepare with it); a restart before it
 //! completes ends the run FAILED (`journal::PREPARING`).
 use crate::{
     api::domain,
@@ -55,9 +55,7 @@ pub struct Spec {
     pub remove: bool,
     /// A warm run's whole warm set for its caller, replacing the previous one.
     pub set: Option<Vec<SetItem>>,
-    /// `kind: job`: `entrypoint` names an `@app.job`; its installed declaration selects its device.
-    pub job: bool,
-    /// A child run's parent execution (a job's call through its seam).
+    /// A child run's parent execution (a call through its parent's seam).
     pub parent: String,
     pub source: Source,
     pub entrypoint: String,
@@ -70,7 +68,8 @@ pub struct Spec {
     pub hub: Option<hub::Source>,
     /// Provider tokens for source models, held in memory only.
     pub providers: Providers,
-    /// `org/name`: a model-only warm run puts the source model it made there.
+    /// `org/name`: the requester's repository for the run's weights outputs, or where a
+    /// model-only warm run puts the source model it made.
     pub weights_destination: String,
     pub owner: String,
     /// The caller's catalog revision: held resolutions are reused only under it (th-245).
@@ -90,151 +89,31 @@ pub struct Runs {
     pub own_hub: Option<hub::Source>,
     /// This machine's TLS leaf key: it trades a run's capability for its token.
     pub leaf: Option<Arc<hub::Leaf>>,
-    /// Unfinished runs' preparation: their children prepare with it. Provider tokens live only
-    /// here; a job's is journaled too (`Durable`), for a paused job resumed after a restart.
-    pub jobs: Mutex<HashMap<String, JobContext>>,
+    /// Unfinished runs' preparation: their children prepare with it, and their weights are
+    /// fetched and published with its access. Tokens live only here.
+    pub contexts: Mutex<HashMap<String, RunContext>>,
 }
 
-/// What a job's children prepare with: its installation, Hub access, owner, catalog revision,
+/// What a run's children prepare with: its installation, Hub access, owner, catalog revision,
 /// attention pin and the model choices addressed to its callables (`<entrypoint>.models.<p>`).
-#[derive(Clone)]
-pub struct JobContext {
-    installation: String,
-    application: String,
-    hub: Option<hub::Source>,
-    providers: Providers,
-    owner: String,
-    catalog_revision: String,
-    attention_kernel: String,
-    gpus: u32,
-    models: Vec<domain::ModelChoice>,
-    /// The job's own model inputs, made present: parameter -> (class, manifest).
-    inputs: BTreeMap<String, (String, ObjectRef)>,
-    /// The Hub checkpoint each input held here in part is, by manifest: the job's reads fetch
-    /// its absent objects from there.
-    origins: BTreeMap<String, Named>,
-    weights_destination: String,
+#[derive(Clone, Default)]
+pub struct RunContext {
+    pub(crate) installation: String,
+    pub(crate) hub: Option<hub::Source>,
+    pub(crate) providers: Providers,
+    pub(crate) owner: String,
+    pub(crate) catalog_revision: String,
+    pub(crate) attention_kernel: String,
+    pub(crate) gpus: u32,
+    pub(crate) models: Vec<domain::ModelChoice>,
+    pub(crate) weights_destination: String,
 }
 
-/// What a job's weights grant reads of its context (`jobs.rs`).
-pub struct JobWeights {
-    pub inputs: BTreeMap<String, (String, ObjectRef)>,
-    pub destination: Option<crate::weights::Destination>,
-    pub fetch: Option<crate::weights::Fetch>,
-}
-
-/// A job context's journaled part: everything but its credentials (choices prost-encoded). A
-/// job resumed after a restart reads its Hub's public content again; its capability, traded
-/// once by the machine that stopped, is not kept.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct Durable {
-    #[serde(default)]
-    hub: Option<DurableHub>,
-    installation: String,
-    #[serde(default)]
-    application: String,
-    owner: String,
-    #[serde(default)]
-    catalog_revision: String,
-    attention_kernel: String,
-    #[serde(default)]
-    gpus: u32,
-    models: Vec<Vec<u8>>,
-    #[serde(default)]
-    inputs: BTreeMap<String, (String, String, u64)>,
-    /// Manifest -> [repository, release, lane].
-    #[serde(default)]
-    origins: BTreeMap<String, [String; 3]>,
-    #[serde(default)]
-    weights_destination: String,
-}
-#[derive(serde::Serialize, serde::Deserialize)]
-struct DurableHub {
-    origin: String,
-    #[serde(default)]
-    ca_der: Option<Vec<u8>>,
-    #[serde(default)]
-    object_hosts: Vec<String>,
-}
-impl Durable {
-    fn of(context: &JobContext) -> Self {
-        Self {
-            hub: context.hub.as_ref().map(|hub| DurableHub {
-                origin: hub.origin.clone(),
-                ca_der: hub.ca_der.clone(),
-                object_hosts: hub.object_hosts.clone(),
-            }),
-            installation: context.installation.clone(),
-            application: context.application.clone(),
-            owner: context.owner.clone(),
-            catalog_revision: context.catalog_revision.clone(),
-            attention_kernel: context.attention_kernel.clone(),
-            gpus: context.gpus,
-            models: context.models.iter().map(crate::archive::encode_model_choice).collect(),
-            inputs: context
-                .inputs
-                .iter()
-                .map(|(p, (class, m))| (p.clone(), (class.clone(), m.sha256.clone(), m.length)))
-                .collect(),
-            origins: context
-                .origins
-                .iter()
-                .map(|(m, n)| (m.clone(), [n.repository.clone(), n.release.clone(), n.lane.clone()]))
-                .collect(),
-            weights_destination: context.weights_destination.clone(),
-        }
-    }
-    fn context(self) -> io::Result<JobContext> {
-        let hub = self
-            .hub
-            .map(|hub| hub::Source::new(&hub.origin, hub.ca_der, hub.object_hosts, None))
-            .transpose()
-            .map_err(|e| io::Error::other(e.0))?;
-        Ok(JobContext {
-            installation: self.installation,
-            application: self.application,
-            hub,
-            providers: Providers::default(),
-            owner: self.owner,
-            catalog_revision: self.catalog_revision,
-            attention_kernel: self.attention_kernel,
-            gpus: self.gpus,
-            models: self
-                .models
-                .iter()
-                .map(|m| crate::archive::decode_model_choice(m.as_slice()))
-                .collect::<Result<_, _>>()
-                .map_err(io::Error::other)?,
-            inputs: self
-                .inputs
-                .into_iter()
-                .map(|(p, (class, sha256, length))| (p, (class, ObjectRef { sha256, length })))
-                .collect(),
-            origins: self
-                .origins
-                .into_iter()
-                .map(|(manifest, [repository, release, lane])| {
-                    (manifest.clone(), Named { repository, release, lane, manifest })
-                })
-                .collect(),
-            weights_destination: self.weights_destination,
-        })
-    }
-}
-
-/// The manifests of a journaled job context's model inputs (`sha256:<hex>`): the store keeps
-/// them while the job is unfinished.
-pub(crate) fn job_models(journaled: &[u8]) -> io::Result<Vec<String>> {
-    let context: Durable = serde_json::from_slice(journaled).map_err(io::Error::other)?;
-    let manifests = context.inputs.into_values();
-    Ok(manifests.map(|(_, sha256, _)| format!("sha256:{sha256}")).collect())
-}
-
-/// A job's own model input: a bare parameter, or one under the job's own name.
-fn own_input(choice: &domain::ModelChoice, job: &str) -> bool {
+/// A choice for the run's own slots: a bare parameter, or one under its own name.
+fn own_choice(choice: &domain::ModelChoice, entrypoint: &str) -> bool {
     match choice.parameter.split_once(".models.") {
         None => true,
-        Some((callable, _)) => callable == job,
+        Some((callable, _)) => callable == entrypoint,
     }
 }
 
@@ -246,13 +125,11 @@ fn addressed(parameter: &str, package: &str, interface: &Value) -> Option<String
         .strip_prefix(package)
         .and_then(|rest| rest.strip_prefix('/'))
         .unwrap_or(parameter);
-    ["jobs", "entrypoints"]
-        .iter()
-        .any(|section| {
-            interface[section].as_array().into_iter().flatten().any(|entry| {
-                entry["models"].as_array().into_iter().flatten().any(|slot| slot["path"] == path)
-            })
-        })
+    interface["entrypoints"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|entry| entry["models"].as_array().into_iter().flatten().any(|slot| slot["path"] == path))
         .then(|| path.to_string())
 }
 
@@ -280,20 +157,6 @@ fn refused(code: &'static str, message: impl Into<String>) -> Refused {
     Refused {
         code,
         message: message.into(),
-    }
-}
-
-/// A child's kind is whatever its held package declares it as.
-fn captured_child_job(interface: &[u8], name: &str) -> Result<bool, Refused> {
-    let interface: Value = serde_json::from_slice(interface)
-        .map_err(|_| refused("package_interface_invalid", "held interface is corrupt"))?;
-    let declares = |rows: &str| {
-        interface[rows].as_array().into_iter().flatten().any(|row| row["name"] == name)
-    };
-    match (declares("jobs"), declares("entrypoints")) {
-        (true, false) => Ok(true),
-        (false, true) => Ok(false),
-        _ => Err(refused("invalid_entrypoint", format!("the package declares {name:?} as neither one job nor one entrypoint"))),
     }
 }
 
@@ -389,8 +252,6 @@ impl Runs {
             attention_kernel: spec.attention_kernel.clone(),
             gpus: spec.gpus,
             inputs: spec.inputs.clone(),
-            job: spec.job,
-            accelerator: false, // known only after the actual installation is prepared
             parent: spec.parent.clone(),
             ..Default::default() // root and family: stamped at acceptance
         };
@@ -651,8 +512,12 @@ impl Runs {
             Source::Release { package, release } => Some((package.clone(), release.clone())),
             _ => None,
         };
-        // A job's choices address its callables; its children resolve them.
-        let choices = if spec.job || install_only { &[][..] } else { &spec.models[..] };
+        // Its own slots' choices resolve here; the rest address its callables, whose calls
+        // resolve them.
+        let own: Vec<_> = match install_only {
+            true => vec![],
+            false => spec.models.iter().filter(|c| own_choice(c, &spec.entrypoint)).cloned().collect(),
+        };
         let (installation, plan) = self.resolve(
             actor,
             held,
@@ -660,7 +525,7 @@ impl Runs {
             hub.clone(),
             &spec,
             &spec.entrypoint,
-            choices,
+            &own,
             Some(Box::new({
                 let observe = observe.clone();
                 move |stage: &str, done: u64, total: u64| observe(stage, done, total)
@@ -669,25 +534,20 @@ impl Runs {
         )?;
         let interface: Value = serde_json::from_slice(&installation.interface)
             .map_err(|_| refused("package_interface_invalid", "held interface is corrupt"))?;
-        if let Ok(held) = self.service.catalog.resolve(&installation.generation) {
-            if !held.record.sdk_fallback.is_empty() {
-                let warning = format!("{} {}: {}", installation.package, installation.release, held.record.sdk_fallback);
-                if let Err(error) = self.service.engine.append_log(id, "warning", &warning) {
-                    eprintln!("run {id}: {warning} ({error})");
-                }
+        let generation = self.service.catalog.resolve(&installation.generation)?;
+        if !generation.record.sdk_fallback.is_empty() {
+            let warning = format!("{} {}: {}", installation.package, installation.release, generation.record.sdk_fallback);
+            if let Err(error) = self.service.engine.append_log(id, "warning", &warning) {
+                eprintln!("run {id}: {warning} ({error})");
             }
         }
-        let (rows, noun) = match spec.job {
-            true => ("jobs", "job"),
-            false => ("entrypoints", "entrypoint"),
-        };
-        let declared = interface[rows]
+        let declared = interface["entrypoints"]
             .as_array()
             .and_then(|rows| rows.iter().find(|row| row["name"] == spec.entrypoint.as_str()));
         if declared.is_none() && !install_only {
             return Err(refused(
                 "invalid_entrypoint",
-                format!("{} declares no {noun} {:?}", installation.package, spec.entrypoint),
+                format!("{} declares no entrypoint {:?}", installation.package, spec.entrypoint),
             ));
         }
         if spec.parent.is_empty() {
@@ -695,28 +555,20 @@ impl Runs {
                 public_root(entry)?;
             }
         }
-        // A job's device is its declaration; it is checked before any model input downloads.
-        if let (true, false, Some(entry)) = (spec.job, spec.warm, declared) {
-            crate::catalog::job_gpu(entry, self.service.gpu().is_some()).map_err(|(code, message)| refused(code, message))?;
-        }
-        if spec.job {
-            // A bare parameter, or `<job>.models.<parameter>`, is the job's own model input.
-            // Another goes to the child it names: one of this package's callables, or a slot a
-            // callee App of its environment declares. One naming neither is only a warning.
-            let callees = self.service.catalog.resolve(&installation.generation).map(|held| held.record.callees)?;
-            for choice in spec.models.iter().filter(|c| !own_input(c, &spec.entrypoint)) {
-                let declared = addressed(&choice.parameter, &installation.package, &interface).is_some()
-                    || callees.iter().any(|callee| {
-                        addressed(&choice.parameter, &callee.package, &callee.interface).is_some()
-                    });
-                if !declared {
-                    let warning = format!(
-                        "model choice {:?} names no model slot of this job or the packages it calls; it is ignored",
-                        choice.parameter
-                    );
-                    if let Err(error) = self.service.engine.append_log(id, "warning", &warning) {
-                        eprintln!("run {id}: {warning} ({error})");
-                    }
+        // A choice for another callable goes to the call that names it: one of this package's,
+        // or a slot a callee App of its environment declares. One naming neither is a warning.
+        for choice in spec.models.iter().filter(|c| !install_only && !own_choice(c, &spec.entrypoint)) {
+            let declared = addressed(&choice.parameter, &installation.package, &interface).is_some()
+                || generation.record.callees.iter().any(|callee| {
+                    addressed(&choice.parameter, &callee.package, &callee.interface).is_some()
+                });
+            if !declared {
+                let warning = format!(
+                    "model choice {:?} names no model slot of this function or the packages it calls; it is ignored",
+                    choice.parameter
+                );
+                if let Err(error) = self.service.engine.append_log(id, "warning", &warning) {
+                    eprintln!("run {id}: {warning} ({error})");
                 }
             }
         }
@@ -730,21 +582,29 @@ impl Runs {
                 "interface": interface});
             return warm_result(installed, models);
         }
+        let entry = declared.expect("checked above");
+        let degree = match (&plan, self.service.pool()) {
+            (Some(plan), _) => plan.degree,
+            (None, Some(pool)) => pool.degree(entry, spec.gpus).map_err(|e| refused("gpu_count_unavailable", e.to_string()))?,
+            (None, None) => 0,
+        };
         // A memoized callable's run is answered from the success this machine holds for its
-        // signer under the same computation, and starts nothing. A run that names a weights
-        // destination has an effect beyond its result: it always runs.
-        let generation = self.service.catalog.resolve(&installation.generation)?;
-        let memo = match declared {
-            Some(entry) if spec.weights_destination.is_empty() => call_memo::of(
+        // signer under the same computation, and starts nothing. A writer (weights outputs,
+        // published media) has an effect beyond its result: it always runs.
+        let writer = entry["weights_outputs"].as_array().is_some_and(|rows| !rows.is_empty())
+            || entry["publishes"].as_bool() == Some(true)
+            || !spec.weights_destination.is_empty();
+        let memo = match writer {
+            false => call_memo::of(
                 &generation.record,
                 &spec.application,
                 &entry["invocable"],
                 &spec.input,
                 &spec.inputs,
                 &spec.attention_kernel,
-                call_memo::models(plan.as_ref(), &spec.models),
+                call_memo::models(plan.as_ref(), &own),
             ),
-            _ => Memo::Off,
+            true => Memo::Off,
         };
         let (memo, answer) = match memo {
             Memo::Key(computation) => {
@@ -754,16 +614,10 @@ impl Runs {
             Memo::Unmet(why) => (CallMemo { unmemoized: why, ..Default::default() }, None),
             Memo::Off => (CallMemo::default(), None),
         };
-        // Its children prepare with its context (a served call's too); a job's is journaled,
-        // for its resume.
+        // Its children prepare with its context, and its weights travel under its access.
         if answer.is_none() {
-            let (inputs, origins) = match spec.job {
-                true => self.job_inputs(&spec, &installation.package, &interface, hub.as_ref(), &*observe, &stoppable.stop)?,
-                false => Default::default(),
-            };
-            let context = JobContext {
+            let context = RunContext {
                 installation: installation.alias.clone(),
-                application: spec.application.clone(),
                 hub,
                 providers: spec.providers.clone(),
                 owner: spec.owner.clone(),
@@ -771,19 +625,11 @@ impl Runs {
                 attention_kernel: spec.attention_kernel.clone(),
                 gpus: spec.gpus,
                 models: spec.models.clone(),
-                inputs,
-                origins,
                 weights_destination: spec.weights_destination.clone(),
             };
-            if spec.job {
-                let durable = serde_json::to_vec(&Durable::of(&context)).map_err(io::Error::other)?;
-                self.service
-                    .engine
-                    .with_journal(|journal| journal.bind_job_context(id, &durable))?;
-            }
-            self.jobs.lock().unwrap().insert(id.into(), context);
+            self.contexts.lock().unwrap().insert(id.into(), context);
         }
-        self.service.bind_prepared(
+        let bound = self.service.bind_prepared(
             id,
             &installation.generation,
             Call {
@@ -792,14 +638,18 @@ impl Runs {
                 attention_kernel: spec.attention_kernel,
                 gpus: spec.gpus,
                 inputs: spec.inputs,
-                job: spec.job,
+                degree,
                 parent: spec.parent,
                 application: spec.application,
             },
             plan.as_ref().map(|plan| plan.id.as_str()).unwrap_or_default(),
             memo,
             answer,
-        )?;
+        );
+        if bound.is_err() {
+            self.end(id);
+        }
+        bound?;
         Ok(None)
     }
 
@@ -982,7 +832,7 @@ impl Runs {
         choices: &[domain::ModelChoice],
         observe: Option<crate::published::Observer>,
         stop: Option<&PullCancellation>,
-    ) -> Result<(Installation, Option<crate::gpu_service::GpuPlan>), Refused> {
+    ) -> Result<(Installation, Option<crate::gpu_service::Plan>), Refused> {
         let needs_hub = held
             .as_ref()
             .is_none_or(|installed| declares_models(installed, entrypoint));
@@ -1019,9 +869,9 @@ impl Runs {
         }
     }
 
-    /// A child call of a running job: a run `<request>` under the job's signer, idempotent on
-    /// `intent`, preparing inside itself with the job's context and the choices addressed to
-    /// its callable.
+    /// A child call of a running attempt: a run `<request>` under its parent's signer,
+    /// idempotent on `intent`, preparing inside itself with its parent's context and the
+    /// choices addressed to its callable.
     #[allow(clippy::too_many_arguments)]
     pub fn child(
         self: &Arc<Self>,
@@ -1035,7 +885,7 @@ impl Runs {
         passed: Vec<domain::ModelChoice>,
     ) -> Result<Execution, Refused> {
         let actor = parent.submission.as_ref().map(|s| s.actor.clone()).unwrap_or_default();
-        // An earlier attempt's call is already its run (a resumed job): nothing prepares.
+        // A call the same attempt made already is its run: nothing prepares.
         if let Some(existing) = self.existing(&actor, request, intent)? {
             return Ok(existing);
         }
@@ -1077,26 +927,12 @@ impl Runs {
         digest: &str,
         passed: &[domain::ModelChoice],
     ) -> Result<Spec, Refused> {
-        let held = self.jobs.lock().unwrap().get(parent).cloned();
-        let context = match held {
-            Some(context) => context,
-            None => {
-                let journaled = self
-                    .service
-                    .engine
-                    .with_journal(|journal| journal.job_context(parent))?
-                    .ok_or_else(|| {
-                        refused("child_call_refused", "the job's preparation context is gone")
-                    })?;
-                serde_json::from_slice::<Durable>(&journaled)
-                    .map_err(io::Error::other)?
-                    .context()?
-            }
-        };
+        let context = self.contexts.lock().unwrap().get(parent).cloned().ok_or_else(|| {
+            refused("child_call_refused", "the caller's preparation context is gone")
+        })?;
         let installed = self.service.engine.installation(actor, &context.installation)?
-            .ok_or_else(|| refused("child_call_refused", "the job's installation is gone"))?;
+            .ok_or_else(|| refused("child_call_refused", "the caller's installation is gone"))?;
         let installed = self.callee_view(installed, application)?;
-        let job = captured_child_job(&installed.interface, entrypoint)?;
         let callee_interface: Value = serde_json::from_slice(&installed.interface)
             .map_err(|_| refused("package_interface_invalid", "held interface is corrupt"))?;
         let prefix = format!("{entrypoint}.");
@@ -1104,7 +940,6 @@ impl Runs {
             remove: false,
             warm: false,
             set: None,
-            job,
             parent: parent.into(),
             source: Source::Installation(context.installation),
             entrypoint: entrypoint.into(),
@@ -1112,7 +947,7 @@ impl Runs {
             inputs,
             // A child takes the caller's choices addressed to a slot its own interface declares
             // (a callee's included), named by that slot's path; any other was a warning at the
-            // job's preparation.
+            // caller's preparation.
             models: context
                 .models
                 .into_iter()
@@ -1175,7 +1010,7 @@ impl Runs {
                     runs.resolve(&actor, held, None, hub, &spec, &spec.entrypoint, &models, None, None)
                 })();
             match prepared {
-                Ok((installation, Some(plan))) => {
+                Ok((installation, Some(plan))) if plan.degree > 0 && !plan.slots.is_empty() => {
                     match runs.service.catalog.resolve(&installation.generation)
                         .and_then(|held| held.application(&application)) {
                         Ok(held) => gpu.prefetch(&runs.service.engine, held, plan, (root, family.clone()), owner.clone()),
@@ -1194,36 +1029,42 @@ impl Runs {
         Ok(())
     }
 
-    /// A job ended: its children prepare no more.
-    /// A job's model inputs and where its weights outputs go, for its weights grant.
-    pub fn job_weights(&self, id: &str) -> io::Result<Option<JobWeights>> {
-        let context = match self.jobs.lock().unwrap().get(id).cloned() {
-            Some(context) => context,
-            None => match self.service.engine.with_journal(|journal| journal.job_context(id))? {
-                Some(journaled) => serde_json::from_slice::<Durable>(&journaled)
-                    .map_err(io::Error::other)?
-                    .context()?,
-                None => return Ok(None),
-            },
-        };
-        let hub = context.hub.clone().or_else(|| self.own_hub.clone());
-        let destination = match (context.weights_destination.is_empty(), hub) {
+    /// Where a run's weights outputs go (the requester's repository, under its capability) and
+    /// how its sources held in part fetch what they lack, from the Hub each was resolved at.
+    pub fn weights_access(
+        &self,
+        id: &str,
+        plan: &crate::gpu_service::Plan,
+    ) -> io::Result<(Option<crate::weights::Destination>, Option<crate::weights::Fetch>)> {
+        let context = self.contexts.lock().unwrap().get(id).cloned();
+        let hub = context.as_ref().and_then(|c| c.hub.clone()).or_else(|| self.own_hub.clone());
+        let repository = context.map(|c| c.weights_destination).unwrap_or_default();
+        let destination = match (repository.is_empty(), &hub) {
             (true, _) => None,
-            (false, Some(hub)) => Some(crate::weights::Destination {
-                repository: context.weights_destination.clone(),
-                hub,
-            }),
+            (false, Some(hub)) => Some(crate::weights::Destination { repository, hub: hub.clone() }),
             (false, None) => {
                 return Err(io::Error::other(
-                    "a weights destination needs the run's Hub access, and the job has none",
+                    "a weights destination needs the run's Hub access, and the run has none",
                 ))
             }
         };
-        let fetch = match (&self.publisher, context.hub.clone().or_else(|| self.own_hub.clone())) {
-            (Some(publisher), Some(hub)) if !context.origins.is_empty() => {
+        let origins: BTreeMap<String, (Named, Parts)> = plan
+            .sources
+            .iter()
+            .filter(|source| !source.repository.is_empty() && !source.repository.starts_with("local/"))
+            .map(|source| {
+                let named = Named {
+                    repository: source.repository.clone(),
+                    release: source.release.clone(),
+                    lane: source.lane.clone(),
+                    manifest: source.manifest.clone(),
+                };
+                (source.manifest.clone(), (named, Parts::default()))
+            })
+            .collect();
+        let fetch = match (&self.publisher, hub) {
+            (Some(publisher), Some(hub)) if !origins.is_empty() => {
                 let (publisher, service) = (publisher.clone(), self.service.clone());
-                let origins: BTreeMap<_, _> =
-                    context.origins.into_iter().map(|(manifest, named)| (manifest, (named, Parts::default()))).collect();
                 Some(Arc::new(move |manifest: &ObjectRef, objects: &[ObjectRef]| {
                     let (named, parts) = origins.get(&manifest.id()).ok_or("this source names no Hub checkpoint")?;
                     publisher.fetch_part(&service, &hub, named, parts, objects).map_err(|(code, message)| format!("{code}: {message}"))
@@ -1231,99 +1072,12 @@ impl Runs {
             }
             _ => None,
         };
-        Ok(Some(JobWeights {
-            inputs: context.inputs,
-            destination,
-            fetch,
-        }))
+        Ok((destination, fetch))
     }
 
-    /// The job's own model inputs (`<job>.models.<parameter>`), each made present here: a
-    /// Hub checkpoint by its structure alone (what the job reads it fetches as it reads, and
-    /// the Hub keeps the rest: its origin, by manifest), a provider source made.
-    #[allow(clippy::type_complexity)]
-    fn job_inputs(
-        &self,
-        spec: &Spec,
-        package: &str,
-        interface: &Value,
-        hub: Option<&hub::Source>,
-        observe: &(dyn Fn(&str, u64, u64) + Sync),
-        stop: &PullCancellation,
-    ) -> Result<(BTreeMap<String, (String, ObjectRef)>, BTreeMap<String, Named>), Refused> {
-        let declared = interface["jobs"]
-            .as_array()
-            .and_then(|rows| rows.iter().find(|row| row["name"] == spec.entrypoint.as_str()))
-            .and_then(|row| row["models"].as_array().cloned())
-            .unwrap_or_default();
-        let (mut inputs, mut origins) = (BTreeMap::new(), BTreeMap::new());
-        for row in declared {
-            let path = row["path"].as_str().unwrap_or_default();
-            let parameter = path.rsplit_once(".models.").map_or(path, |(_, p)| p).to_string();
-            let class = row["class"].as_str().unwrap_or_default().to_string();
-            let choice = spec
-                .models
-                .iter()
-                .find(|c| c.parameter == parameter || c.parameter == path);
-            let publisher = self.publisher.as_ref().ok_or_else(|| {
-                refused("capability_unavailable", "this machine prepares no models")
-            })?;
-            // A model passed by value (a `ModelArtifact` another run here produced) is the call's
-            // own argument: its exact checkpoint, as this machine holds it.
-            let passed = spec.input.get(&parameter).and_then(|value| {
-                let digest = value["manifest"]["digest"].as_str()?.strip_prefix("sha256:")?;
-                Some((digest.to_string(), value["manifest"]["length"].as_u64()?))
-            });
-            let manifest = if let Some((sha256, length)) = passed {
-                let held = std::fs::metadata(publisher.store().manifest_path(&sha256)).map(|m| m.len());
-                if held.ok() != Some(length) {
-                    return Err(refused(
-                        "checkpoint_absent",
-                        format!("the model passed to {parameter:?} (sha256:{sha256}) is not held on this machine"),
-                    ));
-                }
-                ObjectRef { sha256, length }
-            } else if let Some(choice) = choice.filter(|c| !c.source.is_empty()) {
-                publisher
-                    .make_source(&choice.source, &choice.profiles, &spec.providers, Some(stop), observe)?
-                    .manifest
-            } else {
-                // A Hub checkpoint by name, or the owner's by hash (th-245); unnamed, the
-                // job's declared default.
-                let declared = crate::published::default_choice(&row, path, package, &spec.owner);
-                let choice = choice.or(declared.as_ref()).ok_or_else(|| {
-                    let (code, message) = crate::published::choice_absent(path, package);
-                    refused(code, message)
-                })?;
-                let (gpu, width) = crate::published::machine_gpu(&self.service);
-                let named = crate::published::choose(choice, path, (&gpu, width))
-                    .map_err(|(code, message)| refused(code, message))?;
-                let hub = hub.ok_or_else(|| {
-                    refused("hub_access_absent", "a Hub model downloads with the run's Hub access, and this run carries none")
-                })?;
-                let stage = format!("downloading {}", named.repository);
-                let named = publisher.download(&self.service, hub, named, &spec.catalog_revision, true, Some(stop), &|done, total| {
-                    observe(&stage, done, total)
-                })?;
-                let sha256 = named.manifest.trim_start_matches("sha256:").to_string();
-                let length = std::fs::metadata(publisher.store().manifest_path(&sha256))?.len();
-                origins.insert(named.manifest.clone(), named);
-                ObjectRef { sha256, length }
-            };
-            inputs.insert(parameter, (class, manifest));
-        }
-        Ok((inputs, origins))
-    }
-
-    pub fn end_job(&self, id: &str) {
-        self.jobs.lock().unwrap().remove(id);
-        if let Err(error) = self
-            .service
-            .engine
-            .with_journal(|journal| journal.forget_job_context(id))
-        {
-            eprintln!("job {id}: its journaled context remains: {error}");
-        }
+    /// A run ended: its children prepare no more, and its access is forgotten.
+    pub fn end(&self, id: &str) {
+        self.contexts.lock().unwrap().remove(id);
     }
 
     /// Without a Hub, held code's models come from the operator's configured grants.
@@ -1334,7 +1088,7 @@ impl Runs {
         entrypoint: &str,
         choices: &[domain::ModelChoice],
         gpus: u32,
-    ) -> Result<Option<crate::gpu_service::GpuPlan>, Refused> {
+    ) -> Result<Option<crate::gpu_service::Plan>, Refused> {
         if !declares_models(installed, entrypoint) {
             if !choices.is_empty() {
                 return Err(refused(
@@ -1344,13 +1098,10 @@ impl Runs {
             }
             return Ok(None);
         }
-        let gpu = self.service.gpu().ok_or_else(|| {
-            refused(
-                "capability_unavailable",
-                "this callable needs a GPU and this machine has none configured",
-            )
+        let pool = self.service.pool().ok_or_else(|| {
+            refused("capability_unavailable", "this machine runs no functions")
         })?;
-        let plan = gpu
+        let plan = pool
             .prepare_root(installed, entrypoint, choices, &[], gpus)
             .map_err(|e| refused("model_preparation_failed", e.to_string()))?;
         self.service.engine.bind_preparation(Preparation {
@@ -1370,56 +1121,50 @@ mod tests {
     use std::{fs, path::Path, process::Command, time::Duration};
     use tensorfs_core::{sha256, store::Store};
 
+    /// The store keeps every checkpoint an unfinished run's plan reads (its raw sources too);
+    /// a plan that cannot be read stops store GC for that pass.
     #[test]
-    fn unfinished_jobs_keep_their_model_inputs_and_an_unreadable_one_stops_store_gc_for_a_pass() {
+    fn unfinished_runs_keep_their_checkpoints_and_an_unreadable_plan_stops_store_gc_for_a_pass() {
         let root = std::env::temp_dir().join(format!("cm-keep-list-{}", uuid::Uuid::new_v4()));
         let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
         let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
-        let publisher = Publisher::new(&root.join("published"), Default::default(), store).unwrap();
+        let publisher = Publisher::new(&root.join("published"), Default::default(), store.clone()).unwrap();
         service.configure_publisher(publisher.clone());
-        let context = |model: &str| Durable {
-            hub: None,
-            installation: String::new(),
-            application: String::new(),
-            owner: "alice".into(),
-            catalog_revision: String::new(),
-            attention_kernel: String::new(),
-            gpus: 0,
-            models: vec![],
-            inputs: BTreeMap::from([("model".into(), ("Model".into(), model.repeat(64), 1))]),
-            origins: BTreeMap::new(),
-            weights_destination: String::new(),
-        };
-        let bind = |id: &str, context: &[u8]| {
-            let bound = service.engine.with_journal(|journal| journal.bind_job_context(id, context));
-            bound.unwrap()
-        };
-        let job = |name: &str, model: &str| {
-            let invocation = crate::journal::Invocation {
-                package: "audit/job".into(),
-                input: json!({}),
-                job: true,
-                ..Default::default()
+        let config = crate::gpu_service::GpuConfig::deviceless(&root.join("home")).unwrap();
+        service.configure_pool(crate::gpu_service::Pool::new(&root.join("pool"), config, store).unwrap()).unwrap();
+        service.engine.bind_installation(Installation {
+            actor: "alice".into(), alias: "installed".into(), generation: "g".into(),
+            package: "audit/derive".into(), release: "1".into(), interface: b"{}".to_vec(), hub: String::new(),
+        }).unwrap();
+        let kept = |model: &str| format!("sha256:{}", model.repeat(64));
+        let run = |name: &str, model: &str| {
+            let plan = crate::gpu_service::Plan {
+                id: format!("plan-{model}"), construction: "c".into(), installation: "installed".into(),
+                generation: "g".into(), entrypoint: "derive".into(), slots: vec![], degree: 0,
+                sources: vec![crate::gpu_service::PlanSource { parameter: "source".into(), manifest: kept(model),
+                    length: 1, repository: String::new(), release: String::new(), lane: String::new() }],
             };
-            let (run, _) = service.engine.accept_run("alice", name, name, invocation).unwrap();
-            bind(&run.id, &serde_json::to_vec(&context(model)).unwrap());
+            service.engine.bind_preparation(Preparation { actor: "alice".into(), id: plan.id.clone(),
+                installation: "installed".into(), document: serde_json::to_vec(&plan).unwrap() }).unwrap();
+            let invocation = crate::journal::Invocation { package: "audit/derive".into(), input: json!({}), ..Default::default() };
+            let (run, _) = service.engine.accept_run("alice", name, name, invocation.clone()).unwrap();
+            service.engine.bind_prepared(&run.id, invocation, &plan.id, Default::default(), None).unwrap();
             run.id
         };
-        let (paused, unknown, ended) = (job("paused", "a"), job("unknown", "b"), job("ended", "c"));
-        service.engine.pause(&paused, "alice", true).unwrap();
+        let (queued, unknown, ended) = (run("queued", "a"), run("unknown", "b"), run("ended", "c"));
         // A state a newer machine wrote is unfinished to this one.
         let journal = rusqlite::Connection::open(root.join("state/execution/executions.sqlite3")).unwrap();
-        let future = "UPDATE executions SET state='future-state' WHERE id=?1";
-        journal.execute(future, [&unknown]).unwrap();
-        service.engine.end_preparation(&ended, Outcome::Failed(Failure::machine("failed", "ended"))).unwrap();
-        let kept = |model: &str| format!("sha256:{}", model.repeat(64));
+        journal.execute("UPDATE executions SET state='future-state' WHERE id=?1", [&unknown]).unwrap();
+        service.engine.cancel(&ended, "alice").unwrap();
         assert_eq!(publisher.caches(&service).unwrap().keep, [kept("a"), kept("b")]);
-        // An unreadable context is no list at all, for this pass only.
-        bind(&paused, b"not a context");
+        // An unreadable plan is no list at all, for this pass only.
+        let plan = journal.query_row("SELECT record FROM preparations WHERE id='plan-a'", [], |row| row.get::<_, String>(0)).unwrap();
+        journal.execute("UPDATE preparations SET record='not a plan' WHERE id='plan-a'", []).unwrap();
         assert!(publisher.caches(&service).is_err());
         assert_eq!(service.reclaim(), crate::reclaim::Swept::default());
-        bind(&paused, &serde_json::to_vec(&context("a")).unwrap());
+        journal.execute("UPDATE preparations SET record=?1 WHERE id='plan-a'", [plan]).unwrap();
         assert_eq!(publisher.caches(&service).unwrap().keep, [kept("a"), kept("b")]);
+        drop(queued);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1447,7 +1192,6 @@ mod tests {
             remove: false,
             warm,
             set: None,
-            job: false,
             parent: String::new(),
             source,
             entrypoint: "steps".into(),
@@ -1477,8 +1221,7 @@ mod tests {
         fs::write(directory.join(".hold"), "").unwrap();
         let interface = json!({
             "application":"fixture:app",
-            "entrypoints":[{"name":"steps","internal":true}],
-            "jobs":[{"name":"steps","internal":true}]
+            "entrypoints":[{"name":"steps","internal":true}]
         });
         fs::write(directory.join("generation.json"), json!({
             "identity":generation,"package":"fixture","version":"2.0.0",
@@ -1494,18 +1237,14 @@ mod tests {
         let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
         let objects = Arc::new(Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap());
         let runs = Runs { service: service.clone(), objects, publisher: None, local: None,
-            own_hub: None, leaf: None, jobs: Default::default() };
-        for job in [false, true] {
-            let mut root_call = spec(Source::Installation("installed".into()), true, "root");
-            root_call.job = job;
-            let refused = runs.prepare("alice", "root", root_call, &runs.service.engine.stoppable("root")).err().unwrap();
-            assert_eq!(refused.code, "callable_internal");
-            let mut child = spec(Source::Installation("installed".into()), true, "child");
-            child.job = job;
-            child.parent = "managed-parent".into();
-            let prepared = runs.prepare("alice", "child", child, &runs.service.engine.stoppable("child")).unwrap().unwrap();
-            assert_eq!(prepared.value["release"], "2.0.0");
-        }
+            own_hub: None, leaf: None, contexts: Default::default() };
+        let root_call = spec(Source::Installation("installed".into()), true, "root");
+        let refused = runs.prepare("alice", "root", root_call, &runs.service.engine.stoppable("root")).err().unwrap();
+        assert_eq!(refused.code, "callable_internal");
+        let mut child = spec(Source::Installation("installed".into()), true, "child");
+        child.parent = "managed-parent".into();
+        let prepared = runs.prepare("alice", "child", child, &runs.service.engine.stoppable("child")).unwrap().unwrap();
+        assert_eq!(prepared.value["release"], "2.0.0");
         let mut warm = spec(Source::Models, true, "set");
         warm.set = Some(vec![SetItem {
             source: Source::Installation("installed".into()), entrypoint: "steps".into(),
@@ -1685,9 +1424,11 @@ mod tests {
             local: Some(Arc::new(local)),
             own_hub: None,
             leaf: None,
-            jobs: Default::default(),
+            contexts: Default::default(),
         });
-        crate::jobs::Jobs::configure(&service, store, Some(&runs)).unwrap();
+        let config = crate::gpu_service::GpuConfig::deviceless(&root.join("home")).unwrap();
+        service.configure_pool(crate::gpu_service::Pool::new(&root.join("pool"), config, store.clone()).unwrap()).unwrap();
+        crate::calls::Calls::configure(&service, store, Some(&runs)).unwrap();
         (runs, objects)
     }
 
@@ -1781,36 +1522,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// A model passed by value to a job's model slot (a `ModelArtifact` a sibling produced
-    /// here) is that exact checkpoint; one this machine does not hold is refused by name.
-    #[test]
-    fn a_model_passed_by_value_is_its_exact_checkpoint() {
-        let root = std::env::temp_dir().join(format!("cm-by-value-{}", uuid::Uuid::new_v4()));
-        let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
-        let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
-        let publisher = Publisher::new(&root.join("published"), Default::default(), store.clone()).unwrap();
-        let objects = Arc::new(Objects::new(&root.join("writes"), store.clone(), service.engine.clone()).unwrap());
-        let runs = Runs { service: service.clone(), objects, publisher: Some(publisher), local: None,
-            own_hub: None, leaf: None, jobs: Default::default() };
-        let held = "ab".repeat(32);
-        let path = store.manifest_path(&held);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, b"manifest").unwrap();
-        let interface = json!({"jobs":[{"name":"compute","models":[{"path":"compute.models.source","class":"Source"}]}]});
-        let artifact = |hex: &str| json!({"producer_request_id":"job-1/0","output_slot":"weights",
-            "manifest":{"digest":format!("sha256:{hex}"),"length":8},"tensorfs_receipt_digest":format!("sha256:{hex}")});
-        let mut spec = spec(Source::Models, false, "d");
-        (spec.job, spec.entrypoint) = (true, "compute".into());
-        spec.input = json!({"source": artifact(&held), "factor": 2});
-        let (inputs, _) = runs.job_inputs(&spec, "local/job", &interface, None, &|_, _, _| (), &PullCancellation::default()).unwrap();
-        assert_eq!(inputs["source"], ("Source".to_string(), ObjectRef { sha256: held, length: 8 }));
-        spec.input = json!({"source": artifact(&"cd".repeat(32)), "factor": 2});
-        let absent = runs.job_inputs(&spec, "local/job", &interface, None, &|_, _, _| (), &PullCancellation::default()).unwrap_err();
-        assert_eq!(absent.code, "checkpoint_absent", "{}", absent.message);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    /// A job's child that is itself a job runs as one, as its held package declares it.
+    /// A callee's child runs with its own model slots in its caller's environment, and takes
+    /// the choices its caller carries for them.
     #[test]
     fn a_callee_uses_its_own_model_slots_in_the_callers_environment() {
         let root = std::env::temp_dir().join(format!("cm-callee-model-{}", uuid::Uuid::new_v4()));
@@ -1835,7 +1548,7 @@ mod tests {
         let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
         let objects = Arc::new(Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap());
         let runs = Runs { service: service.clone(), objects, publisher: None, local: None,
-            own_hub: None, leaf: None, jobs: Default::default() };
+            own_hub: None, leaf: None, contexts: Default::default() };
         let installed = service.engine.bind_installation(Installation {
             actor:"alice".into(),alias:"caller".into(),generation:generation.clone(),
             package:"first/caller".into(),release:"1.0.0".into(),interface:serde_json::to_vec(&caller).unwrap(),
@@ -1871,21 +1584,16 @@ mod tests {
         assert!(!legacy.record.owns("callee:app","other/callee-lib-name"));
 
         let source = hub::Source::new("https://hub.example", None, vec![], None).unwrap();
-        runs.jobs.lock().unwrap().insert("7".into(), JobContext {
-            installation:"caller".into(),application:String::new(),hub:Some(source),providers:Default::default(),
-            owner:"alice".into(),catalog_revision:String::new(),attention_kernel:String::new(),gpus:2,
+        runs.contexts.lock().unwrap().insert("7".into(), RunContext {
+            installation:"caller".into(),hub:Some(source),owner:"alice".into(),gpus:2,
             models:vec![
                 domain::ModelChoice { parameter:"second/callee/render.models.network".into(),repository:"second/chosen".into(),..Default::default() },
                 domain::ModelChoice { parameter:"render.models.absent".into(),repository:"second/nowhere".into(),..Default::default() },
             ],
-            inputs:Default::default(),origins:Default::default(),weights_destination:String::new(),
+            ..Default::default()
         });
         let child = runs.child_spec("alice","7","callee:app","render",json!({}),vec![],"child",&[]).unwrap();
         assert_eq!(child.gpus, 2);
-        let durable = serde_json::to_vec(&Durable::of(&runs.jobs.lock().unwrap()["7"])).unwrap();
-        let restored = serde_json::from_slice::<Durable>(&durable).unwrap().context().unwrap();
-        assert_eq!(restored.gpus, 2, "a resumed job keeps its exact GPU request");
-        runs.jobs.lock().unwrap().insert("7".into(), restored);
         let chosen: Vec<_> = child.models.iter().map(|c| (c.parameter.as_str(), c.repository.as_str())).collect();
         assert_eq!(chosen, [("render.models.network", "second/chosen")],
             "a choice addressed to the callee's package reaches its declared slot, by that slot's path");
@@ -1905,40 +1613,10 @@ mod tests {
         assert_eq!(runs.child_spec("alice", "7", "callee:app", "render", json!({}), vec![], "", &[]).unwrap().models[0].repository, "second/chosen");
         let bad = domain::ModelChoice { parameter: "render.models.absent".into(), ..Default::default() };
         assert_eq!(runs.child_spec("alice", "7", "callee:app", "render", json!({}), vec![], "", &[bad]).err().unwrap().code, "invalid_request");
-        runs.jobs.lock().unwrap().get_mut("7").unwrap().models.clear();
+        runs.contexts.lock().unwrap().get_mut("7").unwrap().models.clear();
         assert!(runs.child_spec("alice", "7", "callee:app", "render", json!({}), vec![], "", &[]).unwrap().models.is_empty(),
             "without inherited/explicit choices the normal resolver owns captured defaults");
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn a_child_takes_its_kind_from_the_held_package() {
-        let root = std::env::temp_dir().join(format!("cm-child-kind-{}", uuid::Uuid::new_v4()));
-        let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
-        let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
-        let objects = Arc::new(Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap());
-        let runs = Runs { service: service.clone(), objects, publisher: None, local: None, own_hub: None, leaf: None, jobs: Default::default() };
-        let interface = json!({
-            "jobs": [{"name": "pipeline"}, {"name": "leaf-job"}, {"name": "both"}],
-            "entrypoints": [{"name": "leaf-call"}, {"name": "both"}],
-        });
-        service.engine.bind_installation(crate::journal::Installation {
-            actor: "alice".into(), alias: "pkg".into(), generation: "g1".into(), package: "org/pkg".into(),
-            release: "1.0.0".into(), interface: serde_json::to_vec(&interface).unwrap(),
-            hub: String::new(),
-        }).unwrap();
-        runs.jobs.lock().unwrap().insert("7".into(), JobContext {
-            installation: "pkg".into(), hub: None, providers: Default::default(), owner: "alice".into(),
-            catalog_revision: String::new(), application: String::new(),
-            attention_kernel: String::new(), gpus: 0, models: vec![],
-            inputs: Default::default(), origins: Default::default(), weights_destination: String::new(),
-        });
-        let child = |name: &str| runs.child_spec("alice", "7", "", name, json!({}), vec![], "d", &[]);
-        assert!(child("leaf-job").unwrap().job);
-        assert!(!child("leaf-call").unwrap().job);
-        assert_eq!(child("missing").err().unwrap().code, "invalid_entrypoint");
-        assert_eq!(child("both").err().unwrap().code, "invalid_entrypoint");
-        let _ = fs::remove_dir_all(root);
     }
 
     /// A preparing run's stages are observed like a running attempt's.

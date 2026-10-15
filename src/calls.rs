@@ -1,64 +1,43 @@
-//! Jobs and their child runs. A root job's executor holds its GPU allocation (`gpu_allocation`)
-//! until exit or `Context.release_gpus()`; an accelerator job also keeps its own GPU.
-//! A served call (`gpu_service`, or `call` here) is a `Caller` too: its children share its GPU.
-//! Each call it makes to one of its package's invocables arrives on the seam (`child_call`)
-//! and becomes a run of its own, `<parent>/<call_index>`, under the parent's signer: same
-//! records, dispatched like any run, canceled with the parent. A child's result and files
-//! reach the parent through the seam (`CallState`), its files copied into the parent's spool.
-//!
-//! Only a job pauses. Its root stops (as a cancel stops it) and the run rests `paused`; its
-//! unstarted children are held, started ones run to their end. Resume replays only the root:
-//! each call it makes again finds its child by index and intent, finished children answer
-//! with their results, held ones go on. The run's scratch and checkpoint declarations persist
-//! across attempts; the self-managing sweep removes the scratch once the run has ended.
+//! Child calls and each attempt's weights grant. Every call an attempt makes to a callable of
+//! its environment arrives on the seam (`child_call`) and becomes a run of its own,
+//! `<parent>/<call_index>`, under the parent's signer: same records, dispatched like any run,
+//! canceled with the parent. A child's result and files reach the parent through the seam
+//! (`state`), its files copied into the parent's spool. A memoized child's success is held when
+//! it completes, whatever its parent then does: a parent canceled or failed and run again finds
+//! its finished calls answered.
 use crate::{
     catalog::HeldGeneration,
-    device_executor::{
-        self, Answer, Binding, Budgets, CallInterface, DeviceCommand, DeviceExecutor,
-        ExecutorConfig, Frame, Kind, Services,
-    },
+    device_executor::{Answer, CallInterface, Frame, Kind},
     execution::Engine,
-    gpu_allocation::Claims,
-    gpu_service::{
-        command_ok, keep_triage, output_bindings, record_measurements, settle, stage_inputs,
-        WakeOnExit,
-    },
-    journal::{Execution, ExecutorFacts, Failure, InputFile, Outcome, State},
-    launch_identity::{LaunchIdentity, Seal},
+    gpu_service::Plan,
+    journal::{Execution, Failure, InputFile, State},
+    launch_identity::LaunchIdentity,
     runs::Runs,
     service::Service,
 };
 use serde_json::{json, Value};
-use crate::objects::Refused;
 use std::{
     collections::{BTreeMap, HashMap},
     fs::{self, File},
     io::{self, Write},
-    os::{fd::AsRawFd, unix::net::UnixStream},
+    os::unix::net::UnixStream,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, Weak},
 };
 use tensorfs_core::store::Store;
 
-/// The weightless construction a model-less child is served from.
-const WEIGHTLESS: &str = "weightless";
-
-pub struct Jobs {
-    root: PathBuf,
-    incarnation: String,
-    environment: BTreeMap<String, String>,
+pub struct Calls {
     identity: Option<LaunchIdentity>,
-    store: Arc<Store>,
     service: Weak<Service>,
-    /// Children prepare as runs do, with their job's context.
+    /// Children prepare as runs do, with their parent's context.
     runs: Weak<Runs>,
-    /// Running jobs by execution id: what their child calls need.
+    /// Running attempts that may call, by execution id.
     parents: Mutex<HashMap<String, Arc<Parent>>>,
-    /// A job's weights sources and outputs (`weights_writer`).
+    /// Every attempt's weights sources and outputs (`weights_writer`).
     weights: crate::weights::Weights,
 }
 
-/// A running job: its signer, spool, callables and calls.
+/// A running attempt that calls: its signer, spool, callables and calls.
 struct Parent {
     id: String,
     request: String,
@@ -67,17 +46,14 @@ struct Parent {
     /// `(module, export)` of each invocable it may call: the App it belongs to (empty: its own
     /// package's; else a callee's in its environment) and the entrypoint registered for it.
     callables: Callables,
-    /// The job itself is memoized: each call it makes must be too, or replaying its result
-    /// would skip that call's effects.
+    /// It is itself memoized: each call it makes must be too, or replaying its result would
+    /// skip that call's effects.
     pure: bool,
     /// The callables declared `memoize=True` (with or without an operation identity).
     pure_callables: std::collections::HashSet<(String, String)>,
-    /// Other packages' entrypoints: the Runtime's typed callers send them a serving call,
-    /// `{"payload": <request>, "models": {<slot>: ModelArtifact | null}}`.
-    serving: std::collections::HashSet<(String, String)>,
     /// The parent's own file inputs: a child may be handed any of them.
     inputs: Vec<InputFile>,
-    calls: Mutex<Calls>,
+    calls: Mutex<CallTable>,
 }
 
 impl Parent {
@@ -109,7 +85,7 @@ impl Parent {
             ))
     }
 
-    /// A call of this job has not ended: its executor is watched, and the root waits on it.
+    /// A call of this attempt has not ended: its executor is watched, and the parent waits on it.
     fn unfinished(&self, engine: &Engine) -> bool {
         let calls = self.calls.lock().unwrap();
         calls.by_index.values().any(|call| {
@@ -120,16 +96,15 @@ impl Parent {
     }
 }
 
-/// An attempt that may call (a job's or a served call's): its calls' record, kept for the
-/// nudges while it lives.
+/// An attempt that may call: its calls' record, kept for the nudges while it lives.
 pub(crate) struct Caller {
-    jobs: Arc<Jobs>,
+    calls: Arc<Calls>,
     parent: Arc<Parent>,
 }
 impl Caller {
     /// One of its attempt's call frames: a child call, poll, cancel, prefetch or GPU release.
     pub(crate) fn seam(&self, frame: &Frame) -> io::Result<(Answer, Option<File>)> {
-        self.jobs.seam(&self.parent, frame)
+        self.calls.seam(&self.parent, frame)
     }
     /// Its executor is still while a call it waits on runs: that call's executor is watched.
     pub(crate) fn waits(&self, engine: &Arc<Engine>) -> crate::process::Waits {
@@ -139,18 +114,18 @@ impl Caller {
 }
 impl Drop for Caller {
     fn drop(&mut self) {
-        self.jobs.parents.lock().unwrap().remove(&self.parent.id);
+        self.calls.parents.lock().unwrap().remove(&self.parent.id);
     }
 }
 
-/// What a served package's executor may call, sent on its Start (`interface`: its App's
-/// interface beside the executor).
+/// What a package's executor may call, sent on its Start (`interface`: its App's interface
+/// beside the executor).
 pub(crate) fn call_interfaces(held: &HeldGeneration, interface: &Path) -> Vec<CallInterface> {
     invocables(&held.record, &held.record.application, &held.record.interface, interface).0
 }
 
 #[derive(Default)]
-struct Calls {
+struct CallTable {
     /// The parent's nudge socket (`child_events`): a byte when one of its calls may have moved.
     watcher: Option<UnixStream>,
     by_index: HashMap<u64, ChildCall>,
@@ -178,69 +153,29 @@ struct Received {
     media_type: String,
 }
 
-impl Jobs {
-    /// Jobs and model-less calls, with the configured executor environment and identity.
-    /// CPU jobs remain deviceless; their GPU children borrow a workflow reservation.
-    /// `runs` prepares a job's children (none: no children).
+impl Calls {
+    /// The machine's call broker; `runs` prepares children (none: no children).
     pub fn configure(
         service: &Arc<Service>,
         store: Arc<Store>,
         runs: Option<&Arc<Runs>>,
     ) -> io::Result<Arc<Self>> {
-        let root = service
-            .engine
-            .root
-            .parent()
-            .ok_or_else(|| io::Error::other("the engine has no machine root"))?
-            .join("cpu");
-        let (environment, identity) = match service.gpu() {
-            Some(gpu) => (gpu.config().environment.clone(), gpu.config().identity),
-            None => {
-                let home = root.join("home");
-                fs::create_dir_all(&home)?;
-                let home = home.to_string_lossy().into_owned();
-                let minimal = [("PATH", "/usr/local/bin:/usr/bin:/bin"), ("LANG", "C.UTF-8"), ("HOME", &home)];
-                (minimal.into_iter().map(|(k, v)| (k.into(), v.into())).collect(), None)
-            }
-        };
-        let jobs = Self::new(&root, store, environment, identity, service, runs)?;
-        service.configure_jobs(jobs.clone());
-        Ok(jobs)
-    }
-
-    fn new(
-        root: &Path,
-        store: Arc<Store>,
-        environment: BTreeMap<String, String>,
-        identity: Option<LaunchIdentity>,
-        service: &Arc<Service>,
-        runs: Option<&Arc<Runs>>,
-    ) -> io::Result<Arc<Self>> {
-        fs::create_dir_all(root)?;
-        let incarnation = uuid::Uuid::new_v4().simple().to_string();
-        crate::launch_identity::remove_stale_jit(root, &incarnation);
-        crate::gpu_service::remove_old_executor_roots(root);
-        let jobs = Arc::new(Self {
-            root: root.into(),
-            incarnation,
-            environment,
-            identity,
-            store: store.clone(),
+        let calls = Arc::new(Self {
+            identity: service.pool().and_then(|pool| pool.config().identity),
             service: Arc::downgrade(service),
             runs: runs.map_or_else(Weak::new, Arc::downgrade),
             parents: Mutex::new(HashMap::new()),
             weights: crate::weights::Weights::new(store)?,
         });
-        // The startup sweep ran before jobs were configured: ended runs' scratch goes now.
-        jobs.sweep_scratch(&service.engine);
-        if let Err(error) = jobs.sweep_canceled_outputs(&service.engine) {
+        if let Err(error) = calls.sweep_canceled_outputs(&service.engine) {
             eprintln!("startup canceled native outputs: {error}");
         }
-        let (watching, engine) = (Arc::downgrade(&jobs), service.engine.clone());
+        let (watching, engine) = (Arc::downgrade(&calls), service.engine.clone());
         std::thread::Builder::new()
-            .name("job-nudges".into())
+            .name("call-nudges".into())
             .spawn(move || nudge(watching, engine))?;
-        Ok(jobs)
+        service.configure_calls(calls.clone());
+        Ok(calls)
     }
 
     /// `id`'s attempt waits on a call it made.
@@ -248,228 +183,8 @@ impl Jobs {
         self.parents.lock().unwrap().get(id).is_some_and(|parent| parent.unfinished(engine))
     }
 
-    /// Whether this record runs here: a job, or a call that needs no GPU.
-    pub fn takes(record: &Execution) -> bool {
-        record.invocation.job
-            || record
-                .submission
-                .as_ref()
-                .is_none_or(|s| s.preparation_id.is_empty())
-    }
-
-    /// Start `record`, or leave it queued (false). A root job registers its allocation; an
-    /// accelerator job also needs its GPU.
-    pub fn dispatch(
-        self: &Arc<Self>,
-        engine: &Arc<Engine>,
-        record: &Execution,
-        held: HeldGeneration,
-        claims: &mut Claims,
-    ) -> io::Result<bool> {
-        let pool = self.service.upgrade().and_then(|s| s.gpu());
-        let root = pool.as_ref().filter(|_| record.invocation.job && record.invocation.parent.is_empty()).and_then(|pool| {
-            let width = match record.invocation.gpus {
-                0 => held.record.widest_group(pool.width()) as usize,
-                gpus => gpus as usize,
-            };
-            pool.root(engine, record, width)
-        });
-        let allocation = match (record.invocation.accelerator, &pool) {
-            (true, None) => return Err(io::Error::other("accelerator_job_unavailable: no configured GPU")),
-            (true, Some(pool)) => match pool.job_allocation(engine, record, claims)? {
-                Some(allocation) => Some(allocation),
-                None => return Ok(false),
-            },
-            (false, _) => None,
-        };
-        let (jobs, job) = (self.clone(), record.invocation.job);
-        engine.dispatch_managed(&record.id, move |engine, id| {
-            let result = match job {
-                true => jobs.job(&engine, &id, held, allocation, root),
-                false => jobs.call(&engine, &id, held),
-            };
-            let settled = match &result {
-                Err(error) => settle(&engine, &id, error),
-                Ok(()) => Ok(()),
-            };
-            jobs.ended(&id);
-            settled.and(result)
-        })
-    }
-
-    /// An executor sealed to its admitted allocation (otherwise deviceless). None if stopped.
-    fn launch(
-        self: &Arc<Self>,
-        engine: &Arc<Engine>,
-        id: &str,
-        held: &HeldGeneration,
-        allocation: Option<crate::gpu_service::JobAllocation>,
-        root_allocation: Option<crate::gpu_service::RootAllocation>,
-    ) -> io::Result<Option<DeviceExecutor>> {
-        if let Some(gpu) = &allocation { gpu.prepare()?; }
-        // Reclamation may have waited for a serving descendant to finish.
-        // A stopped job never opens an accelerator after that wait.
-        let pending = engine.get(id)?;
-        if pending.cancel_actor.is_some() || pending.pause_actor.is_some() {
-            engine.finish_stopped(id)?;
-            return Ok(None);
-        }
-        let root = self.root.join(uuid::Uuid::new_v4().simple().to_string());
-        fs::create_dir(&root)?;
-        let directory = File::open(&root)?;
-        let socket = match self.identity {
-            Some(_) => root.join("executor"),
-            None => PathBuf::from(format!(
-                "/proc/{}/fd/{}/executor",
-                std::process::id(),
-                directory.as_raw_fd()
-            )),
-        };
-        let config = ExecutorConfig {
-            python: held.record.python.clone(),
-            root,
-            socket,
-            environment: self.environment.clone(),
-            seal: Seal::prepare(
-                &self.root,
-                self.identity,
-                &self.incarnation,
-                &held.record.identity,
-                allocation.as_ref().map(|gpu| gpu.devices.as_str()).unwrap_or_default(),
-            )?,
-            generation_hold: Some(held.retention()),
-            identity: self.identity,
-            cgroup_namespace: Some(crate::scope::namespace(
-                self.root.parent().unwrap_or(&self.root),
-            )),
-        };
-        let jobs = Arc::downgrade(self);
-        let mut executor = DeviceExecutor::spawn_observed(config, |birth, cancel| {
-            let (cancel, request) = (cancel.clone(), id.to_string());
-            engine.register_managed(
-                id,
-                birth.clone(),
-                Arc::new(move || {
-                    let canceled = cancel.cancel(&request);
-                    if let Some(jobs) = jobs.upgrade() {
-                        // The root is still running: no resume can change this answer.
-                        let hold = jobs
-                            .service
-                            .upgrade()
-                            .is_some_and(|s| Self::holding(&s.engine, &request));
-                        jobs.stop_children(&request, hold);
-                    }
-                    canceled
-                }),
-            )
-        })?;
-        executor.retain_until_exit(directory);
-        if let Some(allocation) = allocation {
-            executor.retain_until_exit(allocation);
-        }
-        if let Some(root_allocation) = root_allocation {
-            executor.retain_until_exit(root_allocation);
-        }
-        executor.retain_until_exit(WakeOnExit(Arc::downgrade(engine)));
-        let facts = ExecutorFacts::observed(
-            executor.birth.pid, executor.hello.runtime_version.clone(),
-            executor.hello.tensorfs_version.clone(),
-        );
-        if !engine.authorize_managed(id, Some(facts))? {
-            engine.finish_stopped(id)?;
-            executor.shutdown()?;
-            return Ok(None);
-        }
-        Ok(Some(executor))
-    }
-
-    /// The interface of the App a run calls (`module`: the root's or a callee's) beside its
-    /// executor, and that App.
-    fn interface(
-        &self,
-        executor: &DeviceExecutor,
-        held: &HeldGeneration,
-        module: &str,
-    ) -> io::Result<(PathBuf, String, Value)> {
-        let (_, _, interface) = held
-            .record
-            .app(module)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "this environment holds no such App"))?;
-        let path = executor.root_path().join("package-interface.json");
-        fs::write(&path, serde_json::to_vec(interface)?)?;
-        if let Some(identity) = self.identity {
-            identity.readable(&path)?;
-        }
-        Ok((path, module.to_string(), interface.clone()))
-    }
-
-    fn spool(&self, executor: &DeviceExecutor, id: &str) -> io::Result<PathBuf> {
-        let spool = executor.root_path().join(format!("output-{id}"));
-        fs::create_dir(&spool)?;
-        if let Some(identity) = self.identity {
-            identity.own(&spool)?;
-        }
-        Ok(spool)
-    }
-
-    fn job(
-        self: &Arc<Self>,
-        engine: &Arc<Engine>,
-        id: &str,
-        held: HeldGeneration,
-        allocation: Option<crate::gpu_service::JobAllocation>,
-        root: Option<crate::gpu_service::RootAllocation>,
-    ) -> io::Result<()> {
-        let record = engine.get(id)?;
-        let Some(mut executor) = self.launch(engine, id, &held, allocation, root)? else {
-            return Ok(());
-        };
-        let (interface, application, document) =
-            self.interface(&executor, &held, &record.invocation.module)?;
-        let spool = self.spool(&executor, id)?;
-        let scratch = self.scratch(id)?;
-        let inputs = stage_inputs(&self.store, self.identity, &spool, &record.invocation.inputs)?;
-        let (caller, call_interfaces) = self.caller(&record, &held, &document, &interface, &spool);
-        executor.waits = Some(caller.waits(engine));
-        let (grant, models) = self.weights_grant(engine, &record, &document, &spool)?;
-        let mut services = Seam {
-            engine,
-            id,
-            store: &self.store,
-            spool: &spool,
-            completed: 0,
-            publish: true,
-            job: Some(&caller),
-            appended: HashMap::new(),
-            weights: Some((&self.weights, &grant)),
-        };
-        let command = DeviceCommand::RunJob {
-            max_output_bytes: crate::output_capacity::for_callable(&document, "jobs", &record.invocation.entrypoint)?,
-            request_id: id.into(),
-            job: record.invocation.entrypoint.clone(),
-            payload: record.invocation.input.clone(),
-            application,
-            package_interface: interface,
-            spool: spool.clone(),
-            scratch,
-            deadline_s: None,
-            inputs: inputs.inputs,
-            trees: inputs.trees,
-            call_interfaces,
-            models,
-            weights: true,
-            budget: record.invocation.accelerator.then_some(device_executor::JobBudget { gpu_count: 1 }),
-        };
-        // A command over the control frame fails its run by name; the executor never sees it.
-        if let Some(why) = oversized(&command) {
-            executor.shutdown()?;
-            let failure = Failure::executor("refused", "runtime", "job_command_too_large", &why);
-            return engine.finish(id, Outcome::Failed(failure)).map(drop);
-        }
-        let reply = executor.command(&command, &mut services);
-        drop(caller);
-        conclude(engine, id, &executor, &spool, command_ok(reply?)?)?;
-        executor.shutdown()
+    pub(crate) fn weights(&self) -> &crate::weights::Weights {
+        &self.weights
     }
 
     /// `record`'s attempt as a caller of its environment's callables (`document`: its App's
@@ -483,12 +198,6 @@ impl Jobs {
         spool: &Path,
     ) -> (Caller, Vec<CallInterface>) {
         let (rows, callables) = invocables(&held.record, &record.invocation.module, document, interface);
-        let serving = rows
-            .iter()
-            .filter(|row| !row.self_call && row.kind == "entrypoint")
-            .map(|row| (row.module.clone(), row.export.clone()))
-            .collect();
-        let kind = if record.invocation.job { "job" } else { "entrypoint" };
         let submission = record.submission.as_ref();
         let parent = Arc::new(Parent {
             id: record.id.clone(),
@@ -496,190 +205,81 @@ impl Jobs {
             actor: submission.map(|s| s.actor.clone()).unwrap_or_default(),
             spool: spool.into(),
             callables,
-            pure: declarations(document).any(|(declared, entry, declared_kind)| {
-                declared_kind == kind
-                    && entry["name"].as_str() == Some(record.invocation.entrypoint.as_str())
+            pure: declarations(document).any(|(declared, entry)| {
+                entry["name"].as_str() == Some(record.invocation.entrypoint.as_str())
                     && declared["memoize"].as_bool() == Some(true)
             }),
             pure_callables: pure_callables(&held.record),
-            serving,
             inputs: record.invocation.inputs.clone(),
-            calls: Mutex::new(Calls::default()),
+            calls: Mutex::new(CallTable::default()),
         });
         self.parents.lock().unwrap().insert(record.id.clone(), parent.clone());
-        (Caller { jobs: self.clone(), parent }, rows)
+        (Caller { calls: self.clone(), parent }, rows)
     }
 
-    /// The job attempt's weights grant: its model inputs as sources (and as the executor's
-    /// `models`), its declared weights outputs, and where they are published.
-    fn weights_grant(
+    /// The attempt's weights grant: its plan's `Weights[M]` sources, the weights outputs its
+    /// function declares, where they are published and how a source held in part fetches what
+    /// it lacks. None when it reads and writes no weights.
+    pub(crate) fn grant(
         &self,
         engine: &Arc<Engine>,
         record: &Execution,
-        interface: &Value,
+        plan: &Plan,
+        document: &Value,
         spool: &Path,
-    ) -> io::Result<(crate::weights::Grant, BTreeMap<String, Value>)> {
-        let context = match self.runs.upgrade() {
-            Some(runs) => runs.job_weights(&record.id)?,
-            None => None,
-        };
-        let (inputs, destination, fetch) = context.map_or_else(Default::default, |c| (c.inputs, c.destination, c.fetch));
-        let models = inputs
-            .iter()
-            .map(|(parameter, (class, manifest))| {
-                (parameter.clone(), json!({"class": class, "manifest": manifest.id(), "length": manifest.length}))
-            })
-            .collect();
-        let sources = inputs.values().map(|(_, m)| (m.id(), m.length)).collect();
-        let outputs = interface["jobs"]
+    ) -> io::Result<Option<crate::weights::Grant>> {
+        let entry = document["entrypoints"]
             .as_array()
             .and_then(|rows| rows.iter().find(|row| row["name"] == record.invocation.entrypoint.as_str()))
-            .and_then(|row| row["weights_outputs"].as_array())
+            .cloned()
+            .unwrap_or_default();
+        let outputs: BTreeMap<String, u64> = entry["weights_outputs"]
+            .as_array()
             .into_iter()
             .flatten()
             .filter_map(|row| Some((row["output_id"].as_str()?.to_string(), row["max_bytes"].as_u64()?)))
             .collect();
+        if plan.sources.is_empty() && outputs.is_empty() {
+            return Ok(None);
+        }
+        let (destination, fetch) = match self.runs.upgrade() {
+            Some(runs) => runs.weights_access(&record.id, plan)?,
+            None => (None, None),
+        };
+        let sources = plan.sources.iter().map(|s| (s.manifest.clone(), s.length)).collect();
         let actor = record.submission.as_ref().map(|s| s.actor.clone()).unwrap_or_default();
-        let current = weights_current(engine.clone(), record);
-        let (journal, run, attempt) = (engine.clone(), record.id.clone(), record.attempt);
-        let bind_output = Arc::new(move |transaction: &str, slot: &str| {
-            journal.with_journal(|journal| journal.bind_derived_output(&run, attempt, transaction, slot))
+        let (run, attempt) = (record.id.clone(), record.attempt);
+        let current = {
+            let (engine, run) = (engine.clone(), run.clone());
+            Arc::new(move || {
+                engine.get(&run).is_ok_and(|r| {
+                    r.attempt == attempt && r.state == State::Running && r.cancel_actor.is_none()
+                })
+            })
+        };
+        let bind_output = {
+            let engine = engine.clone();
+            Arc::new(move |transaction: &str, slot: &str| {
+                engine.with_journal(|journal| journal.bind_derived_output(&run, attempt, transaction, slot))
+            })
+        };
+        // A committed derivation is replayed for the same code, declaration and inputs (the
+        // raw declaration the writer opens), never for its declaration alone.
+        let replay = self.service.upgrade().and_then(|service| {
+            let held = service.catalog.resolve(&record.invocation.generation).ok()?;
+            let operation = crate::call_memo::operation(&held.record, &record.invocation.module, &entry["invocable"])?;
+            let declared = serde_json_canonicalizer::to_vec(&entry).ok()?;
+            Some(format!("{operation}\0{}", tensorfs_core::sha256::hex_digest(&declared)))
         });
-        let grant = crate::weights::Grant::new(&actor, &record.id, spool, sources, outputs, destination,
-            crate::weights::GrantAuthority { current, bind_output, fetch });
-        Ok((grant, models))
-    }
-
-    /// A model-less call (a run's own, or a job's child) in a weightless construction.
-    fn call(
-        self: &Arc<Self>,
-        engine: &Arc<Engine>,
-        id: &str,
-        held: HeldGeneration,
-    ) -> io::Result<()> {
-        let record = engine.get(id)?;
-        let Some(mut executor) = self.launch(engine, id, &held, None, None)? else {
-            return Ok(());
-        };
-        let (interface, application, document) =
-            self.interface(&executor, &held, &record.invocation.module)?;
-        let spool = self.spool(&executor, id)?;
-        let (caller, call_interfaces) = self.caller(&record, &held, &document, &interface, &spool);
-        executor.waits = Some(caller.waits(engine));
-        let mut services = Seam {
-            engine,
-            id,
-            store: &self.store,
-            spool: &spool,
-            completed: 0,
-            // A child's products show nothing; its parent decides.
-            publish: record.invocation.parent.is_empty(),
-            job: Some(&caller),
-            appended: HashMap::new(),
-            weights: None,
-        };
-        command_ok(executor.command(
-            &DeviceCommand::Start {
-                devices: String::new(),
-                application: application.clone(),
-                package_interface: interface.clone(),
-                sequence_parallel_degree: 1,
-                import_only: false,
-                call_interfaces,
-            },
-            &mut services,
-        )?)?;
-        command_ok(executor.command(
-            &DeviceCommand::Load {
-                construction: WEIGHTLESS.into(),
-                devices: String::new(),
-                sequence_parallel_degree: 1,
-                binding: Box::new(Binding {
-                    application,
-                    package_interface: interface.to_string_lossy().into_owned(),
-                    ..Binding::default()
-                }),
-                budgets: Budgets::default(),
-                models: vec![],
-                authorized_device_limit_bytes: None,
-                attention_pin: String::new(),
-                sealed_tiers: false,
-                model_sources: false,
-                staged_tiers: false,
-                pinned_bytes: None,
-                device_weights: false,
-                cap_bytes: None,
-            },
-            &mut services,
-        )?)?;
-        command_ok(executor.command(
-            &DeviceCommand::Activate {
-                construction: WEIGHTLESS.into(),
-            },
-            &mut services,
-        )?)?;
-        let invocation = &record.invocation;
-        let prepared = executor.command(
-            &DeviceCommand::PrepareRequest {
-                request_id: id.into(),
-                construction: WEIGHTLESS.into(),
-                entrypoint: invocation.entrypoint.clone(),
-                payload: invocation.input.clone(),
-                attention_kernel: String::new(),
-                input_metadata: invocation
-                    .inputs
-                    .iter()
-                    .map(|i| (i.input_id.clone(), json!({"input_id": i.input_id, "media_type": i.media_type, "digest": i.digest, "length": i.length, "order": i.order})))
-                    .collect(),
-            },
-            &mut services,
-        )?;
-        if !prepared.ok {
-            let terminal = match prepared.terminal.as_str() {
-                "" => "refused",
-                terminal => terminal,
-            };
-            let failure =
-                Failure::executor(terminal, &prepared.origin, &prepared.code, &prepared.detail);
-            engine.finish(id, Outcome::Failed(failure))?;
-            return executor.shutdown();
-        }
-        let inputs = stage_inputs(&self.store, self.identity, &spool, &invocation.inputs)?;
-        let reply = executor.command(
-            &DeviceCommand::Invoke {
-                max_output_bytes: crate::output_capacity::for_callable(&document, "entrypoints", &invocation.entrypoint)?,
-                request_id: id.into(),
-                construction: WEIGHTLESS.into(),
-                entrypoint: invocation.entrypoint.clone(),
-                spool: spool.clone(),
-                deadline_s: None,
-                attention_kernel: String::new(),
-                plane_budget_bytes: -1,
-                cap_bytes: None,
-                inputs: inputs.inputs,
-                trees: inputs.trees,
-                floor_bytes: None,
-                activation_bytes: BTreeMap::new(),
-                squeezed_bytes: BTreeMap::new(),
-                device_weights: None,
-            },
-            &mut services,
-        )?;
-        conclude(engine, id, &executor, &spool, command_ok(reply)?)?;
-        executor.shutdown()
-    }
-
-    /// The run's scratch (`<root>/scratch/<id>`), kept across its attempts.
-    fn scratch(&self, id: &str) -> io::Result<PathBuf> {
-        let root = self.root.join("scratch");
-        fs::create_dir_all(&root)?;
-        let scratch = root.join(id);
-        fs::create_dir_all(&scratch)?;
-        if let Some(identity) = self.identity {
-            identity.traverse(&root)?;
-            identity.own(&scratch)?;
-        }
-        Ok(scratch)
+        Ok(Some(crate::weights::Grant::new(
+            &actor,
+            &record.id,
+            spool,
+            sources,
+            outputs,
+            destination,
+            crate::weights::GrantAuthority { current, bind_output, fetch, replay },
+        )))
     }
 
     /// Write roots no unfinished run needs (`objects::Objects::sweep`).
@@ -716,55 +316,9 @@ impl Jobs {
         }
         failure.map_or(Ok(released), Err)
     }
-    /// Scratch of runs that have ended (or are unknown); a paused run keeps its own.
-    pub fn sweep_scratch(&self, engine: &Engine) -> usize {
-        let Ok(entries) = fs::read_dir(self.root.join("scratch")) else {
-            return 0;
-        };
-        let mut removed = 0;
-        for entry in entries.flatten() {
-            let id = entry.file_name().to_string_lossy().into_owned();
-            let ended = match engine.get(&id) {
-                Ok(record) => record.state.terminal(),
-                Err(error) => error.kind() == io::ErrorKind::NotFound,
-            };
-            if ended {
-                match fs::remove_dir_all(entry.path()) {
-                    Ok(()) => removed += 1,
-                    Err(error) => eprintln!("scratch of run {id}: {error}"),
-                }
-            }
-        }
-        removed
-    }
 
-    /// Whether `parent` is pausing or paused (not canceled): its children are held, not ended.
-    fn holds(parent: &Execution) -> bool {
-        parent.pause_actor.is_some() && parent.cancel_actor.is_none() && !parent.state.terminal()
-    }
-    fn holding(engine: &Engine, parent: &str) -> bool {
-        engine.get(parent).is_ok_and(|record| Self::holds(&record))
-    }
-
-    /// One child follows its parent's stop: held while unstarted if the parent pauses (started
-    /// work runs to its end), else canceled.
-    fn stop_child(engine: &Engine, child: &Execution, hold: bool) {
-        let actor = child
-            .submission
-            .as_ref()
-            .map(|s| s.actor.as_str())
-            .unwrap_or_default();
-        let stopped = match hold {
-            true => engine.pause(&child.id, actor, true),
-            false => engine.cancel(&child.id, actor),
-        };
-        if let Err(error) = stopped {
-            eprintln!("child run {} of {} remains: {error}", child.id, child.invocation.parent);
-        }
-    }
-
-    /// Every unfinished child of `parent` follows its stop: held (`hold`), else canceled.
-    pub(crate) fn stop_children(&self, parent: &str, hold: bool) {
+    /// Every unfinished child of `parent` is canceled with it.
+    pub(crate) fn stop_children(&self, parent: &str) {
         let Some(service) = self.service.upgrade() else {
             return;
         };
@@ -772,85 +326,36 @@ impl Jobs {
             return;
         };
         for child in &children {
-            Self::stop_child(&service.engine, child, hold);
+            cancel(&service.engine, child);
         }
     }
 
-    /// A run's attempt has stopped (a job's or a call's): its children follow, and unless it
-    /// rests paused its children prepare no more. A root that is queued again runs again and
-    /// nothing ends: it was deferred before it started, or resumed since this attempt stopped
-    /// (its next attempt waits for this thread, `Engine::dispatch_managed`). The run is read
-    /// once: a resume between two reads would cancel the children its next attempt needs.
+    /// A run's attempt has stopped: its children follow and prepare no more. A run that is
+    /// queued again (deferred before it started) runs again and nothing ends.
     pub(crate) fn ended(&self, id: &str) {
         let Some(service) = self.service.upgrade() else {
             return;
         };
-        let record = service.engine.get(id).ok();
-        if record.as_ref().is_some_and(|r| r.invocation.job) {
-            if let Err(error) = self.sweep_canceled_outputs(&service.engine) {
-                eprintln!("canceled native outputs: {error}");
-            }
+        if let Err(error) = self.sweep_canceled_outputs(&service.engine) {
+            eprintln!("canceled native outputs: {error}");
         }
-        if record.as_ref().is_some_and(|r| r.state == State::Queued) {
+        if service.engine.get(id).is_ok_and(|r| r.state == State::Queued) {
             return;
         }
-        let hold = record.as_ref().is_some_and(Self::holds);
-        self.stop_children(id, hold);
-        if let (false, Some(runs)) = (hold, self.runs.upgrade()) {
-            runs.end_job(id);
+        self.stop_children(id);
+        if let Some(runs) = self.runs.upgrade() {
+            runs.end(id);
         }
     }
 
-    /// Control's pause: only a job pauses.
-    pub fn pause(&self, record: &Execution, actor: &str) -> Result<Execution, Refused> {
-        let service = self.service()?;
-        if !record.invocation.job {
-            return Err(refused(
-                "pause_unsupported",
-                "only a job pauses; a call runs to its end or is canceled",
-            ));
-        }
-        let paused = service.engine.pause(&record.id, actor, false)?;
-        self.stop_children(&record.id, Self::holds(&paused));
-        Ok(paused)
-    }
-
-    /// Control's resume: a paused job queues for a fresh attempt that replays its root.
-    pub fn resume(&self, record: &Execution) -> Result<Execution, Refused> {
-        let service = self.service()?;
-        let resumed = service.engine.resume(&record.id)?;
-        match resumed.state {
-            _ if resumed.pause_actor.is_some() => Err(refused(
-                "run_pausing",
-                "the run is still pausing; resume it once it is paused",
-            )),
-            state if state.terminal() => Err(refused(
-                "run_not_paused",
-                format!("the run has {} and does not resume", state_name(state)),
-            )),
-            _ => Ok(resumed),
-        }
-    }
-
-    /// A cancel reached a run with no attempt running (paused or queued): its children end too.
+    /// A cancel reached a run with no attempt running (queued): its children end too.
     pub fn canceled(&self, record: &Execution) {
         if record.cancel_actor.is_none() {
             return;
         }
-        if let (true, Some(service)) = (record.invocation.job, self.service.upgrade()) {
-            if let Err(error) = self.sweep_canceled_outputs(&service.engine) {
-                eprintln!("canceled native outputs: {error}");
-            }
-        }
         if record.state.terminal() {
             self.ended(&record.id);
         }
-    }
-
-    fn service(&self) -> Result<Arc<Service>, Refused> {
-        self.service
-            .upgrade()
-            .ok_or_else(|| refused("machine_stopping", "the machine is stopping"))
     }
 
     /// `child_call`: the call's run, accepted once per index (its intent must not change).
@@ -865,7 +370,7 @@ impl Jobs {
             return Err((
                 "child_impure",
                 format!(
-                    "a memoized job cannot call {}.{}, which is not memoized",
+                    "a memoized function cannot call {}.{}, which is not memoized",
                     frame.module, frame.export
                 ),
             ));
@@ -876,18 +381,9 @@ impl Jobs {
                 format!("call request is not JSON: {e}"),
             )
         })?;
-        if !input.is_object() {
-            return Err((
-                "child_call_refused",
-                "call request must be an object".into(),
-            ));
-        }
-        // A serving call's request, and the models it passed by value to the callee's slots
-        // (null leaves a slot to the choice the job carries for it).
-        let (request_input, choices) = match parent.serving.contains(&callable) {
-            true => serving_call(&input, entrypoint)?,
-            false => (input.clone(), vec![]),
-        };
+        // Every call is a serving call: its request, and the models it passes by value to the
+        // callee's slots (null leaves a slot to the choice its parent carries for it).
+        let (request_input, choices) = serving_call(&input, entrypoint)?;
         let runs = self
             .runs
             .upgrade()
@@ -896,12 +392,12 @@ impl Jobs {
         let inputs = child_inputs(&request_input, parent, &calls.received);
         let request = format!("{}/{}", parent.request, frame.call_index);
         let intent = child_intent(&frame.module, &frame.export, &input);
-        let job = service
+        let caller = service
             .engine
             .get(&parent.id)
             .map_err(|e| ("child_call_refused", e.to_string()))?;
         let record = runs
-            .child(&job, &request, &intent, application, entrypoint, request_input, inputs, choices)
+            .child(&caller, &request, &intent, application, entrypoint, request_input, inputs, choices)
             .map_err(|refusal| match refusal.code {
                 "run_id_conflict" => (
                     "child_call_refused",
@@ -909,16 +405,6 @@ impl Jobs {
                 ),
                 code => (code, refusal.message),
             })?;
-        // A pausing job starts nothing new; a resumed one's held call goes on.
-        let engine = &service.engine;
-        let held = match Self::holding(engine, &parent.id) {
-            true => engine.pause(&record.id, &parent.actor, true),
-            false if record.state == State::Paused || record.pause_actor.is_some() => {
-                engine.resume(&record.id)
-            }
-            false => Ok(record.clone()),
-        };
-        held.map_err(|e| ("child_call_refused", e.to_string()))?;
         calls.by_index.entry(frame.call_index).or_insert(ChildCall {
             child: record.id.clone(),
             module: frame.module.clone(),
@@ -940,7 +426,7 @@ impl Jobs {
             .upgrade()
             .ok_or(("child_call_refused", "machine is stopping".into()))?;
         let mut calls = parent.calls.lock().unwrap();
-        let Calls {
+        let CallTable {
             by_index, received, ..
         } = &mut *calls;
         let call = by_index.get_mut(&frame.call_index).ok_or((
@@ -975,7 +461,7 @@ impl Jobs {
                         .spool
                         .join("child-results")
                         .join(frame.call_index.to_string());
-                    let (text, rows, held) = grant(&service.engine.root, result, &parent.spool, &directory, self.identity)
+                    let (text, rows, held) = receive(&service.engine.root, result, &parent.spool, &directory, self.identity)
                         .map_err(|e| ("child_result_unavailable", e.to_string()))?;
                     let settled = (text, rows);
                     // Each file is the signer's object too: a later child may be handed it.
@@ -1026,40 +512,6 @@ impl Jobs {
         Ok(answer)
     }
 
-    /// `checkpoint`: the declaration is journaled on the run (the bytes stay in its scratch or
-    /// spool); a repeat replays its receipt, other content under the same keys is refused.
-    fn checkpoint(&self, parent: &Parent, frame: &Frame) -> Result<Answer, (&'static str, String)> {
-        if frame.logical_key.is_empty() || !frame.content_digest.starts_with("sha256:") {
-            return Err((
-                "checkpoint_invalid",
-                "a checkpoint names a logical key and a sha256 content digest".into(),
-            ));
-        }
-        let service = self
-            .service
-            .upgrade()
-            .ok_or(("child_call_refused", "machine is stopping".into()))?;
-        let attempt = service.engine.get(&parent.id).map_or(0, |record| record.attempt);
-        let (receipt, replayed) = service
-            .engine
-            .declare_checkpoint(
-                &parent.id,
-                attempt,
-                &frame.operation_key,
-                &frame.logical_key,
-                &frame.content_digest,
-                frame.length,
-            )
-            .map_err(|e| match e.kind() {
-                io::ErrorKind::AlreadyExists => ("checkpoint_conflict", e.to_string()),
-                _ => ("checkpoint_unrecorded", e.to_string()),
-            })?;
-        let mut answer = Answer::ok(frame.seq);
-        answer.receipt_id = receipt;
-        answer.replayed = replayed;
-        Ok(answer)
-    }
-
     fn seam(&self, parent: &Parent, frame: &Frame) -> io::Result<(Answer, Option<File>)> {
         let answered = match frame.kind {
             Kind::ChildCall => self.child_call(parent, frame),
@@ -1074,8 +526,7 @@ impl Jobs {
                     .map(|c| c.child.clone());
                 if let (Some(child), Some(service)) = (call, self.service.upgrade()) {
                     if let Ok(record) = service.engine.get(&child) {
-                        let hold = Self::holding(&service.engine, &parent.id);
-                        Self::stop_child(&service.engine, &record, hold);
+                        cancel(&service.engine, &record);
                     }
                 }
                 let mut answer = Answer::ok(frame.seq);
@@ -1109,16 +560,13 @@ impl Jobs {
                 let service = self.service.upgrade()
                     .ok_or_else(|| io::Error::other("the machine is stopping"))?;
                 let record = service.engine.get(&parent.id)?;
-                // Only a CPU root ends its lane: an accelerator job cannot give up its own
-                // device safely, and a nested job cannot end its root's future GPU work.
-                if record.invocation.parent.is_empty() && !record.invocation.accelerator {
-                    if let Some(pool) = service.gpu() {
-                        pool.release(&service.engine, record.root_seq());
-                    }
+                // Only a deviceless root ends its lane: a call on a GPU cannot give up its own
+                // device safely, and a child cannot end its root's future GPU work.
+                if let (true, Some(pool)) = (record.invocation.parent.is_empty() && record.invocation.degree == 0, service.pool()) {
+                    pool.release(&service.engine, record.root_seq());
                 }
                 Ok(Answer::ok(frame.seq))
             }
-            Kind::Checkpoint => self.checkpoint(parent, frame),
             _ => return Ok((Answer::unavailable(frame.seq), None)),
         };
         Ok((
@@ -1129,8 +577,8 @@ impl Jobs {
 
     fn model_prefetch(&self, parent: &Parent, frame: &Frame) -> Result<Answer, (&'static str, String)> {
         let (application, entrypoint) = parent.callable(frame)?;
-        // Older callers sent no choices. Explicit choices use the ordinary child-call
-        // decoder and selection path; a hint cannot turn a model name into byte authority.
+        // Explicit choices use the ordinary child-call decoder and selection path; a hint
+        // cannot turn a model name into byte authority.
         let raw = if frame.payload.is_empty() { "{}" } else { &frame.payload };
         let models = crate::boundary_json::parse(raw.as_bytes())
             .map_err(|error| ("child_call_refused", format!("prefetch choices are not JSON: {error}")))?;
@@ -1141,11 +589,19 @@ impl Jobs {
         let service = self.service.upgrade().ok_or((
             "model_prefetch_unsupported", "machine is stopping".into(),
         ))?;
-        let job = service.engine.get(&parent.id)
+        let caller = service.engine.get(&parent.id)
             .map_err(|error| ("child_call_refused", error.to_string()))?;
-        runs.prefetch(&job, application, entrypoint, choices)
+        runs.prefetch(&caller, application, entrypoint, choices)
             .map_err(|error| (error.code, error.message))?;
         Ok(Answer::ok(frame.seq))
+    }
+}
+
+/// A child follows its parent's stop: canceled.
+fn cancel(engine: &Engine, child: &Execution) {
+    let actor = child.submission.as_ref().map(|s| s.actor.as_str()).unwrap_or_default();
+    if let Err(error) = engine.cancel(&child.id, actor) {
+        eprintln!("child run {} of {} remains: {error}", child.id, child.invocation.parent);
     }
 }
 
@@ -1182,142 +638,29 @@ pub(crate) fn observe(engine: &Engine, id: &str, completed: &mut u64, frame: &Fr
     let _ = engine.observe_progress(id, *completed, payload.to_string());
 }
 
-/// Every executor exchange of one job or child run.
-struct Seam<'a> {
-    engine: &'a Arc<Engine>,
-    id: &'a str,
-    store: &'a Store,
-    spool: &'a Path,
-    completed: u64,
-    /// A job's products show to its owner; a child's do not (its parent publishes).
-    publish: bool,
-    job: Option<&'a Caller>,
-    /// This attempt's list items per output: a resumed job's replay adds no duplicates.
-    appended: HashMap<String, usize>,
-    /// A job's weights broker and this attempt's grant.
-    weights: Option<(&'a crate::weights::Weights, &'a crate::weights::Grant)>,
-}
-impl Services for Seam<'_> {
-    fn progress(&mut self, frame: &Frame) {
-        observe(self.engine, self.id, &mut self.completed, frame, self.job);
-    }
-    fn request(
-        &mut self,
-        frame: &Frame,
-        descriptor: Option<File>,
-    ) -> io::Result<(Answer, Option<File>)> {
-        drop(descriptor);
-        match (frame.kind, self.job) {
-            (Kind::Publish, _) if self.publish => Ok((
-                crate::products::publish_replayed(
-                    self.store,
-                    self.engine,
-                    self.id,
-                    self.spool,
-                    frame,
-                    &mut self.appended,
-                ),
-                None,
-            )),
-            // A child call's product shows nothing (`sequence` 0): its parent decides.
-            (Kind::Publish, _) => Ok((Answer::ok(frame.seq), None)),
-            (Kind::WeightsWriter, _) => {
-                let Some((weights, grant)) = self.weights else {
-                    return Ok((Answer::unavailable(frame.seq), None));
-                };
-                let (mut answer, channel, adopted) = weights.answer(grant, frame);
-                for upload in grant.take_uploads() {
-                    record_upload(self.engine, self.id, &upload);
-                }
-                if let Some(adopted) = adopted {
-                    if let Err(error) = crate::products::record_manifest(self.engine, self.id, &adopted.output, &adopted.manifest) {
-                        answer = Answer::refused(frame.seq, "publish_refused", error.to_string());
-                    }
-                }
-                Ok((answer, channel))
-            }
-            (_, Some(caller)) => caller.seam(frame),
-            _ => Ok((Answer::unavailable(frame.seq), None)),
-        }
-    }
-}
-
-/// A run's executor reply settles it: its result in custody, or its typed failure.
-fn conclude(
-    engine: &Arc<Engine>,
-    id: &str,
-    executor: &DeviceExecutor,
-    spool: &Path,
-    reply: Frame,
-) -> io::Result<()> {
-    record_measurements(engine, id, &reply, &Default::default());
-    let outcome = reply
-        .outcome
-        .as_ref()
-        .ok_or_else(|| io::Error::other("executor outcome absent"))?;
-    match outcome.terminal.as_str() {
-        "succeeded" => {
-            let custody = device_executor::postprocess(&executor.codec(), spool, &reply).and_then(
-                |(value, bindings)| {
-                    engine.managed_result(id, spool, value, output_bindings(bindings)?)
-                },
-            );
-            if let Err(error) = custody {
-                engine.finish(
-                    id,
-                    Outcome::Failed(Failure::custody(&error.to_string())),
-                )?;
-            }
-        }
-        // A journaled cancel ends it CANCELED, however it stopped (a job may first see its
-        // child canceled with it); a pause's stop leaves it PAUSED.
-        terminal if engine.get(id).is_ok_and(|r| {
-            r.cancel_actor.is_some() || (terminal == "canceled" && r.pause_actor.is_some())
-        }) =>
-        {
-            engine.finish_stopped(id)?;
-        }
-        _ => {
-            keep_triage(engine, id, executor, outcome);
-            let failure = Failure::executor(
-                &outcome.terminal,
-                &outcome.origin,
-                &outcome.code,
-                &outcome.message,
-            );
-            engine.finish(id, Outcome::Failed(failure))?;
-        }
-    }
-    Ok(())
-}
-
 /// `(module, export)` of every invocable of the environment declared `memoize=True`.
 fn pure_callables(generation: &crate::catalog::Generation) -> std::collections::HashSet<(String, String)> {
     std::iter::once(&generation.interface)
         .chain(generation.callees.iter().map(|c| &c.interface))
         .flat_map(declarations)
-        .filter(|(declared, _, _)| declared["memoize"].as_bool() == Some(true))
-        .filter_map(|(declared, _, _)| {
+        .filter(|(declared, _)| declared["memoize"].as_bool() == Some(true))
+        .filter_map(|(declared, _)| {
             Some((declared["module"].as_str()?.into(), declared["export"].as_str()?.into()))
         })
         .collect()
 }
 
-/// Each declared invocable of an interface: its declaration, its entry and its kind.
-fn declarations(interface: &Value) -> impl Iterator<Item = (&Value, &Value, &'static str)> {
-    [("jobs", "job"), ("entrypoints", "entrypoint")]
+/// Each declared invocable of an interface: its declaration and its entry.
+fn declarations(interface: &Value) -> impl Iterator<Item = (&Value, &Value)> {
+    interface["entrypoints"]
+        .as_array()
         .into_iter()
-        .flat_map(move |(section, kind)| {
-            interface[section]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(move |entry| (&entry["invocable"], entry, kind))
-        })
+        .flatten()
+        .map(|entry| (&entry["invocable"], entry))
 }
 
 /// Every App this environment holds: its own exports, including internal ones, and the
-/// other Apps' public exports. A callee job can call its own App or another dependency too.
+/// other Apps' public exports. A callee can call its own App or another dependency too.
 /// None names an export owned by different Apps: only that call is refused.
 type Callables = HashMap<(String, String), Option<(String, String)>>;
 fn invocables(
@@ -1338,7 +681,7 @@ fn invocables(
         }));
     for (owner, interface, builtin) in apps {
         let own = owner == application;
-        for (declared, entry, kind) in declarations(interface) {
+        for (declared, entry) in declarations(interface) {
             let (Some(module), Some(export), Some(name)) = (
                 declared["module"].as_str(),
                 declared["export"].as_str(),
@@ -1363,7 +706,6 @@ fn invocables(
                 export: export.into(),
                 interface_path: if own { path.into() } else { PathBuf::new() },
                 self_call: own,
-                kind: kind.into(),
                 // The Runtime binds its own operations from its own code, not a document.
                 interface_document: (!own && !builtin && documented.insert(module.to_string()))
                     .then(|| module_interface(interface, module)),
@@ -1374,42 +716,15 @@ fn invocables(
     (rows, callables)
 }
 
-/// Why `command` cannot travel in one executor control frame, naming its largest parts; None
-/// when it fits.
-fn oversized(command: &DeviceCommand) -> Option<String> {
-    let size = serde_json::to_vec(command).map_or(usize::MAX, |b| b.len());
-    if size <= crate::device_executor::MAX_DEVICE_FRAME {
-        return None;
-    }
-    let mut by_part = BTreeMap::<String, usize>::new();
-    if let DeviceCommand::RunJob { call_interfaces, payload, .. } = command {
-        for row in call_interfaces {
-            let bytes = row.interface_document.as_ref().and_then(|d| serde_json::to_vec(d).ok()).map_or(0, |b| b.len());
-            *by_part.entry(format!("{}'s interface", row.module)).or_default() += bytes;
-        }
-        by_part.insert("the job's payload".into(), serde_json::to_vec(payload).map_or(0, |b| b.len()));
-    }
-    let mut parts: Vec<(usize, String)> = by_part.into_iter().map(|(part, bytes)| (bytes, part)).collect();
-    parts.sort_by(|a, b| b.cmp(a));
-    let largest: Vec<String> = parts.iter().take(3).map(|(bytes, part)| format!("{part} {bytes} B")).collect();
-    Some(format!(
-        "the job's command encodes to {size} B, over the executor control frame's {} B (largest: {})",
-        crate::device_executor::MAX_DEVICE_FRAME,
-        largest.join(", ")
-    ))
-}
-
 /// An App's interface narrowed to one module's exported callables (the Runtime generates that
 /// module's callers from it).
 fn module_interface(interface: &Value, module: &str) -> Value {
     let mut narrowed = interface.clone();
-    for rows in ["entrypoints", "jobs"] {
-        if let Some(Value::Array(entries)) = narrowed.get_mut(rows) {
-            entries.retain(|entry| {
-                entry["invocable"]["module"].as_str() == Some(module)
-                    && entry["internal"].as_bool() != Some(true)
-            });
-        }
+    if let Some(Value::Array(entries)) = narrowed.get_mut("entrypoints") {
+        entries.retain(|entry| {
+            entry["invocable"]["module"].as_str() == Some(module)
+                && entry["internal"].as_bool() != Some(true)
+        });
     }
     narrowed
 }
@@ -1517,7 +832,7 @@ fn child_inputs(
 /// The files a parent now holds from a child's result, to adopt as its own objects.
 type Held = Vec<(PathBuf, tensorfs_core::ids::ObjectRef)>;
 
-fn grant(
+fn receive(
     root: &Path,
     result: &crate::journal::ResultRecord,
     spool: &Path,
@@ -1652,18 +967,18 @@ fn child_intent(module: &str, export: &str, input: &Value) -> String {
 }
 
 
-/// One byte to every running job's nudge socket each time anything moved: its calls re-poll.
-fn nudge(jobs: Weak<Jobs>, engine: Arc<Engine>) {
+/// One byte to every calling attempt's nudge socket each time anything moved: its calls re-poll.
+fn nudge(calls: Weak<Calls>, engine: Arc<Engine>) {
     let mut seen = engine.activity_epoch();
     loop {
         seen = engine.wait_activity(seen, None);
-        let Some(jobs) = jobs.upgrade() else {
+        let Some(calls) = calls.upgrade() else {
             return;
         };
         if seen == u64::MAX {
             return;
         }
-        for parent in jobs.parents.lock().unwrap().values() {
+        for parent in calls.parents.lock().unwrap().values() {
             let calls = parent.calls.lock().unwrap();
             if let (Some(mut watcher), false) = (calls.watcher.as_ref(), calls.by_index.is_empty())
             {
@@ -1674,25 +989,10 @@ fn nudge(jobs: Weak<Jobs>, engine: Arc<Engine>) {
     }
 }
 
-fn refused(code: &'static str, message: impl Into<String>) -> Refused {
-    Refused {
-        code,
-        message: message.into(),
-    }
-}
-
-fn state_name(state: State) -> &'static str {
-    match state {
-        State::Completed => "succeeded",
-        State::Failed => "failed",
-        _ => "been canceled",
-    }
-}
-
 /// Journals a weights output's publication as a `call` event on its run (`run show` lists it
 /// beside the run's child calls), before the run settles. Keyed by output and transaction, so
 /// a replay adds no second row.
-fn record_upload(engine: &Engine, id: &str, upload: &crate::weights::Upload) {
+pub(crate) fn record_upload(engine: &Engine, id: &str, upload: &crate::weights::Upload) {
     let body = json!({
         "request": format!("{id}/upload/{}", upload.output), "parent": id, "index": 0, "attempt": 1,
         "module": "cozy_runtime.author.publication", "export": "upload_checkpoint",
@@ -1724,7 +1024,7 @@ fn record_call(
         _ => match Failure::decode(record.failure.as_deref().unwrap_or_default()) {
             Ok(failure) => ("failed", failure.code, failure.message),
             Err(error) => {
-                eprintln!("job {}: invalid child failure record: {error}", parent.id);
+                eprintln!("run {}: invalid child failure record: {error}", parent.id);
                 return false;
             }
         },
@@ -1746,80 +1046,24 @@ fn record_call(
     match engine.append_call(&parent.id, &record.id, &crate::boundary_json::exact(&body)) {
         Ok(_) => true,
         Err(error) => {
-            eprintln!("job {}: call {index}: {error}", parent.id);
+            eprintln!("run {}: call {index}: {error}", parent.id);
             false
         }
     }
-}
-
-/// An execution can return to Running after a pause; its former storage grants cannot.
-fn weights_current(engine: Arc<Engine>, record: &Execution) -> Arc<dyn Fn() -> bool + Send + Sync> {
-    let (run, attempt) = (record.id.clone(), record.attempt);
-    Arc::new(move || {
-        engine.get(&run).is_ok_and(|r| {
-            r.attempt == attempt && r.state == State::Running
-                && r.cancel_actor.is_none() && r.pause_actor.is_none()
-        })
-    })
 }
 
 #[cfg(test)]
 mod prefetch_tests;
 #[cfg(test)]
 mod progress_tests;
-#[cfg(test)]
-mod software_tests;
 
 #[cfg(test)]
 mod exact_tests {
     use super::*;
 
-    #[test]
-    fn resumed_execution_does_not_reactivate_the_old_attempts_storage_grant() {
-        use crate::journal::{Journal, Outcome};
-        use std::process::{Command, Stdio};
-        let root =
-            std::env::temp_dir().join(format!("cm-weights-attempt-{}", uuid::Uuid::new_v4()));
-        let engine = Engine::open(&root).unwrap();
-        let mut journal = Journal::open(&root).unwrap();
-        let id = journal
-            .accept("weights-attempt", crate::journal::Invocation::default())
-            .unwrap()
-            .id;
-        let mut child = Command::new("/bin/cat")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap();
-        let mut previous = None;
-        for ordinal in 1..=2 {
-            assert!(journal.claim(&id).unwrap());
-            journal
-                .register_process(&id, crate::execution::process_birth(child.id()).unwrap())
-                .unwrap();
-            let running = journal.running(&id, None).unwrap();
-            assert_eq!(running.attempt, ordinal);
-            if let Some(old) = previous.as_ref() {
-                let old: &Arc<dyn Fn() -> bool + Send + Sync> = old;
-                assert!(!old(), "old attempt regained source/output authority");
-            }
-            let current = weights_current(engine.clone(), &running);
-            assert!(current());
-            journal.pause(&id, "owner", false).unwrap();
-            assert!(!current());
-            journal.finish(&id, Outcome::Paused).unwrap();
-            journal.resume(&id).unwrap();
-            previous = Some(current);
-        }
-        child.kill().unwrap();
-        child.wait().unwrap();
-        drop(journal);
-        drop(engine);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-    /// A serving call (the Runtime's typed caller of another package's entrypoint) is its
-    /// request plus models: a passed ModelArtifact is the exact checkpoint of the callee's slot,
-    /// a null one leaves the slot to the callee's ladder.
+    /// A serving call (the Runtime's typed caller of a callable) is its request plus models: a
+    /// passed ModelArtifact is the exact checkpoint of the callee's slot, a null one leaves the
+    /// slot to the callee's ladder.
     #[test]
     fn a_serving_call_unwraps_into_its_request_and_the_callees_slot_choices() {
         let hex = "ab".repeat(32);
@@ -1839,17 +1083,17 @@ mod exact_tests {
     }
 
     /// A callee App with many exports across modules: each module's first row carries only its
-    /// own callables, so the job's command fits the control frame where one full interface per
-    /// export (cozy-eval 0.7.5: 8.7 KB on 9 rows) did not. One that cannot fit fails by name.
+    /// own callables, so its Start fits the control frame where one full interface per export
+    /// (cozy-eval 0.7.5: 8.7 KB on 9 rows) did not.
     #[test]
-    fn a_callee_interface_travels_once_per_module_and_an_oversized_command_is_named() {
+    fn a_callee_interface_travels_once_per_module() {
         let entry = |module: &str, name: &str| json!({"name": name, "description": "x".repeat(900),
             "invocable": {"module": module, "export": name}});
         let modules = ["eval.a", "eval.b", "eval.c", "eval.d", "eval.e", "eval.f"];
         let mut entries: Vec<Value> = modules.iter().flat_map(|m| [entry(m, &format!("{}_1", &m[5..])), entry(m, &format!("{}_2", &m[5..]))]).collect();
         entries.push(json!({"name": "hidden", "internal": true, "invocable": {"module": "eval.a", "export": "hidden"}}));
         let callee = json!({"application": "eval:app", "format": "interface/1", "entrypoints": entries});
-        let own = json!({"jobs": [{"name": "root", "invocable": {"module": "root", "export": "root"}}]});
+        let own = json!({"entrypoints": [{"name": "root", "invocable": {"module": "root", "export": "root"}}]});
         let mut generation: crate::catalog::Generation = serde_json::from_value(json!({
             "identity": "a".repeat(32), "package": "root", "version": "1", "application": "root:app",
             "python": "/usr/bin/python3", "interface": own,
@@ -1866,20 +1110,8 @@ mod exact_tests {
             assert_eq!(names, [*module, *module], "only its own exported callables");
             assert_eq!(document["application"], "eval:app");
         }
-        let command = |call_interfaces| DeviceCommand::RunJob {
-            max_output_bytes: crate::output_capacity::DEFAULT_BYTES,
-            request_id: "job".into(), job: "root".into(), payload: json!({}), application: "root:app".into(),
-            package_interface: "interface.json".into(), spool: "spool".into(), scratch: "scratch".into(),
-            deadline_s: None, inputs: Default::default(), trees: Default::default(), call_interfaces,
-            models: Default::default(), weights: true, budget: None,
-        };
-        assert_eq!(oversized(&command(rows.clone())), None);
-        let each_row: Vec<_> = rows.iter().cloned().map(|mut r| {
-            r.interface_document = (!r.self_call).then(|| callee.clone());
-            r
-        }).collect();
-        let why = oversized(&command(each_row)).expect("one full interface per export overflows");
-        assert!(why.contains("over the executor control frame's 65536 B") && why.contains("eval.f's interface 23794 B"), "{why}");
+        let bytes: usize = rows.iter().map(|row| serde_json::to_vec(row).unwrap().len()).sum();
+        assert!(bytes < crate::device_executor::MAX_DEVICE_FRAME, "{bytes} B");
     }
 
     #[test]
@@ -1908,34 +1140,34 @@ mod exact_tests {
         let root = std::env::temp_dir().join(format!("cm-ambiguous-{}", uuid::Uuid::new_v4()));
         let service = Service::open(&root.join("state"),&root.join("generations"),1).unwrap();
         let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
-        let jobs = Jobs::configure(&service,store,None).unwrap();
+        let broker = Calls::configure(&service,store,None).unwrap();
         let parent = Parent { id:"parent".into(),request:"parent".into(),actor:"alice".into(),spool:root.clone(),
-            callables:calls,pure:false,pure_callables:Default::default(),serving:Default::default(),
+            callables:calls,pure:false,pure_callables:Default::default(),
             inputs:vec![],calls:Default::default() };
         let frame = Frame { module:"shared".into(),export:"apply".into(),..Default::default() };
-        assert_eq!(jobs.child_call(&parent,&frame).unwrap_err().0,"child_ambiguous");
+        assert_eq!(broker.child_call(&parent,&frame).unwrap_err().0,"child_ambiguous");
         assert!(service.engine.nonterminal(usize::MAX).unwrap().is_empty());
-        // A memoized job calls only memoized callables: replaying its result skips its calls.
-        let unrelated = Frame { module:"root".into(),export:"unrelated".into(),payload:"{}".into(),..Default::default() };
+        // A memoized function calls only memoized callables: replaying its result skips its calls.
+        let unrelated = Frame { module:"root".into(),export:"unrelated".into(),payload:r#"{"payload":{}}"#.into(),..Default::default() };
         let pure = Parent { pure:true, ..parent };
-        assert_eq!(jobs.child_call(&pure,&unrelated).unwrap_err().0,"child_impure");
+        assert_eq!(broker.child_call(&pure,&unrelated).unwrap_err().0,"child_impure");
         let pure = Parent { pure_callables:[("root".into(),"unrelated".into())].into(), ..pure };
-        assert_ne!(jobs.child_call(&pure,&unrelated).unwrap_err().0,"child_impure");
+        assert_ne!(broker.child_call(&pure,&unrelated).unwrap_err().0,"child_impure");
         assert!(service.engine.nonterminal(usize::MAX).unwrap().is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn only_a_cpu_root_releases_its_gpu_lane() {
+    fn only_a_deviceless_root_releases_its_gpu_lane() {
         let root = std::env::temp_dir().join(format!("cm-release-{}", uuid::Uuid::new_v4()));
         let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
         let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
         let config = serde_json::from_value(json!({"devices": "GPU-test-release", "prespawn": false})).unwrap();
-        let pool = crate::gpu_service::GpuPool::new(&root.join("gpu"), config, store.clone()).unwrap();
-        service.configure_gpu(pool.clone()).unwrap();
-        let jobs = Jobs::configure(&service, store, None).unwrap();
+        let pool = crate::gpu_service::Pool::new(&root.join("gpu"), config, store.clone()).unwrap();
+        service.configure_pool(pool.clone()).unwrap();
+        let broker = Calls::configure(&service, store, None).unwrap();
         let submit = |key: &str, parent: &str| service.engine.submit(key, crate::journal::Invocation {
-            job: true, parent: parent.into(), ..Default::default()
+            parent: parent.into(), ..Default::default()
         }).unwrap();
         let (job, next) = (submit("root", ""), submit("next", ""));
         let (_owner, _next_owner) = (pool.root(&service.engine, &job, 1).unwrap(), pool.root(&service.engine, &next, 1).unwrap());
@@ -1947,13 +1179,13 @@ mod exact_tests {
         let mut parent = Parent {
             id: nested.id, request: "root".into(), actor: "alice".into(), spool: root.clone(),
             callables: Default::default(), pure: false, pure_callables: Default::default(),
-            serving: Default::default(), inputs: vec![], calls: Default::default(),
+            inputs: vec![], calls: Default::default(),
         };
         let release = Frame { kind: Kind::GpuRelease, seq: 7, ..Default::default() };
-        assert!(jobs.seam(&parent, &release).unwrap().0.ok);
-        assert!(lane(&next).is_none(), "a nested job must not release its root's lane");
+        assert!(broker.seam(&parent, &release).unwrap().0.ok);
+        assert!(lane(&next).is_none(), "a child must not release its root's lane");
         parent.id = job.id;
-        let (answer, file) = jobs.seam(&parent, &release).unwrap();
+        let (answer, file) = broker.seam(&parent, &release).unwrap();
         assert!(answer.ok && file.is_none());
         assert!(lane(&next).is_some(), "the live root's release lets the next root bind");
         pool.stop().unwrap();
@@ -1969,7 +1201,7 @@ mod exact_tests {
         assert_eq!(intent(&first), intent(&seed(r#" {"nested":{"a":1,"b":2}, "seed":9007199254740992} "#)));
         assert_ne!(intent(&first), intent(&seed(r#"{"seed":9007199254740993,"nested":{"b":2,"a":1}}"#)));
         let result = crate::journal::ResultRecord { value: json!({"seed": u64::MAX, "float": 1.0}), artifacts: vec![], asset_bindings: vec![] };
-        let (sent, _, _) = grant(Path::new("unused"), &result, Path::new("unused"), Path::new("unused"), None).unwrap();
+        let (sent, _, _) = receive(Path::new("unused"), &result, Path::new("unused"), Path::new("unused"), None).unwrap();
         let received = crate::boundary_json::parse(sent.as_bytes()).unwrap();
         assert_eq!(received["seed"].as_u64(), Some(u64::MAX));
         assert!(received["float"].is_f64());

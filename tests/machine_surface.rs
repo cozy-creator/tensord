@@ -878,8 +878,8 @@ mod v1_api {
             .thumbprint()
     }
 
-    /// Actual installed CPU jobs retain paused work and relinquish only explicitly canceled
-    /// unfinished or unadopted output custody, including across a daemon restart.
+    /// Actual installed CPU writers relinquish only explicitly canceled unfinished or unadopted
+    /// output custody, including across a daemon restart.
     #[tokio::test]
     async fn explicit_cancel_releases_unowned_native_outputs_and_preserves_adopted_custody() {
         use tensorfs_core::{derived, meta::Meta, store::Store};
@@ -903,7 +903,7 @@ mod v1_api {
                         id: "native-cancel".into(),
                         after: 0,
                         spec: Some(v1::RunSpec {
-                            kind: v1::RunKind::Job as i32,
+                            kind: v1::RunKind::Call as i32,
                             source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
                             entrypoint: "table".into(),
                             payload: serde_json::to_vec(
@@ -949,10 +949,9 @@ mod v1_api {
                 )
             };
             if phase == "checkpoint" {
-                // Pause and observer disconnect preserve progress. The explicit cancel is
-                // durable while the daemon is down; startup must finish its native cleanup.
-                peer.control(control(v1::Action::Pause)).await.unwrap();
-                until(&mut peer, &all, "native-cancel", "paused").await;
+                // Observer disconnect and a stopped machine preserve progress. The explicit
+                // cancel is durable while the daemon is down; startup must finish its native
+                // cleanup.
                 drop(stream);
                 machine.stop();
                 let store = Store::open(&machine.store()).unwrap();
@@ -1038,7 +1037,7 @@ mod v1_api {
         });
         let manifest = write_package(&mut client, &all, "cpu_weights", "local/tensord-cpu-weights").await;
         let job = v1::RunSpec {
-            kind: v1::RunKind::Job as i32,
+            kind: v1::RunKind::Call as i32,
             source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
             entrypoint: "table".into(),
             payload: br#"{"size":64}"#.to_vec(),
@@ -1544,7 +1543,7 @@ mod v1_api {
         let size = tree.len() as u64;
         assert_eq!(write(&mut client, &all, &tree_digest, size, 0, &tree).await.unwrap(), size);
         let spec = v1::RunSpec {
-            kind: v1::RunKind::Job as i32,
+            kind: v1::RunKind::Call as i32,
             source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
             entrypoint: "count".into(),
             // As `cozy run --asset data=<dir>` sends it: the payload names the tree's manifest.
@@ -1601,7 +1600,7 @@ mod v1_api {
         });
         let manifest = write_package(&mut client, &all, "cpu_tree", "local/tensord-cpu-tree").await;
         let spec = v1::RunSpec {
-            kind: v1::RunKind::Job as i32,
+            kind: v1::RunKind::Call as i32,
             source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
             entrypoint: "descriptors".into(),
             payload: b"{}".to_vec(),
@@ -1641,7 +1640,7 @@ mod v1_api {
         });
         let manifest = write_package(&mut client, &all, "cpu_tree", "local/tensord-cpu-tree").await;
         let spec = v1::RunSpec {
-            kind: v1::RunKind::Job as i32,
+            kind: v1::RunKind::Call as i32,
             source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
             entrypoint: "survey".into(),
             payload: serde_json::to_vec(&serde_json::json!({ "text": "verified" })).unwrap(),
@@ -1703,7 +1702,7 @@ mod v1_api {
         let counter = machine.root.join("measured");
         let survey = |id: &str, values: &[i64]| {
             let spec = v1::RunSpec {
-                kind: v1::RunKind::Job as i32,
+                kind: v1::RunKind::Call as i32,
                 source: Some(v1::run_spec::Source::Local(v1::LocalSource {
                     manifest: manifest.clone(),
                 })),
@@ -1804,7 +1803,7 @@ mod v1_api {
         assert!(!other.memoized && other.computation_digest != computed.computation_digest, "{other:?}");
         assert_eq!(count(&counter), "2");
         // A memoized job whose result is a file: answered with the same file.
-        let job = v1::RunKind::Job;
+        let job = v1::RunKind::Call;
         let mut notes = vec![];
         for id in ["note-1", "note-2"] {
             let events = run(id, &manifest, job, "note", probe(5, &noted)).await;
@@ -1910,7 +1909,7 @@ mod v1_api {
                 .collect()
         };
         // `gallery` declares no accelerator: on this GPU-less machine it runs on CPU.
-        let job = v1::RunKind::Job;
+        let job = v1::RunKind::Call;
         let seeded = run("gallery-1", job, "gallery", paint("heron", Some(9))).await;
         assert_eq!(outcome(&seeded).status, "succeeded", "{seeded:?}");
         assert_eq!(calls(&seeded), [(false, String::new()), (true, String::new())]);
@@ -1969,7 +1968,7 @@ mod v1_api {
         write(&mut client, &all, &manifest_digest, manifest.len() as u64, 0, &manifest).await.unwrap();
         let counter = machine.root.join("measured");
         let spec = v1::RunSpec {
-            kind: v1::RunKind::Job as i32,
+            kind: v1::RunKind::Call as i32,
             source: Some(v1::run_spec::Source::Local(v1::LocalSource {
                 manifest: manifest_digest,
             })),
@@ -2194,7 +2193,7 @@ mod v1_api {
         let wheel_counter = machine.root.join("wheel-measured");
         let events = collect(client.run(authorized(v1::RunRequest {
             id:"relay-wheels".into(),after:0,spec:Some(v1::RunSpec {
-                kind:v1::RunKind::Job as i32,entrypoint:"relay".into(),owner:"alice".into(),
+                kind:v1::RunKind::Call as i32,entrypoint:"relay".into(),owner:"alice".into(),
                 source:Some(v1::run_spec::Source::Local(v1::LocalSource { manifest:manifest_digest })),
                 payload:serde_json::to_vec(&serde_json::json!({"values":[3,4],"counter":wheel_counter})).unwrap(),
                 ..Default::default()
@@ -2264,7 +2263,7 @@ mod v1_api {
         let counter = machine.root.join("published-measured");
         let events = collect(client.run(authorized(v1::RunRequest {
             id: "published-relay".into(), after: 0, spec: Some(v1::RunSpec {
-                kind: v1::RunKind::Job as i32, entrypoint: "relay".into(), owner: "alice".into(),
+                kind: v1::RunKind::Call as i32, entrypoint: "relay".into(), owner: "alice".into(),
                 source: Some(v1::run_spec::Source::Release(v1::Release {
                     package: "acme/tensord-cpu-caller".into(), release: "0.1.0".into() })),
                 payload: serde_json::to_vec(&serde_json::json!({"values": [3, 4], "counter": counter})).unwrap(),
@@ -2525,7 +2524,7 @@ mod v1_api {
         );
         let segments = ["a dawn", "a storm", "a calm"];
         let spec = v1::RunSpec {
-            kind: v1::RunKind::Job as i32,
+            kind: v1::RunKind::Call as i32,
             source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
             entrypoint: "long_form".into(),
             payload: serde_json::to_vec(
@@ -2859,13 +2858,12 @@ mod v1_api {
         }
     }
 
-    /// Pause and resume (Control): a job pauses while its second segment runs. Its root stops,
-    /// the started segment runs to its end and the unstarted one waits; the job rests `paused`,
-    /// keeping its scratch and checkpoint declarations, across a machine restart too. Resume
-    /// replays only the root: its calls find the finished segments, so no segment runs twice,
-    /// and the film is whole.
+    /// Cancel and submit again: a film canceled while its second segment runs ends with that
+    /// segment, its first one finished. The same film submitted again (after a machine restart)
+    /// finds that segment answered from the memo, held when it completed: nothing of it runs
+    /// again, the rest run once, and the film is whole.
     #[tokio::test]
-    async fn a_paused_job_resumes_from_its_finished_children() {
+    async fn a_canceled_film_submitted_again_skips_its_finished_segments() {
         let (mut machine, tools) = installing_machine().await;
         let mut client = client(&machine).await;
         let all = cap(Grant {
@@ -2896,7 +2894,7 @@ mod v1_api {
             .unwrap();
         let segments = ["a dawn", "a storm", "a calm"];
         let spec = v1::RunSpec {
-            kind: v1::RunKind::Job as i32,
+            kind: v1::RunKind::Call as i32,
             source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
             entrypoint: "long_form".into(),
             payload: serde_json::to_vec(&serde_json::json!({
@@ -2912,118 +2910,61 @@ mod v1_api {
             owner: "alice".into(),
             ..Default::default()
         };
-        let control = |action: v1::Action, id: &str| {
+        let submit = |id: &str| {
             authorized(
-                v1::ControlRequest {
-                    id: id.into(),
-                    action: action as i32,
-                },
-                &all,
-            )
-        };
-        let code = |status: tonic::Status| {
-            status
-                .metadata()
-                .get("cozy-error-code")
-                .map(|v| v.to_str().unwrap().to_string())
-        };
-        client
-            .run(authorized(
                 v1::RunRequest {
-                    id: "film".into(),
+                    id: id.into(),
                     after: 0,
                     spec: Some(spec.clone()),
                 },
                 &all,
-            ))
-            .await
-            .unwrap();
+            )
+        };
+        client.run(submit("film")).await.unwrap();
         until(&mut client, &all, "film/1", "running").await;
-        let paused = client
-            .control(control(v1::Action::Pause, "film"))
+        let canceled = client
+            .control(authorized(
+                v1::ControlRequest { id: "film".into(), action: v1::Action::Cancel as i32 },
+                &all,
+            ))
             .await
             .unwrap()
             .into_inner();
-        assert!(["running", "paused"].contains(&paused.state.as_str()), "{paused:?}");
-        let rest = until(&mut client, &all, "film", "paused").await;
-        assert_eq!(rest.attempt, 1);
-        // A call does not pause, and a job still pausing does not resume.
-        let call = client.control(control(v1::Action::Pause, "film/1")).await;
-        assert_eq!(call.err().and_then(code).as_deref(), Some("pause_unsupported"));
-
-        // The started segment runs to its end; the unstarted one never starts while paused.
-        let second = until(&mut client, &all, "film/1", "succeeded").await;
-        assert_eq!(second.attempt, 1);
+        assert_eq!(canceled.state, "canceled");
+        until(&mut client, &all, "film/1", "canceled").await;
+        assert_eq!(snapshot(&mut client, &all, "film/0").await.unwrap().state, "succeeded");
         assert!(snapshot(&mut client, &all, "film/2").await.is_none());
-        assert_eq!(snapshot(&mut client, &all, "film").await.unwrap().state, "paused");
-        let scratch = machine
-            .root
-            .join("state/cpu/scratch")
-            .join(rest.number.to_string());
-        assert_eq!(
-            fs::read_to_string(scratch.join("checkpoints/long_form/attempts")).unwrap(),
-            "1"
-        );
 
-        // A paused job survives a machine restart, scratch and all.
+        // The memo is the machine's: a restart keeps it.
         machine.stop();
         let extra = installing_args(&tools);
         let (child, address) = launch(&machine.root, &extra);
         machine.child = child;
         machine.address = address;
         let mut client = self::client(&machine).await;
-        assert_eq!(snapshot(&mut client, &all, "film").await.unwrap().state, "paused");
-        assert!(scratch.join("checkpoints/long_form/film-0").exists());
-
-        let resumed = client
-            .control(control(v1::Action::Resume, "film"))
+        let events = collect(client.run(submit("again")).await.unwrap().into_inner())
             .await
-            .unwrap()
-            .into_inner();
-        assert!(["queued", "running"].contains(&resumed.state.as_str()), "{resumed:?}");
-        let events = collect(
-            client
-                .run(authorized(
-                    v1::RunRequest {
-                        id: "film".into(),
-                        after: 0,
-                        spec: None,
-                    },
-                    &all,
-                ))
-                .await
-                .unwrap()
-                .into_inner(),
-        )
-        .await
-        .unwrap();
+            .unwrap();
         let done = outcome(&events);
         assert_eq!(done.status, "succeeded", "{done:?}");
-        // Its running time sums both attempts, never the rest in between.
-        assert!(done.execution_ms > 0, "{done:?}");
         let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
-        // Two attempts counted in the run's scratch; the first attempt had declared the first
-        // segment's checkpoint (it stopped while the second ran), so that declaration replayed.
-        assert_eq!(
-            (result["segments"].as_u64(), result["attempts"].as_u64(), result["replayed"].as_u64()),
-            (Some(3), Some(2), Some(1)),
-            "{result}"
-        );
-        let states: Vec<_> = events
+        assert_eq!(result["segments"].as_u64(), Some(3), "{result}");
+        let calls: Vec<_> = events
             .iter()
             .filter_map(|e| match &e.event {
-                Some(v1::run_event::Event::State(s)) => Some((s.state.clone(), s.attempt)),
+                Some(v1::run_event::Event::Call(call)) => Some((call.index, call.memoized)),
                 _ => None,
             })
             .collect();
-        assert!(states.contains(&("running".into(), 2)), "{states:?}");
-
-        // Each segment ran exactly once, and the film is every segment in order.
-        for index in 0..3 {
-            let child = snapshot(&mut client, &all, &format!("film/{index}"))
-                .await
-                .unwrap();
-            assert_eq!((child.state.as_str(), child.attempt), ("succeeded", 1), "{child:?}");
+        assert_eq!(calls, [(0, true), (1, false), (2, false)], "only the finished segment is answered");
+        for (index, memoized) in [(0, true), (1, false), (2, false)] {
+            let attached = authorized(
+                v1::RunRequest { id: format!("again/{index}"), after: 0, spec: None },
+                &all,
+            );
+            let child = collect(client.run(attached).await.unwrap().into_inner()).await.unwrap();
+            let ended = outcome(&child);
+            assert_eq!((ended.status.as_str(), ended.memoized), ("succeeded", memoized), "{ended:?}");
         }
         let seen = tensorfs_core::sha256::hex_digest(&reference);
         let (mut film, mut context) = (String::new(), String::new());
@@ -3037,7 +2978,7 @@ mod v1_api {
             &all,
             v1::ReadRequest {
                 target: Some(v1::read_request::Target::Output(v1::OutputTarget {
-                    run: "film".into(),
+                    run: "again".into(),
                     output: "video".into(),
                     index: 0,
                     ..Default::default()
@@ -3048,70 +2989,6 @@ mod v1_api {
         .await
         .unwrap();
         assert_eq!(String::from_utf8(bytes).unwrap(), film);
-        // The replayed root's identical publishes add nothing to the output log.
-        let labels: Vec<_> = events
-            .iter()
-            .filter_map(|e| match &e.event {
-                Some(v1::run_event::Event::Product(p)) if p.output == "video" => {
-                    Some(p.label.clone())
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            labels,
-            ["Video (segments 1-1)", "Video (segments 1-2)", "Video (segments 1-3)"]
-        );
-        // Nor do its list items: each segment is one item of `parts`, in order.
-        let parts: Vec<_> = events
-            .iter()
-            .filter_map(|e| match &e.event {
-                Some(v1::run_event::Event::Product(p)) if p.output == "parts" => {
-                    Some((p.index, p.label.clone()))
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            parts,
-            [(1, "Segment 1".into()), (2, "Segment 2".into()), (3, "Segment 3".into())]
-        );
-        let again = client.control(control(v1::Action::Resume, "film")).await;
-        assert_eq!(again.err().and_then(code).as_deref(), Some("run_not_paused"));
-
-        // A paused job's cancel ends it and every unfinished child, started ones too.
-        let mut dropped = spec.clone();
-        dropped.payload = serde_json::to_vec(&serde_json::json!({
-            "reference": digest, "segments": segments, "hold": 60.0, "hold_at": 0}))
-        .unwrap();
-        client
-            .run(authorized(
-                v1::RunRequest {
-                    id: "dropped".into(),
-                    after: 0,
-                    spec: Some(dropped),
-                },
-                &all,
-            ))
-            .await
-            .unwrap();
-        until(&mut client, &all, "dropped/0", "running").await;
-        client.control(control(v1::Action::Pause, "dropped")).await.unwrap();
-        until(&mut client, &all, "dropped", "paused").await;
-        assert_eq!(snapshot(&mut client, &all, "dropped/0").await.unwrap().state, "running");
-        let canceled = client
-            .control(control(v1::Action::Cancel, "dropped"))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(canceled.state, "canceled");
-        until(&mut client, &all, "dropped/0", "canceled").await;
-
-        // The ended run's scratch goes with the next sweep (one runs at start).
-        machine.stop();
-        let (child, _) = launch(&machine.root, &extra);
-        machine.child = child;
-        assert!(!scratch.exists());
         let _ = fs::remove_dir_all(tools);
     }
 
@@ -3149,7 +3026,7 @@ mod v1_api {
             .await
             .unwrap();
         let spec = v1::RunSpec {
-            kind: v1::RunKind::Job as i32,
+            kind: v1::RunKind::Call as i32,
             source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
             entrypoint: "long_form".into(),
             payload: serde_json::to_vec(
@@ -3223,7 +3100,7 @@ mod v1_api {
             .unwrap();
         let segments = ["a dawn", "a storm", "a calm"];
         let spec = v1::RunSpec {
-            kind: v1::RunKind::Job as i32,
+            kind: v1::RunKind::Call as i32,
             source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
             entrypoint: "long_form".into(),
             payload: serde_json::to_vec(

@@ -34,4 +34,4 @@ async def gallery(ctx: Context, *, prompt: str, counter: str, seed: int | None =
 
 
 app.entrypoint(paint)
-app.job(gallery)
+app.entrypoint(gallery)

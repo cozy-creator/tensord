@@ -1,5 +1,5 @@
-"""A quantizer's shape without torch: a CPU job writes one weights output through its owner's
-native writer channel, adopts it and returns the model."""
+"""A quantizer's shape without torch: a CPU function writes one weights output through its
+owner's native writer channel, adopts it and returns the model."""
 from __future__ import annotations
 
 import asyncio
@@ -47,4 +47,4 @@ async def table(ctx: Context, payload: TableInput, tel: Telemetry) -> ModelArtif
         return result
 
 
-app.job(table, weights=(WeightsOutput("model", max_new_bytes=1 << 20),), accelerator=False)
+app.entrypoint(table, weights=(WeightsOutput("model", max_new_bytes=1 << 20),), accelerator=False)

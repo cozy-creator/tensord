@@ -1,6 +1,6 @@
-//! A job's weights: the executor's `weights_writer` requests answered over TensorFS's native
-//! channels (`tensorfs_core::derived::channel`). A source is granted when it is one of the job's
-//! model inputs, an output when the job declares it. An adopted output is held in a local
+//! An attempt's weights: the executor's `weights_writer` requests answered over TensorFS's
+//! native channels (`tensorfs_core::derived::channel`). A source is granted when it is one of
+//! the call's `Weights[M]` arguments, an output when its function declares it. An adopted output is held in a local
 //! repository, becomes a product of the run's log (its digest the output's manifest) and, with
 //! a weights destination, is published there before the adopt is answered.
 use crate::{
@@ -34,15 +34,17 @@ type BindOutput = Arc<dyn Fn(&str, &str) -> io::Result<()> + Send + Sync>;
 /// Makes objects of a source held here in part present, from the Hub it came from.
 pub type Fetch = Arc<dyn Fn(&ObjectRef, &[ObjectRef]) -> Result<(), String> + Send + Sync>;
 
-/// Execution-owner hooks: current attempt authority, durable output association and the
-/// sources' fetch.
+/// Execution-owner hooks: current attempt authority, durable output association, the
+/// sources' fetch, and the identity a committed derivation replays under (its function's code
+/// and declaration; none: this run's own).
 pub struct GrantAuthority {
     pub current: Arc<dyn Fn() -> bool + Send + Sync>,
     pub bind_output: BindOutput,
     pub fetch: Option<Fetch>,
+    pub replay: Option<String>,
 }
 
-/// Where a job's outputs are published: the repository and its Hub, written under the run's
+/// Where a run's weights outputs are published: the repository and its Hub, written under the run's
 /// capability there.
 #[derive(Clone)]
 pub struct Destination {
@@ -50,7 +52,7 @@ pub struct Destination {
     pub hub: hub::Source,
 }
 
-/// One job attempt's weights grant.
+/// One attempt's weights grant.
 pub struct Grant {
     pub actor: String,
     pub run: String,
@@ -65,6 +67,7 @@ pub struct Grant {
     /// Persist the run/output association before any native transaction can begin.
     bind_output: BindOutput,
     fetch: Option<Fetch>,
+    replay: Option<String>,
     opened: Mutex<BTreeMap<String, String>>,
     /// Publications attempted and not yet in the run's log.
     uploads: Mutex<Vec<Upload>>,
@@ -94,6 +97,7 @@ impl Grant {
             current,
             bind_output,
             fetch,
+            replay,
         } = authority;
         Self {
             actor: actor.into(),
@@ -105,6 +109,7 @@ impl Grant {
             current,
             bind_output,
             fetch,
+            replay,
             opened: Mutex::new(BTreeMap::new()),
             uploads: Mutex::new(Vec::new()),
         }
@@ -213,10 +218,11 @@ impl Weights {
                 "source is outside invocation grant".into(),
             ));
         }
-        // The output's work is its run, its slot and what it declares: a resumed attempt that
-        // declares the same resumes the same transaction.
+        // The output's work is its code, its slot and what it declares (its sources and
+        // request among it): any run of the same resumes or replays the same transaction.
         let work = sha256::hex_digest(&raw);
-        let identity = format!("{}\0{}\0{slot}\0{work}", grant.actor, grant.run);
+        let code = grant.replay.as_deref().unwrap_or(&grant.run);
+        let identity = format!("{}\0{code}\0{slot}\0{work}", grant.actor);
         let transaction = format!("sha256:{}", sha256::hex_digest(identity.as_bytes()));
         declaration.work_fingerprint = Some(format!("sha256:{work}"));
         (grant.bind_output)(&transaction, slot).map_err(io_refusal)?;
@@ -495,7 +501,7 @@ impl Weights {
     }
 }
 
-/// A job's fetch as TensorFS's: what its source lacks, from the Hub it came from.
+/// A run's fetch as TensorFS's: what its source lacks, from the Hub it came from.
 fn fetching(fetch: Option<Fetch>) -> impl Fn(&ObjectRef, &[ObjectRef]) -> tensorfs_core::err::Result<()> + Sync {
     move |manifest, objects| match &fetch {
         Some(fetch) => fetch(manifest, objects).map_err(|detail| tensorfs_core::err::Refusal {
@@ -504,7 +510,7 @@ fn fetching(fetch: Option<Fetch>) -> impl Fn(&ObjectRef, &[ObjectRef]) -> tensor
         }),
         None => Err(tensorfs_core::err::Refusal {
             code: tensorfs_core::err::Code::OBJECT_ABSENT,
-            detail: format!("{} of {} is not here and this job names no Hub it came from", objects[0].id(), manifest.id()),
+            detail: format!("{} of {} is not here and this run names no Hub it came from", objects[0].id(), manifest.id()),
         }),
     }
 }

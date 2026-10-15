@@ -42,8 +42,6 @@ pub struct Swept {
     pub results: usize,
     pub kernels: usize,
     pub generations: usize,
-    /// Ended jobs' scratch trees (`jobs::Jobs::sweep_scratch`).
-    pub scratch: usize,
     /// Adapter views whose repositories went (`adapter_views::evict`).
     pub adapter_views: usize,
     /// Bytes TensorFS's GC collected: garbage, and expired or evicted model caches.

@@ -92,8 +92,6 @@ pub struct LocalPackageUploadHeader {
 #[repr(i32)]
 pub enum MachineExecutionAction {
     Unspecified = 0,
-    Pause = 1,
-    Resume = 2,
     Cancel = 3,
 }
 
@@ -176,7 +174,6 @@ pub struct MachineExecutionTarget {
     pub release: String,
     pub entrypoint: String,
     pub installation_id: String,
-    pub job: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

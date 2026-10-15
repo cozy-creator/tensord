@@ -109,7 +109,6 @@ impl NativeBackend {
                 // The worker protocol has no "starting": an attempt is queued until it runs.
                 State::Starting => "queued",
                 State::Running => "running",
-                State::Paused => "paused",
                 State::Unknown => "unknown",
             }
             .into(),
@@ -204,7 +203,7 @@ impl NativeBackend {
             let interface: Value = serde_json::from_slice(&held.interface)
                 .map_err(|_| Status::data_loss("held installation interface corrupt"))?;
             let declaration =
-                entrypoint(&interface, &record.invocation.entrypoint, record.invocation.job)?;
+                entrypoint(&interface, &record.invocation.entrypoint)?;
             schema_digest =
                 Some(identity(declaration.get("result").ok_or_else(|| {
                     Status::failed_precondition("result schema absent")
@@ -895,29 +894,12 @@ impl MachineBackend for NativeBackend {
                     std::io::ErrorKind::ResourceBusy => refusal("cancel_unavailable", &error.to_string()),
                     _ => problem(error),
                 })?;
-            if let Some(jobs) = self.service.jobs() {
-                jobs.canceled(&canceled);
+            if let Some(calls) = self.service.calls() {
+                calls.canceled(&canceled);
             }
             return self.state(&canceled);
         }
-        let record = self.query(actor, query)?;
-        let actor = actor_id(actor);
-        let jobs = self.service.jobs();
-        let typed = |refused: crate::objects::Refused| {
-            refusal(refused.code, &refused.message)
-        };
-        let changed = match domain::MachineExecutionAction::try_from(request.action) {
-            Ok(domain::MachineExecutionAction::Pause) => jobs
-                .ok_or_else(|| refusal("pause_unsupported", "this machine runs no jobs"))?
-                .pause(&record, &actor)
-                .map_err(typed)?,
-            Ok(domain::MachineExecutionAction::Resume) => jobs
-                .ok_or_else(|| refusal("run_not_paused", "this machine runs no jobs"))?
-                .resume(&record)
-                .map_err(typed)?,
-            _ => return Err(Status::invalid_argument("control names an action")),
-        };
-        self.state(&changed)
+        Err(Status::invalid_argument("control names an action"))
     }
     fn list(
         &self,
@@ -1042,10 +1024,10 @@ fn digest_bytes(value: &str) -> Result<Vec<u8>, Status> {
         })
         .collect()
 }
-/// A callable's declaration: an entrypoint, or a job's (`jobs`).
-fn entrypoint<'a>(interface: &'a Value, name: &str, job: bool) -> Result<&'a Value, Status> {
+/// A callable's declaration.
+fn entrypoint<'a>(interface: &'a Value, name: &str) -> Result<&'a Value, Status> {
     interface
-        .get(if job { "jobs" } else { "entrypoints" })
+        .get("entrypoints")
         .and_then(Value::as_array)
         .and_then(|entries| {
             entries
@@ -1456,6 +1438,7 @@ print(json.dumps({"identity": generation.identity}))
                             sequence_parallel_degree: 1,
                             import_only: false,
                             call_interfaces: vec![],
+                            constructions: Vec::new(),
                         },
                     )?;
                     command(
@@ -1517,6 +1500,8 @@ print(json.dumps({"identity": generation.identity}))
                             activation_bytes: Default::default(),
                             squeezed_bytes: Default::default(),
                             device_weights: None,
+                            sources: Default::default(),
+                            weights: Default::default(),
                         },
                         &mut Publisher {
                             store: &task_store,

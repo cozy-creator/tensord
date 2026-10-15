@@ -4,7 +4,7 @@
 //! download) with its `release_root_preparing` progress answers.
 use crate::{
     api::domain,
-    gpu_service::{GpuPlan, GpuPool, ModelGrant},
+    gpu_service::{Plan, Pool, ModelGrant},
     hub::{self, Catalog},
     journal::{Installation, Preparation},
     objects::Refused,
@@ -50,7 +50,7 @@ pub struct PackageSdk {
 
 pub struct Prepared {
     pub installation: Installation,
-    pub plan: Option<GpuPlan>,
+    pub plan: Option<Plan>,
 }
 
 #[derive(Clone)]
@@ -682,27 +682,20 @@ impl Publisher {
     /// unfinished run, paused and unknown states included. A journal or plan that cannot be
     /// read is an error, never a shorter list: the caller then runs no store GC this pass.
     fn protected(&self, service: &Service) -> io::Result<Vec<String>> {
-        let gpu = service.gpu();
-        let mut keep = gpu.as_ref().map(|gpu| gpu.serving()).unwrap_or_default();
+        let pool = service.pool();
+        let mut keep = pool.as_ref().map(|pool| pool.serving()).unwrap_or_default();
         keep.extend(self.fetching.lock().unwrap().keys().cloned());
         keep.extend(self.remainders.lock().unwrap().keys().cloned());
         for record in service.engine.with_journal(|journal| journal.unfinished())? {
-            if record.invocation.job {
-                let context = service.engine.with_journal(|journal| journal.job_context(&record.id))?;
-                if let Some(context) = context {
-                    keep.extend(crate::runs::job_models(&context)?);
-                }
-            }
             let prepared = record.submission.filter(|s| !s.preparation_id.is_empty());
-            let (Some(submission), Some(gpu)) = (prepared, &gpu) else {
+            let (Some(submission), Some(pool)) = (prepared, &pool) else {
                 continue;
             };
             let preparation = service
                 .engine
                 .preparation(&submission.actor, &submission.preparation_id)?;
             if let Some(preparation) = preparation {
-                let selections = gpu.plan(&preparation)?.selections();
-                keep.extend(selections.into_iter().map(|s| s.manifest));
+                keep.extend(pool.plan(&preparation)?.manifests());
             }
         }
         keep.sort();
@@ -791,13 +784,13 @@ impl Publisher {
                 plan: None,
             }));
         }
-        let Some(gpu) = service.gpu() else {
+        let Some(gpu) = service.pool() else {
             return Ok(None);
         };
         let key = Self::resolution_key(
             &installation.alias,
             request,
-            &format!("{}x{}", gpu.width(), gpu_name(&gpu.config().envelope()[0])),
+            &format!("{}x{}", gpu.width(), gpu.config().envelope().first().map(|d| gpu_name(d)).unwrap_or_default()),
         );
         let Some(id) = service.engine.with_journal(|j| j.resolution(actor, &key))? else {
             return Ok(None);
@@ -846,9 +839,9 @@ impl Publisher {
                 plan: None,
             });
         }
-        let gpu = service.gpu().ok_or((
+        let gpu = service.pool().ok_or((
             "capability_unavailable",
-            "this callable needs a GPU and this machine has none configured".to_string(),
+            "this machine runs no functions".to_string(),
         ))?;
         let plan = self.model(service, &gpu, actor, &installation, request, job)?;
         Ok(Prepared {
@@ -1267,12 +1260,12 @@ impl Publisher {
     fn model(
         &self,
         service: &Service,
-        gpu: &GpuPool,
+        gpu: &Pool,
         actor: &str,
         installation: &Installation,
         request: &Request,
         job: &Job,
-    ) -> Result<GpuPlan, Failure> {
+    ) -> Result<Plan, Failure> {
         let interface: Value = serde_json::from_slice(&installation.interface).map_err(|_| {
             (
                 "package_prepare_interface_invalid",
@@ -1285,7 +1278,7 @@ impl Publisher {
                 "package_prepare_interface_invalid",
                 "declared model slot absent".to_string(),
             ))?;
-        let gpu_model = gpu_name(&gpu.config().envelope()[0]);
+        let gpu_model = gpu.config().envelope().first().map(|d| gpu_name(d)).unwrap_or_default();
         let width = gpu.width();
         let degree = crate::gpu_service::group_degree(&slots, request.gpus, width)
             .map_err(|e| ("gpu_count_unavailable", e.to_string().trim_start_matches("gpu_count_unavailable: ").into()))?;
@@ -1362,15 +1355,25 @@ impl Publisher {
             };
             parts.insert(grant.manifest.as_str(), merged);
         }
+        // A `Weights[M]` slot's checkpoint lands as its structure alone: its reads fetch the
+        // objects they need (`fetch_part`), and the Hub keeps what they never read.
+        let raw: std::collections::BTreeSet<&str> = slots
+            .iter()
+            .filter(|slot| !crate::gpu_service::constructed(slot))
+            .filter_map(|slot| slot.get("path")?.as_str())
+            .collect();
+        let structure = |manifest: &str| {
+            grants.iter().filter(|g| g.manifest == manifest).all(|g| raw.contains(g.slot.as_str()))
+        };
         let mut fetched = std::collections::BTreeSet::new();
-        let downloads: Vec<(&ModelGrant, Vec<String>)> = grants
+        let downloads: Vec<(&ModelGrant, Vec<String>, bool)> = grants
             .iter()
             .filter(|g| fetched.insert(g.manifest.clone()) && !g.repository.is_empty() && !g.repository.starts_with("local/"))
-            .map(|g| (g, parts.get(g.manifest.as_str()).cloned().flatten().unwrap_or_default()))
+            .map(|g| (g, parts.get(g.manifest.as_str()).cloned().flatten().unwrap_or_default(), structure(&g.manifest)))
             .collect();
         let landed = download_all(self, service, &request.source, &downloads, job)?;
         let mut remainders = self.remainders.lock().unwrap();
-        for (grant, hold) in landed {
+        for (grant, hold) in landed.into_iter().filter(|(grant, _)| !structure(&grant.manifest)) {
             remainders
                 .entry(grant.manifest.clone())
                 .or_insert_with(|| Remainder {
@@ -1597,7 +1600,7 @@ fn download_all<'g>(
     publisher: &Publisher,
     service: &Service,
     source: &hub::Source,
-    grants: &[(&'g ModelGrant, Vec<String>)],
+    grants: &[(&'g ModelGrant, Vec<String>, bool)],
     job: &Job,
 ) -> Result<Vec<(&'g ModelGrant, tensorfs_core::ensure::PartHold)>, Failure> {
     if grants.is_empty() {
@@ -1605,9 +1608,10 @@ fn download_all<'g>(
     }
     let names: Vec<String> = grants
         .iter()
-        .map(|(g, part)| match part.is_empty() {
-            true => format!("{}@{} {}", g.repository, g.release, g.lane),
-            false => format!("{}@{} {} ({})", g.repository, g.release, g.lane, part.join(", ")),
+        .map(|(g, part, structure)| match (part.is_empty(), structure) {
+            (_, true) => format!("{}@{} {} (structure)", g.repository, g.release, g.lane),
+            (true, false) => format!("{}@{} {}", g.repository, g.release, g.lane),
+            (false, false) => format!("{}@{} {} ({})", g.repository, g.release, g.lane, part.join(", ")),
         })
         .collect();
     job.stage(format!("downloading {}", names.join(" and ")));
@@ -1616,10 +1620,10 @@ fn download_all<'g>(
         let handles: Vec<_> = grants
             .iter()
             .enumerate()
-            .map(|(at, (grant, part))| {
+            .map(|(at, (grant, part, structure))| {
                 let moved = &moved;
                 scope.spawn(move || {
-                    let pull = Pull { components: part.clone(), behind: job.behind, stop: job.stop.clone(), ..Pull::default() };
+                    let pull = Pull { components: part.clone(), part: *structure, behind: job.behind, stop: job.stop.clone(), ..Pull::default() };
                     publisher.ensure(service, source, &Named::of(grant), &pull, &|done, total| {
                         let (done, total) = {
                             let mut moved = moved.lock().unwrap();
@@ -1637,7 +1641,7 @@ fn download_all<'g>(
             .collect()
     });
     let mut held = Vec::new();
-    for ((grant, _), result) in grants.iter().zip(results) {
+    for ((grant, _, _), result) in grants.iter().zip(results) {
         if let Some(hold) = result? {
             held.push((*grant, hold));
         }
@@ -2715,7 +2719,7 @@ mod tests {
         });
         let grant = crate::weights::Grant::new("owner", "run", &bench.root, [(manifest.id(), manifest.length)].into(),
             BTreeMap::new(), None, crate::weights::GrantAuthority {
-                current: Arc::new(|| true), bind_output: Arc::new(|_, _| Ok(())), fetch: Some(fetch) });
+                current: Arc::new(|| true), bind_output: Arc::new(|_, _| Ok(())), fetch: Some(fetch), replay: None });
         let frame = crate::device_executor::Frame { operation: "source".into(), manifest: manifest.id(), ..Default::default() };
         let (answer, channel, _) = weights.answer(&grant, &frame);
         assert!(answer.ok, "{}", answer.detail);

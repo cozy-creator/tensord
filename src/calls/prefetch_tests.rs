@@ -1,8 +1,10 @@
 //! Real control frames, native handler and durable child bindings; no GPU is configured.
 use super::*;
 use crate::{
+    device_executor,
     journal::{Installation, Invocation},
     objects::Objects,
+    runs::RunContext,
 };
 
 fn artifact() -> Value {
@@ -29,9 +31,9 @@ fn prefetch_choices_cross_the_native_handler_and_keep_callee_authority() {
         local: None,
         own_hub: None,
         leaf: None,
-        jobs: Default::default(),
+        contexts: Default::default(),
     });
-    let jobs = Jobs::configure(&service, store, Some(&runs)).unwrap();
+    let broker = Calls::configure(&service, store, Some(&runs)).unwrap();
     let interface = json!({"entrypoints": [{"name": "render", "models": [
         {"path": "render.models.network", "class": "fixture.Network"}
     ]}]});
@@ -53,22 +55,11 @@ fn prefetch_choices_cross_the_native_handler_and_keep_callee_authority() {
             "alice",
             "parent",
             "parent",
-            Invocation {
-                job: true,
-                ..Default::default()
-            },
+            Invocation::default(),
         )
         .unwrap();
-    let context = json!({
-        "installation": "installed", "owner": "alice",
-        "attention_kernel": "", "models": [],
-    });
-    service
-        .engine
-        .with_journal(|journal| {
-            journal.bind_job_context(&record.id, &serde_json::to_vec(&context).unwrap())
-        })
-        .unwrap();
+    let context = RunContext { installation: "installed".into(), owner: "alice".into(), ..Default::default() };
+    runs.contexts.lock().unwrap().insert(record.id.clone(), context.clone());
     let parent = Parent {
         id: record.id.clone(),
         request: "parent".into(),
@@ -81,7 +72,6 @@ fn prefetch_choices_cross_the_native_handler_and_keep_callee_authority() {
         .into(),
         pure: false,
         pure_callables: Default::default(),
-        serving: Default::default(),
         inputs: vec![],
         calls: Default::default(),
     };
@@ -97,7 +87,7 @@ fn prefetch_choices_cross_the_native_handler_and_keep_callee_authority() {
             .unwrap();
         client.write_all(&body).unwrap();
         let frame = device_executor::read_frame(&mut server).unwrap().unwrap();
-        jobs.seam(&parent, &frame).unwrap().0
+        broker.seam(&parent, &frame).unwrap().0
     };
     // Empty payload is an older peer. Null/omitted choices keep inherited/default selection.
     for payload in [
@@ -122,25 +112,17 @@ fn prefetch_choices_cross_the_native_handler_and_keep_callee_authority() {
     ] {
         assert_eq!(ask("render", &payload).code, "child_call_refused", "{payload}");
     }
-    // An installation held by Alice cannot be used through another actor's job context.
+    // An installation held by Alice cannot be used through another actor's context.
     let (other, _) = service
         .engine
         .accept_run(
             "bob",
             "parent",
             "parent",
-            Invocation {
-                job: true,
-                ..Default::default()
-            },
+            Invocation::default(),
         )
         .unwrap();
-    service
-        .engine
-        .with_journal(|journal| {
-            journal.bind_job_context(&other.id, &serde_json::to_vec(&context).unwrap())
-        })
-        .unwrap();
+    runs.contexts.lock().unwrap().insert(other.id.clone(), context);
     let denied = runs.prefetch(&other, "", "render", vec![]).unwrap_err();
     assert_eq!(denied.code, "child_call_refused");
     assert_eq!(
@@ -149,7 +131,7 @@ fn prefetch_choices_cross_the_native_handler_and_keep_callee_authority() {
         "a hint must not create a child execution"
     );
 
-    let unsupported = Jobs::configure(
+    let unsupported = Calls::configure(
         &service,
         Arc::new(Store::open(&root.join("store")).unwrap()),
         None,
@@ -168,7 +150,7 @@ fn prefetch_choices_cross_the_native_handler_and_keep_callee_authority() {
         .unwrap_err();
     assert_eq!(reply.0, "model_prefetch_unsupported");
     drop(unsupported);
-    drop(jobs);
+    drop(broker);
     drop(runs);
     drop(service);
     std::fs::remove_dir_all(root).unwrap();

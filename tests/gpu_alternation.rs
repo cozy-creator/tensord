@@ -8,7 +8,7 @@
 //! request `at`, run `start` (a ballast taking device memory while the call runs) and create
 //! `release` once that request ends.
 use tensord::{
-    gpu_service::{GpuConfig, GpuPool},
+    gpu_service::{GpuConfig, Pool},
     journal::{Preparation, State, SubmissionContext},
     service::Service,
 };
@@ -58,13 +58,13 @@ fn published_models_alternate_on_one_gpu_under_the_memory_policy() {
     let plan: Plan = serde_json::from_reader(File::open(path).unwrap()).unwrap();
     let service = Service::open(&plan.state, &plan.generations, 1).unwrap();
     let store = Arc::new(Store::ensure(&plan.store).unwrap());
-    let gpu = GpuPool::new(
+    let gpu = Pool::new(
         &plan.state.join("gpu"),
         GpuConfig::load(&plan.gpu_config).unwrap(),
         store,
     )
     .unwrap();
-    service.configure_gpu(gpu.clone()).unwrap();
+    service.configure_pool(gpu.clone()).unwrap();
     let mut output = File::create(&plan.output).unwrap();
     let salt = uuid::Uuid::new_v4().simple().to_string();
     let mut failed = vec![];

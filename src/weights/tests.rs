@@ -37,6 +37,7 @@ impl Fixture {
                 current: Arc::new(move || state.load(Ordering::SeqCst)),
                 bind_output: Arc::new(|_, _| Ok(())),
                 fetch: None,
+                replay: None,
             },
         );
         let plain = tensorfs_core::registry::seeds()
@@ -436,10 +437,7 @@ fn cancel_between_durable_binding_and_native_begin_cannot_resurrect_the_transact
     let record = engine
         .submit(
             "before-begin",
-            Invocation {
-                job: true,
-                ..Default::default()
-            },
+            Invocation::default(),
         )
         .unwrap();
     let mut child = Command::new("/bin/cat")
@@ -527,11 +525,11 @@ fn changed_declaration_in_one_slot_keeps_both_acknowledged_results() {
 
 #[test]
 fn cancellation_retries_released_root_cleanup_before_acknowledging_the_binding() {
-    use crate::{execution::process_birth, jobs::Jobs, journal::Invocation, service::Service};
+    use crate::{calls::Calls, execution::process_birth, journal::Invocation, service::Service};
     use std::process::{Command, Stdio};
     let mut f = Fixture::new();
     let service = Service::open(&f.root.join("state"), &f.root.join("generations"), 1).unwrap();
-    let jobs = Jobs::configure(&service, f.owner.store.clone(), None).unwrap();
+    let calls = Calls::configure(&service, f.owner.store.clone(), None).unwrap();
     let engine = service.engine.clone();
     let mut child = Command::new("/bin/cat")
         .stdin(Stdio::piped())
@@ -542,7 +540,7 @@ fn cancellation_retries_released_root_cleanup_before_acknowledging_the_binding()
         .with_journal(|j| {
             // This fixture supplies its own process. Publish its complete running state
             // atomically so Service cannot dispatch the empty-generation record first.
-            let record = j.accept("cleanup-retry", Invocation { job: true, ..Default::default() })?;
+            let record = j.accept("cleanup-retry", Invocation::default())?;
             assert!(j.claim(&record.id)?);
             j.register_process(&record.id, process_birth(child.id())?)?;
             j.running(&record.id, None)
@@ -591,7 +589,7 @@ fn cancellation_retries_released_root_cleanup_before_acknowledging_the_binding()
     // Real native dispose commits Released, then fails to unlink its original root path.
     assert!(derived::dispose(&f.owner.store, &f.owner.meta, &transaction).is_err());
     engine.cancel(&running.id, "owner").unwrap();
-    assert!(jobs.sweep_canceled_outputs(&engine).is_err());
+    assert!(calls.sweep_canceled_outputs(&engine).is_err());
     assert_eq!(
         engine
             .with_journal(|j| j.canceled_derived_outputs())
@@ -601,7 +599,7 @@ fn cancellation_retries_released_root_cleanup_before_acknowledging_the_binding()
     );
     std::fs::remove_dir_all(&root).unwrap();
     std::fs::write(&root, genuine_root).unwrap();
-    assert_eq!(jobs.sweep_canceled_outputs(&engine).unwrap(), 1);
+    assert_eq!(calls.sweep_canceled_outputs(&engine).unwrap(), 1);
     assert!(!root.exists());
     assert!(engine
         .with_journal(|j| j.canceled_derived_outputs())
@@ -615,7 +613,7 @@ fn cancellation_retries_released_root_cleanup_before_acknowledging_the_binding()
     engine
         .finish(&running.id, crate::journal::Outcome::Canceled)
         .unwrap();
-    drop(jobs);
+    drop(calls);
     drop(service);
     engine.notify_activity();
 }

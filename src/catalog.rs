@@ -35,7 +35,7 @@ pub struct Generation {
     /// The package's own installed files, hashed; empty when its installer recorded none.
     #[serde(default)]
     pub source_digest: String,
-    /// Other packages' Apps this environment holds as dependencies: a job calls them here.
+    /// Other packages' Apps this environment holds as dependencies: a call calls them here.
     #[serde(default)]
     pub callees: Vec<Callee>,
     /// Empty when this machine's own Runtime and TensorFS installed; else why the release's
@@ -65,14 +65,17 @@ impl Generation {
         })
     }
 
-    /// The widest GPU group any model entrypoint of this environment (its own App's or a
-    /// callee's) runs on `available` GPUs: the width of a workflow's allocation. 0: none.
+    /// The widest GPU group any constructing entrypoint of this environment (its own App's or
+    /// a callee's) runs on `available` GPUs: the width of a workflow's allocation. 0: none.
     pub fn widest_group(&self, available: usize) -> u32 {
         std::iter::once(&self.interface)
             .chain(self.callees.iter().map(|callee| &callee.interface))
             .filter_map(|interface| interface.get("entrypoints")?.as_array())
             .flatten()
-            .filter_map(|entry| entry.get("models")?.as_array().filter(|models| !models.is_empty()))
+            .filter_map(|entry| {
+                let models = entry.get("models")?.as_array()?;
+                models.iter().any(crate::gpu_service::constructed).then_some(models)
+            })
             .filter_map(|models| crate::gpu_service::group_degree(models, 0, available).ok())
             .max()
             .unwrap_or(0)
@@ -197,16 +200,6 @@ impl Catalog {
         found.into_iter().map(|(_, held)| held).collect()
     }
 }
-/// Whether a job holds this machine's GPU: `accelerator=True` requires one, False runs on CPU, and
-/// an undeclared job takes the GPU when the machine has one, else runs on CPU.
-pub fn job_gpu(row: &serde_json::Value, gpu: bool) -> Result<bool, (&'static str, &'static str)> {
-    match row.get("accelerator") {
-        None | Some(serde_json::Value::Null) => Ok(gpu),
-        Some(serde_json::Value::Bool(true)) if !gpu => Err(("accelerator_job_unavailable", "this job requires a configured GPU")),
-        Some(serde_json::Value::Bool(value)) => Ok(*value),
-        _ => Err(("package_interface_invalid", "job accelerator declaration must be boolean")),
-    }
-}
 impl HeldGeneration {
     /// One App's executor view, with the environment and lifetime hold unchanged.
     pub fn application(&self, application: &str) -> io::Result<Self> {
@@ -222,12 +215,6 @@ impl HeldGeneration {
         held.record.interface = callee.interface.clone();
         held.record.source_digest = callee.source_digest.clone();
         Ok(held)
-    }
-    pub fn accelerator_job(&self, application: &str, name: &str, gpu: bool) -> io::Result<bool> {
-        let (_, _, interface) = self.record.app(application).ok_or_else(|| invalid("this environment holds no such application"))?;
-        let row = interface["jobs"].as_array().and_then(|rows| rows.iter().find(|row| row["name"].as_str() == Some(name)))
-            .ok_or_else(|| invalid("this application declares no such job"))?;
-        job_gpu(row, gpu).map_err(|(code, detail)| invalid(&format!("{code}: {detail}")))
     }
     pub fn retention(&self) -> Arc<File> {
         self.hold.clone()
@@ -278,43 +265,5 @@ impl HeldGeneration {
                 )
             }),
         }
-    }
-}
-
-#[cfg(test)]
-mod accelerator_tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn device_declaration_is_scoped_to_the_actual_installed_app() {
-        let path = std::env::temp_dir().join(format!("accelerator-interface-{}", uuid::Uuid::new_v4()));
-        let file = File::create(&path).unwrap();
-        let held = HeldGeneration {
-            hold: Arc::new(file),
-            record: Generation {
-                identity: "a".repeat(32), package: "local/root".into(), version: "1".into(),
-                application: "root:app".into(), python: "/usr/bin/python3".into(), dependencies: vec![],
-                cpu_bridge: String::new(), source_digest: String::new(), sdk_fallback: String::new(),
-                interface: json!({"jobs":[{"name":"work","accelerator":false},{"name":"undeclared"}]}),
-                callees: vec![Callee {
-                    distribution: "child".into(), version: "1".into(), application: "child:app".into(),
-                    package: "local/child".into(), source_digest: String::new(),
-                    interface: json!({"jobs":[{"name":"work","accelerator":true},{"name":"broken","accelerator":"true"}]}),
-                }],
-            },
-        };
-        for gpu in [true, false] {
-            assert!(!held.accelerator_job("root:app", "work", gpu).unwrap());
-            assert_eq!(held.accelerator_job("", "undeclared", gpu).unwrap(), gpu);
-            assert!(held.accelerator_job("", "absent", gpu).is_err());
-            assert!(held.accelerator_job("child:app", "broken", gpu).is_err());
-            assert!(held.accelerator_job("other:app", "work", gpu).is_err());
-        }
-        assert!(held.accelerator_job("child:app", "work", true).unwrap());
-        let refused = held.accelerator_job("child:app", "work", false).unwrap_err().to_string();
-        assert_eq!(refused, "accelerator_job_unavailable: this job requires a configured GPU");
-        drop(held);
-        fs::remove_file(path).unwrap();
     }
 }

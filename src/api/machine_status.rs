@@ -9,7 +9,7 @@ use tonic::Status;
 pub(super) type Frames = Pin<Box<dyn Stream<Item = Result<v1::StatusFrame, Status>> + Send>>;
 
 /// What this machine serves on `cozy.machine.v1`, for clients that adapt to it.
-/// `run-gpus/1`: a run may request an exact GPU group, inherited and reserved by its jobs.
+/// `run-gpus/1`: a run may request an exact GPU group, inherited and reserved by its calls.
 /// `warm/1`: a warm run with no entrypoint installs its code and makes its model choices
 /// present. `warm/2`: a warm run's `set` replaces the caller's warm set, and Status reports the
 /// set and each environment's level. `upload/1`: a warm run of one provider source puts it in
@@ -36,7 +36,7 @@ pub const CAPABILITIES: &[&str] = &[
     "live-source/2",
 ];
 
-const LIVE: [&str; 4] = ["queued", "starting", "running", "paused"];
+const LIVE: [&str; 3] = ["queued", "starting", "running"];
 
 pub(super) async fn status<B: MachineBackend>(
     identity: Arc<MachineIdentity>,

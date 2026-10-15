@@ -73,7 +73,7 @@ pub trait TierLimit: Send + Sync {
     }
 }
 /// A simple standalone policy: half the live headroom plus the tier's retained bytes.
-/// GpuPool uses the shared host ledger's TierPolicy to include executor-private pinned bytes.
+/// Pool uses the shared host ledger's TierPolicy to include executor-private pinned bytes.
 pub struct HalfOfHeadroom;
 impl TierLimit for HalfOfHeadroom {
     fn limit(&self, host: &HostMemory, charged: u64) -> u64 {

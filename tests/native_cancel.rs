@@ -72,7 +72,7 @@ fn request<T>(value: T, key: [u8; 32], run: Option<&str>) -> Request<T> {
 }
 fn spec() -> v1::RunSpec {
     v1::RunSpec {
-        kind: v1::RunKind::Job as i32,
+        kind: v1::RunKind::Call as i32,
         source: Some(v1::run_spec::Source::Installation(
             "unused-installation".into(),
         )),
@@ -117,7 +117,7 @@ impl Server {
             local: None,
             own_hub: None,
             leaf: None,
-            jobs: Default::default(),
+            contexts: Default::default(),
         }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -478,21 +478,20 @@ fn update_and_cancel_admission_serialize_across_real_sqlite_connections() {
 async fn absent_cancel_is_observable_scoped_repeatable_and_survives_restart() {
     let root = Root::new();
     let mut server = Server::open(&root.0).await;
-    for action in [v1::Action::Pause, v1::Action::Resume] {
-        let error = server
-            .client
-            .control(request(
-                v1::ControlRequest {
-                    id: "never-sent".into(),
-                    action: action as i32,
-                },
-                ALICE,
-                None,
-            ))
-            .await
-            .unwrap_err();
-        assert_eq!(error.code(), Code::NotFound);
-    }
+    // Cancel is the only control: a run is canceled, and submitted again.
+    let error = server
+        .client
+        .control(request(
+            v1::ControlRequest {
+                id: "never-sent".into(),
+                action: 2,
+            },
+            ALICE,
+            None,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::InvalidArgument);
     for id in ["".to_string(), "x".repeat(257)] {
         let error = server
             .client

@@ -15,7 +15,7 @@ pub mod host_memory;
 pub mod host_pressure;
 pub mod host_tier;
 pub mod hub;
-pub mod jobs;
+pub mod calls;
 pub mod journal;
 pub mod launch_identity;
 pub mod local_source;

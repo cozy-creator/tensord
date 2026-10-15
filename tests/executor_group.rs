@@ -86,6 +86,7 @@ fn start(
         sequence_parallel_degree: degree,
         import_only: false,
         call_interfaces: vec![],
+        constructions: Vec::new(),
     }
 }
 
@@ -239,6 +240,7 @@ fn a_forked_rank_zero_takes_the_group_seal_and_spawns_its_follower() {
                 sequence_parallel_degree: 1,
                 import_only: true,
                 call_interfaces: vec![],
+                constructions: Vec::new(),
             },
             &mut Baseline,
         )
@@ -293,6 +295,7 @@ fn a_forked_rank_zero_takes_the_group_seal_and_spawns_its_follower() {
                 sequence_parallel_degree: 2,
                 import_only: false,
                 call_interfaces: vec![],
+                constructions: Vec::new(),
             },
             &mut Baseline,
         )

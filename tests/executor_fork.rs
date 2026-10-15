@@ -67,6 +67,7 @@ fn start(generation: &Generation, interface: &Path, import_only: bool) -> Device
         sequence_parallel_degree: 1,
         import_only,
         call_interfaces: vec![],
+        constructions: Vec::new(),
     }
 }
 
@@ -175,6 +176,8 @@ fn a_forked_executor_is_sealed_serves_and_is_reaped_with_its_status() {
                     activation_bytes: Default::default(),
                     squeezed_bytes: Default::default(),
                     device_weights: None,
+                    sources: Default::default(),
+                    weights: Default::default(),
                 },
                 &mut Baseline,
             )

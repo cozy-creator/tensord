@@ -80,6 +80,7 @@ fn prepared(version: &str, generation_path: &str) -> (DeviceExecutor, PathBuf) {
                 sequence_parallel_degree: 1,
                 import_only: false,
                 call_interfaces: vec![],
+                constructions: Vec::new(),
             },
             &mut Baseline,
         )
@@ -153,6 +154,8 @@ fn invoke(
                 activation_bytes: Default::default(),
                 squeezed_bytes: Default::default(),
                 device_weights: None,
+                sources: Default::default(),
+                weights: Default::default(),
             },
             services,
         )
@@ -295,6 +298,8 @@ fn stock_executor_deferred_webp_reuses_sdk_encoder_and_exact_asset_binding() {
                 activation_bytes: Default::default(),
                 squeezed_bytes: Default::default(),
                 device_weights: None,
+                sources: Default::default(),
+                weights: Default::default(),
             },
             &mut Baseline,
         )

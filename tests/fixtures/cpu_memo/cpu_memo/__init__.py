@@ -1,5 +1,6 @@
-"""A job whose call is memoized: `measure` counts each time it truly runs in the file its
-request names, so a call answered from its caller's known results shows as no run."""
+"""A caller whose call is memoized: `measure` counts each time it truly runs in the file its
+request names, so a call answered from the machine's memo shows as no run. A writer
+(`produce`) is never memoized."""
 from __future__ import annotations
 
 import io
@@ -49,7 +50,7 @@ async def survey(ctx: Context, payload: Survey) -> Surveyed:
 
 
 app.entrypoint(measure)
-app.job(survey, accelerator=False)
+app.entrypoint(survey, accelerator=False)
 
 
 @invocable()
@@ -64,7 +65,7 @@ async def restricted(ctx: Context, *, payload: Probe) -> Measured:
     return Measured(square=payload.value * payload.value)
 
 
-app.job(nested, accelerator=False)
+app.entrypoint(nested, accelerator=False)
 app.entrypoint(restricted, internal=True)
 
 
@@ -100,7 +101,7 @@ def paint(ctx: Context, payload: Painting, out: Outputs) -> Painted:
     return Painted(out.save_image(ImageFrame(8, 8, bytes([payload.shade, 90, 160]) * 64), format="png"))
 
 
-@invocable(memoize=True)
+@invocable()
 async def produce(ctx: Context) -> ModelArtifact:
     """A small f16 model this package writes, for a caller to quantize."""
     plain = dict(tensorfs.seed_digests())["plain/1"]
@@ -117,7 +118,7 @@ async def produce(ctx: Context) -> ModelArtifact:
         return ctx.adopt_model(output.commit())
 
 
-app.job(produce, weights=(WeightsOutput("model", max_new_bytes=65536),), accelerator=False)
+app.entrypoint(produce, weights=(WeightsOutput("model", max_new_bytes=65536),), accelerator=False)
 
 
 class Noted(msgspec.Struct):
@@ -133,4 +134,4 @@ async def note(ctx: Context, *, payload: Probe, out: Outputs) -> Noted:
     return Noted(out.save_bytes(f"note {payload.value}".encode(), media_type="text/plain"), payload.value)
 
 
-app.job(note, accelerator=False)
+app.entrypoint(note, accelerator=False)

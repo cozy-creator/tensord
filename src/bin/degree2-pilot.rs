@@ -203,6 +203,7 @@ fn exec(
             sequence_parallel_degree: 1,
             import_only: false,
             call_interfaces: vec![],
+            constructions: Vec::new(),
         },
         &mut pilot,
     )?;
@@ -288,6 +289,8 @@ fn exec(
                 activation_bytes: Default::default(),
                 squeezed_bytes: Default::default(),
                 device_weights: None,
+                sources: Default::default(),
+                weights: Default::default(),
             },
             &mut pilot,
         )?;

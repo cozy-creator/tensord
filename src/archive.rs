@@ -354,6 +354,7 @@ pub fn encode_model_choice(value: &domain::ModelChoice) -> Vec<u8> {
     ModelChoice::from(value.clone()).encode_to_vec()
 }
 
+#[cfg(test)]
 pub fn decode_model_choice(bytes: &[u8]) -> Result<domain::ModelChoice, prost::DecodeError> {
     ModelChoice::decode(bytes).map(Into::into)
 }

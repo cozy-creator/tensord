@@ -7,7 +7,7 @@
 //! (`{package, release}`) of different publishers that bind the same checkpoint. On a card
 //! with room for both executors.
 use tensord::{
-    gpu_service::{GpuConfig, GpuPool},
+    gpu_service::{GpuConfig, Pool},
     journal::{Execution, Preparation, State, SubmissionContext},
     process::process_ended,
     resident_custody::HoldingFacts,
@@ -46,7 +46,7 @@ struct Plan {
 struct Pod {
     plan: Plan,
     service: Arc<Service>,
-    gpu: Arc<GpuPool>,
+    gpu: Arc<Pool>,
     output: File,
     salt: String,
     submitted: u32,
@@ -170,8 +170,8 @@ fn submitters_share_a_packages_executor_and_packages_share_a_checkpoints_weights
     let service = Service::open(&plan.state, &plan.generations, 1).unwrap();
     let store = Arc::new(Store::ensure(&plan.store).unwrap());
     let config = GpuConfig::load(&plan.gpu_config).unwrap();
-    let gpu = GpuPool::new(&plan.state.join("gpu"), config, store).unwrap();
-    service.configure_gpu(gpu.clone()).unwrap();
+    let gpu = Pool::new(&plan.state.join("gpu"), config, store).unwrap();
+    service.configure_pool(gpu.clone()).unwrap();
     let mut pod = Pod {
         output: File::create(&plan.output).unwrap(),
         plan,

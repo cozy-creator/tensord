@@ -76,10 +76,10 @@ fn restart_ends_a_retained_gpu_birth_before_admitting_gpu_work() {
 }
 
 fn complete(journal: &mut Journal, n: usize, generation: &str, birth: ProcessBirth, preparation: &str) {
-    complete_device(journal, n, generation, birth, preparation, false);
+    complete_device(journal, n, generation, birth, preparation, 1);
 }
 
-fn complete_device(journal: &mut Journal, n: usize, generation: &str, birth: ProcessBirth, preparation: &str, accelerator: bool) {
+fn complete_device(journal: &mut Journal, n: usize, generation: &str, birth: ProcessBirth, preparation: &str, degree: u32) {
     let context = SubmissionContext {
         actor: "actor".into(),
         request_id: format!("request-{n}"),
@@ -98,8 +98,7 @@ fn complete_device(journal: &mut Journal, n: usize, generation: &str, birth: Pro
                 generation: generation.into(),
                 module: "fixture:app".into(),
                 entrypoint: "infer".into(),
-                job: accelerator,
-                accelerator,
+                degree,
                 input: json!({"n":n}),
                 ..Default::default()
             },
@@ -158,7 +157,7 @@ fn restart_ends_processes_left_in_earlier_executor_scopes() {
 }
 
 #[test]
-fn restart_fences_a_terminal_inline_gpu_job_without_a_model_preparation() {
+fn restart_fences_a_terminal_weightless_gpu_call_by_its_degree() {
     let root = std::env::temp_dir().join(format!("machine-job-gpu-fence-{}", uuid::Uuid::new_v4()));
     let mut child = Command::new("/usr/bin/python3")
         .args(["-I", "-c", "import sys; sys.stdin.buffer.read()"])
@@ -166,8 +165,8 @@ fn restart_fences_a_terminal_inline_gpu_job_without_a_model_preparation() {
     let birth = process_birth(child.id()).unwrap();
     let state = root.join("state");
     let mut journal = Journal::open(&state.join("execution")).unwrap();
-    complete_device(&mut journal, 1, &"a".repeat(32), birth.clone(), "", true);
-    complete_device(&mut journal, 2, &"a".repeat(32), birth, "", false);
+    complete_device(&mut journal, 1, &"a".repeat(32), birth.clone(), "", 1);
+    complete_device(&mut journal, 2, &"a".repeat(32), birth, "", 0);
     assert_eq!(journal.gpu_births_after(0, 256).unwrap().len(), 1);
     drop(journal);
     let service = Service::open(&state, &root.join("generations"), 1).unwrap();

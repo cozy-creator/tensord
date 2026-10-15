@@ -244,14 +244,13 @@ fn member(mut item: v1::WarmItem) -> Result<crate::runs::SetItem, Status> {
 /// A Run spec as this machine's run sources (`runs`), and the Hub it reads. Its digest (the
 /// Hub's origin alone) makes the id idempotent: the same id with another spec is refused.
 fn spec_of(mut spec: v1::RunSpec) -> Result<(crate::runs::Spec, Option<v1::HubAccess>), Status> {
-    let (warm, job, remove) = match v1::RunKind::try_from(spec.kind) {
-        Ok(v1::RunKind::Call) => (false, false, false),
-        Ok(v1::RunKind::Warm) => (true, false, false),
-        Ok(v1::RunKind::Job) => (false, true, false),
-        Ok(v1::RunKind::Remove) => (false, false, true),
+    let (warm, remove) = match v1::RunKind::try_from(spec.kind) {
+        Ok(v1::RunKind::Call) => (false, false),
+        Ok(v1::RunKind::Warm) => (true, false),
+        Ok(v1::RunKind::Remove) => (false, true),
         _ => {
             return Err(Status::unimplemented(
-                "Run takes calls, jobs, warm-ups, removals and updates",
+                "Run takes calls, warm-ups, removals and updates",
             ))
         }
     };
@@ -302,7 +301,6 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<(crate::runs::Spec, Option<v1::HubAc
         warm,
         remove,
         set,
-        job,
         parent: String::new(),
         source,
         entrypoint: spec.entrypoint,
@@ -709,13 +707,7 @@ impl<B: MachineBackend> v1::machine_server::Machine for MachineV1<B> {
         }
         let action = match v1::Action::try_from(request.action) {
             Ok(v1::Action::Cancel) => domain::MachineExecutionAction::Cancel,
-            Ok(v1::Action::Pause) => domain::MachineExecutionAction::Pause,
-            Ok(v1::Action::Resume) => domain::MachineExecutionAction::Resume,
             _ => return Err(Status::invalid_argument("control names an action")),
-        };
-        let _admitted = match action {
-            domain::MachineExecutionAction::Resume => self.admit()?,
-            _ => None,
         };
         let actor = caller.actor;
         let id = request.id.clone();
@@ -1198,7 +1190,7 @@ mod tests {
         let store = Arc::new(tensorfs_core::store::Store::ensure(&root.join("store")).unwrap());
         let objects = Arc::new(crate::objects::Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap());
         let runs = Arc::new(crate::runs::Runs {
-            service: service.clone(), objects, publisher: None, local: None, own_hub: None, leaf: None, jobs: Default::default(),
+            service: service.clone(), objects, publisher: None, local: None, own_hub: None, leaf: None, contexts: Default::default(),
         });
         let held = authored();
         let (spec, access) = spec_of(held.clone()).unwrap();

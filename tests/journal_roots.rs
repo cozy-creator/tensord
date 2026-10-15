@@ -1,12 +1,13 @@
-//! Objects an unfinished run still needs survive the store's collection, and a restart. A job
-//! paused after one finished child and a job that never started each hold a Write input (and
-//! the paused one its children's results); the first tier of every pressured sweep
-//! (`gc::collect`, run here in the process that owns the store, as the machine runs it) then
-//! collects whatever nothing holds. Both runs are resumed and must finish whole.
+//! A run canceled after one finished child, submitted again, skips that child: its memoized
+//! success was held when it completed, whatever its root then did. Between the two runs the
+//! first tier of every pressured sweep (`gc::collect`, run here in the process that owns the
+//! store, as the machine runs it), after a restart too, keeps what the memo and the second run
+//! need.
 use tensord::{
     api::install::InstallerConfig,
+    calls::Calls,
     execution::Engine,
-    jobs::Jobs,
+    gpu_service::{GpuConfig, Pool},
     journal::{Execution, InputFile, State},
     local_source::LocalSources,
     objects::Objects,
@@ -19,7 +20,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 use tensorfs_core::{err::Code, sha256, store::Store};
 
@@ -91,9 +92,11 @@ fn open(root: &Path, tools: &Tools) -> Machine {
         local: Some(Arc::new(local)),
         own_hub: None,
         leaf: None,
-        jobs: Default::default(),
+        contexts: Default::default(),
     });
-    Jobs::configure(&service, store.clone(), Some(&runs)).unwrap();
+    let config = GpuConfig::deviceless(&root.join("home")).unwrap();
+    service.configure_pool(Pool::new(&root.join("pool"), config, store.clone()).unwrap()).unwrap();
+    Calls::configure(&service, store.clone(), Some(&runs)).unwrap();
     Machine {
         service,
         store,
@@ -135,13 +138,12 @@ fn write_longform(objects: &Objects) -> String {
     write(objects, manifest.to_string().as_bytes()).0
 }
 
-/// A film whose segment `hold_at` takes 15 s: long enough to pause the job inside it.
+/// A film whose segment `hold_at` takes 15 s: long enough to cancel it inside that segment.
 fn film(manifest: &str, reference: &(String, u64), segments: &[&str], hold_at: i64) -> Spec {
     Spec {
         warm: false,
         remove: false,
         set: None,
-        job: true,
         parent: String::new(),
         source: Source::Local(manifest.into()),
         entrypoint: "long_form".into(),
@@ -200,62 +202,38 @@ fn collect(store: &Store) {
     }
 }
 
-/// A job paused after one finished child, and one paused before it started; the store's
-/// collection runs (after a restart, when `restart`); both resume and finish whole.
-fn paused_and_unstarted_runs_keep_their_objects(restart: bool) {
+/// A film canceled inside its second segment, then submitted again (after a restart, when
+/// `restart`), with the store's collection in between: its first segment is answered from the
+/// memo, nothing of it runs; the rest run, and the film is whole.
+fn a_canceled_root_resubmitted_skips_its_finished_steps(restart: bool) {
     let root = std::env::temp_dir().join(format!("cm-journal-roots-{}", uuid::Uuid::new_v4()));
     let tools = tools(&root);
     let mut machine = open(&root, &tools);
     let manifest = write_longform(&machine.objects);
-    let (first, second) = (write(&machine.objects, &png(9)), write(&machine.objects, &png(77)));
+    let reference = write(&machine.objects, &png(9));
     let engine = machine.service.engine.clone();
-    let jobs = machine.service.jobs().unwrap();
-
-    // `paused`: its second segment holds; it pauses there, so one child has finished.
-    let paused = machine
-        .runs
-        .submit(ACTOR, "paused", film(&manifest, &first, &["a dawn", "a storm", "a calm"], 1))
-        .unwrap();
-    until(&engine, &paused.id, "ran its second segment", |_| {
-        let children = children(&engine, &paused.id);
-        children.len() == 2 && children[0].state == State::Completed
+    let segments = ["a dawn", "a storm", "a calm"];
+    let first = machine.runs.submit(ACTOR, "first", film(&manifest, &reference, &segments, 1)).unwrap();
+    until(&engine, &first.id, "ran its second segment", |_| {
+        let children = children(&engine, &first.id);
+        children.len() == 2 && children[0].state == State::Completed && children[1].state == State::Running
     });
-    // Paused once its second segment is claimed: the window where nothing of it has run yet.
-    let segment = children(&engine, &paused.id)[1].id.clone();
-    until(&engine, &segment, "was claimed", |r| r.state != State::Queued);
-    jobs.pause(&engine.get(&paused.id).unwrap(), ACTOR).unwrap();
-    let paused_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-    until(&engine, &paused.id, "rested paused", |r| r.state == State::Paused);
-    // Its finished child's result is what the parent adopted. The second segment is held if
-    // its code had not started when the job paused, and runs to its end if it had: nothing
-    // starts after the pause.
-    for child in children(&engine, &paused.id) {
-        until(&engine, &child.id, "rested", |r| matches!(r.state, State::Completed | State::Paused));
+    let canceled = engine.cancel(&first.id, ACTOR).unwrap();
+    machine.service.calls().unwrap().canceled(&canceled);
+    until(&engine, &first.id, "ended", |r| r.state.terminal());
+    let ended = children(&engine, &first.id);
+    for child in &ended {
+        until(&engine, &child.id, "ended", |r| r.state.terminal());
     }
-    let rested = children(&engine, &paused.id);
-    assert_eq!(rested[0].state, State::Completed);
-    let segment = &rested[1];
-    assert!(
-        segment.state == State::Paused || segment.started_at_ms <= paused_at,
-        "the second segment started after its job paused: {:?} at {} (paused by {paused_at})",
-        segment.state,
-        segment.started_at_ms
-    );
-    // `unstarted`: accepted and paused before its root ever ran (no segment 9: none holds).
-    let unstarted = machine
-        .runs
-        .submit(ACTOR, "unstarted", film(&manifest, &second, &["a field"], 9))
-        .unwrap();
-    jobs.pause(&engine.get(&unstarted.id).unwrap(), ACTOR).unwrap();
-    until(&engine, &unstarted.id, "rested paused", |r| r.state == State::Paused);
-    assert!(children(&engine, &unstarted.id).is_empty());
+    let (done, stopped) = (engine.get(&ended[0].id).unwrap(), engine.get(&ended[1].id).unwrap());
+    assert_eq!((done.state, stopped.state), (State::Completed, State::Canceled));
+    assert!(!done.memo.computation.is_empty() && !done.memo.memoized, "{:?}", done.memo);
 
     if restart {
         assert!(machine.service.stop().unwrap(), "the machine was not idle");
         let store_root = machine.store.root().to_path_buf();
-        drop(jobs);
         drop(machine);
-        // stop() requests dispatch shutdown. Its thread may still retain Jobs and the
+        // stop() requests dispatch shutdown. Its thread may still retain the broker and the
         // Store until it observes that request; an in-process restart must wait for that
         // custody to end just as a process restart waits for the old process to exit. A
         // successful claim observes the lock's release, including completion of destructors.
@@ -276,32 +254,28 @@ fn paused_and_unstarted_runs_keep_their_objects(restart: bool) {
         machine = open(&root, &tools);
     }
     collect(&machine.store);
-    for (input, run) in [(&first, "paused"), (&second, "unstarted")] {
-        let hex = input.0.trim_start_matches("sha256:");
-        assert!(machine.store.object_path(hex).is_file(), "the collection took {run}'s input");
-    }
-
     let engine = machine.service.engine.clone();
-    let jobs = machine.service.jobs().unwrap();
-    for id in [&paused.id, &unstarted.id] {
-        jobs.resume(&engine.get(id).unwrap()).unwrap();
-    }
-    let film = until(&engine, &paused.id, "settled", |r| r.state.terminal());
+    let mut again = film(&manifest, &reference, &segments, 1);
+    again.digest.push_str("-again");
+    let second = machine.runs.submit(ACTOR, "second", again).unwrap();
+    let film = until(&engine, &second.id, "settled", |r| r.state.terminal());
     assert_eq!(film.state, State::Completed, "{:?}", film.failure);
-    let value = &film.result.unwrap().value;
-    assert_eq!((value["segments"].as_u64(), value["attempts"].as_u64()), (Some(3), Some(2)), "{value}");
-    let single = until(&engine, &unstarted.id, "settled", |r| r.state.terminal());
-    assert_eq!(single.state, State::Completed, "{:?}", single.failure);
+    assert_eq!(film.result.unwrap().value["segments"].as_u64(), Some(3));
+    let steps = children(&engine, &second.id);
+    let memoized: Vec<bool> = steps.iter().map(|step| step.memo.memoized).collect();
+    assert_eq!(memoized, [true, false, false], "only the finished segment is answered");
+    assert_eq!(steps[0].memo.computation, done.memo.computation);
+    assert_eq!(steps[0].started_at_ms, 0, "the answered segment never ran");
     assert!(machine.service.stop().unwrap());
     let _ = fs::remove_dir_all(root);
 }
 
 #[test]
-fn a_sweep_keeps_what_paused_and_unstarted_runs_need() {
-    paused_and_unstarted_runs_keep_their_objects(false);
+fn a_canceled_root_resubmitted_skips_its_finished_memoized_steps() {
+    a_canceled_root_resubmitted_skips_its_finished_steps(false);
 }
 
 #[test]
-fn a_sweep_after_a_restart_keeps_what_paused_and_unstarted_runs_need() {
-    paused_and_unstarted_runs_keep_their_objects(true);
+fn after_a_restart_a_resubmitted_root_skips_its_finished_memoized_steps() {
+    a_canceled_root_resubmitted_skips_its_finished_steps(true);
 }

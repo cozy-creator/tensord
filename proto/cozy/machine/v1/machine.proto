@@ -24,8 +24,8 @@ message RunRequest {
 }
 
 enum RunKind {
+  reserved 1;  // jobs: every function is a call
   RUN_KIND_CALL = 0;
-  RUN_KIND_JOB = 1;
   RUN_KIND_WARM = 2;    // prepare only: install and download, then succeed
   RUN_KIND_UPDATE = 3;  // stage, verify and activate a software cohort at idle
   // `remove/1`: the caller's installations of the source leave the machine: an installation
@@ -80,7 +80,7 @@ message RunSpec {
   string catalog_revision = 10;
   reserved 11;  // known results: memos are the machine's own
   string attention_kernel = 12;
-  string weights_destination = 13;  // org/name: a job's weights outputs, or a warm run's source model
+  string weights_destination = 13;  // org/name: the requester's repository for the call's weights outputs, or a warm run's source model
   HubAccess hub = 14;               // where the run reads, and its capability there
   string owner = 15;                // the account that org-relative references of local code name
   ProviderAccess providers = 16;    // provider tokens for source models, memory only like hub
@@ -209,7 +209,7 @@ message GpuAllocation {
 message RunState {
   string id = 1;
   uint64 number = 2;   // this machine's run number
-  string state = 3;    // queued, preparing, running, paused, succeeded, failed, canceled
+  string state = 3;    // queued, preparing, running, succeeded, failed, canceled
   uint64 sequence = 4; // the log's head
   uint32 attempt = 5;
   string waiting = 6;  // why a queued run waits, for people
@@ -283,10 +283,9 @@ message Call {
 // ---- Control -----------------------------------------------------------------------------
 
 enum Action {
+  reserved 2, 3;  // pause, resume: a canceled run is submitted again, its memoized calls answered
   ACTION_UNSPECIFIED = 0;
   ACTION_CANCEL = 1;
-  ACTION_PAUSE = 2;
-  ACTION_RESUME = 3;
 }
 message ControlRequest {
   string id = 1;

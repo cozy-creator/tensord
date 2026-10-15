@@ -7,9 +7,8 @@
 //! holder, at the holder's next step boundary: the holder starts no new step, its calls in
 //! flight and their families finish (nothing is preempted), then its lane ends and it queues
 //! again at its own place. A root that released (or yielded) its lane comes back at its place
-//! among the waiting ones and never displaces a holder. An accelerator job keeps one GPU of
-//! its root's lane for its life; only its family (it and its descendants) call there. A call's
-//! family may call where it calls: a served call waiting on its child shares its GPU with it.
+//! among the waiting ones and never displaces a holder. A call's family may call where it
+//! calls: a call waiting on its child shares its GPU with it.
 use std::{
     collections::BTreeMap,
     ops::Range,
@@ -31,9 +30,6 @@ struct Table {
 struct Gpu {
     /// The root whose lane this GPU is.
     root: Option<u64>,
-    /// The accelerator job keeping it, and how many jobs of its family do.
-    family: Option<String>,
-    keeps: usize,
     /// Calls running there, all of one family.
     calling: usize,
     /// The family of the calls running there, if any, and their root.
@@ -63,13 +59,12 @@ pub(crate) struct Hold {
 pub(crate) struct Permit {
     table: Arc<Allocations>,
     devices: Range<usize>,
-    keep: bool,
 }
 
 impl Table {
     fn free(&self, device: usize, root: u64, claims: &Claims) -> bool {
         let gpu = &self.gpus[device];
-        gpu.root.is_none() && gpu.family.is_none() && gpu.calling == 0
+        gpu.root.is_none() && gpu.calling == 0
             && claims.get(device).copied().flatten().is_none_or(|claimer| claimer == root)
     }
     /// `root` gets `device` at the latest at its holder's next step boundary: no other request
@@ -84,9 +79,9 @@ impl Table {
         lane.flat_map(|d| [claims.get(d).copied().flatten(), self.gpus[d].root, self.gpus[d].running])
             .flatten().filter(|other| *other != root).min()
     }
-    /// No call runs and no accelerator job stays on `root`'s lane.
+    /// No call runs on `root`'s lane.
     fn between_steps(&self, root: u64) -> bool {
-        self.gpus.iter().filter(|gpu| gpu.root == Some(root)).all(|gpu| gpu.calling == 0 && gpu.family.is_none())
+        self.gpus.iter().filter(|gpu| gpu.root == Some(root)).all(|gpu| gpu.calling == 0)
     }
     /// An older root's first ready step waits for `root`'s lane: it starts no new step.
     fn yielding(&self, root: u64, claims: &Claims) -> bool {
@@ -94,11 +89,9 @@ impl Table {
             gpu.root == Some(root) && claim.is_some_and(|claimer| claimer < root && self.roots.contains_key(&claimer))
         })
     }
-    /// A call of `family` continues a step in flight: its family calls or keeps a GPU.
+    /// A call of `family` continues a step in flight: its family calls on a GPU.
     fn continuing(&self, family: Option<&str>) -> bool {
-        family.is_some_and(|family| self.gpus.iter().any(|gpu| {
-            gpu.caller.as_deref() == Some(family) || gpu.family.as_deref() == Some(family)
-        }))
+        family.is_some_and(|family| self.gpus.iter().any(|gpu| gpu.caller.as_deref() == Some(family)))
     }
     fn bind(&mut self, root: u64, lane: Range<usize>) {
         lane.clone().for_each(|d| self.gpus[d].root = Some(root));
@@ -229,8 +222,8 @@ impl Allocations {
     }
     /// A call on `devices`: inside `root`'s lane when it is registered, else on GPUs no root
     /// holds or older request claims (a standalone call: its own root; `None`: machine
-    /// warming). No GPU may be calling or kept outside `family`. A yielding root's call runs
-    /// only when it continues a step in flight.
+    /// warming). No GPU may be calling outside `family`. A yielding root's call runs only when
+    /// it continues a step in flight.
     pub(crate) fn call(self: &Arc<Self>, root: Option<u64>, family: Option<&str>, devices: Range<usize>, claims: &Claims) -> Option<Permit> {
         let mut table = self.table.lock().unwrap();
         let registered = root.is_some_and(|root| table.roots.contains_key(&root));
@@ -242,7 +235,6 @@ impl Allocations {
             };
             let shared = family.is_some() && gpu.caller.as_deref() == family;
             placed && (gpu.calling == 0 || shared)
-                && gpu.family.as_deref().is_none_or(|kept| Some(kept) == family)
         }) && !(registered && root.is_some_and(|root| table.yielding(root, claims)) && !table.continuing(family));
         if !usable {
             return None;
@@ -251,58 +243,25 @@ impl Allocations {
             let gpu = &mut table.gpus[d];
             (gpu.calling, gpu.caller, gpu.running) = (gpu.calling + 1, family.map(String::from), root);
         }
-        Some(Permit { table: self.clone(), devices, keep: false })
+        Some(Permit { table: self.clone(), devices })
     }
-    /// Keep `device` of `root`'s lane for accelerator job family `family` while it lives (a
-    /// yielding root's only for a family keeping it already).
-    pub(crate) fn keep(self: &Arc<Self>, root: u64, family: &str, device: usize, claims: &Claims) -> Option<Permit> {
-        let mut table = self.table.lock().unwrap();
-        let yielding = table.yielding(root, claims);
-        let gpu = table.gpus.get_mut(device)?;
-        let ours = gpu.family.as_deref() == Some(family);
-        let calls_here = gpu.calling > 0 && gpu.caller.as_deref() != Some(family);
-        let taken = gpu.family.is_some() || calls_here || yielding;
-        if gpu.root != Some(root) || (taken && !ours) {
-            return None;
-        }
-        gpu.family = Some(family.into());
-        gpu.keeps += 1;
-        Some(Permit { table: self.clone(), devices: device..device + 1, keep: true })
-    }
-    /// Machine upkeep on `devices` (ending idle executors): no call or accelerator job there.
+    /// Machine upkeep on `devices` (ending idle executors): no call there.
     pub(crate) fn upkeep(self: &Arc<Self>, devices: Range<usize>) -> Option<Permit> {
         let mut table = self.table.lock().unwrap();
-        if devices.clone().any(|d| table.gpus.get(d).is_none_or(|gpu| gpu.calling > 0 || gpu.family.is_some())) {
+        if devices.clone().any(|d| table.gpus.get(d).is_none_or(|gpu| gpu.calling > 0)) {
             return None;
         }
         devices.clone().for_each(|d| table.gpus[d].calling += 1);
-        Some(Permit { table: self.clone(), devices, keep: false })
-    }
-    /// Wait until no call runs on `device` (an accelerator job's own keep may stay).
-    pub(crate) fn quiet(&self, device: usize) {
-        let mut table = self.table.lock().unwrap();
-        while table.gpus[device].calling > 0 {
-            table = self.freed.wait(table).unwrap();
-        }
+        Some(Permit { table: self.clone(), devices })
     }
 }
 impl Drop for Permit {
     fn drop(&mut self) {
         let mut table = self.table.table.lock().unwrap();
         for gpu in &mut table.gpus[self.devices.clone()] {
-            match self.keep {
-                true => {
-                    gpu.keeps -= 1;
-                    if gpu.keeps == 0 {
-                        gpu.family = None;
-                    }
-                }
-                false => {
-                    gpu.calling -= 1;
-                    if gpu.calling == 0 {
-                        (gpu.caller, gpu.running) = (None, None);
-                    }
-                }
+            gpu.calling -= 1;
+            if gpu.calling == 0 {
+                (gpu.caller, gpu.running) = (None, None);
             }
         }
         drop(table);
@@ -381,23 +340,6 @@ mod tests {
         let mut claims = [None; 2];
         assert!(matches!(gpus.lane(1, &mut claims).0, Lane::Waiting { behind: Some(2), .. }));
         assert!(gpus.call(Some(2), None, 0..1, &claims).is_some());
-    }
-
-    #[test]
-    fn an_accelerator_job_keeps_its_gpu_for_its_family_only() {
-        let gpus = Allocations::new(2);
-        let _root = gpus.register(5, 2);
-        held(gpus.lane(5, &mut [None; 2]));
-        let job = gpus.keep(5, "job", 0, &[None; 2]).unwrap();
-        assert!(gpus.keep(5, "sibling", 0, &[None; 2]).is_none());
-        assert!(gpus.call(Some(5), None, 0..1, &[None; 2]).is_none(), "a sibling's call goes elsewhere");
-        let borrowed = gpus.call(Some(5), Some("job"), 0..2, &[None; 2]).unwrap();
-        let nested = gpus.keep(5, "job", 0, &[None; 2]).unwrap();
-        assert!(gpus.upkeep(1..2).is_none());
-        drop((borrowed, job));
-        assert!(gpus.call(Some(5), None, 0..1, &[None; 2]).is_none(), "the nested job still keeps it");
-        drop(nested);
-        assert!(gpus.call(Some(5), None, 0..1, &[None; 2]).is_some());
     }
 
     #[test]

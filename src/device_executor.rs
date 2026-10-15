@@ -198,9 +198,12 @@ pub enum DeviceCommand {
         #[serde(skip_serializing_if = "is_false")]
         import_only: bool,
         /// What its attempts may call: the Runtime installs their callers before it imports
-        /// the package and brokers each attempt's calls, a served call's as a job's.
+        /// the package and brokers each attempt's calls.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         call_interfaces: Vec<CallInterface>,
+        /// Each constructed slot's checkpoint, so Runtime schedules fetches before it imports.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        constructions: Vec<Construction>,
     },
     Load {
         construction: String,
@@ -283,6 +286,12 @@ pub enum DeviceCommand {
         /// Degree 2 for this call (`weights.attach/1`); None leaves the executor's setting.
         #[serde(skip_serializing_if = "Option::is_none")]
         device_weights: Option<bool>,
+        /// Each `Weights[M]` parameter's checkpoint (`sha256:<hex>`), read through `weights_writer`.
+        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+        sources: BTreeMap<String, String>,
+        /// The weights outputs this attempt may write: output id to its byte bound.
+        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+        weights: BTreeMap<String, u64>,
     },
     Budget {
         vram_bytes: i64,
@@ -324,42 +333,17 @@ pub enum DeviceCommand {
         root: PathBuf,
         environment: BTreeMap<String, String>,
     },
-    /// One `@app.job` to completion; its child calls come back as `child_*` requests.
-    RunJob {
-        /// Retained asset capacity derived from the actual installed result schema.
-        max_output_bytes: u64,
-        request_id: String,
-        job: String,
-        payload: Value,
-        application: String,
-        package_interface: PathBuf,
-        spool: PathBuf,
-        /// The run's scratch tree (`Scratch`): the same across its attempts.
-        scratch: PathBuf,
-        deadline_s: Option<f64>,
-        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-        inputs: BTreeMap<String, Value>,
-        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-        trees: BTreeMap<String, (PathBuf, String)>,
-        call_interfaces: Vec<CallInterface>,
-        /// The job's model inputs: `{parameter: {class, manifest, length}}`.
-        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-        models: BTreeMap<String, Value>,
-        /// This owner answers `weights_writer`: the job reads and writes weights through it.
-        #[serde(skip_serializing_if = "is_false")]
-        weights: bool,
-        /// The actual admitted inline-job allocation; absent fields remain CPU.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        budget: Option<JobBudget>,
-    },
 }
 
+/// One constructed model slot of a session: its checkpoint and the components it uses.
 #[derive(Clone, Debug, Serialize)]
-pub struct JobBudget {
-    pub gpu_count: u32,
+pub struct Construction {
+    pub path: String,
+    pub manifest: String,
+    pub components: Vec<String>,
 }
 
-/// One callable a job may call: here, the package's own invocables (`self`).
+/// One callable an attempt may call: its own package's, or another App's of its environment.
 #[derive(Clone, Debug, Serialize)]
 pub struct CallInterface {
     pub module: String,
@@ -367,7 +351,6 @@ pub struct CallInterface {
     pub interface_path: PathBuf,
     #[serde(rename = "self")]
     pub self_call: bool,
-    pub kind: String,
     /// Another package's interface: the Runtime installs its typed callers from it (a caller
     /// imports the callee's function and calls it with its request's fields as arguments).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -381,9 +364,6 @@ impl DeviceCommand {
     fn spool(&self) -> Option<(&str, &Path)> {
         match self {
             Self::Invoke {
-                request_id, spool, ..
-            }
-            | Self::RunJob {
                 request_id, spool, ..
             } => Some((request_id.as_str(), spool.as_path())),
             _ => None,
@@ -406,7 +386,6 @@ impl DeviceCommand {
             Self::Unload { .. } => "unload",
             Self::Probe { .. } => "probe",
             Self::Fork { .. } => "fork",
-            Self::RunJob { .. } => "run_job",
         }
     }
 }
@@ -443,8 +422,7 @@ pub enum Kind {
     ChildEvents,
     GpuRelease,
     ModelPrefetch,
-    Checkpoint,
-    /// A job's weights: one source read, one output written, or an output adopted.
+    /// An attempt's weights: one source read, one output written, or an output adopted.
     WeightsWriter,
     /// A `progress` event carrying a retained `log` observation (`Telemetry.log`).
     Log,
@@ -752,14 +730,10 @@ pub struct Frame {
     pub numerics: String,
     pub local: String,
     pub cost_ms: f64,
-    // `checkpoint` (a job's `Checkpoints.declare`): its keys and content (`length` above).
-    pub operation_key: String,
     /// `weights_writer`: `source`, `output` or `adopt`, its output and its transaction.
     pub operation: String,
     pub output_slot: String,
     pub transaction: String,
-    pub logical_key: String,
-    pub content_digest: String,
 }
 
 impl Frame {
@@ -845,11 +819,6 @@ pub struct Answer {
     pub byte_grants: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress: Option<Value>,
-    /// `CheckpointReceipt`: the declaration's id, and whether it was already recorded.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub receipt_id: String,
-    #[serde(skip_serializing_if = "is_false")]
-    pub replayed: bool,
     /// `Opened` (a weights output) and `Adopted`: its transaction, run and manifest.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub transaction: String,
@@ -914,8 +883,6 @@ impl Answer {
             result: String::new(),
             byte_grants: Vec::new(),
             progress: None,
-            receipt_id: String::new(),
-            replayed: false,
             transaction: String::new(),
             request_id: String::new(),
             manifest: String::new(),

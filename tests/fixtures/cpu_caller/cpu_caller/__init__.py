@@ -1,4 +1,4 @@
-"""A job that calls another package's invocable (`cpu_memo.measure`), installed in its
+"""A caller of another package's invocable (`cpu_memo.measure`), installed in its
 environment as a dependency, as a published package's callee is."""
 from __future__ import annotations
 
@@ -31,11 +31,11 @@ async def relay(ctx: Context, payload: Relay, tel: Telemetry) -> Relayed:
     return Relayed(squares=squares, greeting=greeted.text)
 
 
-app.job(relay, accelerator=False)
+app.entrypoint(relay, accelerator=False)
 
 
 async def relay_served(ctx: Context, payload: Relay) -> Relayed:
-    """A served entrypoint calls another package as a job does."""
+    """A served entrypoint calls another package as any function does."""
     return Relayed([(await measure(payload=Probe(value, payload.counter))).square for value in payload.values])
 
 
@@ -49,7 +49,7 @@ async def relay_nested(ctx: Context, payload: Relay) -> Relayed:
     return Relayed(squares=squares)
 
 
-app.job(relay_nested, accelerator=False)
+app.entrypoint(relay_nested, accelerator=False)
 
 
 async def relay_restricted(ctx: Context, payload: Relay) -> Relayed:
@@ -57,7 +57,7 @@ async def relay_restricted(ctx: Context, payload: Relay) -> Relayed:
     return Relayed(squares=[result.square])
 
 
-app.job(relay_restricted, accelerator=False)
+app.entrypoint(relay_restricted, accelerator=False)
 
 
 class Sitting(msgspec.Struct):
@@ -70,7 +70,7 @@ class Portraits(msgspec.Struct):
 
 async def portrait(ctx: Context, payload: Sitting, out: Outputs) -> Portraits:
     """H3's long_form references: each image another package's entrypoint returns is shown as
-    this job's own output the moment it exists, and returned at the end."""
+    this function's own output the moment it exists, and returned at the end."""
     references = []
     for index, name in enumerate(payload.names):
         result = await paint(prompt=name, shade=40 * (index + 1))
@@ -79,7 +79,7 @@ async def portrait(ctx: Context, payload: Sitting, out: Outputs) -> Portraits:
     return Portraits(references)
 
 
-app.job(portrait, emits_media=True, accelerator=False)
+app.entrypoint(portrait, emits_media=True, accelerator=False)
 
 
 class Requantize(msgspec.Struct):
@@ -98,7 +98,7 @@ async def requantize(ctx: Context, payload: Requantize) -> Requantized:
     return Requantized(source.manifest.digest, result.manifest.digest)
 
 
-app.job(requantize, accelerator=False)
+app.entrypoint(requantize, accelerator=False)
 
 
 class Notes(msgspec.Struct):
@@ -110,4 +110,4 @@ async def annotate(ctx: Context, payload: Relay) -> Notes:
     return Notes([(await note(payload=Probe(value, payload.counter))).file for value in payload.values])
 
 
-app.job(annotate, accelerator=False)
+app.entrypoint(annotate, accelerator=False)

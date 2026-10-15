@@ -104,10 +104,11 @@ fn run() -> io::Result<()> {
             let generations=generations.unwrap_or_else(||root.join("generations"));
             let owner=Owner::new(&root,&root.join("tensorfs"),budget,Duration::from_secs(ttl))?;
             let service=tensord::service::Service::open(&root,&generations,parallelism)?;
-            if let Some(config)=gpu_config {
-                let gpu=tensord::gpu_service::GpuPool::new(&root.join("gpu"),tensord::gpu_service::GpuConfig::load(&config)?,owner.lock().unwrap().store())?;
-                service.configure_gpu(gpu)?;
-            }
+            let config=match gpu_config {
+                Some(config)=>tensord::gpu_service::GpuConfig::load(&config)?,
+                None=>tensord::gpu_service::GpuConfig::deviceless(&root.join("cpu").join("home"))?,
+            };
+            service.configure_pool(tensord::gpu_service::Pool::new(&root.join("gpu"),config,owner.lock().unwrap().store())?)?;
             let listener=bind_control(&owner)?;
             match (machine_config,listen) {
                 (Some(config),Some(listen))=>{
@@ -115,7 +116,7 @@ fn run() -> io::Result<()> {
                     sdk.python=package_python.clone();
                     start_api(&root,&generations,identity,std::net::TcpListener::bind(listen)?,&owner,&service,installer_python,client_wheel,package_python,sdk,None)?
                 }
-                (None,None)=>{ tensord::jobs::Jobs::configure(&service,owner.lock().unwrap().store(),None)?; }
+                (None,None)=>{ tensord::calls::Calls::configure(&service,owner.lock().unwrap().store(),None)?; }
                 _=>return Err(io::Error::other("--machine-config and --listen are required together")),
             }
             serve(owner,service,listener)
@@ -212,11 +213,11 @@ fn run_machine(
             }
             ready.report();
         })?;
-    // A machine with GPUs serves published GPU packages on all of them (the envelope, sorted
-    // by index; a degree-K plan uses the first K), with the executor environment the pod
-    // proofs used.
+    // A machine serves every package on its pool: its GPUs (the envelope, sorted by index; a
+    // degree-K plan uses the first K) and deviceless executors, with the executor environment
+    // the pod proofs used.
     let gpus = receipt::gpus()?;
-    if !gpus.is_empty() {
+    {
         let devices: Vec<String> = gpus.iter().map(|g| g.device_index.to_string()).collect();
         let home = engine.join("executor-home");
         std::fs::create_dir_all(&home)?;
@@ -227,7 +228,7 @@ fn run_machine(
             "environment": {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": home, "COZY_HOME": home},
             // A rented pod is the machine's alone (its grant says so); anywhere else it is a guest.
             "host": {"mode": if rental { "dedicated" } else { "shared" }},
-            "image_kernels": image_kernels(&layout.root, &paths.sdk()),
+            "image_kernels": (!gpus.is_empty()).then(|| image_kernels(&layout.root, &paths.sdk())).flatten(),
         });
         // The operator's GPU settings, when the machine root has them, over these defaults.
         if let Ok(file) = std::fs::File::open(layout.state.join("gpu-config.json")) {
@@ -238,7 +239,7 @@ fn run_machine(
         let config: tensord::gpu_service::GpuConfig =
             serde_json::from_value(config).map_err(io::Error::other)?;
         let store = owner.lock().unwrap().store();
-        service.configure_gpu(tensord::gpu_service::GpuPool::new(
+        service.configure_pool(tensord::gpu_service::Pool::new(
             &engine.join("gpu"),
             config,
             store,
@@ -432,9 +433,9 @@ fn start_api(
             .transpose()
             .map_err(|e| io::Error::other(e.0))?,
         leaf: Some(Arc::new(leaf)),
-        jobs: Default::default(),
+        contexts: Default::default(),
     }));
-    tensord::jobs::Jobs::configure(service, store.clone(), backend.runs.as_ref())?;
+    tensord::calls::Calls::configure(service, store.clone(), backend.runs.as_ref())?;
     listener.set_nonblocking(true)?;
     #[derive(serde::Serialize)]
     struct Ready<'a> {

@@ -122,7 +122,7 @@ fn spool_file(spool: &Path, name: &str) -> io::Result<PathBuf> {
 /// A saved asset's spool file, named as the SDK's post phase names it:
 /// `attempt:<request>/<kind>/<n>` lives at `<kind>-<n>`. A file a child returned is named by
 /// its digest, `sha256:<hex>`, and linked into its parent's spool as `sha256-<hex>`
-/// (`jobs::grant`), so a job can publish it as it is.
+/// (`calls::receive`), so a caller can publish it as it is.
 fn spool_name(asset_ref: &str) -> String {
     if let Some(hex) = asset_ref
         .strip_prefix("sha256:")
@@ -185,33 +185,8 @@ pub fn decode(stored: &StoredProduct) -> io::Result<domain::RunProduct> {
 
 /// The SDK's `publish` request during a running attempt: answers `Published`.
 pub fn publish(store: &Store, engine: &Engine, id: &str, spool: &Path, frame: &Frame) -> Answer {
-    publish_in(store, engine, id, spool, frame, None)
-}
-
-/// `publish` for an attempt that may replay an earlier one's (a resumed job): `appended` counts
-/// this attempt's list items per output, and an item an earlier attempt already published at
-/// that position, with the same bytes, adds nothing.
-pub fn publish_replayed(
-    store: &Store,
-    engine: &Engine,
-    id: &str,
-    spool: &Path,
-    frame: &Frame,
-    appended: &mut std::collections::HashMap<String, usize>,
-) -> Answer {
-    publish_in(store, engine, id, spool, frame, Some(appended))
-}
-
-fn publish_in(
-    store: &Store,
-    engine: &Engine,
-    id: &str,
-    spool: &Path,
-    frame: &Frame,
-    appended: Option<&mut std::collections::HashMap<String, usize>>,
-) -> Answer {
     let mut answer = Answer::unavailable(frame.seq);
-    match commit(store, engine, id, spool, frame, appended) {
+    match commit(store, engine, id, spool, frame) {
         Ok((content, sequence)) => {
             answer.ok = true;
             answer.code.clear();
@@ -238,7 +213,6 @@ fn commit(
     id: &str,
     spool: &Path,
     frame: &Frame,
-    appended: Option<&mut std::collections::HashMap<String, usize>>,
 ) -> io::Result<(domain::Ref, u64)> {
     let record = engine.get(id)?;
     let context = record
@@ -249,12 +223,8 @@ fn commit(
         .installation_for_generation(&context.actor, &record.invocation.generation)?
         .ok_or_else(|| io::Error::other("held installation interface absent"))?;
     let interface: Value = serde_json::from_slice(&installed.interface).map_err(storage)?;
-    let section = match record.invocation.job {
-        true => "jobs",
-        false => "entrypoints",
-    };
     let result = interface
-        .get(section)
+        .get("entrypoints")
         .and_then(Value::as_array)
         .and_then(|rows| {
             rows.iter().find(|row| {
@@ -336,21 +306,11 @@ fn commit(
     let sequence = engine.append_product(id, |prior| {
         let prior = prior.iter().map(decode).collect::<io::Result<Vec<_>>>()?;
         if op == domain::RunProductOp::Append {
-            let items: Vec<_> = prior
+            let items = prior
                 .iter()
                 .filter(|p| p.output == product.output && p.op == op as i32)
-                .collect();
-            if let Some(appended) = appended {
-                let position = appended.entry(product.output.clone()).or_default();
-                let replayed = items
-                    .get(*position)
-                    .is_some_and(|item| item.content == product.content);
-                *position += 1;
-                if replayed {
-                    return Ok(None);
-                }
-            }
-            product.index = items.len() as u32;
+                .count();
+            product.index = items as u32;
         } else if prior
             .iter()
             .rev()
@@ -364,9 +324,9 @@ fn commit(
     Ok((content, sequence))
 }
 
-/// A job's adopted weights output as a product of its run's log: its bytes are the output's
-/// manifest (`weights::MANIFEST_MEDIA`), held in the machine's store; a resumed attempt that
-/// adopts the same manifest adds nothing.
+/// An adopted weights output as a product of its run's log: its bytes are the output's
+/// manifest (`weights::MANIFEST_MEDIA`), held in the machine's store; the same manifest
+/// adopted again adds nothing.
 pub fn record_manifest(engine: &Engine, id: &str, output: &str, manifest: &tensorfs_core::ids::ObjectRef) -> io::Result<u64> {
     let content = domain::Ref {
         digest: unhex(&manifest.sha256)?,

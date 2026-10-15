@@ -1,8 +1,9 @@
-//! The machine's sole CPU dispatch policy; the engine only journals/supervises.
+//! The machine's sole dispatch policy; the engine only journals/supervises. Every run takes
+//! one path: its plan (journaled when it binds models, else weightless) on the pool.
 use crate::{
     catalog::Catalog,
     execution::{process_ended, Engine},
-    gpu_service::{GpuPool, KeptMember, Level, Member},
+    gpu_service::{KeptMember, Level, Member, Plan, Pool},
     journal::{Execution, ProcessBirth, SubmissionContext},
 };
 use serde_json::Value;
@@ -22,7 +23,8 @@ pub struct Call {
     pub attention_kernel: String,
     pub gpus: u32,
     pub inputs: Vec<crate::journal::InputFile>,
-    pub job: bool,
+    /// GPUs its plan runs on: 0 deviceless.
+    pub degree: u32,
     /// A child run's parent execution id.
     pub parent: String,
     /// The callee App a child run calls in its parent's environment; empty for the root's.
@@ -35,9 +37,9 @@ pub struct Service {
     parallelism: usize,
     stopped: Mutex<bool>,
     retained: Mutex<HashMap<String, Arc<File>>>,
-    gpu: Mutex<Option<Arc<crate::gpu_service::GpuPool>>>,
-    /// Jobs and model-less child runs, in deviceless executors.
-    jobs: Mutex<Option<Arc<crate::jobs::Jobs>>>,
+    pool: Mutex<Option<Arc<Pool>>>,
+    /// The child-call broker and weights grants.
+    calls: Mutex<Option<Arc<crate::calls::Calls>>>,
     /// The TensorFS store's caches (`Publisher::reclaim`), swept with the machine's.
     publisher: Mutex<Option<Arc<crate::published::Publisher>>>,
     startup_gpu_births: Mutex<Vec<ProcessBirth>>,
@@ -114,8 +116,8 @@ impl Service {
             parallelism,
             stopped: Mutex::new(false),
             retained: Mutex::new(HashMap::new()),
-            gpu: Mutex::new(None),
-            jobs: Mutex::new(None),
+            pool: Mutex::new(None),
+            calls: Mutex::new(None),
             publisher: Mutex::new(None),
             startup_gpu_births: Mutex::new(startup_gpu_births),
             preparing: std::sync::atomic::AtomicUsize::new(0),
@@ -124,9 +126,8 @@ impl Service {
         });
         service.engine.reconcile()?;
         service.reclaim();
-        // Keep queued and paused runs' generations alive, including a prior boot's.
-        let paused = service.engine.paused(usize::MAX)?;
-        for record in service.engine.nonterminal(usize::MAX)?.into_iter().chain(paused) {
+        // Keep queued runs' generations alive, including a prior boot's.
+        for record in service.engine.nonterminal(usize::MAX)? {
             if let Ok(held) = service.catalog.resolve(&record.invocation.generation) {
                 service
                     .retained
@@ -144,17 +145,22 @@ impl Service {
             .spawn(move || owner.dispatch_loop())?;
         Ok(service)
     }
-    pub fn gpu(&self) -> Option<Arc<crate::gpu_service::GpuPool>> {
-        self.gpu.lock().unwrap().clone()
+    /// The executor pool every run runs on, once configured.
+    pub fn pool(&self) -> Option<Arc<Pool>> {
+        self.pool.lock().unwrap().clone()
     }
-    pub fn jobs(&self) -> Option<Arc<crate::jobs::Jobs>> {
-        self.jobs.lock().unwrap().clone()
+    /// The pool when this machine has GPUs.
+    pub fn gpu(&self) -> Option<Arc<Pool>> {
+        self.pool().filter(|pool| pool.width() > 0)
+    }
+    pub fn calls(&self) -> Option<Arc<crate::calls::Calls>> {
+        self.calls.lock().unwrap().clone()
     }
     pub fn configure_publisher(&self, publisher: Arc<crate::published::Publisher>) {
         *self.publisher.lock().unwrap() = Some(publisher);
     }
-    pub fn configure_jobs(&self, jobs: Arc<crate::jobs::Jobs>) {
-        *self.jobs.lock().unwrap() = Some(jobs);
+    pub fn configure_calls(&self, calls: Arc<crate::calls::Calls>) {
+        *self.calls.lock().unwrap() = Some(calls);
         self.engine.notify_activity();
     }
     /// Observation only. Unknown births stay reserved; CPU dispatch stays available.
@@ -167,29 +173,31 @@ impl Service {
         });
         births.len()
     }
-    pub fn configure_gpu(&self, gpu: Arc<crate::gpu_service::GpuPool>) -> io::Result<()> {
-        let mut current = self.gpu.lock().unwrap();
+    pub fn configure_pool(&self, pool: Arc<Pool>) -> io::Result<()> {
+        let mut current = self.pool.lock().unwrap();
         if current.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "GPU service is already configured",
+                "the executor pool is already configured",
             ));
         }
-        *current = Some(gpu.clone());
+        *current = Some(pool.clone());
         drop(current);
-        // Kernels compile at boot, before any install. An executor starts for a request or an
-        // install: nothing here prepares a package nobody asked for.
-        gpu.image_kernel_boot();
-        for held in self.catalog.installed() {
-            gpu.kernel_boot(held);
+        if pool.width() > 0 {
+            // Kernels compile at boot, before any install. An executor starts for a request or
+            // an install: nothing here prepares a package nobody asked for.
+            pool.image_kernel_boot();
+            for held in self.catalog.installed() {
+                pool.kernel_boot(held);
+            }
+            self.restore_warm_sets(&pool)?;
         }
-        self.restore_warm_sets(&gpu)?;
         self.changed_environment()
     }
     /// Each caller's warm set as the journal keeps it, brought up again in the background: a
     /// restarted machine re-warms without its controller. A member whose installation is gone
     /// leaves the set.
-    fn restore_warm_sets(&self, gpu: &Arc<GpuPool>) -> io::Result<()> {
+    fn restore_warm_sets(&self, gpu: &Arc<Pool>) -> io::Result<()> {
         let kept = self.engine.with_journal(|journal| journal.warm_sets())?;
         let actors: BTreeSet<&String> = kept.iter().map(|(actor, _)| actor).collect();
         for actor in actors {
@@ -220,7 +228,7 @@ impl Service {
     }
 
     /// One kept member, with its plan as it was bound while the store still holds its weights.
-    fn restore_member(&self, gpu: &GpuPool, actor: &str, record: &str) -> Option<Arc<Member>> {
+    fn restore_member(&self, gpu: &Pool, actor: &str, record: &str) -> Option<Arc<Member>> {
         let kept: KeptMember = serde_json::from_str(record).ok()?;
         let installed = self.engine.installation(actor, &kept.installation).ok()??;
         let held = self.catalog.resolve(&installed.generation).ok()?;
@@ -244,7 +252,8 @@ impl Service {
             return Err(io::Error::other("machine is stopping"));
         }
         let held = self.catalog.resolve(generation)?;
-        let invocation = held.invocation(entrypoint, input)?;
+        let mut invocation = held.invocation(entrypoint, input)?;
+        invocation.degree = self.weightless_degree(&held, &invocation)?;
         let record = self.engine.submit(key, invocation)?;
         self.retain(&record, held.retention());
         Ok(record)
@@ -265,6 +274,7 @@ impl Service {
         invocation.attention_kernel = call.attention_kernel;
         invocation.gpus = call.gpus;
         invocation.inputs = call.inputs;
+        invocation.degree = self.weightless_degree(&held, &invocation)?;
         let record = self
             .engine
             .submit_public_on_boot(context, invocation, boot)?;
@@ -287,19 +297,29 @@ impl Service {
         invocation.attention_kernel = call.attention_kernel;
         invocation.gpus = call.gpus;
         invocation.inputs = call.inputs;
-        invocation.job = call.job;
-        invocation.accelerator = call.job && held.accelerator_job(&invocation.module, &invocation.entrypoint, self.gpu().is_some())?;
-        if invocation.job && invocation.gpus > 0 {
-            let available = self.gpu().map_or(0, |gpu| gpu.width());
-            if invocation.gpus as usize > available || (invocation.accelerator && invocation.gpus != 1) {
-                return Err(io::Error::new(io::ErrorKind::Unsupported, format!(
-                    "gpu_count_unavailable: requested {} GPUs; this machine has {available}, and accelerator job bodies support one", invocation.gpus)));
-            }
+        invocation.degree = call.degree;
+        let available = self.gpu().map_or(0, |gpu| gpu.width());
+        if call.degree == 0 && invocation.gpus as usize > available {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, format!(
+                "gpu_count_unavailable: requested {} GPUs; this machine has {available}", invocation.gpus)));
         }
         invocation.parent = call.parent;
         let record = self.engine.bind_prepared(id, invocation, preparation, memo, answer)?;
         self.retain(&record, held.retention());
         Ok(record)
+    }
+    /// A call submitted without a preparation constructs nothing: its declaration's degree.
+    fn weightless_degree(&self, held: &crate::catalog::HeldGeneration, invocation: &crate::journal::Invocation) -> io::Result<u32> {
+        let (_, _, interface) = held.record.app(&invocation.module).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "this environment holds no such application")
+        })?;
+        let entry = interface["entrypoints"].as_array()
+            .and_then(|rows| rows.iter().find(|row| row["name"] == invocation.entrypoint.as_str()))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "this application declares no such entrypoint"))?;
+        match self.pool() {
+            Some(pool) => pool.degree(entry, invocation.gpus),
+            None => Ok(0),
+        }
     }
     fn retain(&self, record: &Execution, hold: Arc<File>) {
         if !record.state.terminal() {
@@ -331,8 +351,8 @@ impl Service {
             return Ok(false);
         }
         *stopped = true;
-        if let Some(gpu) = self.gpu() {
-            gpu.stop()?;
+        if let Some(pool) = self.pool() {
+            pool.stop()?;
         }
         self.engine.notify_activity();
         Ok(true)
@@ -366,31 +386,31 @@ impl Service {
     pub fn reclaim(&self) -> crate::reclaim::Swept {
         *self.swept.lock().unwrap() = std::time::Instant::now();
         // Released Write roots first, so the store's GC can collect their bytes.
-        if let Some(jobs) = self.jobs() {
-            if let Err(error) = jobs.sweep_canceled_outputs(&self.engine) {
+        if let Some(calls) = self.calls() {
+            if let Err(error) = calls.sweep_canceled_outputs(&self.engine) {
                 eprintln!("reclaim canceled native outputs: {error}");
             }
-            if let Err(error) = jobs.sweep_objects() {
+            if let Err(error) = calls.sweep_objects() {
                 eprintln!("reclaim object roots: {error}");
             }
         }
         let sweep = || -> io::Result<crate::reclaim::Swept> {
-            let gpu = self.gpu();
+            let pool = self.pool();
             let mut bound = self.engine.bound_generations()?;
-            if let Some(gpu) = &gpu {
-                bound.extend(gpu.config().packages.iter().map(|p| p.generation.clone()));
+            if let Some(pool) = &pool {
+                bound.extend(pool.config().packages.iter().map(|p| p.generation.clone()));
             }
-            let kernels = gpu.as_ref().map(|gpu| gpu.kernel_caches());
+            let kernels = self.gpu().map(|gpu| gpu.kernel_caches());
             let publisher = self.publisher.lock().unwrap().clone();
             let uv_cache = publisher
                 .as_ref()
                 .and_then(|publisher| publisher.uv_cache());
-            let mut swept = crate::reclaim::sweep(&crate::reclaim::Caches {
+            crate::reclaim::sweep(&crate::reclaim::Caches {
                 engine: &self.engine,
                 catalog: &self.catalog,
                 bound: &bound,
                 kernels: kernels.as_ref(),
-                memo: gpu.as_ref().map(|gpu| gpu.memo()),
+                memo: pool.as_ref().map(|pool| pool.memo()),
                 uv_cache: uv_cache.as_deref(),
                 store: match publisher.as_ref().map(|publisher| publisher.caches(self)) {
                     Some(Ok(caches)) => Some(caches),
@@ -401,11 +421,7 @@ impl Service {
                     None => None,
                 },
                 disk: &|| crate::reclaim::measure(&self.engine.root),
-            })?;
-            if let Some(jobs) = self.jobs() {
-                swept.scratch = jobs.sweep_scratch(&self.engine);
-            }
-            Ok(swept)
+            })
         };
         match sweep() {
             Ok(swept) => {
@@ -421,41 +437,30 @@ impl Service {
         }
     }
     /// One pass over the ready runs, by root acceptance (Slurm FIFO): an older request with a
-    /// ready GPU step keeps the GPUs it waits for (`claims`) from younger ones.
+    /// ready GPU step keeps the GPUs it waits for (`claims`) from younger ones. A deviceless call
+    /// takes CPU room; one waiting on its own call takes none.
     fn dispatch_ready(&self) -> io::Result<()> {
         let stopped = self.stopped.lock().unwrap();
         if *stopped {
             return Ok(());
         }
+        let Some(pool) = self.pool() else {
+            return Ok(());
+        };
         // Orphan exact process births remain reservations; a new owner does not
         // pretend they are free merely because it has no local supervisor.
         let active = self.engine.active(usize::MAX)?;
-        let is_gpu = |record: &Execution| {
-            record.invocation.accelerator || record
-                .submission
-                .as_ref()
-                .is_some_and(|s| !s.preparation_id.is_empty())
-        };
+        let gpu = |record: &Execution| record.invocation.degree > 0;
         // Every GPU call slot is a permit of this machine run; an earlier run's process still
         // alive holds devices nobody here can name, so it fences them all.
         let gpu_fenced = self.gpu_startup_fences() != 0
-            || active.iter().any(|r| is_gpu(r) && !self.engine.owns(&r.id));
-        let gpu = self.gpu();
-        let mut claims = vec![None; gpu.as_ref().map_or(0, |gpu| gpu.width())];
-        let jobs = self.jobs.lock().unwrap().clone();
-        // A job mostly waits on its children, and a call waiting on its own takes none:
-        // only they take CPU room.
-        let waits = |r: &Execution| jobs.as_ref().is_some_and(|jobs| jobs.waiting(&self.engine, &r.id));
+            || active.iter().any(|r| gpu(r) && !self.engine.owns(&r.id));
+        let mut claims = vec![None; pool.width()];
+        let calls = self.calls();
+        let waits = |r: &Execution| calls.as_ref().is_some_and(|calls| calls.waiting(&self.engine, &r.id));
         let mut room = self.parallelism.saturating_sub(
-            active
-                .iter()
-                .filter(|r| !is_gpu(r) && !r.invocation.job && !waits(r))
-                .count(),
+            active.iter().filter(|r| !gpu(r) && !waits(r)).count(),
         );
-        // A queued job needs no room, so with jobs every ready record is looked at.
-        if room == 0 && (gpu_fenced || gpu.is_none()) && jobs.is_none() {
-            return Ok(());
-        }
         for record in self.engine.ready()? {
             let held = match self.catalog.resolve(&record.invocation.generation) {
                 Ok(held) => held,
@@ -470,45 +475,26 @@ impl Service {
                     "held package identity differs from accepted invocation")?;
                 continue;
             }
-            if crate::jobs::Jobs::takes(&record) {
-                let Some(jobs) = &jobs else {
-                    self.engine.fail_unstarted(&record.id, "capability_unavailable",
-                        "CPU execution is not configured on this machine")?;
-                    continue;
-                };
-                if record.invocation.job {
-                    if !(record.invocation.accelerator && gpu_fenced) {
-                        jobs.dispatch(&self.engine, &record, held, &mut claims)?;
-                    }
-                } else if room > 0 && jobs.dispatch(&self.engine, &record, held, &mut claims)? {
-                    room -= 1;
-                }
-            } else if let Some(context) = record
-                .submission
-                .as_ref()
-                .filter(|s| !s.preparation_id.is_empty())
-            {
-                if gpu_fenced {
-                    continue;
-                }
-                let Some(gpu) = &gpu else {
-                    self.engine.fail_unstarted(&record.id, "capability_unavailable",
-                        "GPU execution is not configured on this machine")?;
-                    continue;
-                };
-                let preparation = self
-                    .engine
-                    .preparation(&context.actor, &context.preparation_id)?
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "accepted GPU preparation is absent",
-                        )
-                    })?;
-                let held = held.application(&record.invocation.module)?;
-                gpu.dispatch(&self.engine, &record, held, gpu.plan(&preparation)?, &mut claims, jobs.clone())?;
+            let invocation = &record.invocation;
+            if (invocation.degree == 0 && room == 0) || (invocation.degree > 0 && gpu_fenced) {
+                continue;
             }
-            if room == 0 && jobs.is_none() && (gpu_fenced || claims.iter().all(Option::is_some)) {
+            let plan = match record.submission.as_ref().map(|s| s.preparation_id.as_str()) {
+                None | Some("") => Plan::weightless(&invocation.generation, &invocation.module, &invocation.entrypoint, invocation.degree),
+                Some(id) => {
+                    let actor = record.submission.as_ref().map(|s| s.actor.as_str()).unwrap_or_default();
+                    let preparation = self.engine.preparation(actor, id)?.ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "accepted preparation is absent")
+                    })?;
+                    pool.plan(&preparation)?
+                }
+            };
+            let held = held.application(&invocation.module)?;
+            let deviceless = plan.degree == 0;
+            if pool.dispatch(&self.engine, &record, held, plan, &mut claims, calls.clone())? && deviceless {
+                room -= 1;
+            }
+            if room == 0 && (gpu_fenced || claims.iter().all(Option::is_some)) {
                 return Ok(());
             }
         }

@@ -1,10 +1,10 @@
-//! The machine memo of memoized callables (`memoize=True`). A run of one, top-level or a job's
-//! call, is answered from the success this machine holds for its signer under the same
+//! The machine memo of memoized callables (`memoize=True`). A run of one, top-level or a
+//! child call, is answered from the success this machine holds for its signer under the same
 //! computation, and starts nothing; a success is held (`Objects::hold_memo`). A computation is
 //! the callable's operation identity, its request as given (files by content), its attention
 //! choice and the models it runs with. An author's condition (`memo_requires`) names the
 //! parameters a request must give for it to be memoizable at all.
-use crate::{api::domain::ModelChoice, catalog::Generation, gpu_service::GpuPlan, journal::InputFile};
+use crate::{api::domain::ModelChoice, catalog::Generation, gpu_service::Plan, journal::InputFile};
 use serde_json::{json, Value};
 use tensorfs_core::sha256;
 
@@ -50,15 +50,16 @@ pub fn of(
     Memo::Key(format!("sha256:{}", sha256::hex_digest(&crate::boundary_json::exact(&computation))))
 }
 
-/// The models a call runs with: each slot's checkpoints and adapters once resolved, else the
-/// choices it carries (a job's, which its calls resolve).
-pub fn models(plan: Option<&GpuPlan>, choices: &[ModelChoice]) -> Value {
+/// The models a call runs with: each slot's checkpoints and adapters once resolved (its raw
+/// sources too), else the choices it carries.
+pub fn models(plan: Option<&Plan>, choices: &[ModelChoice]) -> Value {
     match plan {
         Some(plan) => plan
             .slots
             .iter()
             .map(|slot| json!({"slot": slot.binding.model_binding_path,
                 "snapshots": slot.binding.snapshots, "adapters": slot.binding.adapters}))
+            .chain(plan.sources.iter().map(|source| json!({"source": source.parameter, "manifest": source.manifest})))
             .collect(),
         None => {
             let mut chosen: Vec<_> = choices
@@ -75,7 +76,7 @@ pub fn models(plan: Option<&GpuPlan>, choices: &[ModelChoice]) -> Value {
 /// function by its package and the identity this machine read from its installed source, else
 /// its package's installed files; with the module and the export. The root's own description
 /// is its caller's, so its files key it. A package with neither memoizes nothing.
-fn operation(generation: &Generation, application: &str, invocable: &Value) -> Option<String> {
+pub(crate) fn operation(generation: &Generation, application: &str, invocable: &Value) -> Option<String> {
     let (module, export) = (invocable["module"].as_str()?, invocable["export"].as_str()?);
     let identity = invocable["operation_identity"].as_str().filter(|identity| {
         identity

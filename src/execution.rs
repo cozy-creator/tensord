@@ -715,11 +715,6 @@ impl Engine {
 
     /// Trusted adapters share one claim, supervisor reservation and journal. They
     /// register the exact process birth before authorizing any authored code.
-    ///
-    /// A run rests paused before its stopped attempt has ended (its executor still exits,
-    /// its thread still cleans up), and a resume queues it at once. Its next attempt is not
-    /// claimed until that thread is done, which wakes the dispatcher: otherwise the old
-    /// thread's cleanup would disown the new attempt and end its children.
     pub(crate) fn dispatch_managed<F>(self: &Arc<Self>, id: &str, run: F) -> io::Result<bool>
     where
         F: FnOnce(Arc<Self>, String) -> io::Result<()> + Send + 'static,
@@ -817,79 +812,16 @@ impl Engine {
         }
     }
 
-    /// Pause (`Journal::pause`); a started attempt is stopped as a cancel stops it, and the
-    /// journaled pause makes its end `paused`.
-    pub fn pause(&self, id: &str, actor: &str, unstarted_only: bool) -> io::Result<Execution> {
-        let record = {
-            let owned = self.owned.lock().unwrap();
-            let mut progress = self.progress.lock().unwrap();
-            let mut record = self
-                .journal
-                .lock()
-                .unwrap()
-                .pause(id, actor, unstarted_only)?;
-            overlay_observation(&mut record, &owned, &progress);
-            if record.state == State::Paused {
-                progress.remove(id);
-            }
-            record
-        };
-        self.notify_activity();
-        let stopping = matches!(record.state, State::Starting | State::Running)
-            && record.pause_actor.is_some()
-            && record.cancel_actor.is_none();
-        if stopping {
-            // Released before `stop` runs: a job's stop pauses its children through here.
-            let active = self.active.lock().unwrap().get(id).cloned();
-            if let Some(ActiveRun::Managed(stop)) = active {
-                let _ = stop();
-            }
-        }
-        Ok(record)
-    }
-
-    pub fn resume(&self, id: &str) -> io::Result<Execution> {
-        let record = self.journal.lock().unwrap().resume(id)?;
-        self.notify_activity();
-        Ok(record)
-    }
-
-    /// An attempt that ends unauthorized or stopped: CANCELED, or PAUSED, as journaled.
+    /// An attempt that ends unauthorized or stopped: CANCELED, as journaled.
     pub(crate) fn finish_stopped(&self, id: &str) -> io::Result<Execution> {
-        let record = self.get(id)?;
-        let outcome = match (&record.cancel_actor, &record.pause_actor) {
-            (Some(_), _) => Outcome::Canceled,
-            (None, Some(_)) => Outcome::Paused,
-            (None, None) => return Err(io::Error::other("the attempt has no stop authority")),
-        };
-        self.finish(id, outcome)
+        if self.get(id)?.cancel_actor.is_none() {
+            return Err(io::Error::other("the attempt has no stop authority"));
+        }
+        self.finish(id, Outcome::Canceled)
     }
 
     pub fn children(&self, parent: &str) -> io::Result<Vec<Execution>> {
         self.journal.lock().unwrap().children(parent)
-    }
-
-    pub fn paused(&self, limit: usize) -> io::Result<Vec<Execution>> {
-        self.journal.lock().unwrap().paused(limit)
-    }
-
-    pub fn declare_checkpoint(
-        &self,
-        id: &str,
-        attempt: u32,
-        operation_key: &str,
-        logical_key: &str,
-        content_digest: &str,
-        length: u64,
-    ) -> io::Result<(String, bool)> {
-        self.journal.lock().unwrap().declare_checkpoint(
-            id,
-            attempt,
-            operation_key,
-            logical_key,
-            content_digest,
-            length,
-        )
     }
 
     pub fn observe_progress(
@@ -957,7 +889,7 @@ impl Engine {
         }
         let record = journal.finish_observed(id, outcome, progress.get(id), held)?;
         drop(journal);
-        if record.state.terminal() || record.state == State::Paused {
+        if record.state.terminal() {
             progress.remove(id);
         }
         drop(progress);
@@ -1071,7 +1003,7 @@ impl Engine {
             .insert(id.into(), ActiveRun::Managed(cancel.clone()));
         self.notify_activity();
         let record = self.get(id)?;
-        if record.cancel_actor.is_some() || record.pause_actor.is_some() {
+        if record.cancel_actor.is_some() {
             let _ = cancel();
         }
         Ok(())
@@ -1165,9 +1097,9 @@ impl Engine {
             }
             if record.state == State::Starting {
                 journal.requeue_unstarted(&record.id)?;
-            } else if record.invocation.job && record.pause_actor.is_some() {
-                // A pausing job's root is replayed by design: it rests paused.
-                journal.finish(&record.id, Outcome::Paused)?;
+            } else if record.cancel_actor.is_some() {
+                // A journaled cancel ends it CANCELED, however it stopped.
+                journal.finish(&record.id, Outcome::Canceled)?;
             } else {
                 journal.finish(&record.id, Outcome::Failed(crate::journal::Failure::machine("machine_stopped", "owner lost before durable result custody; exact executor birth has ended; started work will not be replayed")))?;
             }
@@ -1723,16 +1655,15 @@ pub(crate) fn open_artifact(root: &Path, path: &Path) -> io::Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{sync::mpsc, time::Duration};
 
     /// Slurm FIFO: an older root's step queued later dispatches before a younger root's
-    /// step queued earlier; each child carries its root and accelerator family.
+    /// step queued earlier; each child carries its root and GPU family.
     #[test]
     fn ready_runs_queue_by_their_roots_acceptance() {
         let root = std::env::temp_dir().join(format!("cm-ready-{}", uuid::Uuid::new_v4()));
         let engine = Engine::open(&root).unwrap();
-        let submit = |key: &str, parent: &str, accelerator| engine.submit(key, Invocation {
-            job: true, accelerator, parent: parent.into(), ..Default::default()
+        let submit = |key: &str, parent: &str, gpu: bool| engine.submit(key, Invocation {
+            degree: gpu as u32, parent: parent.into(), ..Default::default()
         }).unwrap();
         let (older, younger) = (submit("older", "", false), submit("younger", "", false));
         for root in [&older, &younger] {
@@ -1747,64 +1678,5 @@ mod tests {
         assert_eq!((younger_step.root_seq(), younger_step.family()), (younger.root_seq(), None));
         drop(engine);
         std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn a_resumed_run_is_not_dispatched_until_its_stopped_attempt_has_ended() {
-        let root = std::env::temp_dir().join(format!("cm-resume-{}", uuid::Uuid::new_v4()));
-        let engine = Engine::open(&root).unwrap();
-        let invocation = Invocation {
-            package: "audit/job".into(),
-            input: serde_json::json!({}),
-            job: true,
-            ..Default::default()
-        };
-        let run = engine.submit("resumed", invocation).unwrap();
-        // The first attempt rests paused, then goes on ending until the test lets it.
-        let (rested, rests) = mpsc::channel();
-        let (end, ends) = mpsc::channel::<()>();
-        let first = engine.dispatch_managed(&run.id, move |engine, id| {
-            engine.pause(&id, "alice", false)?;
-            engine.finish_stopped(&id)?;
-            rested.send(()).unwrap();
-            ends.recv().unwrap();
-            Ok(())
-        });
-        assert!(first.unwrap());
-        rests.recv().unwrap();
-        assert_eq!(engine.resume(&run.id).unwrap().state, State::Queued);
-        let second = |engine: Arc<Engine>, id: String| {
-            engine
-                .finish(
-                    &id,
-                    Outcome::Failed(crate::journal::Failure::machine(
-                        "test_failed",
-                        "the second attempt ran",
-                    )),
-                )
-                .map(drop)
-        };
-        assert!(
-            !engine.dispatch_managed(&run.id, second).unwrap(),
-            "the next attempt was claimed while the stopped one was still ending"
-        );
-        assert_eq!(engine.get(&run.id).unwrap().state, State::Queued);
-        // Once it has ended, the run is dispatched, and stays this engine's own.
-        end.send(()).unwrap();
-        let mut seen = engine.activity_epoch();
-        while !engine.dispatch_managed(&run.id, second).unwrap() {
-            seen = engine.wait_activity(seen, Some(Duration::from_millis(50)));
-        }
-        loop {
-            engine.reconcile().unwrap();
-            let record = engine.get(&run.id).unwrap();
-            assert_eq!(record.waiting_reason, None);
-            if record.state.terminal() {
-                assert_eq!((record.state, record.attempt), (State::Failed, 2));
-                break;
-            }
-            seen = engine.wait_activity(seen, Some(Duration::from_millis(50)));
-        }
-        let _ = fs::remove_dir_all(root);
     }
 }

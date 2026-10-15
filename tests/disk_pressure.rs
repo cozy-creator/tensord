@@ -357,20 +357,19 @@ fn a_live_seal_holds_its_kernel_namespace() {
 }
 
 #[test]
-fn paused_and_unknown_runs_keep_the_generations_they_name() {
+fn queued_and_unknown_runs_keep_the_generations_they_name() {
     let fixture = Fixture::new();
-    let (paused, unknown) = (fixture.generation('c'), fixture.generation('d'));
+    let (queued, unknown) = (fixture.generation('c'), fixture.generation('d'));
     let invoke = |path: &Path| Invocation {
         generation: path.file_name().unwrap().to_string_lossy().into_owned(),
         package: "audit/package".into(),
         input: serde_json::json!({}),
         ..Default::default()
     };
-    let (run, _) = fixture
+    fixture
         .engine
-        .accept_run("alice", "paused", "paused", invoke(&paused))
+        .accept_run("alice", "queued", "queued", invoke(&queued))
         .unwrap();
-    fixture.engine.pause(&run.id, "alice", true).unwrap();
     let (other, _) = fixture
         .engine
         .accept_run("alice", "unknown", "unknown", invoke(&unknown))
@@ -385,7 +384,7 @@ fn paused_and_unknown_runs_keep_the_generations_they_name() {
         )
         .unwrap();
     assert_eq!(fixture.sweep(None, &fixture.low(MIB / 2)), Swept::default());
-    assert!(paused.exists() && unknown.exists());
+    assert!(queued.exists() && unknown.exists());
 }
 
 #[test]

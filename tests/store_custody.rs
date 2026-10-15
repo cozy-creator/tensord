@@ -84,17 +84,15 @@ fn an_acknowledged_write_survives_gc_until_its_run_ends() {
 }
 
 #[test]
-fn paused_unknown_and_adopted_dependencies_stay_until_their_run_ends() {
+fn unknown_and_adopted_dependencies_stay_until_their_run_ends() {
     let area = Area::new();
-    let input = area.write(b"paused dependency");
-    let paused = area.engine.submit("paused", invocation(&input)).unwrap();
-    area.engine.pause(&paused.id, "alice", false).unwrap();
-    assert_eq!(area.collect(), 0);
+    let input = area.write(b"unknown-state dependency");
+    let unknown = area.engine.submit("unknown", invocation(&input)).unwrap();
     // A state a newer machine wrote is unfinished to this one.
     let db = rusqlite::Connection::open(area.root.join("state/executions.sqlite3")).unwrap();
     db.execute(
         "UPDATE executions SET state='future-state' WHERE id=?1",
-        [&paused.id],
+        [&unknown.id],
     )
     .unwrap();
     assert_eq!(area.collect(), 0);
@@ -105,21 +103,19 @@ fn paused_unknown_and_adopted_dependencies_stay_until_their_run_ends() {
         .submit(
             "parent",
             Invocation {
-                package: "audit/job".into(),
+                package: "audit/caller".into(),
                 input: serde_json::json!({}),
-                job: true,
                 ..Default::default()
             },
         )
         .unwrap();
-    let output = b"child result needed after the parent resumes";
+    let output = b"child result its parent holds";
     let adopted = ObjectRef::of(output);
     let file = area.root.join("child-output");
     fs::write(&file, output).unwrap();
     area.objects
         .adopt("alice", &parent.id, &file, &adopted)
         .unwrap();
-    area.engine.pause(&parent.id, "alice", false).unwrap();
     assert_eq!(area.collect(), 0);
     assert!(area.present(&adopted));
     area.engine.cancel(&parent.id, "alice").unwrap();
