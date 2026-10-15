@@ -95,9 +95,22 @@ fn actor_of(key: &[u8; 32]) -> String {
 }
 
 fn launch(root: &Path, extra: &[std::ffi::OsString]) -> (Child, String) {
+    launch_in(root, extra, &[])
+}
+
+/// `launch` under `scope`, a command that runs the machine as its arguments
+/// (`systemd-run --user --scope …`).
+fn launch_in(root: &Path, extra: &[std::ffi::OsString], scope: &[&str]) -> (Child, String) {
     let state = root.join("state");
     let _ = fs::remove_file(state.join("api-ready.json"));
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tensord"))
+    let tensord = env!("CARGO_BIN_EXE_tensord");
+    let (program, prefix) = match scope {
+        [] => (tensord, &[][..]),
+        [program, prefix @ ..] => (*program, prefix),
+    };
+    let mut child = Command::new(program)
+        .args(prefix)
+        .args((!scope.is_empty()).then_some(tensord))
         .args(["serve", "--state"])
         .arg(&state)
         .arg("--machine-config")
@@ -1780,6 +1793,65 @@ mod v1_api {
         let done = settle(&mut client, &all, "names-5", spec(None, hashed, "r2")).await;
         assert_eq!(done.status, "failed", "{done:?}");
         assert_eq!(take(), [format!("POST /v1/tensorfs/closure acme/model@{other} ")]);
+        let _ = fs::remove_dir_all(source);
+    }
+
+    /// A pod's container caps its tasks (a vast RTX 5060 Ti: `pids.max` 1280) below what two
+    /// cold downloads of up to 512 streams each could start together. Both land. On TensorFS
+    /// 0.9.0 a refused thread panicked past the pull's sampler: the run stayed preparing for good
+    /// and held its flight, so a resubmit joined the dead flight and cancel reached nothing (the
+    /// 2026-10-15 prepare wedge).
+    #[tokio::test]
+    async fn concurrent_cold_downloads_under_a_task_cap_land() {
+        const TASKS: u64 = 160;
+        let limit = format!("TasksMax={TASKS}");
+        let scope = ["systemd-run", "--user", "--scope", "-q", "-p", limit.as_str()];
+        let usable = Command::new(scope[0]).args(&scope[1..]).arg("true").stdout(Stdio::null()).stderr(Stdio::null()).status();
+        if !usable.is_ok_and(|status| status.success()) {
+            eprintln!("SKIPPED: no systemd user manager to create a task-limited cgroup");
+            return;
+        }
+        let source = std::env::temp_dir().join(format!("cm-tasks-{}", uuid::Uuid::new_v4()));
+        let store = tensorfs_core::store::Store::ensure(&source).unwrap();
+        // 300 objects each: a pull would start a stream for every one.
+        let model = |name: &str, tag: u32| {
+            let bodies: Vec<Vec<u8>> = (0..300u32)
+                .map(|at| (0..1024u32).flat_map(|i| [i, at, tag, 0]).flat_map(u32::to_le_bytes).collect())
+                .collect();
+            let weights: Vec<&[u8]> = bodies.iter().map(Vec::as_slice).collect();
+            let manifest = hub_oauth::tensors(&store, &weights);
+            let model = names_hub::Model { repository: name.into(), release: "1.0.0".into(), lane: "bf16".into(), manifest };
+            names_hub::serve(&store, model, None).0
+        };
+        let origins = [model("acme/first", 1), model("acme/second", 2)];
+        let mut machine = Machine::start().await;
+        machine.stop();
+        (machine.child, machine.address) = launch_in(&machine.root, &[], &scope);
+        let client = client(&machine).await;
+        let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
+        let download = |at: usize, name: &str| {
+            let spec = v1::RunSpec {
+                kind: v1::RunKind::Warm as i32,
+                models: vec![v1::ModelChoice {
+                    parameter: "model".into(),
+                    repository: name.into(),
+                    release: "1.0.0".into(),
+                    lane: "bf16".into(),
+                    ..Default::default()
+                }],
+                hub: Some(v1::HubAccess { origin: origins[at].clone(), object_hosts: vec!["localhost".into()], ..Default::default() }),
+                owner: "alice".into(),
+                ..Default::default()
+            };
+            let (mut client, all, id) = (client.clone(), all.clone(), format!("tasks-{at}"));
+            async move { settle(&mut client, &all, &id, spec).await }
+        };
+        // Test harness bound on a wedged preparation; the product has no such limit.
+        let both = tokio::time::timeout(Duration::from_secs(120), async {
+            tokio::join!(download(0, "acme/first"), download(1, "acme/second"))
+        });
+        let (first, second) = both.await.expect("a download under the task cap never settled");
+        assert_eq!((first.status.as_str(), second.status.as_str()), ("succeeded", "succeeded"), "{first:?} {second:?}");
         let _ = fs::remove_dir_all(source);
     }
 
