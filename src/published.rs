@@ -682,20 +682,18 @@ impl Publisher {
     /// unfinished run, paused and unknown states included. A journal or plan that cannot be
     /// read is an error, never a shorter list: the caller then runs no store GC this pass.
     fn protected(&self, service: &Service) -> io::Result<Vec<String>> {
-        let pool = service.pool();
-        let mut keep = pool.as_ref().map(|pool| pool.serving()).unwrap_or_default();
+        let mut keep = service.pool().map(|pool| pool.serving()).unwrap_or_default();
         keep.extend(self.fetching.lock().unwrap().keys().cloned());
         keep.extend(self.remainders.lock().unwrap().keys().cloned());
         for record in service.engine.with_journal(|journal| journal.unfinished())? {
-            let prepared = record.submission.filter(|s| !s.preparation_id.is_empty());
-            let (Some(submission), Some(pool)) = (prepared, &pool) else {
+            let Some(submission) = record.submission.filter(|s| !s.preparation_id.is_empty()) else {
                 continue;
             };
             let preparation = service
                 .engine
                 .preparation(&submission.actor, &submission.preparation_id)?;
             if let Some(preparation) = preparation {
-                keep.extend(pool.plan(&preparation)?.manifests());
+                keep.extend(crate::gpu_service::Plan::of(&preparation)?.manifests());
             }
         }
         keep.sort();

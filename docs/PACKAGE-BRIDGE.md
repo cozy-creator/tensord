@@ -36,7 +36,7 @@ atomically last. A generation is never updated. `catalog.rs` resolves one only u
 
 A generation also records `callees`: the other installed distributions with a statically
 described `cozy.application`, their application, interface, package identity and source digest.
-Their child runs use the caller's immutable environment and the callee's own App. A callee job
+Their child runs use the caller's immutable environment and the callee's own App. A callee
 can call its own internal exports; another package can call only its public exports. Memoized
 calls use the callee's source digest.
 

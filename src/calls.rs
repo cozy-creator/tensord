@@ -348,10 +348,16 @@ impl Calls {
         }
     }
 
-    /// A cancel reached a run with no attempt running (queued): its children end too.
+    /// A cancel reached a run: its unfinished native outputs are let go at once, and when no
+    /// attempt runs (it was queued) its children end too.
     pub fn canceled(&self, record: &Execution) {
         if record.cancel_actor.is_none() {
             return;
+        }
+        if let Some(service) = self.service.upgrade() {
+            if let Err(error) = self.sweep_canceled_outputs(&service.engine) {
+                eprintln!("canceled native outputs: {error}");
+            }
         }
         if record.state.terminal() {
             self.ended(&record.id);

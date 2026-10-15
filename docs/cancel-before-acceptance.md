@@ -8,7 +8,7 @@ SQLite immediate transactions serialize cancellation and acceptance.
 If cancellation wins, every later ordinary Run spec for that actor/ID returns the canceled record
 without preparing or executing it. `Run(id)` observes its ordinary canceled state and outcome,
 including after restart. Repeated cancellation returns the same record. Other actors keep
-their independent IDs. Pause and Resume still require an existing run. Completed outcomes
+their independent IDs. Completed outcomes
 remain completed when cancellation arrives later.
 
 If acceptance wins, existing durable engine cancellation applies. The caller must observe

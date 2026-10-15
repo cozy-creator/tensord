@@ -13,8 +13,7 @@ durable daemon state, and describes the software activation transaction.
   committed receipt. The same file holds installations, preparations, public terminal
   projections, native outputs, input intakes and submission closures.
 - `workspace_id()` is a v4 UUID created once and persisted.
-- States: `queued`, `starting`, `running`, `paused`, `completed`, `failed`, `canceled`.
-  `paused` is neither terminal nor dispatched: a job at rest between attempts (below).
+- States: `queued`, `starting`, `running`, `completed`, `failed`, `canceled`.
 - `Invocation`: `package`, `generation`, `module`, `entrypoint`, `input` (JSON).
 
 ## Acceptance
@@ -67,7 +66,7 @@ let file = engine.open_result(&record.id, 0)?;  // re-verifies digest and length
   measurable CPU/IO progress is killed before it is reaped.
 - A runner `Canceled` without a durable `cancel_actor` becomes `failed`.
 - A launch failure or an exit before `Ready` is `failed` with the reason (and stderr tail).
-- Every job ends completed or failed: a queued job this machine cannot start (its environment not
+- Every run ends completed or failed: a queued run this machine cannot start (its environment not
   held, CPU or GPU execution not configured) fails with that reason at once. Nothing is parked to
   wait, and nothing returns to the queue to fail again.
 
@@ -156,22 +155,9 @@ Runners get the same scope as executors (a cgroup or a token; see device executo
 
 Not implemented: same-UID isolation (reads detect mutation), cleanup of orphan `*.pending` files.
 
-## Pause and resume (jobs only)
+## Cancel and submit again
 
-- `pause(id, actor, unstarted_only)` records `pause_actor`. A queued run rests `paused` at once; a
-  preparing one once prepared; a started one when its attempt stops: the job's root is stopped as a
-  cancel stops it, and an end that is `canceled` (or the root's death) settles `Outcome::Paused`.
-  A failed or succeeded attempt keeps its own outcome. `unstarted_only` (a paused job's children)
-  holds only a queued run: started work runs to its end.
-- `resume` queues a paused run for a fresh attempt (`attempt + 1`, progress from zero); a run still
-  pausing does not resume. `cancel` ends a paused run at once.
-- Resume replays only the job's root. Each call it makes again finds its child run by index and
-  intent (`Runs::child`, no preparation): finished children answer with their results, held ones
-  resume. No started work runs twice.
-- A job's scratch (`<cpu>/scratch/<id>`, `RunJob.scratch`) and its checkpoint declarations
-  (`checkpoints` table: run, operation and logical key, digest; a repeat replays its receipt, other
-  content is `checkpoint_conflict`) persist across attempts and restarts. The job context without
-  its tokens (`job_contexts`) lets children prepare after a restart. The scratch goes with the
-  first sweep after the run ends.
-- A paused run is not activity: a rental's idle release applies. A restart leaves it paused, and a
-  root that was pausing when the machine died rests paused.
+There is no pause. A canceled or failed run is submitted again as a new run. A memoized call's
+success is held when that call completes, whatever its root then does, so the new run's finished
+calls are answered from the memo and only the rest run. A derivation (weights output) is never
+memoized; it replays the committed transaction of the same code and declaration instead.

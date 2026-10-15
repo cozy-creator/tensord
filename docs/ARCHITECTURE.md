@@ -40,18 +40,20 @@ cozy CLI ──TLS/gRPC (Cozy-Cap)──> api::server ─> machine_api::NativeBa
 machine.sock (weight peers) / admin.sock ─> main.rs ▼
                                           service::Service (dispatch policy)
                                            │ journal + supervision: execution::Engine / journal::Journal
-                         CPU ──────────────┤
-                          python -m tensord_client.runner (one process per request)
-                         GPU ──────────────┘
-                          gpu_service::GpuPool ─> device_executor::DeviceExecutor
-                            (one retained executor per plan, via the Runtime trampoline)
+                                           │
+                          gpu_service::Pool ─> device_executor::DeviceExecutor
+                            (retained executors per plan: deviceless, one GPU or a group,
+                             via the Runtime trampoline)
                             memory::GpuMemory: admission, process caps, eviction, floor
                             answers budget-cell, device-room, model-source and sealed-tier requests
+                          calls::Calls: child calls and each attempt's weights grant
 ```
 
 A request is accepted durably (`Engine::submit_public`), then `Service::dispatch_ready` resolves
-its immutable generation (`catalog`) and starts it: CPU work through the runner, GPU work through
-the single retained executor slot in `GpuPool`. Progress, outputs and terminal state are written
+its immutable generation (`catalog`) and its plan, and starts it on the pool. Every run takes one
+path (Start, Load, Activate, PrepareRequest, Invoke): a deviceless call (`accelerator=False`, or a
+machine without GPUs) on a pooled deviceless executor within CPU room, a GPU call on the GPUs the
+pool places it on. Progress, outputs and terminal state are written
 by `Engine`; outputs are kept in native custody until the client acknowledges collection.
 
 Tenancy: a pod has one owner, a package one publisher, and many users submit. A GPU plan (and so
@@ -91,14 +93,14 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 | `published.rs` | Package and model preparation: releases and models from the Hub, provider-source models via TensorFS `source_model`, held per release and resolution; downloads keep the serving set out of GC | `Publisher`, `Request`, `Prepared` | D1 |
 | `adapter_views.rs` | Caller LoRA adapters as a zero-copy TensorFS derivation | — | D1 |
 | `runs.rs` | Run sources and preparation inside a run: accepted at once, install/download as its progress, the Hub capability in memory only. A warm run with no entrypoint installs and fetches its choices; one with no code makes provider sources and uploads to its weights destination | `Runs`, `Spec`, `Source` | D1 |
-| `weights.rs` | A job's weights: `weights_writer` sources and outputs over TensorFS's native channels; an adopted output kept in a local repository, recorded as a manifest product, published to the run's weights destination | `Weights`, `Grant` | D1 |
+| `weights.rs` | An attempt's weights: `weights_writer` sources and outputs over TensorFS's native channels; an adopted output kept in a local repository, recorded as a manifest product, published to the run's weights destination | `Weights`, `Grant` | D1 |
 | `objects.rs` | Write: resumable content-addressed objects into the store, recorded per signer | `Objects`, `Writer` | D1 |
 | `local_source.rs` | A run's local source: each remote manifest owns its source tree and editable environment; explicit local paths read the directory in place | `LocalSources`, `Manifest` | D1 |
 | `machine/` | Launch grant, lifetime identity, readiness receipt, rental lifecycle, supervision, SSH, runtime update, the direct player endpoint (`player.rs`), the embedded Python client and installer helper (`client.rs`) | `Grant`, `Readiness`, `Lifecycle` | D2 |
 | `native_inputs.rs` | Native input custody into TensorFS + journal | `SourceIntake`, `IntakeJournal` | D1 |
 | `catalog.rs` | Immutable package environment generations and their holds | `Catalog`, `Generation`, `HeldGeneration` | D1 |
 | `service.rs` | Sole dispatch policy (CPU parallelism, one GPU slot, startup GPU fences) | `Service` | B2 |
-| `jobs.rs` | Jobs in CPU or explicitly allocated GPU executors, their child runs, pause/resume (root replay over finished children), scratch, checkpoint declarations | `Jobs` | G, L (pause/resume) |
+| `calls.rs` | Child calls (the seam broker): each call a run, canceled with its parent; each attempt's weights grant | `Calls`, `Caller` | G |
 | `execution.rs` | Acceptance, runner supervision, cancellation, progress coalescing, output custody, reconcile | `Engine`, `RunnerConfig` | E |
 | `journal.rs` | SQLite journal: executions, installations, preparations, receipts, process births | `Journal`, `Execution`, `State`, `ProcessBirth` | E |
 | `gpu_service.rs` | GPU pool: published package/model mapping, executor retention, request callbacks; GPU groups (a degree-K plan on the first K GPUs, one memory decision per GPU), one call slot per GPU and one-GPU replicas and multi-slot plans | `GpuPool`, `GpuConfig`, `GpuPlan`, `PlanSlot`, `ModelGrant` | B2 (admission, grants), E (spawn/fencing), D1 (published mapping), I (groups, slots) |
@@ -158,7 +160,7 @@ Before native begin, the existing execution journal records only the run, output
 transaction association, atomically with current-attempt admission. Explicit cancellation
 uses that association to fence and abandon unfinished work, or dispose a committed result
 that still has only pending custody. Acknowledged native adoption and independent consumer
-roots survive. Cleanup is idempotent and retried at startup/reclamation; pause, observer
+roots survive. Cleanup is idempotent and retried at startup/reclamation; observer
 disconnect and ordinary failure do not authorize abandonment. Older unbound transactions
 are never guessed to belong to a canceled run.
 

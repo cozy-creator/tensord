@@ -18,8 +18,8 @@ the same reasons a run's outcome carries. Unknown fields are ignored with a warn
 | Call | Shape | Real callers | Why it cannot fold into another |
 |---|---|---|---|
 | **Status** | server stream `{keepalive?}`. The first frame describes the machine: worker and boot id, versions, capabilities, phase, GPUs, Hubs, the caller's live runs, held environments, disk, idle deadline, and the player endpoint: the `cozy/1` listener's port, the addresses to dial and its DTLS certificate's SHA-256. Each later frame is the whole picture again, sent when it changes. Holding the stream is **not** activity. `keepalive: true` resets the idle deadline once, and the first frame carries the new deadline. Without a cap it answers one frame: identity and the sealed readiness receipt. | CLI `machine show`, `rental show`, endpoint check; `rental keepalive` (one reset); Hub readiness (no cap) | It describes the machine, not a run. A unary describe is just its first frame. |
-| **Run** | server stream. `{id, after, spec?}`. With a spec and a new id it submits (idempotent on `id`). Every call then streams the run's log from `after`: `state`, `progress`, `product` (output, rev, length, label, media type; stable output names), `log`, `outcome` (status, typed reason, result, output list, triage). The spec holds `source` (a published release by name, private placement, or an uploaded local package manifest), `kind` (`call`, `job`, `warm`, `remove` or `update`), entrypoint, payload, input object digests, model choices by name, the caller's catalog revision, attention kernel, weights destination, and the Hub to read with the run's capability there. | CLI `cozy run` (attached or `--detach`), `run watch/show`, `machine model download` and prewarm (`kind: warm`), `rental update` (`kind: update`); Hub public serving; seam child runs | Submit without watch is the first frame then close. Watch is Run without a spec. Prepare is a run that only prepares (`warm`), and an ordinary run prepares inside itself (its `progress` shows install and download). |
-| **Control** | unary `{run, cancel \| pause \| resume}` | CLI `run cancel`, `job cancel`, `run pause/resume`; Hub public cancel; seam child cancel | Closing a Run stream must never cancel accepted work, so cancel needs its own call. A preparing run's cancel stops its downloads, installs and an upload's push (nothing is published; the Hub keeps what landed for an upload asked again); only an upload's finalization is past it (`cancel_unavailable`). |
+| **Run** | server stream. `{id, after, spec?}`. With a spec and a new id it submits (idempotent on `id`). Every call then streams the run's log from `after`: `state`, `progress`, `product` (output, rev, length, label, media type; stable output names), `log`, `outcome` (status, typed reason, result, output list, triage). The spec holds `source` (a published release by name, private placement, or an uploaded local package manifest), `kind` (`call`, `warm`, `remove` or `update`), entrypoint, payload, input object digests, model choices by name, the caller's catalog revision, attention kernel, weights destination, and the Hub to read with the run's capability there. | CLI `cozy run` (attached or `--detach`), `run watch/show`, `machine model download` and prewarm (`kind: warm`), `rental update` (`kind: update`); Hub public serving; seam child runs | Submit without watch is the first frame then close. Watch is Run without a spec. Prepare is a run that only prepares (`warm`), and an ordinary run prepares inside itself (its `progress` shows install and download). |
+| **Control** | unary `{run, cancel}` | CLI `run cancel`; Hub public cancel; seam child cancel | Closing a Run stream must never cancel accepted work, so cancel needs its own call. A preparing run's cancel stops its downloads, installs and an upload's push (nothing is published; the Hub keeps what landed for an upload asked again); only an upload's finalization is past it (`cancel_unavailable`). |
 | **Read** | server stream `{target, offset, length, if_rev}`; target is a run output (`output[/i]`), `triage`, or a machine log (with tail). Frames carry rev, total length, the sha256 once final and where this read ends, then the bytes. A `length` reads one range: the CLI reads a big output as ranges side by side on several connections. | CLI downloads (`cozy run --out`, `cp`), triage quote on failure, `machine logs`, `rental logs` | Bytes do not belong in Run's event stream: a 50 GB output, resume at an offset, and many parallel readers. |
 | **Write** | client stream: one content-addressed object (sha256, length), resumable from the length already held | CLI `cozy run` file inputs and local package sources, Hub public inputs | Content addressing dedups across runs and resumes big uploads; inline bytes in Run would be re-sent on every attach. |
 
@@ -31,8 +31,7 @@ with a self-signed leaf; the CLI does not use it. Caller: the `cozy run play` li
 `RunSpec.gpus` is optional (`run-gpus/1`). Zero uses the widest GPU group supported by
 all package-code model slots on the machine. A positive value requests exactly that many
 GPUs; unsupported operations fail instead of reducing the count. This includes GPU child
-calls of a job. A job with an explicit count reserves one subset until its executor and all
-borrowing children exit; CPU orchestration remains deviceless. Checkpoint identity and weight
+calls of a deviceless root, whose explicit count reserves one subset while it runs. Checkpoint identity and weight
 ladder GPU hints never select parallelism. Busy GPUs cause queuing, not a smaller group.
 
 
@@ -74,26 +73,25 @@ ladder GPU hints never select parallelism. Busy GPUs cause queuing, not a smalle
   that stops moving fails on its measured stillness.
 - **Memo, derived retention, forget and prune** become one self-managing cache: TTL plus low-disk
   eviction, delivered entries first, and no verbs.
-- **Memo** is the machine's own: a memoized function's success, run directly or as a job's call, is
+- **Memo** is the machine's own: a memoized function's success, run directly or as a call, is
   held per signer and answers the same computation (its code, request with files by content,
   attention choice and models) while the machine holds every file it names; the answered run starts
   nothing and its Outcome says `memoized`. An author's `memo_requires` names parameters a request
   must give to be memoizable; one that omits them runs, is not held, and says why (`unmemoized`).
   The client carries no results; a memo answers where its results are (measured 2026-10-06: no
   cross-machine hit ever in the owner's runs).
-- **Jobs** are a run kind. Weights outputs are outputs; with a weights destination the machine
-  pushes them to the Hub and settles the publication itself.
+- **Jobs** are ordinary calls: any function may write weights outputs, and with a weights
+  destination (the requester's repository) the machine pushes them to the Hub and settles the
+  publication itself. A writer is never memoized.
 - **Child runs** are Run and Control issued by a run through its executor seam, scoped to the
   parent: same records, no number, canceled with the parent, outputs granted to the parent's
   spool. Child outputs reach the parent by the seam, so Read is not used for them.
 
-**Pause/resume** stay as Control actions (lead's decision). Only a job pauses (`pause_unsupported`
-otherwise): its root stops, started children run to their end, unstarted ones wait, and the run
-shows `paused`. Resume replays the root, whose calls find their finished children
-(`DURABLE-EXECUTION.md`); `run_pausing` and `run_not_paused` refuse early or late resumes.
+**Pause/resume** are deleted (Paul, 2026-10-14). A canceled or failed run is submitted again; its
+finished memoized calls are answered from the memo (`DURABLE-EXECUTION.md`).
 
 **Activity** (a rental's idle release, `rental-lifetime.md`) is a run queued or running (warm-ups
-and uploads included), and an explicit keepalive restarts the clock once. Updates, paused jobs,
+and uploads included), and an explicit keepalive restarts the clock once. Updates,
 open streams and other calls are not activity: a Calcifer that holds a stream must not bill forever.
 
 ## Today's 35 rows
@@ -116,7 +114,7 @@ open streams and other calls are not activity: a Calcifer that holds a stream mu
 | 14 | Collect, AcknowledgeCollection | Run `outcome`; ack deleted (Read marks delivery) |
 | 15 | ImportInputTree, Retain/ReleaseByteTree, ReadByteTreeObject | Write, Read |
 | 16 | Control CANCEL | Control |
-| 17 | Control PAUSE/RESUME | Control |
+| 17 | Control PAUSE/RESUME | deleted (cancel and submit again) |
 | 18 | seam publish → product events | Run `product` |
 | 19 | HTTPS outputs | Read (CLI), `cozy/1` (browser) |
 | 20 | WebRTC media | `cozy/1` |
@@ -127,8 +125,8 @@ open streams and other calls are not activity: a Calcifer that holds a stream mu
 | 25 | ForgetPackage | deleted (exact choices) |
 | 26 | memo answer, Record/Lookup/PruneOperation | the machine's held memos |
 | 27 | seam child_call/poll/cancel/forget/events | seam Run, Control |
-| 28 | jobs | Run `kind: job` |
-| 29 | seam checkpoint, tree_member, writer | seam, internal |
+| 28 | jobs | Run `kind: call` |
+| 29 | seam checkpoint, tree_member, writer | checkpoint deleted; tree_member, writer: seam, internal |
 | 30 | Retain/ReleaseDerivedResult | deleted (outputs in the cache) |
 | 31 | NativeArtifactTransfer | deleted (machine pushes weights outputs) |
 | 32 | RECONCILE_PUBLICATION | deleted (machine settles with the Hub) |
@@ -139,7 +137,7 @@ open streams and other calls are not activity: a Calcifer that holds a stream mu
 ## Who builds what (approved 2026-10-03)
 
 - **G**: proto `cozy.machine.v1`, Cozy-Cap auth, Run (log, attach, idempotency), Control, Read,
-  `cozy/1` from Read, child runs, jobs, cache and memo, pause/resume; the CLI's `cozy run`, `watch`,
+  `cozy/1` from Read, child runs, cache and memo; the CLI's `cozy run`, `watch`,
   `cancel`, `play` and downloads; the browser player.
 - **D1**: Run sources and preparation inside a run (published, private, local manifest, `warm`),
   Write, Hub capability handling (memory only); the CLI's upload and preparation paths.
@@ -151,7 +149,7 @@ open streams and other calls are not activity: a Calcifer that holds a stream mu
 1. Proto `cozy.machine.v1` and Cozy-Cap auth; Run, Control and Read in the machine; CLI `cozy run`
    on them (G with D1).
 2. Write and Run sources/warm (D1); Status and readiness (D2).
-3. Child runs and jobs (G, with I for H3 long-form); cache; pause/resume; `cozy/1` from Read.
+3. Child runs (G, with I for H3 long-form); cache; `cozy/1` from Read.
 4. Hub readiness and public serving on Status/Run/Control; the browser player on the same caps.
 5. The machine builds only `cozy.machine.v1`. Current domain values and private persisted codecs
    are separate; worker RPC generation/vendor files and Claim verification are removed.

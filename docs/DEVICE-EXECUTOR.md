@@ -103,7 +103,7 @@ longer than eight times the longest pause it has shown, and at least six samples
 
 - Every `command` runs under a watch. Non-invoke commands use CPU plus bytes moved
   (`process::burn`); time the machine spends answering an executor request is excused, and so
-  is a job root's while any of its child runs is unfinished (`DeviceExecutor.waits`: a child
+  is a caller's while any of its child runs is unfinished (`DeviceExecutor.waits`: a child
   is watched by its own executor). A wedged executor and its process group are killed; the
   call returns the measurement.
 - `cancel(request_id)` atomically writes the stock `executor.cancel` marker, keyed by request, so a

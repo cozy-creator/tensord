@@ -790,6 +790,29 @@ mod v1_api {
         args
     }
 
+    /// A Python that describes a project as the machine's Runtime does: the locked test
+    /// environment, its Runtime replaced by a dev wheel (`COZY_TEST_RUNTIME_WHEEL`) when one is
+    /// named. Kept in `tools`.
+    fn describing_python(tools: &Path) -> PathBuf {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let Some(runtime) = std::env::var_os("COZY_TEST_RUNTIME_WHEEL") else {
+            return installing_args(tools)[1].clone().into();
+        };
+        let env = tools.join("describing");
+        let uv = |args: &[&std::ffi::OsStr]| {
+            assert!(Command::new("uv").current_dir(repo).args(args).status().unwrap().success(), "uv {args:?}");
+        };
+        let requirements = env.join("requirements.txt");
+        uv(&["venv".as_ref(), "--python".as_ref(), "3.12".as_ref(), env.as_os_str()]);
+        uv(&["export".as_ref(), "--locked".as_ref(), "--extra".as_ref(), "test".as_ref(), "--no-emit-project".as_ref(),
+            "--no-hashes".as_ref(), "-o".as_ref(), requirements.as_os_str()]);
+        let python = env.join("bin/python");
+        uv(&["pip".as_ref(), "install".as_ref(), "--python".as_ref(), python.as_os_str(), "-r".as_ref(), requirements.as_os_str()]);
+        uv(&["pip".as_ref(), "install".as_ref(), "--python".as_ref(), python.as_os_str(), runtime.as_os_str(),
+            "-e".as_ref(), repo.as_os_str()]);
+        python
+    }
+
     /// A live project's files written with Write, as `cozy run ./dir` sends them: its manifest.
     async fn write_live(
         client: &mut v1::machine_client::MachineClient<Channel>,
@@ -978,7 +1001,7 @@ mod v1_api {
             }
             machine.stop();
             let journal = Journal::open(&journal_root).unwrap();
-            assert!(journal.derived_outputs(&record.id).unwrap().is_empty());
+            assert!(journal.derived_outputs(&record.id).unwrap().is_empty(), "{phase}");
             let store = Store::open(&machine.store()).unwrap();
             let meta = Meta::open(&store).unwrap();
             let observed = derived::lookup(&store, &meta, &transaction).unwrap();
@@ -1049,7 +1072,7 @@ mod v1_api {
             after: 0,
             spec: Some(spec),
         };
-        let events = collect(client.run(authorized(run("weights", job), &all)).await.unwrap().into_inner())
+        let events = collect(client.run(authorized(run("weights", job.clone()), &all)).await.unwrap().into_inner())
             .await
             .unwrap();
         let done = outcome(&events);
@@ -1062,6 +1085,25 @@ mod v1_api {
         assert_eq!(written.media_type, "application/vnd.cozy.model-manifest");
         let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
         assert!(result.to_string().contains(&written.digest), "{result} names {written:?}");
+        // A writer is never memoized: the same call runs again. Its derivation replays the
+        // committed transaction of the same code and declaration, so its output is the same.
+        assert!(!done.memoized && done.computation_digest.is_empty(), "{done:?}");
+        let events = collect(client.run(authorized(run("weights-again", job.clone()), &all)).await.unwrap().into_inner())
+            .await
+            .unwrap();
+        let again = outcome(&events);
+        assert_eq!(again.status, "succeeded", "{again:?}");
+        assert!(!again.memoized && again.computation_digest.is_empty(), "{again:?}");
+        let rewritten = again.outputs.iter().find(|p| p.output == "model").unwrap();
+        assert_eq!((&rewritten.digest, rewritten.length), (&written.digest, written.length));
+        let journal = Journal::open(&machine.root.join("state/execution")).unwrap();
+        let transaction = |id: &str| {
+            let record = journal.get_public(&actor(), id).unwrap();
+            journal.derived_outputs(&record.id).unwrap().into_iter().map(|b| b.transaction).collect::<Vec<_>>()
+        };
+        assert_eq!(transaction("weights-again").len(), 1);
+        assert!(transaction("weights").is_empty(), "the transaction passed to the later run");
+        drop(journal);
         let held = tensorfs_core::store::Store::open(&machine.store()).unwrap();
         let reference = tensorfs_core::ids::ObjectRef {
             sha256: written.digest.trim_start_matches("sha256:").into(),
@@ -1110,6 +1152,148 @@ mod v1_api {
         };
         assert!(refused.message().contains("was not written to this machine"), "{refused:?}");
 
+        let _ = fs::remove_dir_all(tools);
+    }
+
+    /// A deviceless function (`accelerator=False`) runs on a pooled executor: its second call
+    /// is served by the executor of its first, which paid the imports once.
+    #[tokio::test]
+    async fn a_second_deviceless_call_reuses_its_executor() {
+        let (machine, tools) = installing_machine().await;
+        let mut client = client(&machine).await;
+        let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
+        let manifest = write_package(&mut client, &all, "cpu_memo", "local/tensord-cpu-memo").await;
+        let mut served = vec![];
+        for id in ["process-1", "process-2"] {
+            let spec = v1::RunSpec {
+                kind: v1::RunKind::Call as i32,
+                source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest: manifest.clone() })),
+                entrypoint: "process".into(),
+                payload: serde_json::to_vec(&serde_json::json!({"text": id})).unwrap(),
+                owner: "alice".into(),
+                ..Default::default()
+            };
+            let request = v1::RunRequest { id: id.into(), after: 0, spec: Some(spec) };
+            let done = outcome(&collect(client.run(authorized(request, &all)).await.unwrap().into_inner()).await.unwrap());
+            assert_eq!(done.status, "succeeded", "{done:?}");
+            let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+            served.push((result["pid"].as_u64().unwrap(), result["served"].as_u64().unwrap()));
+        }
+        assert_eq!(served[0].0, served[1].0, "one executor served both calls: {served:?}");
+        assert_eq!((served[0].1, served[1].1), (1, 2));
+        let _ = fs::remove_dir_all(tools);
+    }
+
+    /// One run of `function` of the package `manifest` names, to its outcome: its result.
+    async fn call(
+        client: &mut v1::machine_client::MachineClient<Channel>,
+        cap: &str,
+        manifest: &str,
+        (id, function): (&str, &str),
+        payload: serde_json::Value,
+    ) -> serde_json::Value {
+        let spec = v1::RunSpec {
+            kind: v1::RunKind::Call as i32,
+            source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest: manifest.into() })),
+            entrypoint: function.into(),
+            payload: serde_json::to_vec(&payload).unwrap(),
+            owner: "alice".into(),
+            ..Default::default()
+        };
+        let request = authorized(v1::RunRequest { id: id.into(), after: 0, spec: Some(spec) }, cap);
+        let done = outcome(&collect(client.run(request).await.unwrap().into_inner()).await.unwrap());
+        assert_eq!(done.status, "succeeded", "{id}: {done:?}");
+        serde_json::from_slice(&done.result).unwrap()
+    }
+
+    /// On a GPU machine every call runs where its declaration puts it, on pooled executors: a
+    /// deviceless root (`accelerator=False`) never opens CUDA and calls a GPU child; a GPU root
+    /// calls a child on its own GPU, in another process; a raw-GPU call runs beside a warm
+    /// executor without ending it, and that executor's next call finds its CUDA memory intact.
+    #[tokio::test]
+    #[ignore = "GPU: one card (a rental)"]
+    async fn on_one_gpu_every_call_runs_where_its_declaration_puts_it() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let tools = std::env::temp_dir().join(format!("cm-tools-{}", uuid::Uuid::new_v4()));
+        assert!(Command::new("uv").current_dir(repo).args(["build", "--wheel", "--out-dir"]).arg(&tools)
+            .status().unwrap().success());
+        let home = tools.join("executor-home");
+        fs::create_dir_all(&home).unwrap();
+        let config = tools.join("gpu.json");
+        fs::write(&config, serde_json::json!({"devices": "0", "environment": {
+            "PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": home}}).to_string()).unwrap();
+        let mut args = installing_args(&tools);
+        args.extend(["--gpu-config".into(), config.into_os_string()]);
+        let machine = Machine::start_args(|_, _| (), &args).await;
+        let mut client = client(&machine).await;
+        let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
+        let manifest = write_package(&mut client, &all, "gpu_calls", "local/tensord-gpu-calls").await;
+        let hold = serde_json::json!({"hold_s": 0.5});
+
+        let deviceless = call(&mut client, &all, &manifest, ("cpu-root", "cpu_root"), hold.clone()).await;
+        assert_eq!((deviceless["root"]["device"].as_str(), deviceless["child"]["device"].as_str()), (Some("cpu"), Some("cuda")));
+        assert_eq!(deviceless["child"]["total"], 8192.0);
+        let root = deviceless["root"]["pid"].as_u64().unwrap();
+        assert_ne!(Some(root), deviceless["child"]["pid"].as_u64());
+        // Its executor is pooled, still alive: it never mapped a CUDA driver.
+        let maps = fs::read_to_string(format!("/proc/{root}/maps")).unwrap();
+        assert!(!maps.contains("libcuda"), "a deviceless executor opened CUDA");
+
+        let on_gpu = call(&mut client, &all, &manifest, ("gpu-root", "gpu_root"), hold).await;
+        assert_eq!((on_gpu["root"]["device"].as_str(), on_gpu["child"]["device"].as_str()), (Some("cuda"), Some("cuda")));
+        assert_ne!(on_gpu["root"]["pid"], on_gpu["child"]["pid"]);
+
+        let none = serde_json::json!({});
+        let warm = call(&mut client, &all, &manifest, ("warm-1", "warm"), none.clone()).await;
+        let raw = call(&mut client, &all, &manifest, ("raw", "raw"), none.clone()).await;
+        assert_eq!(raw["device"], "cuda");
+        assert_ne!(raw["pid"], warm["pid"]);
+        let again = call(&mut client, &all, &manifest, ("warm-2", "warm"), none).await;
+        assert_eq!((&again["pid"], again["served"].as_u64()), (&warm["pid"], Some(2)), "the warm executor was ended");
+        let _ = fs::remove_dir_all(tools);
+    }
+
+    /// A writer's weights output reaches its run's destination, the requester's repository, under
+    /// the run's capability; the publication is a call event of the run.
+    #[tokio::test]
+    #[ignore = "real AuthKit: needs go and AUTHKIT_TEST_DATABASE_URL"]
+    async fn a_writers_weights_output_reaches_its_destination() {
+        let (upstream, hub) = hub_oauth::test_hub();
+        let authkit = hub_oauth::AuthKit::start(&upstream);
+        let (machine, tools) = installing_machine().await;
+        let jkt = leaf_jkt(&machine);
+        let mut client = client(&machine).await;
+        let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
+        let manifest = write_package(&mut client, &all, "cpu_weights", "local/tensord-cpu-weights").await;
+        let ops = serde_json::json!([{"type": "tensorhub_model_publish", "model": "acme/table"}]);
+        let spec = v1::RunSpec {
+            kind: v1::RunKind::Call as i32,
+            source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
+            entrypoint: "table".into(),
+            payload: br#"{"size":128}"#.to_vec(),
+            weights_destination: "acme/table".into(),
+            hub: Some(v1::HubAccess {
+                origin: authkit.hub.clone(),
+                object_hosts: vec!["localhost".into()],
+                capability: authkit.capability(&jkt, &ops, 600),
+                token_endpoint: authkit.token_endpoint.clone(),
+                ..Default::default()
+            }),
+            owner: "alice".into(),
+            ..Default::default()
+        };
+        let request = v1::RunRequest { id: "published-table".into(), after: 0, spec: Some(spec) };
+        let events = collect(client.run(authorized(request, &all)).await.unwrap().into_inner()).await.unwrap();
+        let done = outcome(&events);
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        let written = done.outputs.iter().find(|p| p.output == "model").unwrap();
+        assert_eq!(hub.lock().unwrap().finalized, [written.digest.clone()]);
+        let uploads: Vec<_> = events.iter().filter_map(|e| match &e.event {
+            Some(v1::run_event::Event::Call(call)) if call.function.ends_with("upload_checkpoint") => Some(call.status.clone()),
+            _ => None,
+        }).collect();
+        assert_eq!(uploads, ["succeeded"]);
+        assert_eq!(authkit.exchanges(), 1, "one trade for the run");
         let _ = fs::remove_dir_all(tools);
     }
 
@@ -2227,7 +2411,7 @@ mod v1_api {
             (path.file_name().unwrap().to_str().unwrap().to_string(), fs::read(&path).unwrap())
         };
         let ((root, root_bytes), callee) = (wheel("tensord_cpu_caller-"), wheel("tensord_cpu_memo-"));
-        let described = Command::new(installing_args(&tools)[1].clone())
+        let described = Command::new(describing_python(&tools))
             .args(["-m", "tensord_client.runtime_describe"])
             .env("PYTHONPATH", Path::new(env!("CARGO_MANIFEST_DIR")).join("python"))
             .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
@@ -2930,7 +3114,8 @@ mod v1_api {
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(canceled.state, "canceled");
+        assert!(["running", "canceled"].contains(&canceled.state.as_str()), "{canceled:?}");
+        until(&mut client, &all, "film", "canceled").await;
         until(&mut client, &all, "film/1", "canceled").await;
         assert_eq!(snapshot(&mut client, &all, "film/0").await.unwrap().state, "succeeded");
         assert!(snapshot(&mut client, &all, "film/2").await.is_none());

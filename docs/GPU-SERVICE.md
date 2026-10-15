@@ -31,27 +31,32 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   within the machine envelope. `RunSpec.gpus > 0` requests that exact degree and refuses an
   unsupported count. Model lanes/checkpoint overrides never change it; weight ladders fit
   within the selected group. Busy GPUs cause queuing, not a smaller group.
-- Allocations (`gpu_allocation.rs`), as Slurm's: a root job (a request with no parent) holds a
-  contiguous lane, `--gpus` wide or as wide as the widest group its environment's models run on
-  here (an accelerator job's own GPU at least). It is registered when the root dispatches and
-  bound when its first GPU step is ready; its steps (child calls, any depth) run only inside it,
-  one call per GPU. It ends at `Context.release_gpus()` (CPU roots only; in-flight calls keep
-  their GPUs until they return) or the root executor's exit. A standalone call is its own root
-  for the call's duration. Children carry `root` and accelerator `family`, stamped at acceptance.
+- Degree 0 (deviceless): `accelerator=False`, or a machine without GPUs. Such a call runs on a
+  pooled deviceless executor within CPU room; idle ones are ended by host pressure, least recently
+  used first, before any GPU executor. Degree 1: a call that constructs nothing, on one GPU, an
+  ordinary tenant of the memory policy.
+- Allocations (`gpu_allocation.rs`), as Slurm's: a deviceless root (a request with no parent)
+  holds a contiguous lane, `--gpus` wide or as wide as the widest group its environment's models
+  run on here. It is registered when the root dispatches and bound when its first GPU step is
+  ready; its steps (child calls, any depth) run only inside it, one call per GPU. It ends at
+  `Context.release_gpus()` (in-flight calls keep their GPUs until they return) or when the root's
+  call ends. A GPU call is its own root for the call's duration, and its family (its calls, any
+  depth) shares its GPUs. Children carry `root` and `family`, stamped at acceptance.
 - Order: ready runs dispatch by (root acceptance, id). A root takes its place only with a GPU
   step ready: one still downloading weights or in CPU start-up claims nothing, so younger ready
   roots use the GPUs meanwhile. A root's first waiting step claims, for the pass, a lane no
   older root holds; its younger holders yield at their next step boundary: they start no new
-  step (calls in flight, their own children and accelerator jobs finish; nothing is preempted),
+  step (calls in flight and their own children finish; nothing is preempted),
   then their lanes end (a `release` naming the root it went to) and they queue again at their
   own place. A root that released or yielded comes back at its place among the waiting roots
   and never displaces a holder: holders keep their lanes between their steps. A waiting step
   keeps free GPUs from younger requests. Each `grant`/`wait`/`release` is a `gpu` entry in the
   root's log (`RunEvent.gpu`); a wait is logged again only when its blocker (the oldest other
   request claiming, holding or calling on its lane) changes.
-- An accelerator job keeps one GPU of its root's lane for its life; only its family calls there.
-- The `GpuPlan` id hashes {actor, generation, entrypoint, slots, degree}. It is journaled as a
-  `Preparation`, and `submit` records `preparation_id`.
+- A `Plan`'s construction hashes {generation, App, entrypoint, constructed slots, degree}: its
+  executors' key. Its id adds the `Weights[M]` sources (`Invoke.sources`). A plan binding a model
+  is journaled as a `Preparation`, and `submit` records `preparation_id`; one binding none is
+  derived at dispatch.
 - An empty `installation_id` binds a `published-<hash>` installation from `packages`.
 
 ## Dispatch
@@ -74,7 +79,7 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   (`cozy run show`): torch's peaks, the process at the end, and what the plane paged since the
   executor's previous call.
 - A memory step on a GPU runs under that GPU's call slot; host pressure ends idle executors only on
-  GPUs no call holds. A resumed accelerator job prepares its GPU once no family call runs there.
+  GPUs no call holds.
 - Host admission counts executors admitted and not yet loaded. Pinned budgets are shared over every
   GPU's executors (a group's once), most recently used first.
 - Startup: every journaled birth still alive from a previous machine run (GPU births including

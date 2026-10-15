@@ -1130,8 +1130,7 @@ mod tests {
         let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
         let publisher = Publisher::new(&root.join("published"), Default::default(), store.clone()).unwrap();
         service.configure_publisher(publisher.clone());
-        let config = crate::gpu_service::GpuConfig::deviceless(&root.join("home")).unwrap();
-        service.configure_pool(crate::gpu_service::Pool::new(&root.join("pool"), config, store).unwrap()).unwrap();
+        drop(store);
         service.engine.bind_installation(Installation {
             actor: "alice".into(), alias: "installed".into(), generation: "g".into(),
             package: "audit/derive".into(), release: "1".into(), interface: b"{}".to_vec(), hub: String::new(),

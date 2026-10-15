@@ -4,6 +4,7 @@ request names, so a call answered from the machine's memo shows as no run. A wri
 from __future__ import annotations
 
 import io
+import os
 import struct
 from pathlib import Path
 
@@ -84,6 +85,22 @@ def greet(ctx: Context, payload: Greeting, tel: Telemetry) -> Greeted:
     qwen-image-2's generate_image."""
     tel.log("greeting", level="warning", times=payload.times)
     return Greeted(" ".join([payload.text] * payload.times))
+
+
+class Process(msgspec.Struct):
+    pid: int
+    #: The calls this process has served.
+    served: int
+
+
+_served: list[int] = []
+
+
+@app.entrypoint(accelerator=False)
+def process(ctx: Context, payload: Greeting) -> Process:
+    """Deviceless: which process served the call, and how many calls it has served."""
+    _served.append(1)
+    return Process(os.getpid(), len(_served))
 
 
 class Painting(msgspec.Struct):

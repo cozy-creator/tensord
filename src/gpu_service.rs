@@ -219,6 +219,21 @@ impl Plan {
             degree,
         }
     }
+    /// The plan a journaled preparation binds.
+    pub fn of(preparation: &Preparation) -> io::Result<Self> {
+        let mut plan: Plan =
+            serde_json::from_slice(&preparation.document).map_err(io::Error::other)?;
+        if plan.id != preparation.id || plan.installation != preparation.installation {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "preparation differs from owned journal binding",
+            ));
+        }
+        if plan.construction.is_empty() {
+            plan.construction = plan.id.clone();
+        }
+        Ok(plan)
+    }
     /// Every checkpoint it reads, constructed or raw: the store keeps them while it may run.
     pub fn manifests(&self) -> Vec<String> {
         let constructed = self.slots.iter().map(|slot| slot.binding.snapshot.clone());
@@ -1414,10 +1429,16 @@ impl Pool {
             let chosen = choices
                 .iter()
                 .find(|c| c.parameter == *path || c.parameter == *parameter);
-            let authority: Vec<&ModelGrant> = if resolved.is_empty() {
-                self.config.models.iter().collect()
-            } else {
-                resolved.iter().collect()
+            // A model passed by value (a ModelArtifact a run here produced) is held here.
+            let passed = chosen
+                .filter(|c| resolved.is_empty() && c.repository.is_empty())
+                .and_then(|c| c.manifest.as_ref())
+                .map(|reference| self.held_grant(&installed.package, path, reference))
+                .transpose()?;
+            let authority: Vec<&ModelGrant> = match (&passed, resolved.is_empty()) {
+                (Some(passed), _) => vec![passed],
+                (None, true) => self.config.models.iter().collect(),
+                (None, false) => resolved.iter().collect(),
             };
             let grants: Vec<_> = authority
                 .into_iter()
@@ -1561,18 +1582,28 @@ impl Pool {
         })
     }
     pub fn plan(&self, preparation: &Preparation) -> io::Result<Plan> {
-        let mut plan: Plan =
-            serde_json::from_slice(&preparation.document).map_err(io::Error::other)?;
-        if plan.id != preparation.id || plan.installation != preparation.installation {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "preparation differs from owned journal binding",
-            ));
-        }
-        if plan.construction.is_empty() {
-            plan.construction = plan.id.clone();
-        }
-        Ok(plan)
+        Plan::of(preparation)
+    }
+    /// A slot's checkpoint this machine's store holds, by its exact manifest.
+    fn held_grant(&self, package: &str, path: &str, reference: &crate::api::domain::Ref) -> io::Result<ModelGrant> {
+        let sha = tensorfs_core::sha256::hex(&reference.digest);
+        let absent = |why: String| io::Error::new(io::ErrorKind::NotFound, format!("checkpoint_absent: {path} names sha256:{sha}: {why}"));
+        let object = tensorfs_core::ids::ObjectRef { sha256: sha.clone(), length: reference.length };
+        let manifest = self.store.read_manifest(&object).map_err(|e| absent(e.to_string()))?;
+        let header = manifest
+            .header()
+            .map(|header| tensorfs_core::checkpoint::load_header(&self.store, header))
+            .transpose()
+            .map_err(|e| absent(e.to_string()))?;
+        Ok(ModelGrant {
+            package: package.into(),
+            slot: path.into(),
+            repository: String::new(),
+            release: String::new(),
+            lane: String::new(),
+            manifest: format!("sha256:{sha}"),
+            components: header.map(|h| h.components.into_iter().map(|(name, _)| name).collect()).unwrap_or_default(),
+        })
     }
     fn permit(
         self: &Arc<Self>,

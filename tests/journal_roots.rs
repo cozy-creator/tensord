@@ -71,6 +71,7 @@ fn open(root: &Path, tools: &Tools) -> Machine {
     let store = Arc::new(Store::ensure_owned(&state.join("tensorfs")).unwrap());
     let objects =
         Arc::new(Objects::new(&root.join("writes"), store.clone(), service.engine.clone()).unwrap());
+    service.engine.hold_memos(&objects);
     let local = LocalSources::new(
         objects.clone(),
         InstallerConfig {
@@ -79,7 +80,8 @@ fn open(root: &Path, tools: &Tools) -> Machine {
             generations: root.join("generations"),
             client_wheel: tools.client.clone(),
             staging_root: root.join("staging"),
-            sdk: vec![],
+            // A Runtime wheel not yet published, installed as this machine's own (a dev build).
+            sdk: std::env::var_os("COZY_TEST_RUNTIME_WHEEL").map(PathBuf::from).into_iter().collect(),
             uv: "uv".into(),
             seed_cache: None,
         },
