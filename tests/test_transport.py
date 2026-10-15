@@ -8,7 +8,7 @@ import struct
 import msgspec
 import pytest
 
-from tensord_client.client import FULL_SEALS, GET_SEALS, ProtocolError, read_exact, receive_fd, sealed_memfd, send_record
+from tensord_client.client import FULL_SEALS, GET_SEALS, Client, ProtocolError, read_exact, receive_fd, sealed_memfd, send_record
 from tensord_client.protocol import MAX_FRAME, Hello, HelloReply, ObjectRef
 from tensord_client.linux import MFD_ALLOW_SEALING, MFD_CLOEXEC, libc_memfd_create
 
@@ -102,14 +102,17 @@ def test_truncated_stream_returns_error():
         receiver.close()
 
 
-def test_oversize_frame_rejected_before_send():
-    sender, receiver = socket.socketpair()
-    try:
-        with pytest.raises(ProtocolError, match="frame length"):
-            send_record(sender, Hello(1, "x" * MAX_FRAME, []))
-    finally:
-        sender.close()
-        receiver.close()
+def test_a_reply_prefix_over_the_guard_is_refused_before_its_body(tmp_path):
+    path = str(tmp_path / "machine.sock")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        listener.bind(path)
+        listener.listen(1)
+        client = Client(path)
+        machine, _ = listener.accept()
+        with machine:
+            machine.sendall(struct.pack("!I", MAX_FRAME + 1))
+            with pytest.raises(ProtocolError, match="reply length"):
+                client.exchange(Hello(1, "x", []), HelloReply)
 
 
 def test_additive_reply_fields_and_arbitrary_version():

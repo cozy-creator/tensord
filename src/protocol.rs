@@ -4,7 +4,10 @@ use std::io::{self, IoSlice, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
-pub const MAX_FRAME: usize = 64 * 1024;
+/// Not a size rule: the most one length prefix may make a reader allocate, on this socket
+/// and the executor seam alike (Runtime's `seam.MAX_FRAME`). Load replies grow with their
+/// checkpoint and stay far below it, so it refuses only a corrupt or hostile prefix.
+pub const MAX_FRAME: usize = 256 << 20;
 pub const CAPS: &[&str] = &["weights.hosted/1", "objects.put-fd/1", "execution.cpu/1"];
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -108,8 +111,17 @@ pub enum Body {
     },
 }
 pub fn read(stream: &mut UnixStream) -> io::Result<Option<Request>> {
+    read_body(stream)?
+        .map(|bytes| serde_json::from_slice(&bytes).map_err(io::Error::other))
+        .transpose()
+}
+pub fn write(stream: &mut UnixStream, reply: &Reply) -> io::Result<()> {
+    write_body(stream, &serde_json::to_vec(reply)?)
+}
+/// One frame's body, read as it arrives: a prefix is never trusted with an allocation. EOF is
+/// clean only between frames.
+pub fn read_body(stream: &mut UnixStream) -> io::Result<Option<Vec<u8>>> {
     let mut header = [0; 4];
-    // EOF is clean only between frames; truncated headers are errors.
     if stream.read(&mut header[..1])? == 0 {
         return Ok(None);
     }
@@ -118,22 +130,25 @@ pub fn read(stream: &mut UnixStream) -> io::Result<Option<Request>> {
     if length == 0 || length > MAX_FRAME {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "invalid control frame length",
+            format!("frame length {length} outside 1..={MAX_FRAME}"),
         ));
     }
-    let mut bytes = vec![0; length];
-    stream.read_exact(&mut bytes)?;
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(io::Error::other)
+    let mut bytes = Vec::with_capacity(length.min(1 << 20));
+    Read::take(&mut *stream, length as u64).read_to_end(&mut bytes)?;
+    if bytes.len() < length {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
+    Ok(Some(bytes))
 }
-pub fn write(stream: &mut UnixStream, reply: &Reply) -> io::Result<()> {
-    let bytes = serde_json::to_vec(reply)?;
+pub fn write_body(stream: &mut UnixStream, bytes: &[u8]) -> io::Result<()> {
     if bytes.len() > MAX_FRAME {
-        return Err(io::Error::other("reply exceeds control frame"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("a {} B frame is over the {MAX_FRAME} B guard", bytes.len()),
+        ));
     }
     stream.write_all(&(bytes.len() as u32).to_be_bytes())?;
-    stream.write_all(&bytes)
+    stream.write_all(bytes)
 }
 pub fn send_fd(stream: &UnixStream, fd: &impl AsRawFd) -> io::Result<()> {
     let fds = [fd.as_raw_fd()];

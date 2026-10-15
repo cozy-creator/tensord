@@ -460,12 +460,6 @@ impl Jobs {
             weights: true,
             budget: record.invocation.accelerator.then_some(device_executor::JobBudget { gpu_count: 1 }),
         };
-        // A command over the control frame fails its run by name; the executor never sees it.
-        if let Some(why) = oversized(&command) {
-            executor.shutdown()?;
-            let failure = Failure::executor("refused", "runtime", "job_command_too_large", &why);
-            return engine.finish(id, Outcome::Failed(failure)).map(drop);
-        }
         let reply = executor.command(&command, &mut services);
         drop(caller);
         conclude(engine, id, &executor, &spool, command_ok(reply?)?)?;
@@ -1374,31 +1368,6 @@ fn invocables(
     (rows, callables)
 }
 
-/// Why `command` cannot travel in one executor control frame, naming its largest parts; None
-/// when it fits.
-fn oversized(command: &DeviceCommand) -> Option<String> {
-    let size = serde_json::to_vec(command).map_or(usize::MAX, |b| b.len());
-    if size <= crate::device_executor::MAX_DEVICE_FRAME {
-        return None;
-    }
-    let mut by_part = BTreeMap::<String, usize>::new();
-    if let DeviceCommand::RunJob { call_interfaces, payload, .. } = command {
-        for row in call_interfaces {
-            let bytes = row.interface_document.as_ref().and_then(|d| serde_json::to_vec(d).ok()).map_or(0, |b| b.len());
-            *by_part.entry(format!("{}'s interface", row.module)).or_default() += bytes;
-        }
-        by_part.insert("the job's payload".into(), serde_json::to_vec(payload).map_or(0, |b| b.len()));
-    }
-    let mut parts: Vec<(usize, String)> = by_part.into_iter().map(|(part, bytes)| (bytes, part)).collect();
-    parts.sort_by(|a, b| b.cmp(a));
-    let largest: Vec<String> = parts.iter().take(3).map(|(bytes, part)| format!("{part} {bytes} B")).collect();
-    Some(format!(
-        "the job's command encodes to {size} B, over the executor control frame's {} B (largest: {})",
-        crate::device_executor::MAX_DEVICE_FRAME,
-        largest.join(", ")
-    ))
-}
-
 /// An App's interface narrowed to one module's exported callables (the Runtime generates that
 /// module's callers from it).
 fn module_interface(interface: &Value, module: &str) -> Value {
@@ -1839,10 +1808,9 @@ mod exact_tests {
     }
 
     /// A callee App with many exports across modules: each module's first row carries only its
-    /// own callables, so the job's command fits the control frame where one full interface per
-    /// export (cozy-eval 0.7.5: 8.7 KB on 9 rows) did not. One that cannot fit fails by name.
+    /// own callables, not one full interface per export (cozy-eval 0.7.5: 8.7 KB on 9 rows).
     #[test]
-    fn a_callee_interface_travels_once_per_module_and_an_oversized_command_is_named() {
+    fn a_callee_interface_travels_once_per_module() {
         let entry = |module: &str, name: &str| json!({"name": name, "description": "x".repeat(900),
             "invocable": {"module": module, "export": name}});
         let modules = ["eval.a", "eval.b", "eval.c", "eval.d", "eval.e", "eval.f"];
@@ -1866,20 +1834,6 @@ mod exact_tests {
             assert_eq!(names, [*module, *module], "only its own exported callables");
             assert_eq!(document["application"], "eval:app");
         }
-        let command = |call_interfaces| DeviceCommand::RunJob {
-            max_output_bytes: crate::output_capacity::DEFAULT_BYTES,
-            request_id: "job".into(), job: "root".into(), payload: json!({}), application: "root:app".into(),
-            package_interface: "interface.json".into(), spool: "spool".into(), scratch: "scratch".into(),
-            deadline_s: None, inputs: Default::default(), trees: Default::default(), call_interfaces,
-            models: Default::default(), weights: true, budget: None,
-        };
-        assert_eq!(oversized(&command(rows.clone())), None);
-        let each_row: Vec<_> = rows.iter().cloned().map(|mut r| {
-            r.interface_document = (!r.self_call).then(|| callee.clone());
-            r
-        }).collect();
-        let why = oversized(&command(each_row)).expect("one full interface per export overflows");
-        assert!(why.contains("over the executor control frame's 65536 B") && why.contains("eval.f's interface 23794 B"), "{why}");
     }
 
     #[test]
