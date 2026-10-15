@@ -93,7 +93,9 @@ jobs:
           cache-on-failure: true
       - name: Release build (Taskfile `release`, as Runtime's `task machine` runs it)
         if: contains(inputs.build, 'tensord')
+        # rust-cache prunes the container's toolchain (target/manylinux/rustup) to a broken stub.
         run: |
+          rm -rf target/manylinux/rustup
           CARGO_BUILD_JOBS=$(nproc) task release OUT=dist
       - if: contains(inputs.build, 'tensord')
         uses: actions/upload-artifact@v4
