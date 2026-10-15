@@ -624,8 +624,9 @@ pub(crate) fn observe(engine: &Engine, id: &str, completed: &mut u64, frame: &Fr
     if frame.stage.is_empty() {
         return;
     }
-    // Zero-advance frames are telemetry (stage/position), not completed work.
-    *completed = completed.saturating_add(frame.advance);
+    // `advance` is the attempt's monotone position in completed units (Runtime
+    // `Telemetry`); a zero one is telemetry, not work.
+    *completed = (*completed).max(frame.advance);
     let mut payload = json!({"stage": frame.stage.chars().take(120).collect::<String>(), "step_ms": frame.step_ms.unwrap_or(0.0)});
     for (name, value) in [
         ("stage_fraction", frame.stage_fraction.map(Value::from)),

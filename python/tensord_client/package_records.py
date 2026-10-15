@@ -26,8 +26,6 @@ class Generation(msgspec.Struct, frozen=True):
     python: str
     dependencies: list[Dependency]
     interface: msgspec.Raw
-    # Empty: the CPU runner's SDK adapter imports in this environment; else why it cannot.
-    cpu_bridge: str = ""
     # The package's own installed files, hashed: what keys its memoized calls across machines.
     source_digest: str = ""
     callees: list[Callee] = []

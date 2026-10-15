@@ -234,7 +234,7 @@ impl LocalSources {
     }
 
     /// The environment a live manifest runs in: one per lock, project metadata, local path
-    /// dependencies, carried wheels and this machine's interpreter, SDK pair and runner.
+    /// dependencies, carried wheels and this machine's interpreter, SDK pair and client.
     /// Remote environments live beside their immutable source; direct paths remain live.
     fn environment(&self, home: &Path, manifest: &Manifest) -> PathBuf {
         let own = manifest.own();
@@ -588,6 +588,13 @@ mod tests {
         Machine { root, service, store, objects, installer }
     }
 
+    /// The fixtures' author surface needs the Runtime of this cohort: a dev wheel
+    /// (`COZY_TEST_RUNTIME_WHEEL`) as the machine's own until a release carries it.
+    fn current_runtime(installer: &InstallerConfig) -> InstallerConfig {
+        let sdk = std::env::var_os("COZY_TEST_RUNTIME_WHEEL").map(PathBuf::from).into_iter().collect();
+        InstallerConfig { sdk, ..installer.clone() }
+    }
+
     /// Its stdout, trimmed; a failure names the command and its stderr.
     fn run(command: &mut Command) -> String {
         let output = command.output().unwrap();
@@ -882,7 +889,7 @@ mod tests {
     #[test]
     fn a_live_tree_carries_the_locked_wheels_its_machine_cannot_fetch() {
         let m = machine("cm-carried");
-        let sources = LocalSources::new(m.objects.clone(), m.installer.clone(), m.store.clone());
+        let sources = LocalSources::new(m.objects.clone(), current_runtime(&m.installer), m.store.clone());
         let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let (project, index) = (m.root.join("project"), m.root.join("index"));
         fs::create_dir_all(project.join("cpu_caller")).unwrap();
@@ -931,7 +938,7 @@ mod tests {
             }
         }
         let m = machine("cm-indexes");
-        let sources = LocalSources::new(m.objects.clone(), m.installer.clone(), m.store.clone());
+        let sources = LocalSources::new(m.objects.clone(), current_runtime(&m.installer), m.store.clone());
         let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let (project, served) = (m.root.join("project"), m.root.join("served"));
         fs::create_dir_all(project.join("cpu_caller")).unwrap();
@@ -985,7 +992,7 @@ mod tests {
     #[test]
     fn an_edited_path_dependency_is_built_again() {
         let m = machine("cm-beside");
-        let sources = LocalSources::new(m.objects.clone(), m.installer.clone(), m.store.clone());
+        let sources = LocalSources::new(m.objects.clone(), current_runtime(&m.installer), m.store.clone());
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
         let project = m.root.join("live");
         for (fixture, to) in [("cpu_caller", ""), ("cpu_memo", "deps/cpu_memo")] {
@@ -997,7 +1004,7 @@ mod tests {
         }
         let pyproject = fs::read_to_string(project.join("pyproject.toml")).unwrap();
         // A settled Runtime: the newest may be mid-upload (its sdist visible before its wheels).
-        fs::write(project.join("pyproject.toml"), pyproject + "\n[tool.uv]\nconstraint-dependencies = [\"cozy-runtime<0.19\"]\n[tool.uv.sources]\ntensord-cpu-memo = { path = \"deps/cpu_memo\" }\n").unwrap();
+        fs::write(project.join("pyproject.toml"), pyproject + "\n[tool.uv]\nconstraint-dependencies = [\"cozy-runtime==0.24.1\"]\n[tool.uv.sources]\ntensord-cpu-memo = { path = \"deps/cpu_memo\" }\n").unwrap();
         run(Command::new("uv").args(["lock", "--python", "3.12", "--project"]).arg(&project));
         let names = ["pyproject.toml", "package.toml", "uv.lock", "cpu_caller/__init__.py",
             "deps/cpu_memo/pyproject.toml", "deps/cpu_memo/package.toml", "deps/cpu_memo/cpu_memo/__init__.py"];
@@ -1055,6 +1062,11 @@ mod tests {
         assert!(!fs::symlink_metadata(site.join("cpu_input/__init__.py")).unwrap().file_type().is_symlink());
 
         // A callee App among the locked dependencies is copied too: the environment describes it.
+        let sources = LocalSources::new(
+            m.objects.clone(),
+            InstallerConfig { seed_cache: Some(seed.clone()), ..current_runtime(&m.installer) },
+            m.store.clone(),
+        );
         let wheel_of = |fixture: &str| {
             let out = m.root.join(fixture);
             run(Command::new("uv").current_dir(repo.join("tests/fixtures").join(fixture)).args(["build", "--wheel", "--out-dir"]).arg(&out));
@@ -1062,7 +1074,7 @@ mod tests {
         };
         let (caller, memo) = (wheel_of("cpu_caller"), wheel_of("cpu_memo"));
         // A settled Runtime: the newest may be mid-upload (its sdist visible before its wheels).
-        fs::write(m.root.join("settled.txt"), "cozy-runtime<0.19\n").unwrap();
+        fs::write(m.root.join("settled.txt"), "cozy-runtime==0.24.1\n").unwrap();
         let compiled = run(Command::new("uv").args(["pip", "compile", "--quiet", "--generate-hashes", "--python-version", "3.12", "--no-header", "--constraint"])
             .arg(m.root.join("settled.txt")).arg("--find-links")
             .arg(memo.parent().unwrap()).arg(repo.join("tests/fixtures/cpu_caller/pyproject.toml")));
@@ -1092,7 +1104,7 @@ mod tests {
             }
         }
         let pyproject = fs::read_to_string(project.join("pyproject.toml")).unwrap();
-        fs::write(project.join("pyproject.toml"), pyproject + "\n[tool.uv]\nconstraint-dependencies = [\"cozy-runtime<0.19\"]\n[tool.uv.sources]\ntensord-cpu-memo = { path = \"deps/cpu_memo\" }\n").unwrap();
+        fs::write(project.join("pyproject.toml"), pyproject + "\n[tool.uv]\nconstraint-dependencies = [\"cozy-runtime==0.24.1\"]\n[tool.uv.sources]\ntensord-cpu-memo = { path = \"deps/cpu_memo\" }\n").unwrap();
         run(Command::new("uv").args(["lock", "--python", "3.12", "--project"]).arg(&project));
         let tree = archive(&project, &["pyproject.toml", "uv.lock", "package.toml", "cpu_caller/__init__.py",
             "deps/cpu_memo/pyproject.toml", "deps/cpu_memo/package.toml", "deps/cpu_memo/cpu_memo/__init__.py"]);

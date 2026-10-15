@@ -208,8 +208,8 @@ pub fn prepare_editable(
     publish(config, command, stop)
 }
 
-/// The trusted helper's command for one package: this machine's interpreter, SDK pair, runner
-/// client and generations, and what the package declares of itself.
+/// The trusted helper's command for one package: this machine's interpreter, SDK pair,
+/// description client and generations, and what the package declares of itself.
 fn installer(config: &InstallerConfig, root: &RootSet) -> Result<Command, Status> {
     let captured_python = &root.python_version;
     let python = if !captured_python.is_empty() {

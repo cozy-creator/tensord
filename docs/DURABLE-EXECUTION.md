@@ -1,7 +1,7 @@
 # Durable execution
 
 `journal.rs` is the machine's single SQLite acceptance and transition authority. `execution.rs`
-(`Engine`) supervises runner processes over it. Neither schedules, installs or authenticates:
+(`Engine`) supervises the pool's attempts over it. Neither schedules, installs or authenticates:
 the owner (`service.rs`) admits work and resolves an immutable environment before dispatch.
 
 [Process replacement and recovery](RECOVERY.md) distinguishes retained executor weights from
@@ -34,18 +34,14 @@ durable daemon state, and describes the software activation transaction.
 ```rust
 let engine = Engine::open(state_root)?;
 let record = engine.submit(key, invocation)?;   // committed receipt
-engine.dispatch(&record.id, runner_config)?;    // false unless queued
 engine.cancel(&record.id, actor)?;              // durable actor first, then cooperative Cancel
 let open = engine.reconcile()?;                 // no adoption, no replay
 let file = engine.open_result(&record.id, 0)?;  // re-verifies digest and length
 ```
 
-- `RunnerConfig`: trusted `python`, `module`, `import_paths` (`PYTHONPATH`), `generation_hold`.
-  The runner holds its generation independently too.
-- `dispatch` launches through the Runtime trampoline like an executor (parent-death SIGKILL,
-  no_new_privs, OOM order, own process group) with the sealed environment and no GPU, one
-  inherited socket (`--execution-fd`), null stdin, and stdout/stderr in `logs/<id>.*.log`. A machine
-  that dies takes its runners with it.
+- Every run executes on a pool executor (`gpu_service.rs`, [GPU service](GPU-SERVICE.md)),
+  deviceless ones included. `dispatch_managed` claims the record and runs the pool's attempt
+  on its own thread; `register_managed` records the executor birth and its stop.
 - Scheduler hooks: `ready`, `active`, `nonterminal` (partial indexes). `activity_epoch()` +
   `wait_activity(epoch, wait)` is a process-local wake. The wait bounds observation only.
 - `waiting_reason` excludes a queued record from `ready`. `wait_for_environment` sets or clears it.
@@ -53,34 +49,32 @@ let file = engine.open_result(&record.id, 0)?;  // re-verifies digest and length
 ## Lifecycle
 
 1. `claim`: `queued` -> `starting`, `attempt += 1`.
-2. Spawn, then record `(pid, boot_id, start_ticks)`.
-3. `Ready` must carry the child's real pid and `runtime.author-cpu/1`.
-4. Commit `running`, then send `Invoke`. A cancel recorded earlier ends the attempt canceled with
+2. The pool picks or starts an executor and records its birth `(pid, boot_id, start_ticks)`.
+3. Commit `running`, then send `Invoke`. A cancel recorded earlier ends the attempt canceled with
    no authored code run.
-5. Read `Progress` until a terminal event, wait for exit, take output custody, commit one outcome.
+4. Progress frames until the executor's terminal; output custody; one outcome.
 
 - Only explicit `cancel` cancels. Disconnect, EOF and submission closure never do. No time-based
-  kill: after a cancel the runner's frames are the meter, and a runner that stops moving for
-  longer than eight times its longest gap (at least 30 s) is killed and the run is `canceled`.
-- After the terminal event the channel closes; a runner that then neither exits nor makes
-  measurable CPU/IO progress is killed before it is reaped.
-- A runner `Canceled` without a durable `cancel_actor` becomes `failed`.
-- A launch failure or an exit before `Ready` is `failed` with the reason (and stderr tail).
+  kill: the executor's cooperative cancel is the meter (see device executor).
+- An attempt that stops without a durable `cancel_actor` is `failed`.
+- A launch failure or an executor that ends mid-call is `failed` with the reason (and stderr tail).
 - Every run ends completed or failed: a queued run this machine cannot start (its environment not
-  held, CPU or GPU execution not configured) fails with that reason at once. Nothing is parked to
+  held, or GPU execution not configured) fails with that reason at once. Nothing is parked to
   wait, and nothing returns to the queue to fail again.
 
 `reconcile` (records not supervised by this process):
 - birth alive, or liveness unknown: stays nonterminal;
 - `starting` with ended or no recorded birth: back to `queued` with a reason;
-- `running` with ended birth: `failed`, never replayed.
+- `running` with ended birth: `canceled` if a cancel was journaled, else `failed`, never replayed.
 
 It returns at most 1,024 nonterminal records.
 
 ## Progress and revisions
 
 - One in-memory snapshot per supervised execution. Detail is capped at 2 KiB.
-  Non-increasing `completed_units` is dropped. Reads overlay it without writes. Cancel and settlement persist it.
+  `completed_units` is the attempt's monotone position (Runtime `Telemetry.advance`);
+  non-increasing values are dropped. Reads overlay it without writes. Cancel and settlement
+  persist it.
 - Durable transitions jump past `revision_ceiling`. `running` reserves 2^32 revisions for volatile
   progress and renews on exhaustion. A new owner reports the old ceiling, so cursors never regress.
 
@@ -91,25 +85,10 @@ It returns at most 1,024 nonterminal records.
   interleave with state and keep their sequence in the terminal page.
 - Only a starting/running execution appends. The terminal page lists the log's products, then
   the result's products the log does not already show, then the outcome.
-- The CPU runner does not publish mid-run yet: its publishes appear with the result.
-
-## Runner wire
-
-4-byte big-endian length + JSON, max 1 MiB. Unknown kinds are ignored. No version gate.
-
-- Ready: `pid`, `capabilities`
-- Invoke: `execution_id`, flattened `Invocation`, absolute `output_root`
-- Cancel / Canceled: `execution_id`
-- Progress: `execution_id`, `completed_units`, `detail`
-- Result: `execution_id`, `value`, `artifacts` (relative paths), `asset_bindings`
-- Failed: `execution_id`, `code`, `detail`
-
-An event for another execution fails the attempt. The runner is
-`python/tensord_client/runner.py`. It imports nothing authored before `Invoke`.
 
 ## Output custody
 
-After `Result` and a zero exit, each declared file is opened with `openat(O_NOFOLLOW)` per
+After the executor's result, each declared file is opened with `openat(O_NOFOLLOW)` per
 component (no absolute, `..` or symlink), checked as a regular file via `O_PATH`, copied to
 `results/<id>/`, SHA-256 hashed, fsynced, made 0400 and renamed. Every `asset_binding` must name
 one held artifact of equal length.
@@ -143,15 +122,13 @@ releases a root once no unfinished run (any state but completed, failed or cance
 nothing used it for the 7-day TTL, or for 10 minutes while the store's disk is low; the store's GC
 then takes the bytes. A root written just before a crash ages from its own mtime.
 
-Triage: every failed CPU run, and every GPU run whose executor ended, failed to start or was killed
+Triage: every run whose executor ended, failed to start or was killed
 without writing its own terminal, keeps a bundle (`triage.rs`) before it settles: the reason, which
 carries any kill measurement, the process id and the end of its stderr. `Read{triage}` serves it.
 
 Journal: `machine_metadata.journal_format` records the layout (1). A newer journal still opens;
 a row this machine cannot decode is skipped (logged) instead of failing every list, and a state
 it does not know is `unknown`: listed, never dispatched, settled or overwritten.
-
-Runners get the same scope as executors (a cgroup or a token; see device executor).
 
 Not implemented: same-UID isolation (reads detect mutation), cleanup of orphan `*.pending` files.
 

@@ -62,8 +62,8 @@ pub fn peer_credentials(stream: &UnixStream) -> io::Result<libc::ucred> {
     Ok(cred)
 }
 
-/// Whether the connecting process descends from this machine (an executor, runner or
-/// anything package code started). Same-UID package code is not a sandbox, but it cannot
+/// Whether the connecting process descends from this machine (an executor or anything
+/// package code started). Same-UID package code is not a sandbox, but it cannot
 /// administer the machine through its own process tree.
 pub fn peer_descends_from_machine(stream: &UnixStream) -> io::Result<bool> {
     let mut pid = peer_credentials(stream)?.pid;

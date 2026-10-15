@@ -101,9 +101,9 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 | `catalog.rs` | Immutable package environment generations and their holds | `Catalog`, `Generation`, `HeldGeneration` | D1 |
 | `service.rs` | Sole dispatch policy (CPU parallelism, one GPU slot, startup GPU fences) | `Service` | B2 |
 | `calls.rs` | Child calls (the seam broker): each call a run, canceled with its parent; each attempt's weights grant | `Calls`, `Caller` | G |
-| `execution.rs` | Acceptance, runner supervision, cancellation, progress coalescing, output custody, reconcile | `Engine`, `RunnerConfig` | E |
+| `execution.rs` | Acceptance, attempt supervision, cancellation, progress coalescing, output custody, reconcile | `Engine` | E |
 | `journal.rs` | SQLite journal: executions, installations, preparations, receipts, process births | `Journal`, `Execution`, `State`, `ProcessBirth` | E |
-| `gpu_service.rs` | GPU pool: published package/model mapping, executor retention, request callbacks; GPU groups (a degree-K plan on the first K GPUs, one memory decision per GPU), one call slot per GPU and one-GPU replicas and multi-slot plans | `GpuPool`, `GpuConfig`, `GpuPlan`, `PlanSlot`, `ModelGrant` | B2 (admission, grants), E (spawn/fencing), D1 (published mapping), I (groups, slots) |
+| `gpu_service.rs` | Executor pool (degree 0, 1 or n): published package/model mapping, executor retention, request callbacks; GPU groups (a degree-K plan on the first K GPUs, one memory decision per GPU), one call slot per GPU and one-GPU replicas and multi-slot plans | `Pool`, `GpuConfig`, `Plan`, `PlanSlot`, `PlanSource`, `ModelGrant` | B2 (admission, grants), E (spawn/fencing), D1 (published mapping), I (groups, slots) |
 | `memory/` | Per-GPU ledger and decisions (`policy`), NVML sampler thread (`nvml`), floor watchdog, per-host pinned budgets (`host`) | `GpuMemory`, `policy::Gpu`, `Step`, `Decision` | B2 |
 | `device_executor.rs` | Typed control seam to the Runtime device executor, per-request output encoding | `DeviceExecutor`, `ExecutorConfig`, `DeviceCommand`, `Frame`, `Answer` | E |
 | `launch_identity.rs` | Runtime trampoline command, the executor environment seal, optional UID/GID | `LaunchIdentity`, `Seal`, `trampoline` | E |
@@ -125,7 +125,6 @@ that descends from the machine. Same-UID package code is still not sandboxed.
 
 | Module | Role |
 |---|---|
-| `runner.py`, `runtime_bridge.py`, `execution_protocol.py`, `progress.py` | CPU runner: `Ready` before importing Runtime, then Runtime author `prepare`/`invoke` |
 | `packages.py`, `captured_packages.py`, `installer.py`, `package_records.py`, `runtime_describe.py` | Static description and uv generation install (`python -m tensord_client.installer`) |
 | `device_codec.py` | Output encoder, embedded into `device_executor.rs` with `include_str!` |
 | `client.py`, `protocol.py`, `linux.py`, `execution_client.py`, `cpu_gate.py` | Private control-socket client and the CPU component gate |
@@ -173,7 +172,7 @@ metadata transitions are coordinated with cancellation.
 - [Durable execution](DURABLE-EXECUTION.md): journal states, acceptance, cancellation, custody.
 - [Recovery](RECOVERY.md): executor and daemon lifetimes, update publication and rollback.
 - [Front door](FRONT-DOOR.md): the listener, TLS identity, install.
-- [Package bridge](PACKAGE-BRIDGE.md): CPU runner and generation install.
+- [Package bridge](PACKAGE-BRIDGE.md): generation description and install.
 - [Device executor](DEVICE-EXECUTOR.md): executor launch and control seam.
 - [GPU service](GPU-SERVICE.md): GPU pool, config, launch identity.
 - [Host tier](HOST-TIER.md), [model sources](MODEL-SOURCES.md): Degree 1.

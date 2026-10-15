@@ -43,7 +43,7 @@ def installed_description(distribution: str, interpreter: Path) -> msgspec.Raw:
 
 
 #: Under symlinks (an image's seeded cache) the code the Runtime describes (an App's wheel, the
-#: SDK, the runner client) is copied into the environment: its static reader refuses metadata
+#: SDK, the machine client) is copied into the environment: its static reader refuses metadata
 #: and sources linked from elsewhere. Only the locked dependencies are linked.
 COPY = ("--link-mode", "copy") if os.environ.get("UV_LINK_MODE") == "symlink" else ()
 
@@ -109,15 +109,15 @@ def interpreter_for(python: str, python_requires: str, python_version: str) -> s
     return python
 
 
-def add_runner(interpreter: Path, constraints: Path, client_wheel: Path) -> None:
-    """The runner client beside a selected closure: it may add its own dependencies only
+def add_client(interpreter: Path, constraints: Path, client_wheel: Path) -> None:
+    """The machine client beside a selected closure: it may add its own dependencies only
     without changing one already selected package or SDK version (uv reports any conflict)."""
     locked = inventory(interpreter)
     constraints.write_text("".join(f"{row.name}=={row.version}\n" for row in locked))
     subprocess.run(["uv", "pip", "install", *COPY, "--python", str(interpreter), "-c", str(constraints), str(client_wheel)], check=True)
     after = {canonicalize_name(row.name): row.version for row in inventory(interpreter)}
     if any(after.get(canonicalize_name(row.name)) != row.version for row in locked):
-        raise PackageError("package_lock_changed", "runner installation changed the captured dependency closure")
+        raise PackageError("package_lock_changed", "client installation changed the captured dependency closure")
     check = subprocess.run(["uv", "pip", "check", "--python", str(interpreter)], capture_output=True, text=True)
     if check.returncode != 0:
         conflicts = [line.strip() for line in (check.stdout + check.stderr).splitlines() if "requires" in line or "not installed" in line]
@@ -188,7 +188,7 @@ def install_editable(*, project: Path, environment: Path, wheels: list[Path], di
 
         capture()
         fallback = machine_sdk(interpreter, sdk, capture) if sdk else ""
-        add_runner(interpreter, environment.parent / (environment.name + ".constraints.txt"), client_wheel)
+        add_client(interpreter, environment.parent / (environment.name + ".constraints.txt"), client_wheel)
         ready.write_text(fallback)
     generations.mkdir(parents=True, exist_ok=True)
     root = generations.resolve() / uuid.uuid4().hex
@@ -279,7 +279,7 @@ def install_captured(*, project: Path | None, wheels: list[Path], requirements: 
 
         capture()
         fallback = machine_sdk(interpreter, sdk, capture) if sdk else ""
-        add_runner(interpreter, root / "captured-constraints.txt", client_wheel)
+        add_client(interpreter, root / "captured-constraints.txt", client_wheel)
         return publish_generation(root, metadata, None, callees, fallback)
     except BaseException:
         shutil.rmtree(root)  # uniquely owned unpublished generation, never dispatched

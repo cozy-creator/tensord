@@ -2262,7 +2262,7 @@ impl Journal {
         })
     }
 
-    /// Called while the runner is blocked awaiting Invoke, before package execution.
+    /// Called once the attempt's executor exists, before its Invoke.
     pub fn register_process(&mut self, id: &str, process: ProcessBirth) -> io::Result<Execution> {
         self.update(id, |record| {
             if record.state != State::Starting || record.process.is_some() {
@@ -2388,7 +2388,7 @@ impl Journal {
                 }
                 Outcome::Canceled => {
                     if record.cancel_actor.is_none() {
-                        return Err(db_error("runner cannot cancel without durable authority"));
+                        return Err(db_error("an attempt cannot cancel without durable authority"));
                     }
                     record.state = State::Canceled;
                 }

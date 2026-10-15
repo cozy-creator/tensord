@@ -1254,7 +1254,7 @@ mod tests {
     }
 
     /// Unpublished code written with Write runs through a run that prepares inside itself,
-    /// on the real installer and CPU runner; a warm run only prepares.
+    /// on the real installer and a deviceless executor; a warm run only prepares.
     #[test]
     fn a_local_source_prepares_inside_its_run_and_runs() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));

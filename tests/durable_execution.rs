@@ -1,308 +1,257 @@
-//! Real process/socket/filesystem checks, not full Runtime/CLI qualification.
-use tensord::{execution, journal};
-
-use execution::{process_birth, Engine, RunnerConfig};
-use journal::{Invocation, Journal, State};
-use serde_json::json;
+//! The engine's durable execution on real processes, sockets and files. Calls run on the
+//! machine's own pool (a deviceless one, `tests/fixtures/cpu_lifecycle` installed); journal
+//! checks drive the journal with stand-in processes. Not CLI qualification.
+use tensord::{
+    execution::{process_birth, Engine},
+    gpu_service::{GpuConfig, Pool},
+    journal::{self, Invocation, Journal, State},
+    service::Service,
+};
+use serde_json::{json, Value};
 use std::{
     fs,
-    io::{Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{Arc, OnceLock},
     thread,
     time::{Duration, Instant},
 };
+use tensorfs_core::store::Store;
 
-static NEXT: AtomicU64 = AtomicU64::new(0);
-/// The runner launches through the Runtime trampoline, so its interpreter needs cozy-runtime:
-/// the repository's test environment (`uv sync --locked --extra test`).
-const RUNNER_PYTHON: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/.venv/bin/python");
-
+/// A journal over a fresh root, for checks that run no package.
 struct Fixture {
     root: PathBuf,
-    engine: std::sync::Arc<Engine>,
+    engine: Arc<Engine>,
 }
 impl Fixture {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "tensord-durable-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        let root = std::env::temp_dir().join(format!("tensord-durable-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("runner_fixture.py"), RUNNER).unwrap();
-        fs::write(root.join("cpu_package.py"), PACKAGE).unwrap();
         let engine = Engine::open(&root.join("state")).unwrap();
         Self { root, engine }
     }
-    fn config(&self) -> RunnerConfig {
-        RunnerConfig {
-            python: RUNNER_PYTHON.into(),
-            module: "runner_fixture".into(),
-            import_paths: vec![self.root.clone()],
-            generation_hold: None,
-            unavailable: None,
-        }
-    }
     fn invocation(&self, mode: &str) -> Invocation {
         Invocation {
-            attention_kernel: String::new(),
-            inputs: vec![],
             package: "fixture-cpu".into(),
             generation: "installed-cpu-v1".into(),
             module: "cpu_package".into(),
             entrypoint: "infer".into(),
-            input: json!({"mode":mode,"side_effect":self.root.join("effect"),"release":self.root.join("release"),"advance":self.root.join("advance")}),
+            input: json!({"mode": mode}),
             ..Default::default()
-        }
-    }
-    fn submit(&self, mode: &str) -> String {
-        let record = self.engine.submit(mode, self.invocation(mode)).unwrap();
-        assert!(self.engine.dispatch(&record.id, self.config()).unwrap());
-        record.id
-    }
-    fn wait(
-        &self,
-        id: &str,
-        predicate: impl Fn(&journal::Execution) -> bool,
-    ) -> journal::Execution {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            let record = self.engine.get(id).unwrap();
-            if predicate(&record) {
-                return record;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "test observation deadline, record={record:?}"
-            );
-            thread::sleep(Duration::from_millis(5));
         }
     }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = fs::write(self.root.join("release"), b"fixture cleanup");
-        if let Ok(records) = self.engine.list() {
-            for record in records {
-                if !record.state.terminal() {
-                    let _ = self.engine.cancel(&record.id, "test-fixture-teardown");
-                }
-            }
-        }
-        // An observation deadline does not authorize a kill or deleting a live generation.
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+/// `cpu_lifecycle` installed once for this test binary: its generations directory and identity.
+fn lifecycle() -> &'static (PathBuf, String) {
+    static INSTALLED: OnceLock<(PathBuf, String)> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        const INSTALL: &str = r#"
+import json, subprocess, sys
+from pathlib import Path
+from tensord_client.packages import install
+fixture, out = Path(sys.argv[1]), Path(sys.argv[2])
+subprocess.run(["uv", "build", "--wheel", "--out-dir", str(out / "client"), "."], check=True, capture_output=True)
+generation = install(fixture, out / "generations", next((out / "client").glob("*.whl")), python="3.12")
+print(json.dumps({"identity": generation.identity}))
+"#;
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let out = std::env::temp_dir().join(format!("tensord-durable-lifecycle-{}", uuid::Uuid::new_v4()));
+        let output = Command::new("uv")
+            .current_dir(repo)
+            .args(["run", "--locked", "--extra", "test", "python", "-c", INSTALL])
+            .arg(repo.join("tests/fixtures/cpu_lifecycle"))
+            .arg(&out)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let line = String::from_utf8(output.stdout).unwrap();
+        let installed: Value = serde_json::from_str(line.lines().last().unwrap()).unwrap();
+        (out.join("generations"), installed["identity"].as_str().unwrap().into())
+    })
+}
+
+/// A machine's service, one call at a time, on a deviceless pool.
+struct Machine {
+    root: PathBuf,
+    service: Arc<Service>,
+}
+impl Machine {
+    fn open() -> Self {
+        let root = std::env::temp_dir().join(format!("tensord-durable-pool-{}", uuid::Uuid::new_v4()));
+        let (generations, _) = lifecycle();
+        let service = Service::open(&root.join("state"), generations, 1).unwrap();
+        let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
+        let config = GpuConfig::deviceless(&root.join("home")).unwrap();
+        service.configure_pool(Pool::new(&root.join("pool"), config, store).unwrap()).unwrap();
+        Self { root, service }
+    }
+    fn engine(&self) -> &Arc<Engine> {
+        &self.service.engine
+    }
+    fn submit(&self, key: &str, entrypoint: &str, input: Value) -> String {
+        self.service.submit(key, &lifecycle().1, entrypoint, input).unwrap().id
+    }
+    fn wait(&self, id: &str, predicate: impl Fn(&journal::Execution) -> bool) -> journal::Execution {
+        // Test harness bound on a broken run; the product has no such limit.
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut seen = self.engine().activity_epoch();
         loop {
-            let _ = self.engine.reconcile();
-            let settled = self
-                .engine
-                .list()
-                .map(|records| {
-                    records
-                        .iter()
-                        .all(|record| record.state.terminal() || record.process.is_none())
-                })
-                .unwrap_or(false);
-            if settled && self.engine.supervising() == 0 {
-                let _ = fs::remove_dir_all(&self.root);
-                break;
+            let record = self.engine().get(id).unwrap();
+            if predicate(&record) {
+                return record;
             }
-            if Instant::now() > deadline {
-                eprintln!("preserving live fixture {}", self.root.display());
-                break;
-            }
-            thread::sleep(Duration::from_millis(5));
+            assert!(Instant::now() < deadline, "test observation deadline, record={record:?}");
+            seen = self.engine().wait_activity(seen, Some(Duration::from_millis(50)));
         }
     }
+    /// One call of `entrypoint` to its end.
+    fn run(&self, key: &str, entrypoint: &str, input: Value) -> journal::Execution {
+        let id = self.submit(key, entrypoint, input);
+        self.wait(&id, |record| record.state.terminal())
+    }
 }
-
-struct OwnedFaultProcess(std::process::Child);
-impl Drop for OwnedFaultProcess {
+impl Drop for Machine {
     fn drop(&mut self) {
-        // Explicit teardown of the test-owned fault driver, never a product kill policy.
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        for record in self.engine().list().unwrap_or_default() {
+            if !record.state.terminal() {
+                let _ = self.engine().cancel(&record.id, "test-fixture-teardown");
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !self.service.stop().unwrap_or(true) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = fs::remove_dir_all(&self.root);
     }
 }
 
+/// A call's success is one durable result: a second submission of the same request names the
+/// same run, another request under its key is refused, and a reopened journal still holds it.
 #[test]
-fn actual_inference_has_one_durable_result_and_survives_observer_loss() {
-    let fixture = Fixture::new();
-    let id = fixture.submit("wait");
-    assert_eq!(fixture.engine.list().unwrap().len(), 1);
-    fixture.wait(&id, |record| record.completed_units == 1);
-    // Observation has no owned handle and dropping every observer changes nothing.
-    drop(fixture.engine.get(&id).unwrap());
-    assert_eq!(fixture.engine.get(&id).unwrap().state, State::Running);
-    let duplicate = fixture
-        .engine
-        .submit("wait", fixture.invocation("wait"))
-        .unwrap();
-    assert_eq!(duplicate.id, id);
-    assert!(!fixture.engine.dispatch(&id, fixture.config()).unwrap());
-    fs::write(fixture.root.join("release"), b"continue").unwrap();
-    let result = fixture.wait(&id, |record| record.state.terminal());
-    assert_eq!(result.state, State::Completed);
-    assert_eq!(result.result.unwrap().value, json!({"prediction": [17,39]}));
-    let mut bytes = String::new();
-    fixture
-        .engine
-        .open_result(&id, 0)
-        .unwrap()
-        .read_to_string(&mut bytes)
-        .unwrap();
-    assert_eq!(bytes, "17,39\n");
-    assert_eq!(
-        fs::read_to_string(fixture.root.join("effect")).unwrap(),
-        "once\n"
-    );
-    drop(fixture.engine.get(&id).unwrap());
-    let reopened = Engine::open(&fixture.root.join("state")).unwrap();
-    assert_eq!(reopened.get(&id).unwrap().state, State::Completed);
-    assert_eq!(
-        reopened
-            .submit("wait", fixture.invocation("wait"))
-            .unwrap()
-            .id,
-        id
-    );
+fn a_call_has_one_durable_result_that_survives_reopen() {
+    let machine = Machine::open();
+    let input = json!({"steps": 2, "seconds": 0.01});
+    let done = machine.run("steps", "steps", input.clone());
+    assert_eq!(done.state, State::Completed, "{done:?}");
+    assert_eq!(done.result.as_ref().unwrap().value["steps"], 2);
+    assert_eq!(machine.service.submit("steps", &lifecycle().1, "steps", input.clone()).unwrap().id, done.id);
+    let other = machine.service.submit("steps", &lifecycle().1, "steps", json!({"steps": 3}));
+    assert_eq!(other.unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+    let reopened = Engine::open(&machine.root.join("state/execution")).unwrap();
+    assert_eq!(reopened.get(&done.id).unwrap().state, State::Completed);
+    assert_eq!(reopened.get(&done.id).unwrap().attempt, 1);
 }
 
+/// An executor that ends in the middle of a call fails that run once: it is never started
+/// again, and submitting it again answers the failure.
 #[test]
-fn started_executor_crash_never_reexecutes_package_effects() {
-    let fixture = Fixture::new();
-    let id = fixture.submit("wait");
-    let running = fixture.wait(&id, |record| record.completed_units == 1);
-    let pid = running.process.unwrap().pid;
-    // Explicit test fault injection into this owned process, never an elapsed-time policy.
-    assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGKILL) }, 0);
-    assert_eq!(
-        fixture.wait(&id, |record| record.state.terminal()).state,
-        State::Failed
-    );
-    assert!(!fixture.engine.dispatch(&id, fixture.config()).unwrap());
-    assert_eq!(
-        fixture
-            .engine
-            .submit("wait", fixture.invocation("wait"))
-            .unwrap()
-            .state,
-        State::Failed
-    );
-    assert_eq!(
-        fs::read_to_string(fixture.root.join("effect")).unwrap(),
-        "once\n"
-    );
+fn an_executor_that_ends_mid_call_fails_its_run_once() {
+    let machine = Machine::open();
+    let failed = machine.run("exit", "exit_now", json!({}));
+    assert_eq!((failed.state, failed.attempt), (State::Failed, 1), "{failed:?}");
+    machine.engine().notify_activity();
+    let again = machine.service.submit("exit", &lifecycle().1, "exit_now", json!({})).unwrap();
+    assert_eq!((again.id, again.state, again.attempt), (failed.id, State::Failed, 1));
 }
 
+/// A cancel needs an actor, stops the call at its next safe point, and keeps the progress it
+/// had made; nothing is killed for time.
 #[test]
 fn cooperative_cancel_is_actor_attributed_and_not_a_timer_kill() {
-    let fixture = Fixture::new();
-    let id = fixture.submit("wait");
-    fixture.wait(&id, |record| record.completed_units == 1);
-    assert!(fixture.engine.cancel(&id, "").is_err());
-    fixture.engine.cancel(&id, "test-controller").unwrap();
-    let result = fixture.wait(&id, |record| record.state.terminal());
-    assert_eq!(result.state, State::Canceled);
-    assert_eq!(result.cancel_actor.as_deref(), Some("test-controller"));
-    assert!(result.result.is_none());
-    assert_eq!(result.completed_units, 1);
-    assert_eq!(
-        Journal::open(&fixture.root.join("state"))
-            .unwrap()
-            .get(&id)
-            .unwrap()
-            .completed_units,
-        1
-    );
+    let machine = Machine::open();
+    let id = machine.submit("long", "steps", json!({"steps": 400, "seconds": 0.05}));
+    machine.wait(&id, |record| record.completed_units >= 1);
+    assert!(machine.engine().cancel(&id, "").is_err());
+    machine.engine().cancel(&id, "test-controller").unwrap();
+    let ended = machine.wait(&id, |record| record.state.terminal());
+    assert_eq!(ended.state, State::Canceled);
+    assert_eq!(ended.cancel_actor.as_deref(), Some("test-controller"));
+    assert!(ended.result.is_none() && ended.completed_units >= 1 && ended.completed_units < 400);
+    let persisted = Journal::open(&machine.root.join("state/execution")).unwrap().get(&id).unwrap();
+    assert_eq!(persisted.completed_units, ended.completed_units);
 }
 
+/// A call's progress is observed in memory, never a journal write per step; its last value is
+/// durable with its end.
 #[test]
 fn progress_is_coalesced_without_wal_writes_and_terminal_preserves_latest() {
-    let fixture = Fixture::new();
-    let id = fixture.submit("progress");
-    let first = fixture.wait(&id, |record| record.completed_units == 1);
-    let independent = Journal::open(&fixture.root.join("state")).unwrap();
+    let machine = Machine::open();
+    let id = machine.submit("progress", "steps", json!({"steps": 60, "seconds": 0.05}));
+    let first = machine.wait(&id, |record| record.completed_units >= 2);
+    let independent = Journal::open(&machine.root.join("state/execution")).unwrap();
     let start = independent.get(&id).unwrap();
-    assert_eq!(start.completed_units, 0);
-    assert!(first.revision > start.revision);
-    let wal = fixture.root.join("state/executions.sqlite3-wal");
-    let durable_bytes = fs::metadata(&wal).unwrap().len();
-    fs::write(fixture.root.join("advance"), b"produce actual progress").unwrap();
-    let latest = fixture.wait(&id, |record| record.completed_units == 257);
-    assert!(latest.revision > first.revision);
-    assert_eq!(fixture.engine.list().unwrap()[0].completed_units, 257);
-    assert_eq!(
-        fixture
-            .engine
-            .submit("progress", fixture.invocation("progress"))
-            .unwrap()
-            .completed_units,
-        257
-    );
-    assert_eq!(independent.get(&id).unwrap().revision, start.revision);
-    assert_eq!(independent.get(&id).unwrap().completed_units, 0);
-    assert_eq!(fs::metadata(&wal).unwrap().len(), durable_bytes);
-    fs::write(fixture.root.join("release"), b"complete").unwrap();
-    let completed = fixture.wait(&id, |record| record.state.terminal());
-    assert_eq!(completed.state, State::Completed);
-    assert_eq!(completed.completed_units, 257);
-    assert!(completed.revision > latest.revision);
-    let persisted = independent.get(&id).unwrap();
-    assert_eq!(persisted.completed_units, 257);
-    assert_eq!(persisted.revision, completed.revision);
+    assert!(start.completed_units < first.completed_units);
+    let wal = machine.root.join("state/execution/executions.sqlite3-wal");
+    let durable = fs::metadata(&wal).unwrap().len();
+    let later = machine.wait(&id, |record| record.completed_units >= 20);
+    assert!(later.revision > first.revision);
+    assert_eq!(fs::metadata(&wal).unwrap().len(), durable, "progress wrote the journal");
+    assert_eq!(independent.get(&id).unwrap().completed_units, start.completed_units);
+    let done = machine.wait(&id, |record| record.state.terminal());
+    assert_eq!(done.state, State::Completed);
+    assert!((60..=61).contains(&done.completed_units), "a position, never a sum: {done:?}");
+    assert_eq!(independent.get(&id).unwrap().completed_units, done.completed_units);
 }
 
+/// With room for one call, a queued call runs once the running one has ended.
 #[test]
-fn completion_wakes_owner_scheduler_to_dispatch_next_queued_package() {
-    let fixture = Fixture::new();
-    let first = fixture.submit("wait");
-    fixture.wait(&first, |record| record.completed_units == 1);
-    let next = fixture
-        .engine
-        .submit("queued-next", fixture.invocation("infer"))
-        .unwrap();
-    assert_eq!(fixture.engine.ready().unwrap()[0].id, next.id);
-    assert_eq!(fixture.engine.active(8).unwrap()[0].id, first);
-    assert_eq!(fixture.engine.nonterminal(1).unwrap().len(), 1);
-    let observed = fixture.engine.activity_epoch();
-    assert_eq!(
-        fixture.engine.wait_activity(observed, Some(Duration::ZERO)),
-        observed
-    );
-    assert_eq!(fixture.engine.get(&first).unwrap().state, State::Running);
-    let engine = fixture.engine.clone();
-    let config = fixture.config();
-    let first_for_scheduler = first.clone();
-    let (sent, received) = std::sync::mpsc::channel();
-    let scheduler = thread::spawn(move || {
-        let mut epoch = observed;
-        loop {
-            epoch = engine.wait_activity(epoch, None);
-            if !engine.get(&first_for_scheduler).unwrap().state.terminal() {
-                continue;
-            }
-            let ready = engine.ready().unwrap();
-            assert_eq!(ready.len(), 1);
-            assert!(engine.dispatch(&ready[0].id, config).unwrap());
-            sent.send(epoch).unwrap();
-            break;
-        }
-    });
-    fs::write(fixture.root.join("release"), b"complete first execution").unwrap();
-    assert!(received.recv_timeout(Duration::from_secs(15)).unwrap() > observed);
-    scheduler.join().unwrap();
-    assert_eq!(
-        fixture
-            .wait(&next.id, |record| record.state.terminal())
-            .state,
-        State::Completed
-    );
-    assert_eq!(fixture.engine.get(&first).unwrap().state, State::Completed);
-    assert!(fixture.engine.nonterminal(8).unwrap().is_empty());
-    assert!(fixture.engine.ready().unwrap().is_empty());
-    assert_eq!(fixture.engine.list().unwrap().len(), 2);
+fn a_queued_call_runs_once_the_running_one_ends() {
+    let machine = Machine::open();
+    let first = machine.submit("first", "steps", json!({"steps": 20, "seconds": 0.05}));
+    machine.wait(&first, |record| record.state == State::Running);
+    let next = machine.submit("next", "steps", json!({"steps": 1}));
+    assert_eq!(machine.engine().ready().unwrap()[0].id, next);
+    let next = machine.wait(&next, |record| record.state.terminal());
+    let first = machine.engine().get(&first).unwrap();
+    assert_eq!((first.state, next.state), (State::Completed, State::Completed));
+    assert!(next.started_at_ms >= first.finished_at_ms, "{next:?} began before {first:?} ended");
+}
+
+/// An environment whose interpreter is gone fails its run once with the reason: nothing
+/// authored ran, and nothing waits in the queue to fail again.
+#[test]
+fn deterministic_launch_failure_fails_once_with_its_reason() {
+    let machine = Machine::open();
+    let (generations, identity) = lifecycle();
+    let broken = format!("{}0", &identity[..identity.len() - 1]);
+    let directory = generations.join(&broken);
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join(".hold"), b"").unwrap();
+    // Its interpreter is a file the kernel cannot execute.
+    fs::create_dir_all(directory.join("env/bin")).unwrap();
+    fs::write(directory.join("env/bin/python"), b"not an interpreter").unwrap();
+    let mut record: Value = serde_json::from_slice(&fs::read(generations.join(identity).join("generation.json")).unwrap()).unwrap();
+    record["identity"] = broken.clone().into();
+    record["python"] = directory.join("env/bin/python").to_string_lossy().into_owned().into();
+    fs::write(directory.join("generation.json"), serde_json::to_vec(&record).unwrap()).unwrap();
+    let id = machine.service.submit("unlaunchable", &broken, "steps", json!({})).unwrap().id;
+    let failed = machine.wait(&id, |record| record.state.terminal());
+    assert_eq!((failed.state, failed.attempt), (State::Failed, 1), "{failed:?}");
+    assert!(failed.failure.as_deref().unwrap_or_default().contains("did not start"), "{failed:?}");
+    let again = machine.service.submit("unlaunchable", &broken, "steps", json!({})).unwrap();
+    assert_eq!((again.state, again.attempt), (State::Failed, 1));
+    let _ = fs::remove_dir_all(directory);
+}
+
+/// A failed call keeps one triage bundle: its own terminal and its executor's stderr.
+#[test]
+fn a_failed_call_keeps_a_triage_bundle_with_its_stderr() {
+    let machine = Machine::open();
+    let failed = machine.run("note", "note", json!({"text": "crashing on purpose", "fail": true}));
+    assert_eq!(failed.state, State::Failed, "{failed:?}");
+    let (reference, bytes) = machine.engine().triage(&failed.id).unwrap().unwrap();
+    assert_eq!(reference.length, bytes.len() as u64);
+    let bundle: Value = serde_json::from_slice(&bytes).unwrap();
+    let stderr = bundle["executor"]["stderr_tail"].as_str().unwrap();
+    assert!(stderr.contains("crashing on purpose"), "{bundle}");
+    assert!(bundle["executor"]["pid"].as_u64().unwrap() > 0);
+    assert_eq!(bundle["software"]["tensord"], env!("CARGO_PKG_VERSION"));
 }
 
 fn public_context(
@@ -425,35 +374,27 @@ fn public_workspace_and_actor_request_binding_survive_reopen() {
         ),
         journal::AdmissionError::WorkspaceMismatch
     );
-    // A malformed public operation does not refuse or cancel the private baseline.
-    let private = fixture.submit("infer");
-    assert_eq!(
-        fixture
-            .wait(&private, |record| record.state.terminal())
-            .state,
-        State::Completed
-    );
 }
 
 #[test]
 fn cancel_before_dispatch_is_durable_and_never_executes_package() {
-    let fixture = Fixture::new();
-    let mut journal = Journal::open(&fixture.root.join("queued-state")).unwrap();
-    let record = journal
-        .accept("cancel-queued", fixture.invocation("infer"))
-        .unwrap();
-    assert_eq!(
-        journal
-            .cancel(&record.id, "explicit-test-controller")
-            .unwrap()
-            .state,
-        State::Canceled
-    );
+    let root = std::env::temp_dir().join(format!("tensord-durable-canceled-{}", uuid::Uuid::new_v4()));
+    let mut journal = Journal::open(&root.join("state/execution")).unwrap();
+    let invocation = Invocation { generation: lifecycle().1.clone(), module: "cpu_lifecycle:app".into(),
+        entrypoint: "steps".into(), input: json!({}), ..Default::default() };
+    let record = journal.accept("cancel-queued", invocation).unwrap();
+    assert_eq!(journal.cancel(&record.id, "explicit-test-controller").unwrap().state, State::Canceled);
     drop(journal);
-    let reopened = Engine::open(&fixture.root.join("queued-state")).unwrap();
-    assert_eq!(reopened.get(&record.id).unwrap().state, State::Canceled);
-    assert!(!reopened.dispatch(&record.id, fixture.config()).unwrap());
-    assert!(!fixture.root.join("effect").exists());
+    // The machine that opens it next never starts it.
+    let service = Service::open(&root.join("state"), &lifecycle().0, 1).unwrap();
+    let config = GpuConfig::deviceless(&root.join("home")).unwrap();
+    let store = Arc::new(Store::ensure(&root.join("store")).unwrap());
+    service.configure_pool(Pool::new(&root.join("pool"), config, store).unwrap()).unwrap();
+    service.engine.notify_activity();
+    let ended = service.engine.get(&record.id).unwrap();
+    assert_eq!((ended.state, ended.attempt, ended.process), (State::Canceled, 0, None));
+    assert!(service.stop().unwrap());
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -508,67 +449,6 @@ fn cursor_reservation_renewal_never_reuses_old_cursors_and_accepts_older_records
 }
 
 #[test]
-fn deterministic_launch_failure_fails_once_with_its_reason() {
-    let fixture = Fixture::new();
-    let record = fixture
-        .engine
-        .submit("unlaunchable", fixture.invocation("infer"))
-        .unwrap();
-    let mut config = fixture.config();
-    config.python = fixture.root.join("absent-python");
-    fixture.engine.dispatch(&record.id, config).unwrap();
-    // Nothing authored ran; the missing interpreter is the reason, not a queue that waits
-    // for someone's next install.
-    let result = fixture.wait(&record.id, |record| record.state.terminal());
-    assert_eq!(result.state, State::Failed);
-    assert_eq!(result.attempt, 1);
-    assert!(result.failure.unwrap().contains("did not start"));
-    let duplicate = fixture
-        .engine
-        .submit("unlaunchable", fixture.invocation("infer"))
-        .unwrap();
-    assert_eq!((duplicate.state, duplicate.attempt), (State::Failed, 1));
-    assert!(!fixture
-        .engine
-        .dispatch(&record.id, fixture.config())
-        .unwrap());
-    assert!(!fixture.root.join("effect").exists());
-}
-
-#[test]
-fn durable_custody_rejects_symlink_escape_and_detects_mutation() {
-    let fixture = Fixture::new();
-    let unsafe_id = fixture.submit("symlink");
-    assert_eq!(
-        fixture
-            .wait(&unsafe_id, |record| record.state.terminal())
-            .state,
-        State::Failed
-    );
-    let fifo_id = fixture.submit("fifo");
-    assert_eq!(
-        fixture
-            .wait(&fifo_id, |record| record.state.terminal())
-            .state,
-        State::Failed
-    );
-    let id = fixture.submit("infer");
-    let record = fixture.wait(&id, |record| record.state.terminal());
-    let path = fixture
-        .root
-        .join("state")
-        .join(&record.result.unwrap().artifacts[0].path);
-    // Same-UID packages are not sandboxed; detect rather than silently serving altered bytes.
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-    fs::write(path, b"corrupted").unwrap();
-    assert_eq!(
-        fixture.engine.open_result(&id, 0).unwrap_err().kind(),
-        std::io::ErrorKind::InvalidData
-    );
-}
-
-#[test]
 fn restart_settlement_waits_for_exact_process_birth_without_adoption() {
     let fixture = Fixture::new();
     let journal_root = fixture.root.join("restart-state");
@@ -597,7 +477,6 @@ fn restart_settlement_waits_for_exact_process_birth_without_adoption() {
     assert!(child.wait().unwrap().success());
     reopened.reconcile().unwrap();
     assert_eq!(reopened.get(&id).unwrap().state, State::Failed);
-    assert!(!reopened.dispatch(&id, fixture.config()).unwrap());
 }
 
 #[test]
@@ -629,13 +508,7 @@ fn never_authorized_restart_can_retry_only_after_exact_birth_ends() {
     let record = reopened.get(&id).unwrap();
     assert_eq!(record.state, State::Queued);
     assert!(record.waiting_reason.is_none(), "dispatched again at once, never parked");
-    assert!(reopened.dispatch(&id, fixture.config()).unwrap());
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while !reopened.get(&id).unwrap().state.terminal() {
-        assert!(Instant::now() < deadline);
-        thread::sleep(Duration::from_millis(5));
-    }
-    assert_eq!(reopened.get(&id).unwrap().state, State::Completed);
+    assert_eq!(reopened.ready().unwrap()[0].id, id);
 }
 
 #[test]
@@ -680,309 +553,6 @@ fn an_authorized_attempt_that_never_reached_a_handler_starts_again_under_its_cla
     journal.cancel(&canceled, "owner").unwrap();
     assert_eq!(journal.redeliver(&canceled).unwrap().state, State::Canceled);
     assert!(journal.redeliver(&canceled).is_err());
-}
-
-#[test]
-fn idempotency_compares_semantics_and_additive_runner_fields_are_tolerated() {
-    let fixture = Fixture::new();
-    fixture
-        .engine
-        .submit("stable", fixture.invocation("infer"))
-        .unwrap();
-    assert_eq!(
-        fixture
-            .engine
-            .submit("stable", fixture.invocation("wait"))
-            .unwrap_err()
-            .kind(),
-        std::io::ErrorKind::AlreadyExists
-    );
-    let id = fixture.submit("infer");
-    assert_eq!(
-        fixture.wait(&id, |record| record.state.terminal()).state,
-        State::Completed
-    );
-}
-
-#[test]
-fn actual_owner_death_kills_its_runner_then_fails_without_repeating_effects() {
-    let fixture = Fixture::new();
-    let mut owner = OwnedFaultProcess(
-        Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--ignored",
-                "--exact",
-                "owner_process_fixture",
-                "--nocapture",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
-    let config = json!({"state":fixture.root.join("state"),"imports":fixture.root,"invocation":fixture.invocation("wait")});
-    writeln!(owner.0.stdin.as_mut().unwrap(), "{config}").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let record = loop {
-        if let Ok(record) = fixture.engine.get("1") {
-            if record.state == State::Running
-                && fixture.root.join("owner-observation.json").exists()
-            {
-                break record;
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "child owner failed to start its package"
-        );
-        thread::sleep(Duration::from_millis(5));
-    };
-    let observed: journal::Execution =
-        serde_json::from_slice(&fs::read(fixture.root.join("owner-observation.json")).unwrap())
-            .unwrap();
-    assert_eq!(observed.completed_units, 1);
-    let birth = record.process.unwrap();
-    let runner = tensord::process::Exact::open(&birth).unwrap();
-    owner.0.kill().unwrap();
-    owner.0.wait().unwrap();
-    // Parent-death SIGKILL: authored code does not outlive the machine that owns it.
-    if let Some(runner) = runner {
-        runner.wait().unwrap();
-    }
-    assert!(execution::process_ended(&birth).unwrap());
-    fixture.engine.reconcile().unwrap();
-    let failed = fixture.engine.get(&record.id).unwrap();
-    assert_eq!(failed.state, State::Failed);
-    assert!(failed.revision > observed.revision);
-    let persisted = Journal::open(&fixture.root.join("state"))
-        .unwrap()
-        .get(&record.id)
-        .unwrap();
-    assert!(persisted.revision > observed.revision_ceiling);
-    assert!(!fixture
-        .engine
-        .dispatch(&record.id, fixture.config())
-        .unwrap());
-    assert_eq!(
-        fs::read_to_string(fixture.root.join("effect")).unwrap(),
-        "once\n"
-    );
-}
-
-#[test]
-fn canceled_runner_that_ignores_cancel_is_killed_on_measured_stillness() {
-    let fixture = Fixture::new();
-    let id = fixture.submit("wedge");
-    let running = fixture.wait(&id, |record| record.completed_units == 1);
-    let birth = running.process.unwrap();
-    let canceled_at = Instant::now();
-    fixture.engine.cancel(&id, "actor-a").unwrap();
-    // Production constants: no frames after the cancel for longer than the 30 s floor.
-    let deadline = Instant::now() + Duration::from_secs(120);
-    let ended = loop {
-        let record = fixture.engine.get(&id).unwrap();
-        if record.state.terminal() {
-            break record;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "canceled wedge was never ended: {record:?}"
-        );
-        thread::sleep(Duration::from_millis(50));
-    };
-    assert_eq!(ended.state, State::Canceled);
-    assert!(canceled_at.elapsed() >= Duration::from_secs(30));
-    assert!(execution::process_ended(&birth).unwrap());
-    assert_eq!(
-        fs::read_to_string(fixture.root.join("effect")).unwrap(),
-        "once\n"
-    );
-}
-
-/// Explicitly selected child-process fixture; its input is typed stdin configuration.
-#[test]
-#[ignore = "launched only by actual_owner_death component test"]
-fn owner_process_fixture() {
-    use std::io::BufRead;
-    let mut input = String::new();
-    std::io::stdin().lock().read_line(&mut input).unwrap();
-    let config: serde_json::Value = serde_json::from_str(&input).unwrap();
-    let engine = Engine::open(std::path::Path::new(config["state"].as_str().unwrap())).unwrap();
-    let invocation: Invocation = serde_json::from_value(config["invocation"].clone()).unwrap();
-    let record = engine.submit("owner-death", invocation).unwrap();
-    engine
-        .dispatch(
-            &record.id,
-            RunnerConfig {
-                python: RUNNER_PYTHON.into(),
-                module: "runner_fixture".into(),
-                import_paths: vec![PathBuf::from(config["imports"].as_str().unwrap())],
-                generation_hold: None,
-                unavailable: None,
-            },
-        )
-        .unwrap();
-    loop {
-        let snapshot = engine.get(&record.id).unwrap();
-        if snapshot.completed_units == 1 {
-            let path =
-                PathBuf::from(config["imports"].as_str().unwrap()).join("owner-observation.json");
-            let temporary = path.with_extension("pending");
-            fs::write(&temporary, serde_json::to_vec(&snapshot).unwrap()).unwrap();
-            fs::rename(temporary, path).unwrap();
-            break;
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-    // Remain the actual owner until explicitly killed by the parent fault experiment.
-    let mut control = String::new();
-    std::io::stdin().read_to_string(&mut control).unwrap();
-}
-
-const RUNNER: &str = r#"
-import argparse, importlib, json, os, socket, struct, threading
-p=argparse.ArgumentParser();p.add_argument('--execution-fd',type=int,required=True);a=p.parse_args()
-s=socket.socket(fileno=a.execution_fd);lock=threading.Lock();canceled=threading.Event()
-def send(value):
-    data=json.dumps(value).encode()
-    with lock:s.sendall(struct.pack('!I',len(data))+data)
-def read():
-    h=s.recv(4)
-    if not h:return None
-    while len(h)<4:h+=s.recv(4-len(h))
-    n=struct.unpack('!I',h)[0];b=b''
-    while len(b)<n:
-        piece=s.recv(n-len(b))
-        if not piece:return None
-        b+=piece
-    return json.loads(b)
-send({'kind':'ready','pid':os.getpid(),'capabilities':['runtime.author-cpu/1'],'future_field':'ignored'})
-command=read()
-if command is None:raise SystemExit(0)
-eid=command['execution_id']
-def controls():
-    while True:
-        c=read()
-        if c is None:return
-        if c['kind']=='cancel' and c['execution_id']==eid:canceled.set()
-threading.Thread(target=controls,daemon=True).start()
-try:
-    module=importlib.import_module(command['module'])
-    def progress(units):send({'kind':'progress','execution_id':eid,'completed_units':units,'detail':'matrix rows completed'})
-    value,artifacts=getattr(module,command['entrypoint'])(command['input'],command['output_root'],canceled,progress)
-    send({'kind':'canceled','execution_id':eid} if canceled.is_set() else {'kind':'result','execution_id':eid,'value':value,'artifacts':artifacts,'extra_result_field':True})
-except Exception as error:send({'kind':'failed','execution_id':eid,'code':type(error).__name__,'detail':str(error)})
-"#;
-
-const PACKAGE: &str = r#"
-from pathlib import Path
-def infer(inputs, output_root, canceled, progress):
-    with open(inputs['side_effect'],'a') as stream:stream.write('once\n')
-    progress(1)
-    if inputs['mode']=='wedge':
-        import threading;threading.Event().wait()
-    if inputs['mode']=='crash':
-        # Like faulthandler: the crash's stack, then Python's long extension-module list.
-        import os,sys;sys.stderr.write('crashing on purpose\nExtension modules: '+', '.join(f'ext{i}._core' for i in range(400))+'\n');sys.stderr.flush();os._exit(3)
-    if inputs['mode']=='progress':
-        while not Path(inputs['advance']).exists() and not canceled.wait(0.01):pass
-        for units in range(2,258):progress(units)
-        progress(257);progress(7)
-    if inputs['mode'] in ('wait','progress'):
-        while not Path(inputs['release']).exists() and not canceled.wait(0.01):pass
-    if canceled.is_set():return None,[]
-    # Actual CPU inference against fixed linear weights, with an independently checked result.
-    weights=[[1,2],[3,4]];vector=[5,6]
-    prediction=[sum(w*x for w,x in zip(row,vector)) for row in weights]
-    root=Path(output_root)
-    if inputs['mode']=='symlink':
-        (root/'prediction').symlink_to('/etc/passwd')
-    elif inputs['mode']=='fifo':
-        import os
-        os.mkfifo(root/'prediction')
-    else:(root/'prediction').write_text(','.join(map(str,prediction))+'\n')
-    return {'prediction':prediction},['prediction']
-"#;
-
-#[test]
-fn an_environment_whose_runner_cannot_import_fails_without_launching() {
-    let fixture = Fixture::new();
-    let record = fixture
-        .engine
-        .submit("no-bridge", fixture.invocation("infer"))
-        .unwrap();
-    let mut config = fixture.config();
-    config.unavailable =
-        Some("CPU runner adapter unavailable in this environment: ImportError".into());
-    assert!(fixture.engine.dispatch(&record.id, config).unwrap());
-    let failed = fixture.wait(&record.id, |record| record.state.terminal());
-    assert_eq!(failed.state, State::Failed);
-    assert!(failed.failure.unwrap().contains("adapter unavailable"));
-    assert!(failed.process.is_none());
-    assert!(!fixture.root.join("effect").exists());
-}
-
-#[test]
-fn a_settled_run_keeps_one_custody_copy_and_its_logs() {
-    let fixture = Fixture::new();
-    let id = fixture.submit("infer");
-    let done = fixture.wait(&id, |record| record.state.terminal());
-    assert_eq!(done.state, State::Completed, "{done:?}");
-    let state = fixture.root.join("state");
-    // The spool is gone; the verified custody copy and the runner's logs remain.
-    assert!(!state.join("staging").join(&id).exists());
-    let artifact = &done.result.unwrap().artifacts[0];
-    assert_eq!(
-        fs::read_to_string(state.join(&artifact.path)).unwrap(),
-        "17,39\n"
-    );
-    assert!(state.join("logs").join(format!("{id}.stderr.log")).exists());
-}
-
-/// A run's attention pin is its calls': a root completing with a pin no call applied says so
-/// once in its log and completes all the same; one a call applied (a child's counts for its
-/// root) completes without it, and a run with no pin logs nothing.
-#[test]
-fn a_pin_no_call_applied_is_a_warning_in_the_runs_log() {
-    let fixture = Fixture::new();
-    let run = |key: &str, pin: &str, applied: bool| {
-        let invocation = Invocation {
-            attention_kernel: pin.into(),
-            ..fixture.invocation("wait")
-        };
-        let id = fixture.engine.submit(key, invocation.clone()).unwrap().id;
-        assert!(fixture.engine.dispatch(&id, fixture.config()).unwrap());
-        fixture.wait(&id, |record| record.state == State::Running);
-        if applied {
-            let child = Invocation {
-                parent: id.clone(),
-                ..invocation
-            };
-            let child = fixture
-                .engine
-                .submit(&format!("{key}-call"), child)
-                .unwrap();
-            fixture.engine.apply_attention(&child.id).unwrap();
-        }
-        let _ = fs::write(fixture.root.join("release"), b"continue");
-        let done = fixture.wait(&id, |record| record.state.terminal());
-        let _ = fs::remove_file(fixture.root.join("release"));
-        assert_eq!(done.state, State::Completed, "{done:?}");
-        let logs = fixture.engine.logs(&id).unwrap();
-        logs.iter()
-            .map(|log| serde_json::from_slice::<serde_json::Value>(&log.product).unwrap())
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(
-        run("unapplied", "sdpa", false),
-        [json!({"level": "warning", "text": "attention pin sdpa was never applied"})]
-    );
-    assert_eq!(
-        run("applied", "sdpa", true),
-        Vec::<serde_json::Value>::new()
-    );
-    assert_eq!(run("unpinned", "", false), Vec::<serde_json::Value>::new());
 }
 
 #[test]
@@ -1043,40 +613,23 @@ fn age(path: &std::path::Path, days: u64) {
 }
 
 #[test]
-fn a_failed_cpu_run_keeps_a_triage_bundle_with_the_runner_stderr() {
-    let fixture = Fixture::new();
-    // The package ends its runner in the middle of the run: a lifecycle failure.
-    let record = fixture.engine.submit("crash", fixture.invocation("crash")).unwrap();
-    assert!(fixture.engine.dispatch(&record.id, fixture.config()).unwrap());
-    let failed = fixture.wait(&record.id, |record| record.state.terminal());
-    assert_eq!(failed.state, State::Failed, "{failed:?}");
-    let (reference, bytes) = fixture.engine.triage(&record.id).unwrap().unwrap();
-    assert_eq!(reference.length, bytes.len() as u64);
-    let bundle: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(bundle["terminal"]["code"], "runner_ended");
-    let stderr = bundle["executor"]["stderr_tail"].as_str().unwrap();
-    assert!(stderr.contains("crashing on purpose"), "{bundle}");
-    assert!(bundle["executor"]["pid"].as_u64().unwrap() > 0);
-    assert_eq!(bundle["software"]["tensord"], env!("CARGO_PKG_VERSION"));
-}
-
-#[test]
 fn caches_expire_but_held_named_and_uncollected_work_stays() {
     use tensord::{catalog::Catalog, reclaim};
-    let fixture = Fixture::new();
+    let fixture = Machine::open();
     // Two completed runs: one collected by its client, one not.
-    let collected = fixture.submit("infer");
-    fixture.wait(&collected, |record| record.state.terminal());
-    let owed = fixture.engine.submit("owed", fixture.invocation("infer")).unwrap().id;
-    assert!(fixture.engine.dispatch(&owed, fixture.config()).unwrap());
-    fixture.wait(&owed, |record| record.state.terminal());
-    fixture.engine.acknowledge_collection(&collected).unwrap();
-    let state = fixture.root.join("state");
+    let collected = fixture.run("collected", "steps", json!({"steps": 1, "seconds": 0.0}));
+    let owed = fixture.run("owed", "steps", json!({"steps": 1, "seconds": 0.0}));
+    assert_eq!((collected.state, owed.state), (State::Completed, State::Completed));
+    let (collected, owed) = (collected.id, owed.id);
+    fixture.engine().acknowledge_collection(&collected).unwrap();
+    let state = fixture.root.join("state/execution");
     for id in [&collected, &owed] {
         age(&state.join("results").join(id), 8);
     }
-    // A crash leftover spool of a settled run, and one of a queued run.
-    let queued = fixture.engine.submit("queued", fixture.invocation("infer")).unwrap().id;
+    // A crash leftover spool of a settled run, and one of a run still preparing.
+    let invocation = Invocation { package: "fixture".into(), input: json!({}), ..Default::default() };
+    let (queued, _) = fixture.engine().accept_run("alice", "queued", "queued", invocation).unwrap();
+    let queued = queued.id;
     for id in [&collected, &queued] {
         fs::create_dir_all(state.join("staging").join(id)).unwrap();
     }
@@ -1112,7 +665,7 @@ fn caches_expire_but_held_named_and_uncollected_work_stays() {
     let executor = reclaim::kernel_hold(&kernels, "u2").unwrap();
     fs2::FileExt::lock_shared(&executor).unwrap();
     let swept = reclaim::sweep(&reclaim::Caches {
-        engine: &fixture.engine,
+        engine: fixture.engine(),
         catalog: &catalog,
         bound: &bound,
         kernels: Some(&caches),
@@ -1141,5 +694,5 @@ fn caches_expire_but_held_named_and_uncollected_work_stays() {
     assert!(held.exists() && named.exists() && recent.exists());
     drop(lease);
     // The journal keeps every row.
-    assert_eq!(fixture.engine.list().unwrap().len(), 3);
+    assert_eq!(fixture.engine().list().unwrap().len(), 3);
 }

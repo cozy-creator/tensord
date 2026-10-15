@@ -42,7 +42,7 @@ pub struct PackageSdk {
     pub python: String,
     pub requirements: Vec<String>,
     pub find_links: Option<PathBuf>,
-    /// The machine's CPU runner client, so a published CPU package can run here too.
+    /// The machine's description client (`tensord_client`), installed into each generation.
     pub client_wheel: Option<PathBuf>,
     /// An image's baked uv cache (expanded wheels, index records), linked rather than copied.
     pub seed_cache: Option<PathBuf>,

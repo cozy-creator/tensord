@@ -1,5 +1,4 @@
 //! Trusted immutable environment selection, independent of request-supplied paths.
-use crate::execution::RunnerConfig;
 use crate::journal::Invocation;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -29,9 +28,6 @@ pub struct Generation {
     #[serde(default)]
     pub dependencies: Vec<Dependency>,
     pub interface: serde_json::Value,
-    /// Empty when the CPU runner's SDK adapter imported at install; else the reason.
-    #[serde(default)]
-    pub cpu_bridge: String,
     /// The package's own installed files, hashed; empty when its installer recorded none.
     #[serde(default)]
     pub source_digest: String,
@@ -251,19 +247,5 @@ impl HeldGeneration {
             inputs: vec![],
             ..Default::default()
         })
-    }
-    pub fn runner(&self) -> RunnerConfig {
-        RunnerConfig {
-            python: self.record.python.clone(),
-            module: "tensord_client.runner".into(),
-            import_paths: vec![],
-            generation_hold: Some(self.hold.clone()),
-            unavailable: (!self.record.cpu_bridge.is_empty()).then(|| {
-                format!(
-                    "CPU runner adapter unavailable in this environment: {}",
-                    self.record.cpu_bridge
-                )
-            }),
-        }
     }
 }

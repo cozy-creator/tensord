@@ -419,7 +419,7 @@ pub fn sweep(caches: &Caches) -> io::Result<Swept> {
             add(Kind::Result, entry.path(), modified(&entry.path()), vec![]);
         }
     }
-    // Runner logs of settled or unknown runs: diagnostics.
+    // Logs no unfinished run names (machine logs, rotated copies): diagnostics.
     if let Ok(logs) = fs::read_dir(root.join("logs")) {
         for entry in logs.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();

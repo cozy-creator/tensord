@@ -48,23 +48,6 @@ def read_metadata(project: Path) -> PackageMetadata:
                            metadata.entry_points.application.default)
 
 
-def probe_cpu_bridge(interpreter: Path) -> subprocess.Popen:
-    """Import the CPU runner's SDK adapter in the new environment, isolated from this one, beside
-    the description; `bridge_result` reads it. GPU executors do not use the adapter, so a failure
-    never refuses the installation."""
-    return subprocess.Popen([str(interpreter), "-I", "-c", "import tensord_client.runtime_bridge"],
-                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-
-
-def bridge_result(probe: subprocess.Popen) -> str:
-    """Empty when the adapter imports; otherwise the reason CPU runs of this generation cannot start."""
-    _, stderr = probe.communicate()
-    if probe.returncode == 0:
-        return ""
-    lines = [line for line in stderr.strip().splitlines() if line.strip()]
-    return (lines[-1] if lines else f"bridge import exited {probe.returncode}")[:1024]
-
-
 # -S prevents authored .pth startup code; only the owned venv's regular site-packages paths
 # are inserted before loading the installed SDK reader.
 BOOTSTRAP = ("import pathlib,runpy,sys;"
@@ -85,22 +68,18 @@ def publish_generation(root: Path, metadata: PackageMetadata, interface: msgspec
                        callees: dict[str, str] | None = None, sdk_fallback: str = "",
                        source_digest: str = "") -> Generation:
     """Record and publish the environment. With no `interface` the root's installed one is
-    described in the same process as the environment; the CPU bridge probe runs beside it.
-    `source_digest` is a live project's own code, whose installed files only point at it."""
+    described in the same process as the environment. `source_digest` is a live project's own
+    code, whose installed files only point at it."""
     interpreter = root / "env" / "bin" / "python"
-    probe = probe_cpu_bridge(interpreter)
-    try:
-        inventory = subprocess.check_output(["uv", "pip", "list", "--python", str(interpreter), "--format", "json"])
-        dependencies = msgspec.json.decode(inventory, type=list[Dependency])
-        request = DescribeEnvironment(metadata.name, callees or {}, interface is None)
-        environment = in_environment(interpreter, request, ENVIRONMENT_DECODER)
-    finally:
-        bridge = bridge_result(probe)
+    inventory = subprocess.check_output(["uv", "pip", "list", "--python", str(interpreter), "--format", "json"])
+    dependencies = msgspec.json.decode(inventory, type=list[Dependency])
+    request = DescribeEnvironment(metadata.name, callees or {}, interface is None)
+    environment = in_environment(interpreter, request, ENVIRONMENT_DECODER)
     if interface is None:
         interface = (msgspec.Raw(environment.interface.encode()) if environment.interface else in_environment(
             interpreter, DescribeInstalled(metadata.name, str(interpreter)), DESCRIPTION_DECODER).interface)
     generation = Generation(root.name, metadata.name, metadata.version, metadata.application,
-                            str(interpreter), dependencies, interface, bridge,
+                            str(interpreter), dependencies, interface,
                             source_digest or environment.source_digest, environment.callees, sdk_fallback)
     with (root / ".generation.json.new").open("wb") as output:
         output.write(msgspec.json.encode(generation))

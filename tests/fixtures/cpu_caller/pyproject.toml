@@ -6,7 +6,7 @@ build-backend = "uv_build"
 name = "tensord-cpu-caller"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = ["cozy-runtime>=0.18.67", "msgspec>=0.19,<1", "tensord-cpu-memo"]
+dependencies = ["cozy-runtime>=0.24.1", "msgspec>=0.19,<1", "tensord-cpu-memo"]
 
 [project.entry-points."cozy.application"]
 default = "cpu_caller:app"

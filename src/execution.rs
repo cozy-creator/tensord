@@ -1,13 +1,9 @@
-//! CPU runner supervision. Scheduling policy remains with the machine owner.
-use crate::{
-    journal::{
-        Artifact, CallMemo, Execution, Invocation, Journal, Outcome, ProcessBirth,
-        ProgressSnapshot, ResultRecord, State, SubmissionContext,
-    },
-    launch_identity::Seal,
-    process::Liveness,
+//! Acceptance, attempt supervision, cancellation, progress coalescing, output custody and
+//! reconcile. Scheduling policy remains with the machine owner (`service`).
+use crate::journal::{
+    Artifact, CallMemo, Execution, Invocation, Journal, Outcome, ProcessBirth, ProgressSnapshot,
+    ResultRecord, State, SubmissionContext,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
@@ -19,18 +15,14 @@ use std::{
         unix::{
             ffi::OsStrExt,
             fs::{OpenOptionsExt, PermissionsExt},
-            net::UnixStream,
-            process::CommandExt,
         },
     },
     path::{Component, Path, PathBuf},
-    process::{Child, Stdio},
     sync::{Arc, Condvar, Mutex, OnceLock, Weak},
     time::Duration,
 };
 use tensorfs_core::transport::PullCancellation;
 
-pub const MAX_RUNNER_FRAME: usize = 1024 * 1024;
 /// The most text one package log line keeps.
 const PACKAGE_LOG_LINE: usize = 2 << 10;
 
@@ -76,108 +68,13 @@ impl crate::native_inputs::IntakeJournal for Engine {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct RunnerConfig {
-    /// Trusted immutable generation interpreter, resolved by the package installer.
-    pub python: PathBuf,
-    pub module: String,
-    pub import_paths: Vec<PathBuf>,
-    /// Already acquired shared environment-generation hold from the installer.
-    /// The runner also holds its generation independently before package imports.
-    pub generation_hold: Option<Arc<File>>,
-    /// Measured at install: why a runner cannot start in this environment.
-    pub unavailable: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum RunnerCommand<'a> {
-    Invoke {
-        execution_id: &'a str,
-        #[serde(flatten)]
-        invocation: &'a Invocation,
-        output_root: &'a Path,
-    },
-    Cancel {
-        execution_id: &'a str,
-    },
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum RunnerEvent {
-    Ready {
-        pid: u32,
-        #[serde(default)]
-        capabilities: Vec<String>,
-    },
-    Progress {
-        execution_id: String,
-        completed_units: u64,
-        detail: String,
-    },
-    Result {
-        execution_id: String,
-        value: Value,
-        #[serde(default)]
-        artifacts: Vec<String>,
-        #[serde(default)]
-        asset_bindings: Vec<crate::journal::AssetBinding>,
-    },
-    Failed {
-        execution_id: String,
-        code: String,
-        detail: String,
-    },
-    Canceled {
-        execution_id: String,
-    },
-    #[serde(other)]
-    Unknown,
-}
-
-pub fn write_command(stream: &mut UnixStream, command: &RunnerCommand<'_>) -> io::Result<()> {
-    let frame = serde_json::to_vec(command)?;
-    if frame.len() > MAX_RUNNER_FRAME {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "runner command exceeds frame limit",
-        ));
-    }
-    stream.write_all(&(frame.len() as u32).to_be_bytes())?;
-    stream.write_all(&frame)
-}
-
-pub fn read_event(stream: &mut UnixStream) -> io::Result<Option<RunnerEvent>> {
-    let mut header = [0; 4];
-    if stream.read(&mut header[..1])? == 0 {
-        return Ok(None);
-    }
-    stream.read_exact(&mut header[1..])?;
-    let length = u32::from_be_bytes(header) as usize;
-    if length == 0 || length > MAX_RUNNER_FRAME {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid runner frame length",
-        ));
-    }
-    let mut frame = vec![0; length];
-    stream.read_exact(&mut frame)?;
-    serde_json::from_slice(&frame)
-        .map(Some)
-        .map_err(io::Error::other)
-}
-
-type Writer = Arc<Mutex<UnixStream>>;
-
 pub struct Engine {
     pub root: PathBuf,
-    /// Scopes runner JIT caches to this machine run.
-    incarnation: String,
     journal: Mutex<Journal>,
     /// Held while a run takes object references, and while unneeded roots are released.
     pub(crate) object_custody: Mutex<()>,
-    active: Mutex<HashMap<String, ActiveRun>>,
+    /// Each supervised attempt's stop.
+    active: Mutex<HashMap<String, Stop>>,
     owned: Mutex<HashSet<String>>,
     progress: Mutex<HashMap<String, ProgressSnapshot>>,
     activity: Mutex<u64>,
@@ -232,11 +129,7 @@ fn stop_preparation(
     Ok(record)
 }
 
-#[derive(Clone)]
-enum ActiveRun {
-    Protocol(Writer, Arc<crate::process::Watch>),
-    Managed(Arc<dyn Fn() -> io::Result<()> + Send + Sync>),
-}
+type Stop = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
 
 impl Engine {
     pub fn open(root: &Path) -> io::Result<Arc<Self>> {
@@ -246,13 +139,10 @@ impl Engine {
             fs::create_dir_all(root.join(name))?;
         }
         File::open(root)?.sync_all()?;
-        let incarnation = uuid::Uuid::new_v4().simple().to_string();
-        crate::launch_identity::remove_stale_jit(&root.join("seal"), &incarnation);
         let mut journal = Journal::open(root)?;
         journal.interrupt_preparations()?;
         Ok(Arc::new(Self {
             root: root.to_path_buf(),
-            incarnation,
             journal: Mutex::new(journal),
             object_custody: Mutex::new(()),
             active: Mutex::new(HashMap::new()),
@@ -708,11 +598,6 @@ impl Engine {
         self.activity_changed.notify_all();
     }
 
-    /// Dispatch only after the owner's admission and trusted generation resolution.
-    pub fn dispatch(self: &Arc<Self>, id: &str, config: RunnerConfig) -> io::Result<bool> {
-        self.dispatch_managed(id, move |engine, id| engine.run(&id, config))
-    }
-
     /// Trusted adapters share one claim, supervisor reservation and journal. They
     /// register the exact process birth before authorizing any authored code.
     pub(crate) fn dispatch_managed<F>(self: &Arc<Self>, id: &str, run: F) -> io::Result<bool>
@@ -795,20 +680,10 @@ impl Engine {
             return;
         }
         let id = &record.id;
-        let active = self.active.lock().unwrap().get(id).cloned();
-        if let Some(active) = active {
+        let stop = self.active.lock().unwrap().get(id).cloned();
+        if let Some(stop) = stop {
             // Delivery failure does not revoke the already committed cancellation authority.
-            let _ = match active {
-                ActiveRun::Protocol(writer, watch) => {
-                    // From now on the runner's frames are the meter: if they stop, it is killed.
-                    watch.canceled();
-                    write_command(
-                        &mut writer.lock().unwrap(),
-                        &RunnerCommand::Cancel { execution_id: id },
-                    )
-                }
-                ActiveRun::Managed(cancel) => cancel(),
-            };
+            let _ = stop();
         }
     }
 
@@ -990,7 +865,7 @@ impl Engine {
         self: &Arc<Self>,
         id: &str,
         birth: ProcessBirth,
-        cancel: Arc<dyn Fn() -> io::Result<()> + Send + Sync>,
+        cancel: Stop,
     ) -> io::Result<()> {
         self.journal
             .lock()
@@ -1000,7 +875,7 @@ impl Engine {
         self.active
             .lock()
             .unwrap()
-            .insert(id.into(), ActiveRun::Managed(cancel.clone()));
+            .insert(id.into(), cancel.clone());
         self.notify_activity();
         let record = self.get(id)?;
         if record.cancel_actor.is_some() {
@@ -1115,277 +990,6 @@ impl Engine {
             self.notify_activity();
         }
         self.nonterminal(1024)
-    }
-
-    fn run(&self, id: &str, config: RunnerConfig) -> io::Result<()> {
-        let _generation_hold = config.generation_hold.clone();
-        let record = self.get(id)?;
-        if record.cancel_actor.is_some() {
-            self.finish(id, Outcome::Canceled)?;
-            return Ok(());
-        }
-        if let Some(reason) = &config.unavailable {
-            // Known before any launch: fail now rather than start a runner that cannot import.
-            self.finish(
-                id,
-                Outcome::Failed(crate::journal::Failure::machine(
-                    "executor_unavailable",
-                    reason.clone(),
-                )),
-            )?;
-            return Ok(());
-        }
-        let output_root = self.root.join("staging").join(id);
-        let spool = Spool(output_root.clone());
-        let logs = self.root.join("logs");
-        let launch = (|| {
-            fs::create_dir_all(&output_root)?;
-            fs::create_dir_all(&logs)?;
-            let seal = Seal::prepare(
-                &self.root.join("seal"),
-                None,
-                &self.incarnation,
-                &record.invocation.generation,
-                "",
-            )?;
-            let (parent, runner) = UnixStream::pair()?;
-            let stdout = File::create(logs.join(format!("{id}.stdout.log")))?;
-            let stderr = File::create(logs.join(format!("{id}.stderr.log")))?;
-            let scope = Arc::new(crate::scope::Scope::create(&crate::scope::namespace(
-                self.root.parent().unwrap_or(&self.root),
-            ))?);
-            let child = match spawn_runner(config, &seal, &scope, &runner, stdout, stderr) {
-                Ok(child) => child,
-                Err(error) => {
-                    let _ = scope.end();
-                    return Err(error);
-                }
-            };
-            drop(runner);
-            let exact = crate::process::Exact::open(&process_birth(child.id())?)?
-                .ok_or_else(|| io::Error::other("launched runner has no exact birth"))?
-                .with_scope(Some(scope));
-            Ok::<_, io::Error>((child, parent, exact))
-        })();
-        let (mut child, mut reader, exact) = match launch {
-            Ok(value) => value,
-            Err(error) => {
-                // Nothing authored ran; a deterministic launch failure is not retried.
-                let reason = format!("runner did not start: {error}");
-                self.runner_triage(id, 0, &reason, &logs);
-                self.finish(
-                    id,
-                    Outcome::Failed(crate::journal::Failure::machine(
-                        "executor_launch_failed",
-                        reason,
-                    )),
-                )?;
-                return Ok(());
-            }
-        };
-        let supervised = self.supervise(id, &record.invocation, &output_root, &exact, &mut reader);
-        // Closing both socket directions is a cooperative EOF signal; the runner is killed
-        // only if it then stops making measurable progress without exiting.
-        self.active.lock().unwrap().remove(id);
-        let _ = reader.shutdown(std::net::Shutdown::Both);
-        drop(reader);
-        let status = crate::process::reap(&exact, Some(&mut child), Liveness::default())?.status;
-        let outcome = match supervised {
-            Ok(terminal) => match terminal {
-                RunnerEvent::Result {
-                    value,
-                    artifacts,
-                    asset_bindings,
-                    ..
-                } if status.success() => {
-                    match self.bound_custody(id, &output_root, value, artifacts, asset_bindings) {
-                        Ok(result) => Outcome::Completed(result),
-                        Err(error) => {
-                            Outcome::Failed(crate::journal::Failure::machine("result_custody_failed", error.to_string()))
-                        }
-                    }
-                }
-                RunnerEvent::Result { .. } => Outcome::Failed(crate::journal::Failure::machine(
-                    "executor_exit_failed",
-                    format!("executor reported result but exited {status}"),
-                )),
-                RunnerEvent::Failed { code, detail, .. } => {
-                    Outcome::Failed(crate::journal::Failure::machine(&code, detail))
-                }
-                RunnerEvent::Canceled { .. } if self.get(id)?.cancel_actor.is_some() => {
-                    Outcome::Canceled
-                }
-                RunnerEvent::Canceled { .. } => Outcome::Failed(crate::journal::Failure::machine(
-                    "cancel_not_authorized",
-                    "runner canceled without durable cancellation authority",
-                )),
-                _ => Outcome::Failed(crate::journal::Failure::machine(
-                    "executor_no_result", "runner ended without a terminal result",
-                )),
-            },
-            Err(error) => {
-                let record = self.get(id)?;
-                if record.cancel_actor.is_some() {
-                    Outcome::Canceled
-                } else if record.state == State::Starting {
-                    // Ended before authorization: no authored code ran; its exit is the reason.
-                    Outcome::Failed(crate::journal::Failure::machine(
-                        "executor_launch_failed",
-                        format!(
-                            "runner ended before start ({status}): {error}; {}",
-                            crate::process::tail(&logs.join(format!("{id}.stderr.log")))
-                        ),
-                    ))
-                } else {
-                    Outcome::Failed(crate::journal::Failure::machine("executor_failed", format!(
-                        "executor ended {status}: {error}"
-                    )))
-                }
-            }
-        };
-        // Custody is complete: a settled run never has a spool.
-        drop(spool);
-        if let Outcome::Failed(reason) = &outcome {
-            self.runner_triage(id, exact.birth.pid, &reason.to_string(), &logs);
-        }
-        self.finish(id, outcome)?;
-        Ok(())
-    }
-
-    /// A failed CPU run's bundle: its reason and the end of the runner's stderr.
-    fn runner_triage(&self, id: &str, pid: u32, reason: &str, logs: &Path) {
-        let Ok(record) = self.get(id) else {
-            return;
-        };
-        let request = record
-            .submission
-            .as_ref()
-            .map_or_else(|| id.to_string(), |s| s.request_id.clone());
-        self.record_triage(
-            id,
-            &crate::triage::Facts {
-                request_id: &request,
-                attempt: record.attempt,
-                terminal: "failed",
-                origin: "machine",
-                code: "runner_ended",
-                message: reason,
-                traceback: "",
-                executor_pid: pid,
-                stderr_tail: &crate::process::tail_from(
-                    &logs.join(format!("{id}.stderr.log")),
-                    0,
-                    crate::triage::MAX_STDERR,
-                ),
-            },
-        );
-    }
-
-    fn supervise(
-        &self,
-        id: &str,
-        invocation: &Invocation,
-        output_root: &Path,
-        exact: &crate::process::Exact,
-        reader: &mut UnixStream,
-    ) -> io::Result<RunnerEvent> {
-        // Register identity immediately after spawn, before any package authorization.
-        let pid = exact.birth.pid;
-        self.journal
-            .lock()
-            .unwrap()
-            .register_process(id, exact.birth.clone())?;
-        self.notify_activity();
-        let ready =
-            read_event(reader)?.ok_or_else(|| io::Error::other("runner EOF before Ready"))?;
-        match ready {
-            RunnerEvent::Ready {
-                pid: ready,
-                capabilities,
-            } if ready == pid && capabilities.iter().any(|cap| cap == "runtime.author-cpu/1") => {}
-            _ => {
-                return Err(io::Error::other(
-                    "runner did not offer CPU author capability for its actual PID",
-                ))
-            }
-        }
-        let writer = Arc::new(Mutex::new(reader.try_clone()?));
-        let watching = crate::process::Watching::start(
-            exact.try_clone()?,
-            crate::process::Meter::Frames,
-            Liveness::default(),
-            Duration::ZERO,
-            None,
-            "invocation",
-        )?;
-        let watch = watching.watch();
-        {
-            let mut stream = writer.lock().unwrap();
-            // Running means authorization may have arrived, including a lost write ack.
-            self.journal.lock().unwrap().running(id, None)?;
-            self.notify_activity();
-            write_command(
-                &mut stream,
-                &RunnerCommand::Invoke {
-                    execution_id: id,
-                    invocation,
-                    output_root,
-                },
-            )?;
-            self.active.lock().unwrap().insert(
-                id.into(),
-                ActiveRun::Protocol(writer.clone(), watch.clone()),
-            );
-        }
-        let terminal = self.events(id, reader, &writer, &watch);
-        match watching.finish().0 {
-            Some(verdict) => Err(io::Error::other(verdict)),
-            None => terminal,
-        }
-    }
-
-    fn events(
-        &self,
-        id: &str,
-        reader: &mut UnixStream,
-        writer: &Writer,
-        watch: &crate::process::Watch,
-    ) -> io::Result<RunnerEvent> {
-        if self.get(id)?.cancel_actor.is_some() {
-            watch.canceled();
-            write_command(
-                &mut writer.lock().unwrap(),
-                &RunnerCommand::Cancel { execution_id: id },
-            )?;
-        }
-        loop {
-            let event = read_event(reader)?
-                .ok_or_else(|| io::Error::other("runner EOF before terminal result"))?;
-            watch.frame();
-            let event_id = match &event {
-                RunnerEvent::Progress { execution_id, .. }
-                | RunnerEvent::Result { execution_id, .. }
-                | RunnerEvent::Failed { execution_id, .. }
-                | RunnerEvent::Canceled { execution_id } => execution_id,
-                RunnerEvent::Unknown => continue,
-                RunnerEvent::Ready { .. } => {
-                    return Err(io::Error::other("duplicate runner Ready"))
-                }
-            };
-            if event_id != id {
-                return Err(io::Error::other(
-                    "runner event identifies another execution",
-                ));
-            }
-            match event {
-                RunnerEvent::Progress {
-                    completed_units,
-                    detail,
-                    ..
-                } => self.observe_progress(id, completed_units, detail)?,
-                terminal => return Ok(terminal),
-            }
-        }
     }
 
     fn bound_custody(
@@ -1523,52 +1127,6 @@ fn overlay_observation(
     }
 }
 
-/// The CPU runner launches like an executor: through the Runtime trampoline (parent-death,
-/// no_new_privs, OOM order, own process group) with the sealed environment and no GPU.
-fn spawn_runner(
-    config: RunnerConfig,
-    seal: &Seal,
-    scope: &crate::scope::Scope,
-    socket: &UnixStream,
-    stdout: File,
-    stderr: File,
-) -> io::Result<Child> {
-    let fd = socket.as_raw_fd();
-    let mut configured = std::collections::BTreeMap::new();
-    if !config.import_paths.is_empty() {
-        // PYTHONPATH is import-path configuration, never an execution-mode switch.
-        configured.insert(
-            "PYTHONPATH".to_string(),
-            std::env::join_paths(config.import_paths)
-                .map_err(io::Error::other)?
-                .to_string_lossy()
-                .into_owned(),
-        );
-    }
-    let mut command = crate::launch_identity::trampoline(&config.python, None, Some(scope))?;
-    command
-        .arg("-m")
-        .arg(config.module)
-        .arg("--execution-fd")
-        .arg(fd.to_string())
-        .env_clear()
-        .envs(seal.environment(&configured))
-        .envs(scope.environment())
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr));
-    // SAFETY: fcntl is async-signal-safe; only this owned socket becomes inheritable.
-    unsafe {
-        command.pre_exec(move || {
-            if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    command.spawn()
-}
-
 pub use crate::process::{process_birth, process_ended};
 
 /// A run's spool: removed once the run is settled, whatever the outcome. Its outputs are in
@@ -1676,6 +1234,105 @@ mod tests {
         assert_eq!(order, [job.id.clone(), nested.id.clone(), younger_step.id.clone()]);
         assert_eq!((nested.root_seq(), nested.family()), (older.root_seq(), Some(job.id.as_str())));
         assert_eq!((younger_step.root_seq(), younger_step.family()), (younger.root_seq(), None));
+        drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// One managed attempt of `id`, as the pool runs it: a real process registered and
+    /// authorized, then `settle` with the engine; the process ends with the attempt.
+    fn attempt(engine: &Arc<Engine>, id: &str, settle: impl FnOnce(&Engine, &str) + Send + 'static) {
+        let (done, finished) = std::sync::mpsc::channel();
+        assert!(engine.dispatch_managed(id, move |engine, id| {
+            let mut process = std::process::Command::new("/bin/cat")
+                .stdin(std::process::Stdio::piped())
+                .spawn()?;
+            engine.register_managed(&id, process_birth(process.id())?, Arc::new(|| Ok(())))?;
+            assert!(engine.authorize_managed(&id, None)?);
+            settle(&engine, &id);
+            drop(process.stdin.take());
+            process.wait()?;
+            done.send(()).unwrap();
+            Ok(())
+        })
+        .unwrap());
+        finished.recv().unwrap();
+    }
+
+    /// A run's attention pin is its calls': a root completing with a pin no call applied says
+    /// so once in its log and completes all the same; one a call applied (a child's counts for
+    /// its root) completes without it, and a run with no pin logs nothing.
+    #[test]
+    fn a_pin_no_call_applied_is_a_warning_in_the_runs_log() {
+        let root = std::env::temp_dir().join(format!("cm-pin-{}", uuid::Uuid::new_v4()));
+        let engine = Engine::open(&root).unwrap();
+        let run = |key: &str, pin: &str, applied: bool| {
+            let invocation = Invocation { attention_kernel: pin.into(), ..Default::default() };
+            let id = engine.submit(key, invocation.clone()).unwrap().id;
+            let child = Invocation { parent: id.clone(), ..invocation };
+            let child = engine.submit(&format!("{key}-call"), child).unwrap().id;
+            attempt(&engine, &id, move |engine, id| {
+                if applied {
+                    engine.apply_attention(&child).unwrap();
+                }
+                let value = ResultRecord { value: serde_json::json!({}), artifacts: vec![], asset_bindings: vec![] };
+                engine.finish(id, Outcome::Completed(value)).unwrap();
+            });
+            assert_eq!(engine.get(&id).unwrap().state, State::Completed);
+            let logs = engine.logs(&id).unwrap();
+            logs.iter().map(|log| serde_json::from_slice::<Value>(&log.product).unwrap()).collect::<Vec<_>>()
+        };
+        assert_eq!(run("unapplied", "sdpa", false),
+            [serde_json::json!({"level": "warning", "text": "attention pin sdpa was never applied"})]);
+        assert_eq!(run("applied", "sdpa", true), Vec::<Value>::new());
+        assert_eq!(run("unpinned", "", false), Vec::<Value>::new());
+        drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A result's files are taken into custody once, from the attempt's spool: a symlink or a
+    /// FIFO in its place fails the run, the spool is gone once it settles, and a held file
+    /// changed afterwards is refused, never served.
+    #[test]
+    fn custody_takes_one_verified_copy_and_refuses_escapes_and_mutation() {
+        let root = std::env::temp_dir().join(format!("cm-custody-{}", uuid::Uuid::new_v4()));
+        let engine = Engine::open(&root).unwrap();
+        let binding = |length: u64| crate::journal::AssetBinding {
+            relative_path: "prediction".into(),
+            asset_ref: "attempt:run/file/0".into(),
+            media_type: "text/plain".into(),
+            checksum: crate::journal::OutputChecksum { algorithm: "sha256".into(), value: String::new() },
+            length,
+        };
+        let run = |key: &str, place: fn(&Path)| {
+            let id = engine.submit(key, Invocation::default()).unwrap().id;
+            attempt(&engine, &id, move |engine, id| {
+                let spool = engine.staging(id).unwrap();
+                place(&spool.join("prediction"));
+                let _spool = Spool(spool.clone());
+                let length = fs::symlink_metadata(spool.join("prediction")).map_or(0, |m| m.len());
+                if let Err(error) = engine.managed_result(id, &spool, serde_json::json!({"rows": 2}), vec![binding(length)]) {
+                    engine.finish(id, Outcome::Failed(crate::journal::Failure::custody(&error.to_string()))).unwrap();
+                }
+            });
+            engine.get(&id).unwrap()
+        };
+        let escaped = run("symlink", |path| std::os::unix::fs::symlink("/etc/passwd", path).unwrap());
+        assert_eq!(escaped.state, State::Failed);
+        let fifo = run("fifo", |path| {
+            let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        });
+        assert_eq!(fifo.state, State::Failed);
+        let held = run("held", |path| fs::write(path, b"17,39\n").unwrap());
+        assert_eq!(held.state, State::Completed, "{held:?}");
+        assert!(!root.join("staging").join(&held.id).exists(), "the spool goes once settled");
+        let mut bytes = String::new();
+        engine.open_result(&held.id, 0).unwrap().read_to_string(&mut bytes).unwrap();
+        assert_eq!(bytes, "17,39\n");
+        let path = root.join(&held.result.unwrap().artifacts[0].path);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&path, b"corrupted").unwrap();
+        assert_eq!(engine.open_result(&held.id, 0).unwrap_err().kind(), io::ErrorKind::InvalidData);
         drop(engine);
         std::fs::remove_dir_all(root).unwrap();
     }

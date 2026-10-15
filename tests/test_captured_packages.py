@@ -1,4 +1,5 @@
-"""Real captured uv installations and classifier inference; no implementation doubles."""
+"""Real captured uv installations; no implementation doubles. Inference in these environments
+runs on the machine's executors (`machine_surface.rs`)."""
 import base64
 import hashlib
 import json
@@ -14,9 +15,8 @@ import tomllib
 
 from tensord_client.captured_packages import install_captured, installed_description
 from tensord_client.packages import GenerationHold, PackageError
-from tensord_client.execution_protocol import Result
 from tensord_client.package_records import GENERATION_DECODER
-from test_package_bridge import FIXTURE, ROOT, spawn_runner, send_command, invoke, terminal, finish
+from test_package_bridge import FIXTURE, ROOT
 
 
 @pytest.fixture(scope="module")
@@ -35,25 +35,21 @@ def capture(tmp_path_factory):
     yield root, source, client, frozen
 
 
-def assert_inference(generation, output):
+def assert_installed(generation):
+    """The environment imports the package and the machine client, and keeps its description."""
     with GenerationHold(Path(generation.python).parents[2]):
-        process, socket = spawn_runner(generation)
-        send_command(socket, invoke(generation, output))
-        result = terminal(socket)
-        assert isinstance(result, Result), result
-        assert result.value["predictions"] == [0, 2, 1]
-        artifact = json.loads((output / result.artifacts[0]).read_bytes())
-        assert artifact["probabilities"] == result.value["probabilities"]
-        finish(process, socket)
+        subprocess.run([generation.python, "-I", "-c", "import cpu_classifier, tensord_client.runtime_describe"],
+                       check=True)
+        assert b"classify" in bytes(generation.interface)
 
 
-def test_frozen_source_keeps_locked_sdk_and_runs_real_classifier(capture):
+def test_frozen_source_keeps_locked_sdk(capture):
     root, source, client, generation = capture
     versions = {dependency.name: dependency.version for dependency in generation.dependencies}
     lock = tomllib.loads((source / "uv.lock").read_text())
     sdk = next(row["version"] for row in lock["package"] if row["name"] == "cozy-runtime")
     assert versions["cozy-runtime"] == sdk == "0.18.89"
-    assert_inference(generation, root / "frozen-result")
+    assert_installed(generation)
 
 
 def test_real_wheel_roster_and_hashed_requirements_preserve_dependency_versions(capture):
@@ -68,7 +64,7 @@ def test_real_wheel_roster_and_hashed_requirements_preserve_dependency_versions(
     before = {dependency.name: dependency.version for dependency in frozen.dependencies}
     after = {dependency.name: dependency.version for dependency in generation.dependencies}
     assert after == before
-    assert_inference(generation, root / "wheel-result")
+    assert_installed(generation)
 
 
 def test_incoherent_source_lock_overlay_and_python_mismatch_refuse_only_installation(capture):
@@ -81,10 +77,10 @@ def test_incoherent_source_lock_overlay_and_python_mismatch_refuse_only_installa
         install_captured(project=source, wheels=[], requirements=None,
             distribution="tensord-cpu-classifier", release="0.1.0", python_requires="", python_version="3.11",
             generations=root / "unsupported", client_wheel=client, python="3.12")
-    assert_inference(generation, root / "surviving-result")
+    assert_installed(generation)
 
 
-def test_rust_tensorfs_materialization_and_trusted_installer_run_real_classifier(capture):
+def test_rust_tensorfs_materialization_and_trusted_installer(capture):
     root, source, client, frozen = capture
     archive = root / "source.tar"
     subprocess.run(["tar", "-cf", str(archive), "-C", str(source), "pyproject.toml", "uv.lock", "package.toml", "cpu_classifier"], check=True)
@@ -96,7 +92,7 @@ def test_rust_tensorfs_materialization_and_trusted_installer_run_real_classifier
     generation = GENERATION_DECODER.decode((output / "prepared-generation.json").read_bytes())
     assert json.loads((output / "package-interface.json").read_bytes()) == json.loads(bytes(generation.interface))
     assert {row.name: row.version for row in generation.dependencies}["cozy-runtime"] == "0.18.89"
-    assert_inference(generation, root / "rust-owner-result")
+    assert_installed(generation)
 
 
 def test_installer_only_helper_uses_locked_sdk_and_static_reader_skips_pth(capture):
@@ -118,7 +114,7 @@ def test_installer_only_helper_uses_locked_sdk_and_static_reader_skips_pth(captu
     installed_description(generation.package, Path(generation.python))
     assert not sentinel.exists()
     pth.unlink()  # uniquely owned authored test fixture, not user source/work
-    assert_inference(generation, root / "minimal-helper-result")
+    assert_installed(generation)
 
 
 def app_wheel(directory: Path, module: str, source: str, requires: str = "") -> Path:
