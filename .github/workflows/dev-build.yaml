@@ -90,6 +90,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ inputs.build }}-${{ inputs.test != '' }}
+          cache-on-failure: true
       - name: Release build (Taskfile `release`, as Runtime's `task machine` runs it)
         if: contains(inputs.build, 'tensord')
         run: |
