@@ -1097,7 +1097,7 @@ impl HostTier {
     fn body(request: SealedRequest<'_>, plan: File) -> io::Result<Vec<u8>> {
         if os::seals(&plan)? & os::FULL_SEALS != os::FULL_SEALS
             || plan.metadata()?.len() != request.length
-            || request.length > 64 << 20
+            || request.length > crate::protocol::MAX_FRAME as u64
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1325,4 +1325,26 @@ fn component_plan(header: &Header, component: &str) -> io::Result<read::ReadPlan
         .collect();
     read::plan_for_traversal(header, &traversal, &[component.to_string()], 4 << 20)
         .map_err(failure)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// A sealed plan is as large as its model's keys (the old 64 MiB refused a valid one with
+    /// long keys); its declared length must be its sealed bytes and within the shared guard.
+    #[test]
+    fn a_sealed_plan_over_64_mib_is_read_and_a_lying_length_is_refused() {
+        let body = vec![b' '; (64 << 20) + 1];
+        let mut file = os::memfd().unwrap();
+        file.write_all(&body).unwrap();
+        os::seal(&file).unwrap();
+        let sha256 = format!("{:x}", Sha256::digest(&body));
+        let request = |length| SealedRequest { sha256: &sha256, length, stage: None };
+        let read = HostTier::body(request(body.len() as u64), file.try_clone().unwrap()).unwrap();
+        assert!(read == body);
+        let lying = HostTier::body(request(crate::protocol::MAX_FRAME as u64 + 1), file);
+        assert_eq!(lying.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
 }
