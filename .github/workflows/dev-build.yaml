@@ -1,6 +1,6 @@
 name: dev-build
 # Builds the release binary for any ref and runs one targeted test command, off the dev box:
-#   gh workflow run dev-build.yaml -R cozy-creator/tensord -f ref=<sha> [-f tensorfs_ref=<ref>] [-f build=none] [-f test='cargo test --test machine_status']
+#   gh workflow run dev-build.yaml -R cozy-creator/tensord -f ref=<sha> [-f tensorfs_ref=<ref>] [-f runtime_ref=<ref>] [-f build=none] [-f test='cargo test --test machine_status']
 # The artifact is tensord-<sha>[-tensorfs-<sha>]. No whole-suite default: `test` is empty unless given.
 on:
   workflow_dispatch:
@@ -21,6 +21,10 @@ on:
         description: TensorFS branch, tag or SHA replacing the Cargo.toml pin; empty keeps the pin
         type: string
         default: ''
+      runtime_ref:
+        description: cozy-runtime branch, tag or SHA whose wheel tests get as COZY_TEST_RUNTIME_WHEEL; empty for none
+        type: string
+        default: ''
       runner:
         description: Runner label
         type: string
@@ -29,7 +33,7 @@ on:
         description: Caller's id, shown in the run name so the caller can find its run
         type: string
         default: ''
-run-name: dev-build ${{ inputs.ref }} ${{ inputs.build }} ${{ inputs.tensorfs_ref }} ${{ inputs.nonce }}
+run-name: dev-build ${{ inputs.ref }} ${{ inputs.build }} ${{ inputs.tensorfs_ref }} ${{ inputs.runtime_ref }} ${{ inputs.nonce }}
 
 permissions:
   contents: read
@@ -106,6 +110,20 @@ jobs:
           path: dist/tensord-linux-x86_64
           if-no-files-found: error
           retention-days: 7
+      # The machine tests drive uv, and with runtime_ref, a dev Runtime as the machine's own.
+      - if: inputs.test != '' || inputs.runtime_ref != ''
+        uses: astral-sh/setup-uv@v7
+      - if: inputs.runtime_ref != ''
+        uses: actions/checkout@v4
+        with:
+          repository: cozy-creator/cozy-runtime
+          ref: ${{ inputs.runtime_ref }}
+          ssh-key: ${{ secrets.COZY_RUNTIME_READ_KEY }}
+          path: .runtime
+      - if: inputs.runtime_ref != ''
+        run: |
+          uv build --wheel --out-dir "$RUNNER_TEMP/runtime" .runtime
+          echo "COZY_TEST_RUNTIME_WHEEL=$(ls "$RUNNER_TEMP"/runtime/cozy_runtime-*.whl)" >> "$GITHUB_ENV"
       - if: inputs.test != ''
         env:
           TEST: ${{ inputs.test }}
