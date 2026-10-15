@@ -310,6 +310,14 @@ pub fn checkpoint(
     store: &tensorfs_core::store::Store,
     weights: &[u8],
 ) -> tensorfs_core::ids::ObjectRef {
+    tensors(store, &[weights])
+}
+
+/// A checkpoint in `store` with one tensor, and one object, per entry of `weights`.
+pub fn tensors(
+    store: &tensorfs_core::store::Store,
+    weights: &[&[u8]],
+) -> tensorfs_core::ids::ObjectRef {
     use tensorfs_core::{
         dtype::Dtype,
         header::{Body, Closure, Header, Part, Tensor},
@@ -317,7 +325,6 @@ pub fn checkpoint(
         registry,
         store::Fault,
     };
-    assert!(!weights.is_empty() && weights.len().is_multiple_of(4));
     let put = |bytes: &[u8]| {
         store
             .put_stream(&mut &bytes[..], None, &Fault::default())
@@ -329,25 +336,23 @@ pub fn checkpoint(
         .find(|seed| seed.alias == "plain/1")
         .unwrap()
         .spec;
-    let shape = vec![(weights.len() / 4) as u64];
-    let tensor = Tensor {
-        dtype: Dtype::F32,
-        shape: shape.clone(),
-        encoding: spec.object_id(),
-        parts: vec![(
-            "value".into(),
-            Part {
-                dtype: Dtype::F32,
-                shape,
-                body: Body::Segments(vec![put(weights)]),
-            },
-        )],
-    };
+    let tensors = weights
+        .iter()
+        .enumerate()
+        .map(|(at, weights)| {
+            assert!(!weights.is_empty() && weights.len().is_multiple_of(4));
+            let shape = vec![(weights.len() / 4) as u64];
+            let part = Part { dtype: Dtype::F32, shape: shape.clone(), body: Body::Segments(vec![put(weights)]) };
+            let tensor = Tensor { dtype: Dtype::F32, shape, encoding: spec.object_id(), parts: vec![("value".into(), part)] };
+            let name = if at == 0 { "weight".to_string() } else { format!("weight{at}") };
+            (name, tensor)
+        })
+        .collect();
     let header = Header {
         configs: Vec::new(),
         assets: Vec::new(),
         encodings: vec![spec],
-        components: vec![("model".into(), vec![("weight".into(), tensor)])],
+        components: vec![("model".into(), tensors)],
     };
     header.validate(&Closure::default()).unwrap();
     let header = put(&header.canonical_bytes().unwrap());

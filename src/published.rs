@@ -1612,28 +1612,35 @@ fn download_all<'g>(
         .collect();
     job.stage(format!("downloading {}", names.join(" and ")));
     let moved = Mutex::new(vec![(0u64, 0u64); grants.len()]);
+    let ensure = |at: usize, grant: &ModelGrant, part: &[String]| {
+        let pull = Pull { components: part.to_vec(), behind: job.behind, stop: job.stop.clone(), ..Pull::default() };
+        publisher.ensure(service, source, &Named::of(grant), &pull, &|done, total| {
+            let (done, total) = {
+                let mut moved = moved.lock().unwrap();
+                moved[at] = (done, total);
+                moved.iter().fold((0, 0), |(d, t), (dd, tt)| (d + dd, t + tt))
+            };
+            job.bytes(done, total);
+        })
+    };
     let results: Vec<Result<Option<tensorfs_core::ensure::PartHold>, Failure>> = std::thread::scope(|scope| {
         let handles: Vec<_> = grants
             .iter()
             .enumerate()
             .map(|(at, (grant, part))| {
-                let moved = &moved;
-                scope.spawn(move || {
-                    let pull = Pull { components: part.clone(), behind: job.behind, stop: job.stop.clone(), ..Pull::default() };
-                    publisher.ensure(service, source, &Named::of(grant), &pull, &|done, total| {
-                        let (done, total) = {
-                            let mut moved = moved.lock().unwrap();
-                            moved[at] = (done, total);
-                            moved.iter().fold((0, 0), |(d, t), (dd, tt)| (d + dd, t + tt))
-                        };
-                        job.bytes(done, total);
-                    })
-                })
+                let ensure = &ensure;
+                std::thread::Builder::new().spawn_scoped(scope, move || ensure(at, grant, part)).map_err(|_| (at, grant, part))
             })
             .collect();
         handles
             .into_iter()
-            .map(|h| h.join().unwrap_or_else(|_| Err(("model_download_failed", "a download thread panicked".to_string()))))
+            .map(|handle| match handle {
+                Ok(handle) => handle
+                    .join()
+                    .unwrap_or_else(|_| Err(("model_download_failed", "a download thread panicked".to_string()))),
+                // A thread the container refused: this download runs here, after the others start.
+                Err((at, grant, part)) => ensure(at, grant, part),
+            })
             .collect()
     });
     let mut held = Vec::new();

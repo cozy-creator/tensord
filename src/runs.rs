@@ -410,7 +410,14 @@ impl Runs {
                 .name(format!("prepare-{run}"))
                 .spawn(move || {
                     let stoppable = this.service.engine.stoppable(&run);
-                    let outcome = this.prepare(&actor, &run, spec, &stoppable);
+                    // A panic (a thread the container's task cap refused) ends the run FAILED:
+                    // no preparation outlives the thread that would end it.
+                    let prepared = std::panic::AssertUnwindSafe(|| this.prepare(&actor, &run, spec, &stoppable));
+                    let outcome = std::panic::catch_unwind(prepared).unwrap_or_else(|panic| {
+                        let text = panic.downcast_ref::<String>().cloned()
+                            .or_else(|| panic.downcast_ref::<&str>().map(|text| text.to_string()));
+                        Err(refused("preparation_failed", text.unwrap_or_else(|| "the preparation panicked".into())))
+                    });
                     let ended = match outcome {
                         Ok(None) => {
                             if let Some(publisher) = &this.publisher {
