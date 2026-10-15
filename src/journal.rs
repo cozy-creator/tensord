@@ -235,13 +235,7 @@ pub struct AssetBinding {
     pub relative_path: String,
     pub asset_ref: String,
     pub media_type: String,
-    pub checksum: OutputChecksum,
     pub length: u64,
-}
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct OutputChecksum {
-    pub algorithm: String,
-    pub value: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

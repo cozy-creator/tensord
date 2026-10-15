@@ -1259,7 +1259,7 @@ fn conclude(
         "succeeded" => {
             let custody = device_executor::postprocess(&executor.codec(), spool, &reply).and_then(
                 |(value, bindings)| {
-                    engine.managed_result(id, spool, value, output_bindings(bindings)?)
+                    engine.managed_result(id, spool, value, output_bindings(bindings))
                 },
             );
             if let Err(error) = custody {

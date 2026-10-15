@@ -92,9 +92,9 @@ and signed byte fields keep the SDK's `-1` sentinel. Observations never authoriz
 `postprocess(codec, spool, reply)` runs `device_codec.py` with the generation's Python (`-I`, env
 cleared, spool passed as an fd). It reuses the SDK's `encode_frame` and its own
 `blob_path` resolver to encode deferred host frames and bind outputs. Each
-`AssetBinding` carries `output_id`, `asset_ref`, spool `name`, `kind`, `media_type`, `length`,
-`producer_digest` (SDK BLAKE2b) and `sha256`. Rust re-hashes every bound file before returning.
-The root must then take durable custody before reporting success.
+`AssetBinding` carries `output_id`, `asset_ref`, spool `name`, `kind`, `media_type` and `length`;
+neither encoder reads an output's bytes. The root then takes durable custody, which hashes each
+file once as it copies it, before reporting success.
 
 ## Cancellation and lifetime
 

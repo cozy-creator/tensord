@@ -185,19 +185,14 @@ fn stock_executor_reuses_actual_classifier_and_spooled_result() {
             assert_eq!(output.kind, "file");
             assert_eq!(output.media_type, "application/json");
             assert_eq!(output.size_bytes, Some(273));
-            assert!(output.digest.starts_with("blake2b:"));
             assert!(output.asset_ref.starts_with(&format!("attempt:{id}/")));
             let (retained, bindings) =
                 postprocess(&executor.codec(), &root.join(id), &reply).unwrap();
             assert_eq!(retained, result);
             assert_eq!(bindings.len(), 1);
             assert_eq!(bindings[0].asset_ref, output.asset_ref);
-            assert_eq!(bindings[0].producer_digest, output.digest);
             let bytes = fs::read(root.join(id).join(&bindings[0].name)).unwrap();
-            assert_eq!(
-                bindings[0].sha256,
-                tensorfs_core::sha256::hex_digest(&bytes)
-            );
+            assert_eq!(bindings[0].length, bytes.len() as u64);
             let saved: Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(saved["predictions"], json!([0, 2, 1]));
             executor.cancel(id).unwrap(); // stale matching old attempt cannot cancel the next one

@@ -38,7 +38,7 @@ let record = engine.submit(key, invocation)?;   // committed receipt
 engine.dispatch(&record.id, runner_config)?;    // false unless queued
 engine.cancel(&record.id, actor)?;              // durable actor first, then cooperative Cancel
 let open = engine.reconcile()?;                 // no adoption, no replay
-let file = engine.open_result(&record.id, 0)?;  // re-verifies digest and length
+let file = engine.open_result(&record.id, 0)?;  // the held file; its length is checked
 ```
 
 - `RunnerConfig`: trusted `python`, `module`, `import_paths` (`PYTHONPATH`), `generation_hold`.
@@ -112,8 +112,9 @@ An event for another execution fails the attempt. The runner is
 
 After `Result` and a zero exit, each declared file is opened with `openat(O_NOFOLLOW)` per
 component (no absolute, `..` or symlink), checked as a regular file via `O_PATH`, copied to
-`results/<id>/`, SHA-256 hashed, fsynced, made 0400 and renamed. Every `asset_binding` must name
-one held artifact of equal length.
+`results/<id>/`, SHA-256 hashed, made 0400, fsynced and renamed. Every `asset_binding` must name
+one held artifact of equal length. This copy is the one read of an output's bytes: nothing before
+it re-reads them (the encoders bind lengths) and nothing after re-hashes them (reads, collection).
 
 Reclamation: the run's spool (`staging/<id>`, the executor's own output directory) is removed
 before the run's terminal state is written. `results/<id>` is removed when the client releases

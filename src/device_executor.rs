@@ -482,8 +482,6 @@ pub struct Output {
     pub media_type: String,
     #[serde(default)]
     pub size_bytes: Option<u64>,
-    #[serde(default)]
-    pub digest: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1258,8 +1256,6 @@ pub struct AssetBinding {
     pub kind: String,
     pub media_type: String,
     pub length: u64,
-    pub producer_digest: String,
-    pub sha256: String,
 }
 #[derive(Debug, Deserialize)]
 struct PostReply {
@@ -1279,8 +1275,8 @@ pub fn postprocess(
     reply: &Frame,
 ) -> io::Result<(Value, Vec<AssetBinding>)> {
     let result = read_result(spool, reply)?;
-    let directory = File::open(spool)?;
     // A tree is held as its manifest and member files; the encoders bind every other output.
+    // Custody (`Engine::managed_result`) reads each bound file once, hashing as it copies.
     let (trees, files): (Vec<_>, Vec<_>) =
         reply.outputs.iter().cloned().partition(|o| o.kind == "tree");
     let reply = &Frame {
@@ -1294,29 +1290,6 @@ pub fn postprocess(
     for tree in &trees {
         post.bindings.push(tree_binding(spool, tree)?);
     }
-    for binding in &post.bindings {
-        let mut file = open_artifact(spool, Path::new(&binding.name))?;
-        let mut hash = tensorfs_core::sha256::Sha256::new();
-        let mut length = 0;
-        let mut buffer = [0; 64 * 1024];
-        loop {
-            let count = file.read(&mut buffer)?;
-            if count == 0 {
-                break;
-            }
-            hash.update(&buffer[..count]);
-            length += count as u64;
-        }
-        if length != binding.length || tensorfs_core::sha256::hex(&hash.finish()) != binding.sha256
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "SDK-bound encoded bytes changed before custody",
-            ));
-        }
-        file.sync_all()?;
-    }
-    directory.sync_all()?;
     Ok((result, post.bindings))
 }
 /// An output tree as the machine holds it: each regular file of its spool directory linked as
@@ -1374,13 +1347,14 @@ fn tree_binding(spool: &Path, output: &Output) -> io::Result<AssetBinding> {
             name
         }
     };
-    let (sha, length) = hash(Path::new(&name))?;
-    let manifest: Value = serde_json::from_slice(&fs::read(spool.join(&name))?)
-        .map_err(|_| invalid("its manifest is not JSON"))?;
+    let mut bytes = Vec::new();
+    open_artifact(spool, Path::new(&name))?.read_to_end(&mut bytes)?;
+    let manifest: Value = serde_json::from_slice(&bytes).map_err(|_| invalid("its manifest is not JSON"))?;
     let mut content = 0;
     for entry in manifest["entries"].as_array().ok_or_else(|| invalid("no entries"))? {
         let member = format!("sha256-{}", entry["blob"]["sha256"].as_str().unwrap_or_default());
-        if hash(Path::new(&member))?.1 != entry["blob"]["length"].as_u64().unwrap_or(u64::MAX) {
+        let length = open_artifact(spool, Path::new(&member))?.metadata()?.len();
+        if length != entry["blob"]["length"].as_u64().unwrap_or(u64::MAX) {
             return Err(invalid("a member differs from its manifest"));
         }
         content += entry["blob"]["length"].as_u64().unwrap_or_default();
@@ -1394,9 +1368,7 @@ fn tree_binding(spool: &Path, output: &Output) -> io::Result<AssetBinding> {
         name,
         kind: "tree".into(),
         media_type: crate::gpu_service::TREE_MEDIA.into(),
-        length,
-        producer_digest: format!("sha256:{sha}"),
-        sha256: sha,
+        length: bytes.len() as u64,
     })
 }
 
@@ -1487,7 +1459,6 @@ fn encode_native(spool: &Path, reply: &Frame) -> io::Result<Option<Vec<AssetBind
             .custom_flags(libc::O_NOFOLLOW)
             .open(&temporary)?;
         file.write_all(&encoded)?;
-        file.sync_all()?;
         fs::rename(&temporary, spool.join(&name))?;
         media.insert(
             frame.handle.clone(),
@@ -1502,26 +1473,12 @@ fn encode_native(spool: &Path, reply: &Frame) -> io::Result<Option<Vec<AssetBind
     let mut bindings = vec![];
     for output in &reply.outputs {
         let name = blob(&output.asset_ref)?;
-        let mut encoded = Vec::new();
-        open_artifact(spool, Path::new(&name))?.read_to_end(&mut encoded)?;
-        use blake2::digest::{Update, VariableOutput};
-        let mut blake = blake2::Blake2bVar::new(16).map_err(io::Error::other)?;
-        blake.update(&encoded);
-        let mut digest = [0; 16];
-        blake
-            .finalize_variable(&mut digest)
-            .map_err(io::Error::other)?;
-        let producer = format!("blake2b:{}", tensorfs_core::sha256::hex(&digest));
-        // A forwarded child file names its bytes by their SHA-256 (`jobs::grant`).
-        let forwarded = output.digest.strip_prefix("sha256:").is_some_and(|hex| {
-            hex == tensorfs_core::sha256::hex_digest(&encoded)
-        });
-        if !output.digest.is_empty() && output.digest != producer && !forwarded
-            || output.size_bytes.is_some_and(|n| n != encoded.len() as u64)
-        {
+        // Its bytes are read once, by custody; here only their length is bound.
+        let length = open_artifact(spool, Path::new(&name))?.metadata()?.len();
+        if output.size_bytes.is_some_and(|n| n != length) {
             return Err(invalid("SDK output bytes changed before custody"));
         }
-        total += encoded.len() as u64;
+        total += length;
         if reply.max_output_bytes.is_some_and(|limit| total > limit) {
             return Err(invalid(
                 "encoded output exceeds the authored aggregate allowance",
@@ -1536,9 +1493,7 @@ fn encode_native(spool: &Path, reply: &Frame) -> io::Result<Option<Vec<AssetBind
                 .get(&output.asset_ref)
                 .map(|m| m.to_string())
                 .unwrap_or_else(|| output.media_type.clone()),
-            length: encoded.len() as u64,
-            producer_digest: producer,
-            sha256: tensorfs_core::sha256::hex_digest(&encoded),
+            length,
         });
     }
     Ok(Some(bindings))
@@ -2413,7 +2368,6 @@ mod codec_tests {
                     kind: "image".into(),
                     media_type: "image/png".into(),
                     size_bytes: None,
-                    digest: String::new(),
                 }],
                 ..Default::default()
             }
@@ -2430,10 +2384,7 @@ mod codec_tests {
             let bytes = fs::read(spool.join(name)).unwrap();
             assert_eq!(post.bindings[0].name, name);
             assert_eq!(post.bindings[0].media_type, "image/png");
-            assert_eq!(
-                post.bindings[0].sha256,
-                tensorfs_core::sha256::hex_digest(&bytes)
-            );
+            assert_eq!(post.bindings[0].length, bytes.len() as u64);
             assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
         }
         // A refused output is that output's failure; the encoder keeps serving.

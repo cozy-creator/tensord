@@ -4,7 +4,6 @@ Embedded by Rust and started once per executor: one JSON request per stdin line,
 answer per stdout line; it ends on stdin EOF. It imports the selected installed SDK; no
 model or codec implementation is copied.
 """
-import hashlib
 import json
 import os
 import stat
@@ -12,7 +11,6 @@ import sys
 import uuid
 from pathlib import Path
 
-from cozy_runtime.author._assets import digest_bytes
 from cozy_runtime.author._codec import FRAME_MEDIA_TYPES, encode_frame
 
 
@@ -27,13 +25,24 @@ def blob_path(spool, ref):
     return spool / f"{tail[-2]}-{tail[-1]}"
 
 
-def read_regular(directory, name):
+def regular(directory, name):
+    """The spool file `name`'s status: a regular file, never a link or a path elsewhere."""
     if not name or name != os.path.basename(name) or name in (".", ".."):
         raise ValueError("SDK output has no single owned spool name")
     handle = os.open(name, os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory)
     try:
-        if not stat.S_ISREG(os.fstat(handle).st_mode):
+        status = os.fstat(handle)
+        if not stat.S_ISREG(status.st_mode):
             raise ValueError("SDK output is not a regular file")
+        return handle, status
+    except BaseException:
+        os.close(handle)
+        raise
+
+
+def read_regular(directory, name):
+    handle, _ = regular(directory, name)
+    try:
         with open(f"/proc/self/fd/{handle}", "rb") as stream:
             return stream.read()
     finally:
@@ -55,10 +64,7 @@ def encode(request, directory):
                      dir_fd=directory)
         with os.fdopen(fd, "wb") as stream:
             stream.write(encoded)
-            stream.flush()
-            os.fsync(stream.fileno())
         os.rename(temporary, destination.name, src_dir_fd=directory, dst_dir_fd=directory)
-    os.fsync(directory)
     bindings = []
     frames = {frame["handle"]: frame for frame in request["frames"]}
     total = 0
@@ -66,23 +72,20 @@ def encode(request, directory):
         destination = blob_path(spool, output["asset_ref"])
         if destination is None:
             raise ValueError("SDK output has no owned spool binding")
-        encoded = read_regular(directory, destination.name)
-        producer = digest_bytes(encoded)
-        # A forwarded child file names its bytes by their SHA-256 (the machine's jobs::grant).
-        forwarded = output.get("digest") == "sha256:" + hashlib.sha256(encoded).hexdigest()
-        if output.get("digest") and output["digest"] != producer and not forwarded:
-            raise ValueError("SDK producer checksum differs from retained output")
-        if output.get("size_bytes") is not None and output["size_bytes"] != len(encoded):
+        # Its bytes are read once, by the machine's custody; here only their length is bound.
+        handle, status = regular(directory, destination.name)
+        os.close(handle)
+        length = status.st_size
+        if output.get("size_bytes") is not None and output["size_bytes"] != length:
             raise ValueError("SDK output byte length changed")
         frame = frames.get(output["asset_ref"])
         media = FRAME_MEDIA_TYPES[frame["codec"]] if frame else output["media_type"]
-        total += len(encoded)
+        total += length
         if request.get("max_output_bytes") is not None and total > request["max_output_bytes"]:
             raise ValueError("encoded output exceeds the authored aggregate allowance")
         bindings.append({"output_id": output["output_id"], "asset_ref": output["asset_ref"],
                          "name": destination.name, "kind": output["kind"], "media_type": media,
-                         "length": len(encoded), "producer_digest": producer,
-                         "sha256": hashlib.sha256(encoded).hexdigest()})
+                         "length": length})
     return {"bindings": bindings}
 
 

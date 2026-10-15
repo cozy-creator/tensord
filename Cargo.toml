@@ -34,7 +34,6 @@ rcgen = { version = "0.14", features = ["pem", "ring"] }
 base64 = "0.22"
 hmac = "0.12"
 sha2 = "0.10"
-blake2 = "0.10"
 png = "0.17"
 image-webp = "0.2"
 tar = "0.4"
