@@ -211,7 +211,7 @@ impl Objects {
     pub fn adopt(&self, actor: &str, parent: &str, file: &Path, object: &ObjectRef) -> io::Result<()> {
         let _custody = self.guard();
         let _writer = self.writer_guard()?;
-        if self.path(actor, &format!("sha256:{}", object.sha256))?.is_none() {
+        if !crate::products::held(&self.store, object) {
             self.store
                 .put_file(file, Some(object), &Fault::default())
                 .map_err(io::Error::other)?;
@@ -455,7 +455,7 @@ mod tests {
             artifacts: vec![crate::journal::Artifact { name: "file-0001".into(), path: String::new(), sha256: hex.clone(), length: 6 }],
             asset_bindings: vec![crate::journal::AssetBinding {
                 relative_path: "file-0001".into(), asset_ref: "attempt:1/file/0001".into(), media_type: "text/plain".into(),
-                checksum: crate::journal::OutputChecksum { algorithm: "sha256".into(), value: hex.clone() }, length: 6,
+                length: 6,
             }],
         };
         let engine = service.engine.clone();

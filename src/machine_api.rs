@@ -228,7 +228,6 @@ impl NativeBackend {
                     .engine
                     .open_result(&record.id, index)
                     .map_err(problem)?;
-                verify_checksum(&mut source, binding)?;
                 let native = crate::products::retain(
                     &self.store,
                     &self.service.engine,
@@ -951,55 +950,6 @@ impl MachineBackend for NativeBackend {
 pub fn actor_id(actor: VerifiedActor) -> String {
     sha256::hex(&actor.public_key)
 }
-fn verify_checksum(
-    source: &mut std::fs::File,
-    binding: &crate::journal::AssetBinding,
-) -> Result<(), Status> {
-    use blake2::digest::{Update, VariableOutput};
-    let mut blake = blake2::Blake2bVar::new(16)
-        .map_err(|_| Status::internal("checksum configuration invalid"))?;
-    let mut sha = sha256::Sha256::new();
-    let mut length = 0;
-    let mut buffer = [0; 64 * 1024];
-    loop {
-        let count = source.read(&mut buffer).map_err(problem)?;
-        if count == 0 {
-            break;
-        }
-        match binding.checksum.algorithm.as_str() {
-            "blake2b-128" => Update::update(&mut blake, &buffer[..count]),
-            "sha256" => sha.update(&buffer[..count]),
-            _ => {
-                return Err(Status::unimplemented(
-                    "producer output checksum algorithm is unavailable",
-                ))
-            }
-        }
-        length += count as u64;
-    }
-    let digest = match binding.checksum.algorithm.as_str() {
-        "blake2b-128" => {
-            let mut bytes = [0; 16];
-            blake
-                .finalize_variable(&mut bytes)
-                .map_err(|_| Status::internal("checksum finalization invalid"))?;
-            sha256::hex(&bytes)
-        }
-        "sha256" => sha256::hex(&sha.finish()),
-        _ => {
-            return Err(Status::unimplemented(
-                "producer output checksum algorithm is unavailable",
-            ))
-        }
-    };
-    source.seek(SeekFrom::Start(0)).map_err(problem)?;
-    if length != binding.length || digest != binding.checksum.value {
-        return Err(Status::data_loss(
-            "SDK output checksum differs from held result bytes",
-        ));
-    }
-    Ok(())
-}
 fn canonical(value: &Value) -> Result<Vec<u8>, Status> {
     serde_json_canonicalizer::to_vec(value)
         .map_err(|_| Status::invalid_argument("JSON value is outside canonical profile"))
@@ -1529,7 +1479,7 @@ print(json.dumps({"identity": generation.identity}))
                         &id,
                         &spool,
                         value,
-                        crate::gpu_service::output_bindings(bindings)?,
+                        crate::gpu_service::output_bindings(bindings),
                     )?;
                     executor.shutdown()
                 })();

@@ -50,9 +50,13 @@ pub fn retain(
         source_artifact::Writer::open(store, owner, tree.object_ref().map_err(storage)?)
             .map_err(storage)?;
     if !writer.completed().map_err(storage)? {
-        store
-            .put_stream(source, Some(object), &Fault::default())
-            .map_err(storage)?;
+        // Bytes the store already holds verified (a product published while the run made
+        // it, a memoized or child result) are not read again.
+        if !held(store, object) {
+            store
+                .put_stream(source, Some(object), &Fault::default())
+                .map_err(storage)?;
+        }
         writer.landed(object).map_err(storage)?;
     }
     let root = writer.finish(&tree).map_err(storage)?;
@@ -71,6 +75,11 @@ pub fn retain(
     };
     engine.bind_native_output(actor, owner, &crate::archive::encode_native_byte_retention_request(&native))?;
     Ok(native)
+}
+
+/// The store holds `object`'s exact bytes and trusts them without hashing them again.
+pub(crate) fn held(store: &Store, object: &ObjectRef) -> bool {
+    store.record_valid(&object.sha256).is_ok_and(|row| row.length == object.length)
 }
 
 fn unhex(text: &str) -> io::Result<Vec<u8>> {

@@ -12,7 +12,7 @@ use crate::{
     gpu_allocation::Claims,
     host_tier::{HostGrant, HostTier, HostTierConfig, SealedRequest},
     journal::{
-        AssetBinding, Execution, Failure, Outcome, OutputChecksum, Preparation, ProcessBirth, State,
+        AssetBinding, Execution, Failure, Outcome, Preparation, ProcessBirth, State,
     },
     launch_identity::Seal,
     memory::{
@@ -3306,7 +3306,7 @@ impl Pool {
                 let result = (|| {
                     let (value, bindings) =
                         device_executor::postprocess(&session.executor.codec(), &spool, &reply)?;
-                    engine.managed_result(id, &spool, value, output_bindings(bindings)?)
+                    engine.managed_result(id, &spool, value, output_bindings(bindings))
                 })();
                 if let Err(error) = result {
                     // The invocation is already quiescent; a codec/custody
@@ -4040,13 +4040,13 @@ fn copy_held(
         0o444,
     )
     .open(local)?;
+    // A scratch copy the attempt reads: its spool goes with the attempt, so it is never synced.
     if std::io::copy(&mut source, &mut copy)? != length {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "an input's held bytes changed length",
         ));
     }
-    copy.sync_all()?;
     if let Some(identity) = identity {
         identity.readable(local)?;
     }
@@ -4180,33 +4180,14 @@ pub(crate) fn keep_triage(
     );
 }
 
-pub(crate) fn output_bindings(
-    bindings: Vec<device_executor::AssetBinding>,
-) -> io::Result<Vec<AssetBinding>> {
+pub(crate) fn output_bindings(bindings: Vec<device_executor::AssetBinding>) -> Vec<AssetBinding> {
     bindings
         .into_iter()
-        .map(|binding| {
-            let (algorithm, value) =
-                if let Some(value) = binding.producer_digest.strip_prefix("blake2b:") {
-                    ("blake2b-128", value)
-                } else if let Some(value) = binding.producer_digest.strip_prefix("sha256:") {
-                    ("sha256", value)
-                } else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "SDK output checksum operation unavailable",
-                    ));
-                };
-            Ok(AssetBinding {
-                relative_path: binding.name,
-                asset_ref: binding.asset_ref,
-                media_type: binding.media_type,
-                checksum: OutputChecksum {
-                    algorithm: algorithm.into(),
-                    value: value.into(),
-                },
-                length: binding.length,
-            })
+        .map(|binding| AssetBinding {
+            relative_path: binding.name,
+            asset_ref: binding.asset_ref,
+            media_type: binding.media_type,
+            length: binding.length,
         })
         .collect()
 }

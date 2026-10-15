@@ -1050,7 +1050,6 @@ impl Engine {
                 length += count as u64;
             }
             let digest = tensorfs_core::sha256::hex(&hash.finish());
-            output.sync_all()?;
             output.set_permissions(fs::Permissions::from_mode(0o400))?;
             output.sync_all()?;
             let filename = format!("{index}-{digest}");
@@ -1071,7 +1070,7 @@ impl Engine {
         })
     }
 
-    /// Reads validate content identity; same-UID package execution is not a security sandbox.
+    /// A held result file. Custody hashed it once as it took it (`custody`); a read serves it.
     pub fn open_result(&self, id: &str, index: usize) -> io::Result<File> {
         let record = self.get(id)?;
         let artifact = record
@@ -1083,28 +1082,13 @@ impl Engine {
                     "durable result artifact is unavailable",
                 )
             })?;
-        let mut file = open_artifact(&self.root, Path::new(&artifact.path))?;
-        let mut hash = tensorfs_core::sha256::Sha256::new();
-        let mut length = 0;
-        let mut buffer = [0; 64 * 1024];
-        loop {
-            let count = file.read(&mut buffer)?;
-            if count == 0 {
-                break;
-            }
-            hash.update(&buffer[..count]);
-            length += count as u64;
-        }
-        if length != artifact.length
-            || tensorfs_core::sha256::hex(&hash.finish()) != artifact.sha256
-        {
+        let file = open_artifact(&self.root, Path::new(&artifact.path))?;
+        if file.metadata()?.len() != artifact.length {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "durable result content changed",
             ));
         }
-        use std::io::Seek;
-        file.rewind()?;
         Ok(file)
     }
 }
@@ -1300,7 +1284,6 @@ mod tests {
             relative_path: "prediction".into(),
             asset_ref: "attempt:run/file/0".into(),
             media_type: "text/plain".into(),
-            checksum: crate::journal::OutputChecksum { algorithm: "sha256".into(), value: String::new() },
             length,
         };
         let run = |key: &str, place: fn(&Path)| {
