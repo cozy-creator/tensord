@@ -1127,6 +1127,67 @@ mod v1_api {
         let _ = fs::remove_dir_all(tools);
     }
 
+    /// A one-tensor checkpoint a model slot constructs from: one inline config.
+    fn constructible(store: &tensorfs_core::store::Store) -> tensorfs_core::ids::ObjectRef {
+        use tensorfs_core::{dtype::Dtype, header::{Body, Closure, Header, Part, Tensor}, manifest::{Draft, Entry}};
+        let put = |bytes: &[u8]| store.put_stream(&mut &bytes[..], None, &Default::default()).unwrap().obj;
+        let spec = tensorfs_core::registry::seeds().into_iter().find(|seed| seed.alias == "plain/1").unwrap().spec;
+        let part = Part { dtype: Dtype::F32, shape: vec![2048], body: Body::Segments(vec![put(&[5; 8192])]) };
+        let tensor = Tensor { dtype: Dtype::F32, shape: vec![2048], encoding: spec.object_id(), parts: vec![("value".into(), part)] };
+        let header = Header { configs: vec![("config".into(), b"{}".to_vec())], assets: vec![], encodings: vec![spec],
+            components: vec![("model".into(), vec![("weight".into(), tensor)])] };
+        header.validate(&Closure::default()).unwrap();
+        let header = put(&header.canonical_bytes().unwrap());
+        let manifest = Draft { entries: vec![("model.cozytensors".into(), Entry::CozyTensors(header))] }.seal().unwrap();
+        store.put_manifest(&manifest).unwrap().obj
+    }
+
+    /// Run 6353: a CPU job run with `--gpus 2` holds both GPUs, and its children, whose model
+    /// slot declares one GPU, run on one each. The caller's count caps a child's group; it is
+    /// never refused.
+    #[tokio::test]
+    #[ignore = "GPU: two cards (a rental)"]
+    async fn on_two_gpus_a_jobs_gpu_count_caps_its_one_gpu_children() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let tools = std::env::temp_dir().join(format!("cm-tools-{}", uuid::Uuid::new_v4()));
+        assert!(Command::new("uv").current_dir(repo).args(["build", "--wheel", "--out-dir"]).arg(&tools)
+            .status().unwrap().success());
+        let home = tools.join("executor-home");
+        fs::create_dir_all(&home).unwrap();
+        let config = tools.join("gpu.json");
+        let mut args = installing_args(&tools);
+        args.extend(["--gpu-config".into(), config.clone().into_os_string()]);
+        let machine = Machine::start_args(|state, _| {
+            let store = tensorfs_core::store::Store::ensure(&state.join("tensorfs")).unwrap();
+            let manifest = constructible(&store);
+            fs::write(&config, serde_json::json!({"devices": "0,1", "environment": {
+                "PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": home},
+                "models": [{"package": "local/tensord-gpu-children", "slot": "modeled.models.model",
+                    "repository": "local/tiny", "release": "1", "lane": "f32",
+                    "manifest": manifest.id(), "components": ["model"]}]}).to_string()).unwrap();
+        }, &args).await;
+        let mut client = client(&machine).await;
+        let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
+        let manifest = write_package(&mut client, &all, "gpu_children", "local/tensord-gpu-children").await;
+        let spec = v1::RunSpec {
+            kind: v1::RunKind::Job as i32,
+            source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
+            entrypoint: "cpu_job".into(),
+            payload: serde_json::to_vec(&serde_json::json!({"hold_s": 0.5})).unwrap(),
+            owner: "alice".into(),
+            gpus: 2,
+            ..Default::default()
+        };
+        let request = authorized(v1::RunRequest { id: "job-2".into(), after: 0, spec: Some(spec) }, &all);
+        let done = outcome(&collect(client.run(request).await.unwrap().into_inner()).await.unwrap());
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+        let children = result["children"].as_array().unwrap();
+        assert_eq!(children.len(), 2, "{result}");
+        assert!(children.iter().all(|c| c["device"].as_str().unwrap().starts_with("cuda")), "{result}");
+        let _ = fs::remove_dir_all(tools);
+    }
+
     /// `cozy model upload local/tiny acme/tiny` under the run's capability (th-241): the spec
     /// names the Hub and carries the owner's device-key-signed capability for this machine's
     /// leaf; the machine trades it once at the upload and AuthKit verifies every proof. With no

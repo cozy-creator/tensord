@@ -1,0 +1,16 @@
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13"]
+build-backend = "uv_build"
+
+[project]
+name = "tensord-gpu-children"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = ["cozy-runtime>=0.24.2,<0.25", "torch==2.14.0", "triton==3.8.0", "msgspec>=0.19"]
+
+[project.entry-points."cozy.application"]
+default = "gpu_children:app"
+
+[tool.uv.build-backend]
+module-name = "gpu_children"
+module-root = ""
