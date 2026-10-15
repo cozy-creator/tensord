@@ -644,7 +644,7 @@ impl Runs {
                     refused("capability_unavailable", "this machine installs no local packages")
                 })?;
                 let installed = local.install(&self.service, actor, digest, Some(&stoppable.stop))?;
-                self.supersede(actor, &installed)?;
+                self.service.supersede(actor, &installed)?;
                 local.collect(actor, &installed.package);
                 Some(installed)
             }
@@ -910,7 +910,7 @@ impl Runs {
             }
             Source::Local(_) | Source::Models => false,
         };
-        let (removed, reclaimed, retained) = self.uninstall(actor, named)?;
+        let (removed, reclaimed, retained) = self.service.uninstall(actor, named)?;
         if let Some(local) = &self.local {
             for gone in removed.iter().filter(|i| i.package.starts_with("local/")) {
                 local.collect(actor, &gone.package);
@@ -925,53 +925,6 @@ impl Runs {
             artifacts: vec![],
             asset_bindings: vec![],
         })
-    }
-
-    /// `actor`'s installations `named` leave the journal, their warm set members and the GPU
-    /// pool. Each environment no installation or unfinished run names any more is deleted,
-    /// its idle executors ended first; one a process still holds is `retained` for reclaim.
-    fn uninstall(
-        &self,
-        actor: &str,
-        named: impl Fn(&Installation) -> bool,
-    ) -> Result<(Vec<Installation>, u64, Vec<String>), Refused> {
-        let engine = &self.service.engine;
-        let mut removed = vec![];
-        for installed in engine.installations(actor)?.into_iter().filter(|i| named(i)) {
-            if let Some(gone) = engine.with_journal(|j| j.remove_installation(actor, &installed.alias))? {
-                removed.push(gone);
-            }
-        }
-        let generations: std::collections::BTreeSet<String> = removed.iter().map(|i| i.generation.clone()).collect();
-        if let Some(gpu) = self.service.gpu() {
-            gpu.drop_members(actor, &generations);
-        }
-        let bound = engine.with_journal(|j| j.bound_generations())?;
-        let (mut reclaimed, mut retained) = (0u64, vec![]);
-        for generation in generations.iter().filter(|g| !bound.contains(*g)) {
-            if let Some(gpu) = self.service.gpu() {
-                gpu.end_generation(generation);
-            }
-            match crate::reclaim::remove_generation(self.service.catalog.root(), generation)? {
-                Some(bytes) => reclaimed += bytes,
-                None => retained.push(generation.clone()),
-            }
-        }
-        Ok((removed, reclaimed, retained))
-    }
-
-    /// A local package is one installation: the state just installed replaces its earlier
-    /// ones, whose executors end and environments' records leave. One an unfinished run names
-    /// stays until a later install finds it idle.
-    fn supersede(&self, actor: &str, current: &Installation) -> Result<(), Refused> {
-        let running = self.service.engine.with_journal(|j| j.running_generations())?;
-        self.uninstall(actor, |prior| {
-            prior.package == current.package
-                && prior.alias != current.alias
-                && prior.alias.starts_with("local-")
-                && !running.contains(&prior.generation)
-        })?;
-        Ok(())
     }
 
     /// The run's installation and model plan: through the Hub when it needs one (a release,

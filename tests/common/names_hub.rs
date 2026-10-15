@@ -1,4 +1,4 @@
-//! A loopback Hub that answers by name (th-245): one package's card, release, locked
+//! A loopback Hub that answers by name (th-245): one package's card, each release's card, locked
 //! requirements and file door, and one model's closure by name, release and lane (its hash only
 //! to a credentialed caller), presign and objects, with ranges. It records every request.
 #![allow(dead_code)]
@@ -40,7 +40,8 @@ struct Served {
     model: Model,
     objects: Vec<ObjectRef>,
     bytes: HashMap<String, Vec<u8>>,
-    package: Option<Package>,
+    /// Releases of one package.
+    packages: Vec<Package>,
     origin: String,
     heard: Arc<Mutex<Vec<String>>>,
     /// How long each object answer takes, as a slow link's would.
@@ -51,12 +52,17 @@ struct Served {
 /// when it carried one.
 pub type Heard = Arc<Mutex<Vec<String>>>;
 
-pub fn serve(store: &Store, model: Model, package: Option<Package>) -> (String, Heard) {
-    paced(store, model, package, std::time::Duration::ZERO)
+pub fn serve(store: &Store, model: Model, packages: impl IntoIterator<Item = Package>) -> (String, Heard) {
+    paced(store, model, packages, std::time::Duration::ZERO)
 }
 
 /// `serve`, each object answering after `pace`.
-pub fn paced(store: &Store, model: Model, package: Option<Package>, pace: std::time::Duration) -> (String, Heard) {
+pub fn paced(
+    store: &Store,
+    model: Model,
+    packages: impl IntoIterator<Item = Package>,
+    pace: std::time::Duration,
+) -> (String, Heard) {
     let document = store.read_manifest(&model.manifest).unwrap();
     let walked = tensorfs_core::checkpoint::walk_cozytensors(store, &document).unwrap();
     let objects: Vec<ObjectRef> =
@@ -74,7 +80,7 @@ pub fn paced(store: &Store, model: Model, package: Option<Package>, pace: std::t
         model,
         objects,
         bytes,
-        package,
+        packages: packages.into_iter().collect(),
         origin: format!("http://127.0.0.1:{port}"),
         heard: heard.clone(),
         pace,
@@ -149,33 +155,34 @@ async fn answer(State(served): State<Arc<Served>>, method: Method, uri: Uri, hea
     }
     served.heard.lock().unwrap().push(heard);
     let model = &served.model;
-    let package = served.package.as_ref();
-    let release_path = package.map(|p| format!("/v1/packages/{}/releases/{}", p.name, p.release)).unwrap_or_default();
+    let first = served.packages.first();
+    let release_path = |p: &Package| format!("/v1/packages/{}/releases/{}", p.name, p.release);
+    let release = served.packages.iter().find(|p| path == release_path(p));
+    let locked = served.packages.iter().find(|p| path == format!("{}/locked-requirements", release_path(p)));
+    let door = served.packages.iter().flat_map(doors).find(|(_, door, _)| *door == path);
     match (method, path.as_str()) {
-        (Method::GET, p) if package.is_some_and(|package| p == format!("/v1/packages/{}", package.name)) => {
-            let package = package.unwrap();
-            json(json!({"package": package.name, "releases": [
-                {"release": package.release}, {"release": "0.9.0"}, {"release": "9.0.0", "yanked": true}]}))
+        (Method::GET, p) if first.is_some_and(|package| p == format!("/v1/packages/{}", package.name)) => {
+            let mut releases: Vec<Value> = served.packages.iter().map(|p| json!({"release": p.release})).collect();
+            releases.extend([json!({"release": "0.9.0"}), json!({"release": "9.0.0", "yanked": true})]);
+            json(json!({"package": first.unwrap().name, "releases": releases}))
         }
-        (Method::GET, p) if p == release_path => {
-            let package = package.unwrap();
+        (Method::GET, _) if release.is_some() => {
+            let package = release.unwrap();
             json(json!({"release": {"release": package.release}, "package_interface": package.interface,
                 "python_version": "3.12"}))
         }
-        (Method::GET, p) if p == format!("{release_path}/locked-requirements") => {
-            let lock: String = doors(package.unwrap())
+        (Method::GET, _) if locked.is_some() => {
+            let package = locked.unwrap();
+            let lock: String = doors(package)
                 .map(|(distribution, door, bytes)| {
                     let sha = tensorfs_core::sha256::hex_digest(bytes);
                     format!("{distribution} @ {}{door} --hash=sha256:{sha}\n", served.origin)
                 })
                 .collect::<String>()
-                + &package.unwrap().pypi;
+                + &package.pypi;
             (StatusCode::OK, lock).into_response()
         }
-        (Method::GET, p) if package.is_some_and(|package| doors(package).any(|(_, door, _)| door == p)) => {
-            let (_, _, bytes) = doors(package.unwrap()).find(|(_, door, _)| door == p).unwrap();
-            ranged(bytes, &headers)
-        }
+        (Method::GET, _) if door.is_some() => ranged(door.unwrap().2, &headers),
         (Method::POST, "/v1/tensorfs/closure") => {
             let refspec = asked["ref"].as_str().unwrap_or_default();
             let lane = asked["lane"].as_str().unwrap_or_default();

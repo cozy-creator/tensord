@@ -1278,6 +1278,145 @@ mod v1_api {
         let _ = fs::remove_dir_all(tools);
     }
 
+    /// An update supersedes: the release a caller installs replaces its other releases of the
+    /// package at that Hub, whose idle executor ends and whose GPU weights leave at the install,
+    /// so the new release's request gets the whole budget. Klein bench (runs 7772, 7779): 0.1.0's
+    /// idle executor kept its VRAM after 0.2.0 installed beside it, whose executor got a 0.4 GiB
+    /// budget and paged 18.6 GiB on every request.
+    #[tokio::test]
+    #[ignore = "GPU: one card (a rental)"]
+    async fn an_installed_release_supersedes_the_older_ones_gpu_and_all() {
+        const WEIGHT_MIB: u64 = 256;
+        const FIXTURE: (&str, &str) = ("gpu_children", "tensord-gpu-children");
+        let tools = std::env::temp_dir().join(format!("cm-tools-{}", uuid::Uuid::new_v4()));
+        assert!(Command::new("uv").current_dir(env!("CARGO_MANIFEST_DIR")).args(["build", "--wheel", "--out-dir"]).arg(&tools)
+            .status().unwrap().success());
+        let home = tools.join("executor-home");
+        fs::create_dir_all(&home).unwrap();
+        let config = tools.join("gpu.json");
+        fs::write(&config, serde_json::json!({"devices": "0", "environment": {
+            "PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": home}}).to_string()).unwrap();
+        let mut args = installing_args(&tools);
+        args.extend(["--gpu-config".into(), config.into_os_string()]);
+        let machine = Machine::start_args(|_, _| (), &args).await;
+        let mut client = client(&machine).await;
+        let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
+        // The release's interface as the machine describes the code it installs.
+        let local = write_package(&mut client, &all, FIXTURE.0, &format!("local/{}", FIXTURE.1)).await;
+        let install = v1::RunSpec { kind: v1::RunKind::Warm as i32, owner: "alice".into(),
+            source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest: local })), ..Default::default() };
+        assert_eq!(settle(&mut client, &all, "describe", install).await.status, "succeeded");
+        let generation = fs::read_dir(machine.root.join("state/generations")).unwrap().flatten()
+            .find_map(|g| fs::read(g.path().join("generation.json")).ok()).unwrap();
+        let interface = serde_json::from_slice::<serde_json::Value>(&generation).unwrap()["interface"].clone();
+        let built = tools.join("hub-wheels");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(FIXTURE.0);
+        assert!(Command::new("uv").args(["build", "--wheel", "--out-dir"]).arg(&built).arg(&fixture).status().unwrap().success());
+        let wheel = fs::read_dir(&built).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|e| e == "whl")).unwrap();
+        let requirements = fs::read_to_string(fixture.join("pyproject.toml")).unwrap();
+        let requirements = requirements.split("dependencies = [").nth(1).unwrap().split(']').next().unwrap()
+            .split('"').skip(1).step_by(2).collect::<Vec<_>>().join("\n");
+        let pypi = Command::new("uv").args(["pip", "compile", "--generate-hashes", "--no-header", "--quiet", "--python-version", "3.12", "-"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().and_then(|mut child| {
+                use std::io::Write as _;
+                child.stdin.take().unwrap().write_all(requirements.as_bytes())?;
+                child.wait_with_output()
+            }).unwrap();
+        assert!(pypi.status.success());
+        let source = std::env::temp_dir().join(format!("cm-update-{}", uuid::Uuid::new_v4()));
+        let store = tensorfs_core::store::Store::ensure(&source).unwrap();
+        let model = names_hub::Model { repository: "acme/weight".into(), release: "1".into(), lane: "f32".into(),
+            manifest: constructible(&store, (WEIGHT_MIB << 18) as usize) };
+        let release = |release: &str| names_hub::Package {
+            name: format!("acme/{}", FIXTURE.1), release: release.into(), interface: interface.clone(),
+            wheel: wheel.file_name().unwrap().to_str().unwrap().into(), bytes: fs::read(&wheel).unwrap(), callees: vec![],
+            pypi: String::from_utf8(pypi.stdout.clone()).unwrap(),
+        };
+        let (origin, _) = names_hub::serve(&store, model, [release("0.1.0"), release("0.2.0")]);
+        let spec = |kind: v1::RunKind, release: &str, entrypoint: &str| v1::RunSpec {
+            kind: kind as i32, entrypoint: entrypoint.into(), owner: "alice".into(),
+            source: Some(v1::run_spec::Source::Release(v1::Release { package: format!("acme/{}", FIXTURE.1), release: release.into() })),
+            models: vec![v1::ModelChoice { parameter: "model".into(), repository: "acme/weight".into(),
+                release: "1".into(), lane: "f32".into(), ..Default::default() }],
+            hub: Some(v1::HubAccess { origin: origin.clone(), object_hosts: vec!["localhost".into()], ..Default::default() }),
+            catalog_revision: "r1".into(),
+            ..Default::default()
+        };
+        let (pid, idle_fds) = (machine.child.id(), driver_fds(machine.child.id()));
+
+        // 0.1.0 warm: its executor maps the weights, and custody keeps them once measured.
+        let mut old = 0;
+        for id in ["old-1", "old-2"] {
+            let done = settle(&mut client, &all, id, spec(v1::RunKind::Call, "0.1.0", "resident")).await;
+            assert_eq!(done.status, "succeeded", "{done:?}");
+            old = serde_json::from_slice::<serde_json::Value>(&done.result).unwrap()["pid"].as_u64().unwrap();
+        }
+        assert!(driver_fds(pid) > idle_fds, "custody kept none of 0.1.0's weights");
+
+        // Installing 0.2.0 supersedes 0.1.0: its executor and GPU weights go before 0.2.0 runs.
+        let done = settle(&mut client, &all, "update", spec(v1::RunKind::Warm, "0.2.0", "")).await;
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        assert!(!Path::new(&format!("/proc/{old}")).exists(), "0.1.0's idle executor outlived the update");
+        assert_eq!(driver_fds(pid), idle_fds, "custody still holds 0.1.0's weights");
+        let releases: Vec<String> = status_frame(&mut client, &all).await.environments.into_iter()
+            .filter(|e| e.package == format!("acme/{}", FIXTURE.1)).map(|e| e.release).collect();
+        assert_eq!(releases, ["0.2.0"]);
+
+        // Its request gets the whole budget: every weight resident, nothing paged out.
+        let done = settle(&mut client, &all, "new", spec(v1::RunKind::Call, "0.2.0", "resident")).await;
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        let measured: serde_json::Value = serde_json::from_slice(&done.measurements).unwrap();
+        let memory = &measured["memory"];
+        assert!(memory["budget_bytes"].as_u64() >= memory["weights_bytes"].as_u64(), "{memory}");
+        assert_eq!((memory["paged_out_bytes"].as_u64().unwrap_or(0), memory["evictions"].as_u64().unwrap_or(0)), (0, 0), "{memory}");
+        let _ = fs::remove_dir_all(source);
+        let _ = fs::remove_dir_all(tools);
+    }
+
+    /// A writer's weights output reaches its run's destination, the requester's repository, under
+    /// the run's capability; the publication is a call event of the run.
+    #[tokio::test]
+    #[ignore = "real AuthKit: needs go and AUTHKIT_TEST_DATABASE_URL"]
+    async fn a_writers_weights_output_reaches_its_destination() {
+        let (upstream, hub) = hub_oauth::test_hub();
+        let authkit = hub_oauth::AuthKit::start(&upstream);
+        let (machine, tools) = installing_machine().await;
+        let jkt = leaf_jkt(&machine);
+        let mut client = client(&machine).await;
+        let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
+        let manifest = write_package(&mut client, &all, "cpu_weights", "local/tensord-cpu-weights").await;
+        let ops = serde_json::json!([{"type": "tensorhub_model_publish", "model": "acme/tiny"}]);
+        let spec = v1::RunSpec {
+            kind: v1::RunKind::Call as i32,
+            source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
+            entrypoint: "table".into(),
+            payload: br#"{"size":128}"#.to_vec(),
+            weights_destination: "acme/tiny".into(),
+            hub: Some(v1::HubAccess {
+                origin: authkit.hub.clone(),
+                object_hosts: vec!["localhost".into()],
+                capability: authkit.capability(&jkt, &ops, 600),
+                token_endpoint: authkit.token_endpoint.clone(),
+                ..Default::default()
+            }),
+            owner: "alice".into(),
+            ..Default::default()
+        };
+        let request = v1::RunRequest { id: "published-table".into(), after: 0, spec: Some(spec) };
+        let events = collect(client.run(authorized(request, &all)).await.unwrap().into_inner()).await.unwrap();
+        let done = outcome(&events);
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        let written = done.outputs.iter().find(|p| p.output == "model").unwrap();
+        assert_eq!(hub.lock().unwrap().finalized, std::slice::from_ref(&written.digest));
+        let uploads: Vec<_> = events.iter().filter_map(|e| match &e.event {
+            Some(v1::run_event::Event::Call(call)) if call.function.ends_with("upload_checkpoint") => Some(call.status.clone()),
+            _ => None,
+        }).collect();
+        assert_eq!(uploads, ["succeeded"]);
+        assert_eq!(authkit.exchanges(), 1, "one trade for the run");
+        let _ = fs::remove_dir_all(tools);
+    }
+
     /// `cozy model upload local/tiny acme/tiny` under the run's capability (th-241): the spec
     /// names the Hub and carries the owner's device-key-signed capability for this machine's
     /// leaf; the machine trades it once at the upload and AuthKit verifies every proof. With no

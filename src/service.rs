@@ -3,7 +3,7 @@ use crate::{
     catalog::Catalog,
     execution::{process_ended, Engine},
     gpu_service::{GpuPool, KeptMember, Level, Member},
-    journal::{Execution, ProcessBirth, SubmissionContext},
+    journal::{Execution, Installation, ProcessBirth, SubmissionContext},
 };
 use serde_json::Value;
 use std::{
@@ -363,6 +363,53 @@ impl Service {
             self.engine.wait_activity(epoch, Some(SWEEP_EVERY));
         }
     }
+    /// `actor`'s installations `named` leave the journal, the warm sets and the pool. Each
+    /// environment no installation or unfinished run names any more is deleted, its idle
+    /// executors and GPU weights let go first; one a process still holds is `retained` for reclaim.
+    pub fn uninstall(
+        &self,
+        actor: &str,
+        named: impl Fn(&Installation) -> bool,
+    ) -> io::Result<(Vec<Installation>, u64, Vec<String>)> {
+        let mut removed = vec![];
+        for installed in self.engine.installations(actor)?.into_iter().filter(|i| named(i)) {
+            if let Some(gone) = self.engine.with_journal(|j| j.remove_installation(actor, &installed.alias))? {
+                removed.push(gone);
+            }
+        }
+        let generations: BTreeSet<String> = removed.iter().map(|i| i.generation.clone()).collect();
+        let pool = self.gpu();
+        if let Some(pool) = &pool {
+            pool.drop_members(actor, &generations);
+        }
+        let bound = self.engine.with_journal(|j| j.bound_generations())?;
+        let (mut reclaimed, mut retained) = (0u64, vec![]);
+        for generation in generations.iter().filter(|g| !bound.contains(*g)) {
+            if let Some(pool) = &pool {
+                pool.end_generation(generation);
+            }
+            match crate::reclaim::remove_generation(self.catalog.root(), generation)? {
+                Some(bytes) => reclaimed += bytes,
+                None => retained.push(generation.clone()),
+            }
+        }
+        Ok((removed, reclaimed, retained))
+    }
+
+    /// The caller holds one installation of a package per Hub: the one just installed (a local
+    /// state, or a release) replaces the others, whose executors and GPU weights go now. One an
+    /// unfinished run names stays until a later install finds it idle.
+    pub fn supersede(&self, actor: &str, current: &Installation) -> io::Result<()> {
+        let running = self.engine.with_journal(|j| j.running_generations())?;
+        self.uninstall(actor, |prior| {
+            prior.package == current.package
+                && prior.hub == current.hub
+                && prior.alias != current.alias
+                && !running.contains(&prior.generation)
+        })?;
+        Ok(())
+    }
+
     /// Caches manage themselves (`reclaim`): a TTL and a low disk, never a purge verb.
     pub fn reclaim(&self) -> crate::reclaim::Swept {
         *self.swept.lock().unwrap() = std::time::Instant::now();

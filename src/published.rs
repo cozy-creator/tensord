@@ -859,7 +859,8 @@ impl Publisher {
 
     /// The request's release installed for this signer: its card and locked requirements read
     /// at its Hub by name (th-245), the Hub's newest release when it names none. An installation
-    /// of that release this signer holds already is the answer.
+    /// of that release this signer holds already is the answer; a new one supersedes
+    /// its other releases.
     fn install(
         &self,
         service: &Service,
@@ -918,7 +919,7 @@ impl Publisher {
             gpu.kernel_boot(held.clone());
             gpu.prespawn(held.clone());
         }
-        service
+        let installed = service
             .engine
             .bind_installation(Installation {
                 actor: actor.into(),
@@ -930,7 +931,9 @@ impl Publisher {
                     .map_err(|e| io_failure(io::Error::other(e)))?,
                 hub: hub::origin_key(&request.source.origin).unwrap_or_default(),
             })
-            .map_err(io_failure)
+            .map_err(io_failure)?;
+        service.supersede(actor, &installed).map_err(io_failure)?;
+        Ok(installed)
     }
 
     /// Builds one immutable environment at its final path (its interpreter embeds the path);
