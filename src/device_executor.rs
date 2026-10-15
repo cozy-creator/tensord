@@ -939,7 +939,7 @@ impl Answer {
     pub fn refused(seq: u64, code: &str, detail: impl Into<String>) -> Self {
         Self {
             code: code.into(),
-            detail: detail.into().chars().take(1024).collect(),
+            detail: crate::triage::ends(&Into::<String>::into(detail), 1024),
             ..Self::unavailable(seq)
         }
     }

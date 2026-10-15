@@ -1199,7 +1199,7 @@ impl Publisher {
         let detail = detail[detail.len().saturating_sub(12)..].join(" | ");
         Ok(format!(
             "this machine's own Runtime and TensorFS did not install ({code}: {}); it runs the release's locked {}",
-            detail.chars().take(2000).collect::<String>(),
+            crate::triage::ends(&detail, 2000),
             rows.join(", ")
         ))
     }

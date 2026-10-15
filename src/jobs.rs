@@ -1011,7 +1011,7 @@ impl Jobs {
                     .map_err(|error| ("failure_record_invalid", error.to_string()))?;
                 answer.ok = false;
                 answer.code = failure.code;
-                answer.detail = failure.message.chars().take(1024).collect();
+                answer.detail = crate::triage::ends(&failure.message, 1024);
             }
             State::Canceled => {
                 answer.ok = false;

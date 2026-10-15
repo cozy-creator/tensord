@@ -429,11 +429,11 @@ impl NativeBackend {
             .map_err(|_| Status::data_loss("durable event projection is corrupt"))
     }
 }
-/// Printable ASCII only, bounded: a reason is shown to the client verbatim.
+/// Printable ASCII only, bounded to its head and tail: a reason is shown to the client verbatim.
 fn safe(text: &str, limit: usize) -> String {
-    text.chars()
+    crate::triage::ends(text, limit)
+        .chars()
         .map(|c| if (' '..='~').contains(&c) { c } else { ' ' })
-        .take(limit)
         .collect()
 }
 fn now_ms() -> u64 {
@@ -1691,9 +1691,8 @@ mod terminal_tests {
     use super::*;
     use crate::journal::{Invocation, Outcome, SubmissionContext};
 
-    /// A run seen queued and next read finished still shows it ran, before its outcome.
-    #[test]
-    fn a_finished_run_shows_its_start() {
+    /// A run that failed with `message`: its events after it was queued, and its running revision.
+    fn failed(message: &str) -> (Vec<domain::MachineExecutionEvent>, u64) {
         let root = std::env::temp_dir().join(format!("cm-terminal-{}", uuid::Uuid::new_v4()));
         let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
         assert!(service.stop().unwrap(), "the test moves the run itself");
@@ -1721,7 +1720,7 @@ mod terminal_tests {
             assert!(journal.claim(&queued.id)?);
             journal.register_process(&queued.id, crate::execution::process_birth(std::process::id())?)?;
             let started = journal.running(&queued.id, None)?;
-            journal.finish(&queued.id, Outcome::Failed(crate::journal::Failure::executor("failed", "author", "author_failed", "it stopped")))?;
+            journal.finish(&queued.id, Outcome::Failed(crate::journal::Failure::executor("failed", "author", "author_failed", message)))?;
             Ok((queued, started))
         }).unwrap();
         let execution = domain::MachineExecutionQuery {
@@ -1729,9 +1728,34 @@ mod terminal_tests {
             expected_execution_workspace_id: engine.workspace_id(),
         };
         let query = domain::MachineExecutionEventsQuery { execution: Some(execution), after: queued.revision, limit: 0, wait: false };
-        let kinds: Vec<_> = backend.events(actor, query).unwrap().events.into_iter().map(|e| (e.kind, e.sequence)).collect();
-        assert_eq!(kinds.first(), Some(&("running".to_string(), started.running_revision)), "{kinds:?}");
-        assert_eq!(kinds.last().map(|(kind, _)| kind.as_str()), Some("outcome"));
+        let events = backend.events(actor, query).unwrap().events;
         let _ = std::fs::remove_dir_all(root);
+        (events, started.running_revision)
+    }
+
+    /// A run seen queued and next read finished still shows it ran, before its outcome.
+    #[test]
+    fn a_finished_run_shows_its_start() {
+        let (events, running) = failed("it stopped");
+        let kinds: Vec<_> = events.into_iter().map(|e| (e.kind, e.sequence)).collect();
+        assert_eq!(kinds.first(), Some(&("running".to_string(), running)), "{kinds:?}");
+        assert_eq!(kinds.last().map(|(kind, _)| kind.as_str()), Some("outcome"));
+    }
+
+    /// Run 6401: an install failure's cause is the last line after uv's progress. The bounded
+    /// outcome keeps it, and the operation that failed at its head.
+    #[test]
+    fn a_long_failure_keeps_its_cause_on_its_last_line() {
+        let progress: Vec<_> = (0..400).map(|n| format!("Downloading part {n} of 400")).collect();
+        let cause = "error: Failed to build `cozy-script`: no matching distribution for numpy==9";
+        let message = format!("package_dependency_operation_failed: uv pip install exited 1:\n{}\n{cause}", progress.join("\n"));
+        let (events, _) = failed(&message);
+        let outcome = events.last().unwrap().outcome.clone().unwrap();
+        let body: Value = serde_json::from_slice(&outcome.outcome_canonical_bytes).unwrap();
+        let shown = body["safe_message"].as_str().unwrap();
+        assert!(shown.chars().count() <= 4096 && shown.contains(" [...] "), "{shown}");
+        assert!(shown.starts_with("package_dependency_operation_failed: uv pip install exited 1:"), "{shown}");
+        assert!(shown.ends_with(cause), "{shown}");
+        assert!(body["cause"]["detail"].as_str().unwrap().ends_with(cause), "{body}");
     }
 }

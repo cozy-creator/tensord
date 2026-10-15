@@ -40,6 +40,19 @@ pub struct Facts<'a> {
     pub stderr_tail: &'a str,
 }
 
+/// `text` within `limit` chars: whole, or its head and its tail around a marker. A failure's
+/// first line names the operation and its last lines the cause (uv's error after its progress).
+pub fn ends(text: &str, limit: usize) -> String {
+    const MARK: &str = " [...] ";
+    let count = text.chars().count();
+    if count <= limit {
+        return text.into();
+    }
+    let head = limit / 4;
+    let tail = limit.saturating_sub(head + MARK.len());
+    text.chars().take(head).chain(MARK.chars()).chain(text.chars().skip(count - tail)).collect()
+}
+
 fn capped(text: &str, limit: usize) -> &str {
     if text.len() <= limit {
         return text;
