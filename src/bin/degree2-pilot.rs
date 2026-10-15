@@ -308,7 +308,10 @@ fn exec(
             payload: *index,
             invoke_ms,
             first_image_ms: began.elapsed().as_secs_f64() * 1000.,
-            digests: bindings.iter().map(|b| b.sha256.clone()).collect(),
+            digests: bindings
+                .iter()
+                .map(|b| fs::read(spool.join(&b.name)).map(|bytes| tensorfs_core::sha256::hex_digest(&bytes)))
+                .collect::<io::Result<_>>()?,
             h2d_bytes: reply.plane.as_ref().and_then(|p| p.h2d_bytes),
             plane: reply.plane.clone(),
         });
