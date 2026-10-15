@@ -1265,13 +1265,13 @@ mod v1_api {
         let mut client = client(&machine).await;
         let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
         let manifest = write_package(&mut client, &all, "cpu_weights", "local/tensord-cpu-weights").await;
-        let ops = serde_json::json!([{"type": "tensorhub_model_publish", "model": "acme/table"}]);
+        let ops = serde_json::json!([{"type": "tensorhub_model_publish", "model": "acme/tiny"}]);
         let spec = v1::RunSpec {
             kind: v1::RunKind::Call as i32,
             source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest })),
             entrypoint: "table".into(),
             payload: br#"{"size":128}"#.to_vec(),
-            weights_destination: "acme/table".into(),
+            weights_destination: "acme/tiny".into(),
             hub: Some(v1::HubAccess {
                 origin: authkit.hub.clone(),
                 object_hosts: vec!["localhost".into()],
@@ -1287,7 +1287,7 @@ mod v1_api {
         let done = outcome(&events);
         assert_eq!(done.status, "succeeded", "{done:?}");
         let written = done.outputs.iter().find(|p| p.output == "model").unwrap();
-        assert_eq!(hub.lock().unwrap().finalized, [written.digest.clone()]);
+        assert_eq!(hub.lock().unwrap().finalized, std::slice::from_ref(&written.digest));
         let uploads: Vec<_> = events.iter().filter_map(|e| match &e.event {
             Some(v1::run_event::Event::Call(call)) if call.function.ends_with("upload_checkpoint") => Some(call.status.clone()),
             _ => None,

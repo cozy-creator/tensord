@@ -2472,50 +2472,6 @@ impl std::fmt::Display for Failure {
     }
 }
 
-#[cfg(test)]
-mod failure_message_tests {
-    use super::*;
-
-    #[test]
-    fn nested_typed_failures_preserve_plain_details() {
-        let code = "model_choice_absent";
-        let detail = "the run names no model for generate_image.models.model";
-        let mut failure = Failure::executor("failed", "author", code, detail);
-        for _ in 0..3 {
-            failure = Failure::decode(&failure.encode()).unwrap();
-            assert_eq!(failure.code, code);
-            assert_eq!(failure.message, detail);
-            failure = Failure::executor("failed", "author", &failure.code, &failure.message);
-        }
-        assert_eq!(failure.to_string(), format!("{code}: {detail}"));
-    }
-
-    #[test]
-    fn current_decoder_rejects_unstructured_formats_and_preserves_literal_details() {
-        assert!(Failure::decode("model_choice_absent: detail").is_err());
-        assert!(Failure::decode(
-            r#"{"status":3,"cause":7,"origin":3,"message":"model_choice_absent: detail"}"#
-        )
-        .is_err());
-        let detail = "the field literally contains model_choice_absent: keep this";
-        let failure = Failure::machine("model_choice_absent", detail);
-        assert_eq!(Failure::decode(&failure.encode()).unwrap().message, detail);
-    }
-
-    #[test]
-    fn refused_oom_keeps_its_request_code_without_an_accepted_breach() {
-        for (terminal, origin) in [("refused", "runtime"), ("failed", "request")] {
-            let failure = Failure::executor(terminal, origin, "device_out_of_memory", "too large");
-            assert_eq!((failure.status, failure.cause, failure.origin), (2, 1, 6));
-            assert_eq!(failure.code, "device_out_of_memory");
-            assert_eq!(failure.message, "too large");
-        }
-        let accepted = Failure::executor("failed", "runtime", "device_out_of_memory", "GPU full");
-        assert_eq!(accepted.code, "accepted_envelope_breach");
-        assert_eq!(accepted.message, "device_out_of_memory: GPU full");
-    }
-}
-
 pub enum Outcome {
     Completed(ResultRecord),
     Failed(Failure),
@@ -2568,4 +2524,48 @@ fn update_run_reserved(connection: &Connection, actor: &str, id: &str) -> io::Re
 
 fn is_zero(value: &u32) -> bool {
     *value == 0
+}
+
+#[cfg(test)]
+mod failure_message_tests {
+    use super::*;
+
+    #[test]
+    fn nested_typed_failures_preserve_plain_details() {
+        let code = "model_choice_absent";
+        let detail = "the run names no model for generate_image.models.model";
+        let mut failure = Failure::executor("failed", "author", code, detail);
+        for _ in 0..3 {
+            failure = Failure::decode(&failure.encode()).unwrap();
+            assert_eq!(failure.code, code);
+            assert_eq!(failure.message, detail);
+            failure = Failure::executor("failed", "author", &failure.code, &failure.message);
+        }
+        assert_eq!(failure.to_string(), format!("{code}: {detail}"));
+    }
+
+    #[test]
+    fn current_decoder_rejects_unstructured_formats_and_preserves_literal_details() {
+        assert!(Failure::decode("model_choice_absent: detail").is_err());
+        assert!(Failure::decode(
+            r#"{"status":3,"cause":7,"origin":3,"message":"model_choice_absent: detail"}"#
+        )
+        .is_err());
+        let detail = "the field literally contains model_choice_absent: keep this";
+        let failure = Failure::machine("model_choice_absent", detail);
+        assert_eq!(Failure::decode(&failure.encode()).unwrap().message, detail);
+    }
+
+    #[test]
+    fn refused_oom_keeps_its_request_code_without_an_accepted_breach() {
+        for (terminal, origin) in [("refused", "runtime"), ("failed", "request")] {
+            let failure = Failure::executor(terminal, origin, "device_out_of_memory", "too large");
+            assert_eq!((failure.status, failure.cause, failure.origin), (2, 1, 6));
+            assert_eq!(failure.code, "device_out_of_memory");
+            assert_eq!(failure.message, "too large");
+        }
+        let accepted = Failure::executor("failed", "runtime", "device_out_of_memory", "GPU full");
+        assert_eq!(accepted.code, "accepted_envelope_breach");
+        assert_eq!(accepted.message, "device_out_of_memory: GPU full");
+    }
 }
