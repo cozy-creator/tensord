@@ -885,8 +885,9 @@ impl GpuPool {
         }
     }
     /// A removed generation leaves memory now: each idle executor of it ends while its lane's
-    /// call slots are free, then its import-only parent once childless. One in a call ends
-    /// with the call's tenancy, as any idle executor does.
+    /// call slots are free, then its import-only parent once childless, then the GPU weights no
+    /// installed generation read. One in a call ends with the call's tenancy, as any idle
+    /// executor does.
     pub fn end_generation(&self, identity: &str) {
         let lanes: Vec<(String, usize, u32)> = {
             let sessions = self.sessions.lock().unwrap();
@@ -916,6 +917,12 @@ impl GpuPool {
                 if let Err(error) = parent.shutdown() {
                     eprintln!("ending a removed package's import-only executor: {error}");
                 }
+            }
+        }
+        let unread = self.custody.as_ref().map(|c| c.lock().unwrap().end_environment(identity));
+        for (key, generation) in unread.unwrap_or_default() {
+            if let Err(error) = self.revoke(&key, generation) {
+                eprintln!("revoking a removed package's GPU weights: {error}");
             }
         }
     }
@@ -1179,19 +1186,17 @@ impl GpuPool {
             custody.holdings()
         })
     }
-    /// Revoke one held generation: no new attachments now; the bytes stay charged until each
-    /// reader released it at an idle boundary (now, when the pool is idle) or ended.
-    pub fn revoke(&self, key: &HoldingKey, generation: u64) -> io::Result<()> {
+    /// Revoke one held generation: no new attachments now; every idle executor reading it
+    /// releases it at once, and the bytes stay charged until each other reader released or ended.
+    fn revoke(&self, key: &HoldingKey, generation: u64) -> io::Result<()> {
         let custody = self
             .custody
             .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "no GPU weight custody"))?;
         custody.lock().unwrap().begin_revoke(key, generation)?;
-        if let Ok(mut sessions) = self.sessions.try_lock() {
-            for session in sessions.values_mut() {
-                if let Err(error) = release_revoked(custody, &mut session.executor) {
-                    eprintln!("resident revoke left a lease charged: {error}");
-                }
+        for session in self.sessions.lock().unwrap().values_mut() {
+            if let Err(error) = release_revoked(custody, &mut session.executor) {
+                eprintln!("resident revoke left a lease charged: {error}");
             }
         }
         log_released(custody.lock().unwrap().collect());
@@ -2289,18 +2294,7 @@ impl GpuPool {
                 let Some(holding) = found else {
                     return Ok(false);
                 };
-                custody
-                    .lock()
-                    .unwrap()
-                    .begin_revoke(&holding.key, holding.generation)?;
-                // Every executor in `sessions` is idle: each releases at once.
-                for session in self.sessions.lock().unwrap().values_mut() {
-                    if let Err(error) = release_revoked(custody, &mut session.executor) {
-                        eprintln!("resident revoke left a lease charged: {error}");
-                    }
-                }
-                log_released(custody.lock().unwrap().collect());
-                return Ok(true);
+                return self.revoke(&holding.key, holding.generation).map(|_| true);
             }
             Step::Trim(id, bytes) => {
                 let Some(custody) = &self.custody else {
@@ -2690,6 +2684,7 @@ impl GpuPool {
             grants: &session.grants,
             birth: session.executor.birth.clone(),
             custody: self.custody.as_ref().filter(|_| sharing),
+            environment: &plan.generation,
             exit: session.executor.observer_pidfd()?,
             pool: self,
             plan: &plan.id,
@@ -3551,10 +3546,8 @@ fn release_revoked(
 
 fn log_released(released: Vec<(HoldingKey, u64)>) {
     for (key, bytes) in released {
-        eprintln!(
-            "resident GPU weights released: {} on {}, {bytes} bytes",
-            key.layout, key.device
-        );
+        crate::memory::note(serde_json::json!({"event": "released", "layout": key.layout,
+            "device": key.device, "bytes": bytes}));
     }
 }
 
@@ -4070,6 +4063,8 @@ struct Callbacks<'a> {
     grants: &'a [HostGrant],
     birth: ProcessBirth,
     custody: Option<&'a Mutex<ResidentCustody>>,
+    /// The executor's package environment: what its holdings live for.
+    environment: &'a str,
     /// The executor's pidfd: a reader lease ends when it does.
     exit: File,
     pool: &'a GpuPool,
@@ -4141,7 +4136,7 @@ impl Services for Callbacks<'_> {
         }
         // The reader's lease is a connection: the executor keeps one end while it maps the
         // holding, and its close (release or death) ends the lease.
-        let (reader, lease) = Reader::lease(self.birth.clone(), self.exit.try_clone()?)?;
+        let (reader, lease) = Reader::lease(self.birth.clone(), self.exit.try_clone()?, self.environment)?;
         answer.ok = true;
         answer.code.clear();
         answer.detail.clear();

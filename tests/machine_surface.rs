@@ -1127,14 +1127,15 @@ mod v1_api {
         let _ = fs::remove_dir_all(tools);
     }
 
-    /// A one-tensor checkpoint a model slot constructs from: one inline config.
-    fn constructible(store: &tensorfs_core::store::Store) -> tensorfs_core::ids::ObjectRef {
+    /// A one-tensor checkpoint of `n` f32 elements a model slot constructs from: one inline config.
+    fn constructible(store: &tensorfs_core::store::Store, n: usize) -> tensorfs_core::ids::ObjectRef {
         use tensorfs_core::{dtype::Dtype, header::{Body, Closure, Header, Part, Tensor}, manifest::{Draft, Entry}};
         let put = |bytes: &[u8]| store.put_stream(&mut &bytes[..], None, &Default::default()).unwrap().obj;
         let spec = tensorfs_core::registry::seeds().into_iter().find(|seed| seed.alias == "plain/1").unwrap().spec;
-        let part = Part { dtype: Dtype::F32, shape: vec![2048], body: Body::Segments(vec![put(&[5; 8192])]) };
-        let tensor = Tensor { dtype: Dtype::F32, shape: vec![2048], encoding: spec.object_id(), parts: vec![("value".into(), part)] };
-        let header = Header { configs: vec![("config".into(), b"{}".to_vec())], assets: vec![], encodings: vec![spec],
+        let part = Part { dtype: Dtype::F32, shape: vec![n as u64], body: Body::Segments(vec![put(&vec![5; 4 * n])]) };
+        let tensor = Tensor { dtype: Dtype::F32, shape: vec![n as u64], encoding: spec.object_id(), parts: vec![("value".into(), part)] };
+        let config = serde_json::json!({"n": n}).to_string().into_bytes();
+        let header = Header { configs: vec![("config".into(), config)], assets: vec![], encodings: vec![spec],
             components: vec![("model".into(), vec![("weight".into(), tensor)])] };
         header.validate(&Closure::default()).unwrap();
         let header = put(&header.canonical_bytes().unwrap());
@@ -1159,7 +1160,7 @@ mod v1_api {
         args.extend(["--gpu-config".into(), config.clone().into_os_string()]);
         let machine = Machine::start_args(|state, _| {
             let store = tensorfs_core::store::Store::ensure(&state.join("tensorfs")).unwrap();
-            let manifest = constructible(&store);
+            let manifest = constructible(&store, 2048);
             fs::write(&config, serde_json::json!({"devices": "0,1", "environment": {
                 "PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": home},
                 "models": [{"package": "local/tensord-gpu-children", "slot": "modeled.models.model",
@@ -1185,6 +1186,95 @@ mod v1_api {
         let children = result["children"].as_array().unwrap();
         assert_eq!(children.len(), 2, "{result}");
         assert!(children.iter().all(|c| c["device"].as_str().unwrap().starts_with("cuda")), "{result}");
+        let _ = fs::remove_dir_all(tools);
+    }
+
+    /// GPU 0's memory in use, by anyone (MiB).
+    fn gpu_used_mib() -> u64 {
+        let out = Command::new("nvidia-smi")
+            .args(["--query-gpu=memory.used", "--format=csv,noheader,nounits", "-i", "0"])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().parse().unwrap()
+    }
+
+    /// Driver descriptors `pid` holds: custody keeps one per exported chunk.
+    fn driver_fds(pid: u32) -> usize {
+        let fds = fs::read_dir(format!("/proc/{pid}/fd")).unwrap().flatten();
+        let driver = |fd: &fs::DirEntry| fs::read_link(fd.path()).is_ok_and(|to| to.to_string_lossy().starts_with("/dev/nvidia"));
+        fds.filter(driver).count()
+    }
+
+    /// A removed package's GPU weights go back to the GPU. Custody (Degree 2) keeps what its
+    /// executor offered past the executor, and its removal ended the executor but revoked
+    /// nothing (5090: the machine held 16.8 GB once both packages were removed, no process
+    /// listed). What no installed package read is let go with the last one that did.
+    #[tokio::test]
+    #[ignore = "GPU: one card (a rental)"]
+    async fn a_removed_packages_gpu_weights_leave_the_gpu() {
+        const WEIGHT_MIB: u64 = 256;
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let tools = std::env::temp_dir().join(format!("cm-tools-{}", uuid::Uuid::new_v4()));
+        assert!(Command::new("uv").current_dir(repo).args(["build", "--wheel", "--out-dir"]).arg(&tools)
+            .status().unwrap().success());
+        let home = tools.join("executor-home");
+        fs::create_dir_all(&home).unwrap();
+        let config = tools.join("gpu.json");
+        let mut args = installing_args(&tools);
+        args.extend(["--gpu-config".into(), config.clone().into_os_string()]);
+        let machine = Machine::start_args(|state, _| {
+            let store = tensorfs_core::store::Store::ensure(&state.join("tensorfs")).unwrap();
+            let manifest = constructible(&store, (WEIGHT_MIB << 18) as usize);
+            fs::write(&config, serde_json::json!({"devices": "0", "environment": {
+                "PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": home},
+                "models": [{"package": "local/tensord-gpu-children", "slot": "resident.models.model",
+                    "repository": "local/weight", "release": "1", "lane": "f32",
+                    "manifest": manifest.id(), "components": ["model"]}]}).to_string()).unwrap();
+        }, &args).await;
+        let mut client = client(&machine).await;
+        let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
+        let manifest = write_package(&mut client, &all, "gpu_children", "local/tensord-gpu-children").await;
+        let (pid, idle_mib) = (machine.child.id(), gpu_used_mib());
+        let idle_fds = driver_fds(pid);
+
+        // The second call ends with its executor's weights offered to custody, if the first did not.
+        for id in ["resident-1", "resident-2"] {
+            let spec = v1::RunSpec {
+                kind: v1::RunKind::Call as i32,
+                source: Some(v1::run_spec::Source::Local(v1::LocalSource { manifest: manifest.clone() })),
+                entrypoint: "resident".into(),
+                owner: "alice".into(),
+                ..Default::default()
+            };
+            let request = authorized(v1::RunRequest { id: id.into(), after: 0, spec: Some(spec) }, &all);
+            let done = outcome(&collect(client.run(request).await.unwrap().into_inner()).await.unwrap());
+            assert_eq!(done.status, "succeeded", "{id}: {done:?}");
+            let ran: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
+            assert_eq!(ran["device"], "cuda:0", "{ran}");
+        }
+        assert!(driver_fds(pid) > idle_fds, "custody kept none of the executor's weights");
+        assert!(gpu_used_mib() >= idle_mib + WEIGHT_MIB);
+
+        let spec = v1::RunSpec {
+            kind: v1::RunKind::Remove as i32,
+            source: Some(v1::run_spec::Source::Release(v1::Release {
+                package: "local/tensord-gpu-children".into(),
+                ..Default::default()
+            })),
+            owner: "alice".into(),
+            ..Default::default()
+        };
+        let request = authorized(v1::RunRequest { id: "remove".into(), after: 0, spec: Some(spec) }, &all);
+        let done = outcome(&collect(client.run(request).await.unwrap().into_inner()).await.unwrap());
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        // The ended executor's context leaves with its process; the weights with custody's fds.
+        assert_eq!(driver_fds(pid), idle_fds, "custody still holds the removed package's weights");
+        let until = Instant::now() + Duration::from_secs(10);
+        while gpu_used_mib() >= idle_mib + WEIGHT_MIB / 2 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let used = gpu_used_mib();
+        assert!(used < idle_mib + WEIGHT_MIB / 2, "{used} MiB in use after the removal, {idle_mib} before the install");
         let _ = fs::remove_dir_all(tools);
     }
 

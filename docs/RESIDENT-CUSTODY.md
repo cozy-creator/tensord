@@ -36,6 +36,8 @@ Rental proof that a CUDA-free holder keeps and frees the bytes:
 - `begin_revoke(key, generation)`: TensorD permits no new attachments. Each reader gets `revoke` at its next idle
   boundary (`GpuPool::revoke`, or the end of the running call). A refusal keeps its lease charged
   until the process ends: no kill.
+- A holding lives while a package environment installed here has read it (offered or attached).
+  `end_environment`, from a removal's `end_generation`, revokes what no other installed one read.
 - `collect`: a lease whose connection closed, or whose pidfd ended with its birth gone, is dropped
   (the driver tore its references down); a Revoking holding with no leases is removed and its fds
   closed.
@@ -52,4 +54,4 @@ Rental proof that a CUDA-free holder keeps and frees the bytes:
 
 `GpuPool` holds custody unless its GPU drives a display (`nvidia-smi display_active`; unknown =
 off). `Load.device_weights` when the executor offers `weights.attach/1`; `share` after every
-call; `GpuPool::resident()` and `GpuPool::revoke()` for the memory policy (B2).
+call; `GpuPool::resident()` and `GpuPool::revoke()` for the memory policy (B2) and package removal.

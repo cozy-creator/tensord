@@ -4,11 +4,12 @@
 //! last reference anywhere frees it. Other Runtime executors map duplicated handles read-only
 //! through their own plane. Each reader holds a lease: one end of a socket pair whose
 //! close (release, or the kernel at process death) ends it. Bytes are counted once per GPU, until
-//! every lease ended and the fds here are closed.
+//! every lease ended and the fds here are closed. A holding lives while a package environment
+//! installed here has read it: the last one's removal revokes it.
 use crate::execution::process_ended;
 use crate::journal::ProcessBirth;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
@@ -83,18 +84,21 @@ pub enum Offered {
 pub struct Reader {
     pub birth: ProcessBirth,
     pub exit: File,
+    /// The package environment (generation identity) the executor runs.
+    pub environment: String,
     lease: UnixStream,
 }
 
 impl Reader {
     /// A new lease and the end the executor keeps (close-on-exec until it is sent).
-    pub fn lease(birth: ProcessBirth, exit: File) -> io::Result<(Reader, OwnedFd)> {
+    pub fn lease(birth: ProcessBirth, exit: File, environment: &str) -> io::Result<(Reader, OwnedFd)> {
         let (ours, theirs) = UnixStream::pair()?;
         ours.set_nonblocking(true)?;
         Ok((
             Reader {
                 birth,
                 exit,
+                environment: environment.into(),
                 lease: ours,
             },
             theirs.into(),
@@ -127,6 +131,8 @@ struct Holding {
     bytes: u64,
     phase: Phase,
     readers: Vec<Reader>,
+    /// Every environment whose executor offered or attached it, until that one is removed.
+    environments: BTreeSet<String>,
     used: Instant,
 }
 
@@ -165,6 +171,7 @@ impl ResidentCustody {
             held.bytes += regions.iter().flat_map(|r| &r.chunks).sum::<u64>();
             held.regions.extend(regions);
             held.fds.extend(fds);
+            held.environments.insert(reader.environment.clone());
             held.readers.push(reader);
             held.used = Instant::now();
             return Ok(Offered::Kept {
@@ -182,6 +189,7 @@ impl ResidentCustody {
                 fds,
                 bytes,
                 phase: Phase::Ready,
+                environments: BTreeSet::from([reader.environment.clone()]),
                 readers: vec![reader],
                 used: Instant::now(),
             },
@@ -204,6 +212,7 @@ impl ResidentCustody {
             .iter()
             .map(|fd| fd.try_clone())
             .collect::<io::Result<Vec<_>>>()?;
+        held.environments.insert(reader.environment.clone());
         held.readers.push(reader);
         held.used = Instant::now();
         Ok(Some(Attachment {
@@ -302,6 +311,19 @@ impl ResidentCustody {
         done.into_iter()
             .filter_map(|key| self.holdings.remove(&key).map(|h| (key, h.bytes)))
             .collect()
+    }
+
+    /// `environment` was removed: the Ready holdings no other installed environment read, to
+    /// revoke.
+    pub fn end_environment(&mut self, environment: &str) -> Vec<(HoldingKey, u64)> {
+        let mut unread = vec![];
+        for (key, held) in &mut self.holdings {
+            let last = held.environments.remove(environment) && held.environments.is_empty();
+            if last && held.phase == Phase::Ready {
+                unread.push((key.clone(), held.generation));
+            }
+        }
+        unread
     }
 
     /// Holdings `birth` maps: (key, generation).
@@ -418,7 +440,7 @@ mod tests {
     /// A lease whose executor end this test process keeps.
     fn mine() -> (Reader, OwnedFd) {
         let me = std::process::id();
-        Reader::lease(process_birth(me).unwrap(), pidfd(me)).unwrap()
+        Reader::lease(process_birth(me).unwrap(), pidfd(me), "mine").unwrap()
     }
     /// A real executor stand-in: a child process holding its lease end as stdin. The reader's
     /// birth is this test process, which stays alive: only the connection can end the lease.
@@ -431,11 +453,11 @@ mod tests {
             .unwrap();
         (reader, child)
     }
-    /// An executor of its own: a real process whose birth and exit are the lease's.
-    fn executor() -> (Reader, OwnedFd, Child) {
+    /// An executor of `environment`: a real process whose birth and exit are the lease's.
+    fn executor(environment: &str) -> (Reader, OwnedFd, Child) {
         let child = Command::new("sleep").arg("60").spawn().unwrap();
         let (reader, end) =
-            Reader::lease(process_birth(child.id()).unwrap(), pidfd(child.id())).unwrap();
+            Reader::lease(process_birth(child.id()).unwrap(), pidfd(child.id()), environment).unwrap();
         (reader, end, child)
     }
     /// The layout whose digest repeats `digit`, on GPU-1.
@@ -529,11 +551,11 @@ mod tests {
         let one = || vec![region(0, vec![GRANULE])];
         // Two packages' executors (real processes) bind the same checkpoint: the first offers,
         // the second attaches, and the GPU is charged the bytes once.
-        let (first, _a_end, mut package_a) = executor();
+        let (first, _a_end, mut package_a) = executor("a");
         custody
             .offer(key("a"), "sdxl", one(), fds(1), first)
             .unwrap();
-        let (second, _b_end, mut package_b) = executor();
+        let (second, _b_end, mut package_b) = executor("b");
         let attached = custody.attach(&key("a"), second).unwrap().unwrap();
         assert_eq!((attached.generation, attached.fds.len()), (1, 1));
         assert_eq!(custody.holdings().len(), 1);
@@ -562,8 +584,11 @@ mod tests {
             .find(|h| h.key == key("a"))
             .unwrap();
         assert_eq!(shared.readers.len(), 1);
+        // A's removal leaves what B read; B's leaves it read by no installed package.
+        assert!(custody.end_environment("a").is_empty());
         package_b.kill().unwrap();
         package_b.wait().unwrap();
+        assert_eq!(custody.end_environment("b"), vec![(key("a"), 1)]);
     }
 
     #[test]

@@ -68,7 +68,7 @@ impl Services for Pilot {
             layout: frame.layout.clone(),
             variant: frame.variant.clone(),
         };
-        let (reader, lease) = Reader::lease(birth.clone(), exit.try_clone()?)?;
+        let (reader, lease) = Reader::lease(birth.clone(), exit.try_clone()?, "pilot")?;
         answer.ok = true;
         answer.code.clear();
         answer.detail.clear();

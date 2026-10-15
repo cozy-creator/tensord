@@ -14,16 +14,16 @@ app = App()
 
 
 class Graph:
-    """The checkpoint's one tensor, `model.weight`."""
+    """The checkpoint's one tensor, `model.weight`, of the config's `n` elements."""
 
-    def __init__(self) -> None:
+    def __init__(self, n: int) -> None:
         module = torch.nn.Module()
-        module.weight = torch.nn.Parameter(torch.empty(2048), requires_grad=False)
+        module.weight = torch.nn.Parameter(torch.empty(n), requires_grad=False)
         self.components = {"model": module}
 
 
 def _graph(config: Config) -> Graph:
-    return Graph()
+    return Graph(config.as_int("n", 2048))
 
 
 class Tiny(Model[Graph]):
@@ -63,6 +63,17 @@ async def modeled(ctx: Context, *, model: Tiny, hold_s: float = 0.0) -> Ran:
 
 
 app.entrypoint(internal=True)(modeled)
+
+
+@invocable
+async def resident(ctx: Context, *, model: Tiny) -> Ran:
+    """Reads its model's weight on the GPU."""
+    weight = model.weight()
+    weight.sum().item()
+    return Ran(str(weight.device), os.getpid())
+
+
+app.entrypoint(resident)
 
 
 async def cpu_job(ctx: Context, payload: Request) -> Children:
