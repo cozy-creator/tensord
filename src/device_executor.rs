@@ -26,7 +26,6 @@ use std::{
     time::Duration,
 };
 
-pub const MAX_DEVICE_FRAME: usize = 64 * 1024;
 /// Chunks of one weight set's shared GPU regions crossing in one exchange.
 const MAX_SHARED_FDS: u32 = 1 << 16;
 pub const RESULT_DOCUMENT: &str = "result.canonical";
@@ -873,8 +872,8 @@ pub struct Answer {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub reason: String,
     /// `object_files`: the SHA-256 of the objects whose fds follow, in the order the executor
-    /// derives from its own plan (`HostTier::objects_digest`); the list itself would not fit a
-    /// control frame (SDXL's UNet: about 1,700 objects).
+    /// derives from its own plan (`HostTier::objects_digest`), in place of the list (SDXL's
+    /// UNet: about 1,700 objects).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub objects_sha256: String,
     /// `sealed_stage`: the regions staged or staging (the rest stay holes).
@@ -2220,33 +2219,11 @@ fn write_frame(
 ) -> io::Result<()> {
     let value = serde_json::to_value(value)?;
     scan(&value)?;
-    let bytes = serde_json::to_vec(&value)?;
-    if bytes.len() > MAX_DEVICE_FRAME {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "device control frame exceeds64KiB; data belongs in spool",
-        ));
-    }
-    stream.write_all(&(bytes.len() as u32).to_be_bytes())?;
-    stream.write_all(&bytes)
+    protocol::write_body(stream, &serde_json::to_vec(&value)?)
 }
 /// SDK control framing shared with the CPU source-qualification receiver.
 pub fn read_frame(stream: &mut std::os::unix::net::UnixStream) -> io::Result<Option<Frame>> {
-    let mut header = [0; 4];
-    if stream.read(&mut header[..1])? == 0 {
-        return Ok(None);
-    }
-    stream.read_exact(&mut header[1..])?;
-    let size = u32::from_be_bytes(header) as usize;
-    if size == 0 || size > MAX_DEVICE_FRAME {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid device frame length",
-        ));
-    }
-    let mut bytes = vec![0; size];
-    stream.read_exact(&mut bytes)?;
-    decode_frame(&bytes).map(Some)
+    protocol::read_body(stream)?.map(|bytes| decode_frame(&bytes)).transpose()
 }
 
 /// Every field of a frame is optional, and the Runtime spells an absent one as null as often as
@@ -2310,6 +2287,26 @@ mod codec_tests {
         assert_eq!((frame.kind, frame.seq, frame.output.as_str()), (Kind::Publish, 4, "image"));
         assert!(frame.label.is_empty() && frame.code.is_empty() && frame.hello.runtime_version.is_empty());
         assert!(frame.call_request.is_none() && frame.size_bytes == 0 && frame.parts.is_empty());
+    }
+
+    /// A frame is as large as its structure: a load reply naming every key its checkpoint
+    /// skips (FLUX.3 Klein's as-is text encoder) failed the old 64 KiB frame. Only a prefix
+    /// over `MAX_FRAME` is refused, before any body byte is read.
+    #[test]
+    fn a_frame_over_64_kib_crosses_and_a_lying_prefix_is_refused() {
+        let keys: Vec<String> = (0..20_000).map(|i| format!("model.visual.blocks.{i}.attn.qkv.weight")).collect();
+        let reply = serde_json::json!({"reply": "load", "ok": true,
+            "facts": {"ignored_extra_keys": keys, "filled_bytes": 7}});
+        assert!(serde_json::to_vec(&reply).unwrap().len() > 512 << 10);
+        let (mut runtime, mut machine) = std::os::unix::net::UnixStream::pair().unwrap();
+        let writer = std::thread::spawn(move || write_frame(&mut runtime, &reply).map(|()| runtime));
+        let frame = read_frame(&mut machine).unwrap().unwrap();
+        let mut runtime = writer.join().unwrap().unwrap();
+        assert!(frame.ok && frame.reply == "load");
+        assert_eq!(frame.facts.unwrap().filled_bytes, Some(7));
+        runtime.write_all(&(protocol::MAX_FRAME as u32 + 1).to_be_bytes()).unwrap();
+        let refused = read_frame(&mut machine).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::InvalidData, "{refused}");
     }
 
     #[test]

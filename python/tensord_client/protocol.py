@@ -4,7 +4,7 @@ from typing import Literal
 import msgspec
 
 CAPABILITIES = ("weights.hosted/1", "objects.put-fd/1")
-MAX_FRAME = 65536
+MAX_FRAME = 256 << 20
 
 
 class ObjectRef(msgspec.Struct, frozen=True):
