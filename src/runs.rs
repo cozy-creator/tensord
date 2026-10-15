@@ -12,7 +12,7 @@ use crate::{
     journal::{CallMemo, Execution, Failure, InputFile, Installation, Outcome, Preparation, ResultRecord},
     local_source::LocalSources,
     objects::{Objects, Refused},
-    published::{declares_models, Named, Providers, Publisher, Request},
+    published::{declares_models, Named, Parts, Providers, Publisher, Request},
     service::{Call, Service},
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -1221,10 +1221,12 @@ impl Runs {
         };
         let fetch = match (&self.publisher, context.hub.clone().or_else(|| self.own_hub.clone())) {
             (Some(publisher), Some(hub)) if !context.origins.is_empty() => {
-                let (publisher, service, origins) = (publisher.clone(), self.service.clone(), context.origins);
+                let (publisher, service) = (publisher.clone(), self.service.clone());
+                let origins: BTreeMap<_, _> =
+                    context.origins.into_iter().map(|(manifest, named)| (manifest, (named, Parts::default()))).collect();
                 Some(Arc::new(move |manifest: &ObjectRef, objects: &[ObjectRef]| {
-                    let named = origins.get(&manifest.id()).ok_or("this source names no Hub checkpoint")?;
-                    publisher.fetch_part(&service, &hub, named, objects).map_err(|(code, message)| format!("{code}: {message}"))
+                    let (named, parts) = origins.get(&manifest.id()).ok_or("this source names no Hub checkpoint")?;
+                    publisher.fetch_part(&service, &hub, named, parts, objects).map_err(|(code, message)| format!("{code}: {message}"))
                 }) as crate::weights::Fetch)
             }
             _ => None,

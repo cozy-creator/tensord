@@ -23,6 +23,7 @@ use std::{
     sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
+pub(crate) use tensorfs_core::ensure::Parts;
 use tensorfs_core::{
     err::{Code, Refusal},
     fetch::{DeliveryGrant, FetchPlan},
@@ -596,11 +597,14 @@ impl Publisher {
     }
 
     /// Objects of a checkpoint held here in part (`download` in part), fetched from its Hub as a
-    /// job reads them.
-    pub(crate) fn fetch_part(&self, service: &Service, source: &hub::Source, named: &Named,
+    /// job reads them, through the `parts` its reads share (one closure, each object once).
+    pub(crate) fn fetch_part(&self, service: &Service, source: &hub::Source, named: &Named, parts: &Parts,
         objects: &[ObjectRef]) -> Result<(), Failure> {
-        let pull = Pull { part: true, objects: objects.to_vec(), ..Pull::default() };
-        self.ensure(service, source, named, &pull, &|_, _| ()).map(drop)
+        self.lanes.run(false, None, |stop| {
+            let keep = self.protected(service).map_err(io_failure)?;
+            let pull = Pull { part: true, objects: objects.to_vec(), ..Pull::default() };
+            requesting(&self.store, source, named, &keep, &pull, stop, &|_, _| (), |request| parts.fetch(request))
+        })
     }
 
     /// Downloads the rest of every checkpoint `run`'s preparation took part of, once the run
@@ -1526,12 +1530,41 @@ fn ensure_with(
     cancellation: Option<PullCancellation>,
     bytes: &(dyn Fn(u64, u64) + Sync),
 ) -> Result<Option<tensorfs_core::ensure::PartHold>, Failure> {
+    requesting(store, source, checkpoint, keep, pull, cancellation, bytes, |request| {
+        if !(pull.part || !pull.components.is_empty()) {
+            return tensorfs_core::ensure::ensure(request).map(|_| None);
+        }
+        match tensorfs_core::ensure::ensure_part(request) {
+            Ok((_, hold)) => Ok(Some(hold)),
+            // A component the slot declares that this checkpoint lacks: the whole of it, as
+            // for a slot that declares none.
+            Err(e) if e.code == tensorfs_core::err::Code::NOT_CONTAINED && !pull.part => {
+                (request.components, request.objects) = (&[], &[]);
+                tensorfs_core::ensure::ensure(request).map(|_| None)
+            }
+            Err(e) => Err(e),
+        }
+    })
+}
+
+/// `checkpoint` as a TensorFS ensure request from its Hub (`pull` its part and streams), handed
+/// to `ensure`; a refusal answered as the run's reason.
+#[allow(clippy::too_many_arguments)]
+fn requesting<T>(
+    store: &Store,
+    source: &hub::Source,
+    checkpoint: &Named,
+    keep: &[String],
+    pull: &Pull,
+    cancellation: Option<PullCancellation>,
+    bytes: &(dyn Fn(u64, u64) + Sync),
+    ensure: impl FnOnce(&mut tensorfs_core::ensure::Request) -> tensorfs_core::err::Result<T>,
+) -> Result<T, Failure> {
     let (model, manifest) = (checkpoint.repository.as_str(), checkpoint.manifest.as_str());
     let catalog = match checkpoint.release.is_empty() {
         true => Catalog::for_op(source, hub::Op::Read { model, manifest })?,
         false => Catalog::new(source).map_err(|e| ("catalog_read_failed", e.0))?,
     };
-    let credential = catalog.credential();
     let refspec = checkpoint.refspec();
     let mut keep = keep.to_vec();
     keep.push(manifest.to_string());
@@ -1540,33 +1573,21 @@ fn ensure_with(
         store,
         catalog.origin(),
         &refspec,
-        credential,
+        catalog.credential(),
         catalog.policy(),
     );
     request.lane = &checkpoint.lane;
     request.keep = &keep;
     request.on_event = Some(&on_event);
     request.cancellation = cancellation;
+    (request.components, request.objects) = (&pull.components, &pull.objects);
     if let Some(streams) = pull.streams {
         request.streams = streams;
     }
-    let refusal = |e| {
+    ensure(&mut request).map_err(|e| {
         let (code, message) = refused("model_download_failed", e);
         catalog.reason(code, message)
-    };
-    if pull.part || !pull.components.is_empty() {
-        (request.components, request.objects) = (&pull.components, &pull.objects);
-        match tensorfs_core::ensure::ensure_part(&request) {
-            Ok((_, hold)) => return Ok(Some(hold)),
-            // A component the slot declares that this checkpoint lacks: the whole of it, as
-            // for a slot that declares none.
-            Err(e) if e.code == tensorfs_core::err::Code::NOT_CONTAINED && !pull.part => {
-                (request.components, request.objects) = (&[], &[]);
-            }
-            Err(e) => return Err(refusal(e)),
-        }
-    }
-    tensorfs_core::ensure::ensure(&request).map(|_| None).map_err(refusal)
+    })
 }
 
 /// Every checkpoint a preparation needs, downloaded at once under one stage whose bytes are
@@ -2673,7 +2694,8 @@ mod tests {
     }
 
     /// A job's Hub model input lands as its structure alone. Its reads over the job's source
-    /// channel fetch the objects they reach, once; the Hub keeps the rest.
+    /// channel fetch the objects they reach, each once, under one closure; the Hub keeps the
+    /// rest.
     #[test]
     fn a_job_reads_its_model_input_in_part_through_its_source_channel() {
         use std::io::{Read, Write};
@@ -2685,9 +2707,11 @@ mod tests {
         let structure = objects();
         assert!(structure <= 2, "{structure} objects for the manifest and header");
         let weights = crate::weights::Weights::new(Arc::new(Store::open(bench.publisher.store().root()).unwrap())).unwrap();
-        let (publisher, service) = (bench.publisher.clone(), bench.service.clone());
+        let closures = || count(&heard, "POST /v1/tensorfs/closure");
+        let resolved = closures();
+        let (publisher, service, parts) = (bench.publisher.clone(), bench.service.clone(), Parts::default());
         let fetch: crate::weights::Fetch = Arc::new(move |_, wanted| {
-            publisher.fetch_part(&service, &hub, &named, wanted).map_err(|(code, message)| format!("{code}: {message}"))
+            publisher.fetch_part(&service, &hub, &named, &parts, wanted).map_err(|(code, message)| format!("{code}: {message}"))
         });
         let grant = crate::weights::Grant::new("owner", "run", &bench.root, [(manifest.id(), manifest.length)].into(),
             BTreeMap::new(), None, crate::weights::GrantAuthority {
@@ -2724,6 +2748,7 @@ mod tests {
         assert_eq!(read("w007"), first);
         assert_eq!(read("w011")[4..8], [11, 4, 0, 0]);
         assert_eq!(objects(), structure + 2, "each object once; the other 18 stay at the Hub");
+        assert_eq!(closures(), resolved + 1, "one closure for every read");
         let _ = fs::remove_dir_all(&bench.root);
     }
 
