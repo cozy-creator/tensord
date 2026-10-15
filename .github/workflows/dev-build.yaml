@@ -1,0 +1,107 @@
+name: dev-build
+# Builds the release binary for any ref and runs one targeted test command, off the dev box:
+#   gh workflow run dev-build.yaml -R cozy-creator/tensord -f ref=<sha> [-f tensorfs_ref=<ref>] [-f build=none] [-f test='cargo test --test machine_status']
+# The artifact is tensord-<sha>[-tensorfs-<sha>]. No whole-suite default: `test` is empty unless given.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or SHA to build
+        type: string
+        default: master
+      build:
+        description: "tensord: the release's manylinux binary; none: tests only"
+        type: string
+        default: tensord
+      test:
+        description: Targeted test command, run with bash at the ref; empty runs none
+        type: string
+        default: ''
+      tensorfs_ref:
+        description: TensorFS branch, tag or SHA replacing the Cargo.toml pin; empty keeps the pin
+        type: string
+        default: ''
+      runner:
+        description: Runner label
+        type: string
+        default: ubuntu-latest
+      nonce:
+        description: Caller's id, shown in the run name so the caller can find its run
+        type: string
+        default: ''
+run-name: dev-build ${{ inputs.ref }} ${{ inputs.build }} ${{ inputs.tensorfs_ref }} ${{ inputs.nonce }}
+
+permissions:
+  contents: read
+
+jobs:
+  dev:
+    runs-on: ${{ inputs.runner }}
+    # Hang bound, not a work budget.
+    timeout-minutes: 60
+    services:
+      # Started only for tests (tests/hub_oauth.rs reads AUTHKIT_TEST_DATABASE_URL).
+      postgres:
+        image: ${{ inputs.test != '' && 'postgres:18-alpine' || '' }}
+        env:
+          POSTGRES_PASSWORD: ci-only
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      AUTHKIT_TEST_DATABASE_URL: postgres://postgres:ci-only@127.0.0.1:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - id: sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      # TensorFS is private: the read key Runtime's publish.yaml uses (TENSORFS_READ_KEY).
+      - name: TensorFS read access
+        env:
+          TENSORFS_KEY: ${{ secrets.TENSORFS_READ_KEY }}
+        run: |
+          set -eu
+          mkdir -m 700 -p ~/.ssh
+          (umask 077; printf '%s\n' "$TENSORFS_KEY" > ~/.ssh/tensorfs)
+          ssh-keygen -y -P '' -f ~/.ssh/tensorfs >/dev/null
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          printf 'Host tensorfs.github.com\n  HostName github.com\n  IdentityFile ~/.ssh/tensorfs\n  IdentitiesOnly yes\n' >> ~/.ssh/config
+          git config --global url.'git@tensorfs.github.com:cozy-creator/tensorfs'.insteadOf https://github.com/cozy-creator/tensorfs
+      - uses: dtolnay/rust-toolchain@1.91.1
+      - uses: arduino/setup-task@v2
+        with:
+          repo-token: ${{ github.token }}
+      # A dev TensorFS: pin its commit and commit locally, since the release build stamps a clean HEAD.
+      - id: tensorfs
+        if: inputs.tensorfs_ref != ''
+        env:
+          REF: ${{ inputs.tensorfs_ref }}
+        run: |
+          set -eu
+          sha=$REF
+          [[ $sha =~ ^[0-9a-f]{40}$ ]] || sha=$(git ls-remote https://github.com/cozy-creator/tensorfs.git "$REF" "$REF^{}" | sort -k2 | tail -1 | cut -f1)
+          [[ $sha =~ ^[0-9a-f]{40}$ ]] || { echo "::error::TensorFS ref $REF not found"; exit 1; }
+          sed -i -E "/cozy-creator\/tensorfs\.git/ s/(tag|branch|rev) = \"[^\"]*\"/rev = \"$sha\"/" Cargo.toml
+          cargo fetch
+          git -c user.name=dev-build -c user.email=dev-build@invalid commit -qam "dev-build: TensorFS $sha"
+          echo "suffix=-tensorfs-$sha" >> "$GITHUB_OUTPUT"
+      # target/manylinux (the release container's build) and target/debug (tests) both live here.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ inputs.build }}-${{ inputs.test != '' }}
+      - name: Release build (Taskfile `release`, as Runtime's `task machine` runs it)
+        if: contains(inputs.build, 'tensord')
+        run: |
+          CARGO_BUILD_JOBS=$(nproc) task release OUT=dist
+      - if: contains(inputs.build, 'tensord')
+        uses: actions/upload-artifact@v4
+        with:
+          name: tensord-${{ steps.sha.outputs.sha }}${{ steps.tensorfs.outputs.suffix }}
+          path: dist/tensord-linux-x86_64
+          if-no-files-found: error
+          retention-days: 7
+      - if: inputs.test != ''
+        env:
+          TEST: ${{ inputs.test }}
+        run: CARGO_BUILD_JOBS=$(nproc) bash -euo pipefail -c "$TEST"
