@@ -1563,6 +1563,10 @@ mod v1_api {
         let done = settle(&mut client, &all, "names-2b", spec(Some("1.0.0"), named.clone(), "r1")).await;
         assert_eq!(done.status, "succeeded", "{done:?}");
         assert_eq!(take(), Vec::<String>::new());
+        // A run naming no release runs the one the Hub named under its revision: not asked again.
+        let done = settle(&mut client, &all, "names-2c", spec(Some(""), named.clone(), "r1")).await;
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        assert_eq!(take(), Vec::<String>::new());
 
         // A name alone is the newest release's only lane: one closure, nothing to move.
         let bare = v1::ModelChoice { repository: "acme/model".into(), ..Default::default() };
@@ -1573,9 +1577,27 @@ mod v1_api {
         assert_eq!(take(), ["POST /v1/tensorfs/closure acme/model "]);
 
         // A revision the caller moved resolves the name once more; the bytes are held.
-        let done = settle(&mut client, &all, "names-4", spec(Some("1.0.0"), named, "r2")).await;
+        let done = settle(&mut client, &all, "names-4", spec(Some("1.0.0"), named.clone(), "r2")).await;
         assert_eq!(done.status, "succeeded", "{done:?}");
         assert_eq!(take(), ["POST /v1/tensorfs/closure acme/model@1.0.0 bf16"]);
+
+        // Another SDK is another environment of the same release: its card and locked
+        // requirements are the ones its first installation kept, never read again.
+        let links = machine.root.join("links");
+        fs::create_dir_all(&links).unwrap();
+        machine.stop();
+        (machine.child, machine.address) = launch(&machine.root, &["--package-find-links".into(), links.into()]);
+        let mut client = self::client(&machine).await;
+        let done = settle(&mut client, &all, "names-4b", spec(Some("1.0.0"), named.clone(), "r2")).await;
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        assert_eq!(take(), Vec::<String>::new());
+        let generations = fs::read_dir(machine.root.join("state/generations")).unwrap().flatten();
+        let kept = generations.filter(|g| g.path().join("release.json").is_file()).count();
+        assert_eq!(kept, 2, "each environment of the release keeps its card");
+        // A moved revision asks once more which release is newest, and nothing else.
+        let done = settle(&mut client, &all, "names-4c", spec(Some(""), named, "r2")).await;
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        assert_eq!(take(), ["GET /v1/packages/acme/pkg"]);
 
         // A hash alone is the owner's: absent without the run's capability.
         let other = format!("sha256:{}", "ab".repeat(32));

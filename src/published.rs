@@ -67,7 +67,7 @@ pub enum Progress {
 pub struct Request {
     pub source: hub::Source,
     pub package: String,
-    /// Empty: the Hub's newest.
+    /// Empty: the Hub's newest, as it named it under `catalog_revision`.
     pub release: String,
     /// Unpublished code this machine already holds, in place of the release.
     pub installed: Option<Installation>,
@@ -556,11 +556,40 @@ impl Publisher {
         Ok(keep)
     }
 
-    fn alias(&self, request: &Request) -> String {
-        match &request.installed {
-            Some(installed) => installed.alias.clone(),
-            None => self.release_alias(request, &request.release),
+    /// The installation a request names. An unnamed release is the one the Hub named under
+    /// the caller's catalog revision (`newest`), so a warm run asks the Hub nothing.
+    fn alias(&self, service: &Service, request: &Request) -> io::Result<String> {
+        if let Some(installed) = &request.installed {
+            return Ok(installed.alias.clone());
         }
+        let release = match request.release.is_empty() {
+            true => service.engine.with_journal(|j| j.named(&newest_key(request), &request.catalog_revision))?.unwrap_or_default(),
+            false => request.release.clone(),
+        };
+        Ok(self.release_alias(request, &release))
+    }
+
+    /// The Hub's newest release of the request's package, journaled per catalog revision as a
+    /// model's name is (`resolve`): a moved revision asks once more.
+    fn newest(&self, service: &Service, request: &Request, catalog: &Catalog, org: &str, name: &str) -> Result<String, Failure> {
+        let key = newest_key(request);
+        if let Some(held) = service.engine.with_journal(|j| j.named(&key, &request.catalog_revision)).map_err(io_failure)? {
+            return Ok(held);
+        }
+        let release = newest_release(catalog, org, name)?;
+        service.engine.with_journal(|j| j.bind_named(&key, &request.catalog_revision, &release)).map_err(io_failure)?;
+        Ok(release)
+    }
+
+    /// A release's card and locked requirements as an earlier installation of it kept them
+    /// beside its environment (`CARD`): an exact release never changes, so its environment for
+    /// another SDK reads nothing from the Hub.
+    fn held_card(&self, service: &Service, actor: &str, request: &Request, release: &str) -> Option<Card> {
+        let origin = hub::origin_key(&request.source.origin).unwrap_or_default();
+        service.engine.installations(actor).ok()?.into_iter()
+            .filter(|i| i.package == request.package && i.release == release && i.hub == origin)
+            .find_map(|i| fs::read(service.catalog.root().join(&i.generation).join(CARD)).ok())
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
     }
 
     /// The installation of `release` of the request's package at its Hub, by this machine's SDK.
@@ -623,7 +652,7 @@ impl Publisher {
     ) -> io::Result<Option<Prepared>> {
         let held = match &request.installed {
             Some(installed) => Some(installed.clone()),
-            None => service.engine.installation(actor, &self.alias(request))?,
+            None => service.engine.installation(actor, &self.alias(service, request)?)?,
         };
         let Some(installation) = held else {
             return Ok(None);
@@ -674,7 +703,7 @@ impl Publisher {
             Some(installed) => Some(installed.clone()),
             None => service
                 .engine
-                .installation(actor, &self.alias(request))
+                .installation(actor, &self.alias(service, request).map_err(io_failure)?)
                 .map_err(io_failure)?,
         };
         let installation = match held {
@@ -704,9 +733,10 @@ impl Publisher {
         })
     }
 
-    /// The request's release installed for this signer: its card and locked requirements read
-    /// at its Hub by name (th-245), the Hub's newest release when it names none. An installation
-    /// of that release this signer holds already is the answer.
+    /// The request's release installed for this signer: its card and locked requirements as an
+    /// earlier installation of it kept them, else read at its Hub by name (th-245); the Hub's
+    /// newest release when it names none (`newest`). An installation of that release this
+    /// signer holds already is the answer.
     fn install(
         &self,
         service: &Service,
@@ -718,9 +748,9 @@ impl Publisher {
             "release_root_invalid",
             "package must be org/name".to_string(),
         ))?;
-        let catalog = Catalog::new(&request.source).map_err(|e| ("catalog_read_failed", e.0))?;
+        let catalog = || Catalog::new(&request.source).map_err(|e| ("catalog_read_failed", e.0));
         let release = match request.release.is_empty() {
-            true => newest_release(&catalog, org, name)?,
+            true => self.newest(service, request, &catalog()?, org, name)?,
             false => request.release.clone(),
         };
         let alias = self.release_alias(request, &release);
@@ -730,35 +760,23 @@ impl Publisher {
             }
         }
         job.stage(format!("installing {}@{release}", request.package));
-        let base = format!("/v1/packages/{}/{}/releases/{}", hub::escape(org), hub::escape(name), hub::escape(&release));
-        let card = catalog.json(&base).map_err(|e| absent(e, "release_absent", || {
-            format!("{} has no release {release} at {}", request.package, catalog.origin())
-        }))?;
-        if card.pointer("/release/release").and_then(Value::as_str) != Some(release.as_str()) {
-            return Err(("catalog_read_failed", format!("{base} named another release")));
-        }
-        let interface = card.get("package_interface").filter(|v| v.is_object()).cloned().ok_or((
-            "package_prepare_interface_missing",
-            "the release carries no package interface".to_string(),
-        ))?;
-        let python = card["python_version"].as_str().filter(|v| !v.is_empty()).unwrap_or(&self.sdk.python).to_string();
-        let lock = catalog
-            .get(&format!("{base}/locked-requirements"), 16 << 20)
-            .map_err(|e| ("catalog_read_failed", e.0))?;
-        let lock = String::from_utf8(lock).map_err(|_| {
-            ("package_prepare_locked_requirements_invalid", "locked requirements are not UTF-8".to_string())
-        })?;
-        let split = split_lock(&lock, name, &release, !self.sdk.requirements.is_empty())?;
+        let card = match self.held_card(service, actor, request, &release) {
+            Some(card) => card,
+            None => hub_card(&catalog()?, &request.package, &release, &self.sdk.python)?,
+        };
+        let Card { interface, python, lock } = &card;
+        let split = split_lock(lock, name, &release, !self.sdk.requirements.is_empty())?;
         let identity = sha256::hex_digest(json!({"lock":lock,"python":python,"hub":hub::origin_key(&request.source.origin),"sdk":self.sdk.requirements,"links":self.sdk.find_links,"client":self.sdk.client_wheel}).to_string().as_bytes())[..32].to_string();
         let wanted = Environment {
             split: &split,
             org,
-            python: &python,
-            interface: &interface,
+            python,
+            interface,
             release: &release,
             source: &request.source,
         };
         self.generation(service.catalog.root(), &identity, &wanted, job)?;
+        keep_card(&service.catalog.root().join(&identity), &card);
         let held = service.catalog.resolve(&identity).map_err(io_failure)?;
         if let Some(gpu) = service.gpu() {
             // Its kernels compile, and a call's imports run, while its weights come.
@@ -1403,6 +1421,57 @@ fn absent(refusal: hub::Refusal, code: &'static str, named: impl FnOnce() -> Str
     match refusal.0.contains("HTTP 404") {
         true => (code, named()),
         false => ("catalog_read_failed", refusal.0),
+    }
+}
+
+/// The journal name of an unnamed release of the request's package at its Hub.
+fn newest_key(request: &Request) -> String {
+    json!(["newest", hub::origin_key(&request.source.origin), request.package]).to_string()
+}
+
+/// What installing a release reads of it: its card's interface and Python, and its locked
+/// requirements. Kept beside each environment built from it (`CARD`).
+#[derive(serde::Deserialize, serde::Serialize)]
+struct Card {
+    interface: Value,
+    python: String,
+    lock: String,
+}
+const CARD: &str = "release.json";
+
+/// `release`'s card and locked requirements, read at its Hub.
+fn hub_card(catalog: &Catalog, package: &str, release: &str, python: &str) -> Result<Card, Failure> {
+    let (org, name) = package.split_once('/').unwrap_or_default();
+    let base = format!("/v1/packages/{}/{}/releases/{}", hub::escape(org), hub::escape(name), hub::escape(release));
+    let card = catalog.json(&base).map_err(|e| absent(e, "release_absent", || {
+        format!("{package} has no release {release} at {}", catalog.origin())
+    }))?;
+    if card.pointer("/release/release").and_then(Value::as_str) != Some(release) {
+        return Err(("catalog_read_failed", format!("{base} named another release")));
+    }
+    let interface = card.get("package_interface").filter(|v| v.is_object()).cloned().ok_or((
+        "package_prepare_interface_missing",
+        "the release carries no package interface".to_string(),
+    ))?;
+    let python = card["python_version"].as_str().filter(|v| !v.is_empty()).unwrap_or(python).to_string();
+    let lock = catalog
+        .get(&format!("{base}/locked-requirements"), 16 << 20)
+        .map_err(|e| ("catalog_read_failed", e.0))?;
+    let lock = String::from_utf8(lock).map_err(|_| {
+        ("package_prepare_locked_requirements_invalid", "locked requirements are not UTF-8".to_string())
+    })?;
+    Ok(Card { interface, python, lock })
+}
+
+/// `card` kept beside the environment at `generation` for the release's later environments.
+/// A cache, written by rename and never synced: one lost is read from the Hub again.
+fn keep_card(generation: &Path, card: &Card) {
+    let staged = generation.join(format!(".{CARD}.{}", uuid::Uuid::new_v4().simple()));
+    let kept = serde_json::to_vec(card).map_err(io::Error::other)
+        .and_then(|bytes| fs::write(&staged, bytes))
+        .and_then(|()| fs::rename(&staged, generation.join(CARD)));
+    if let Err(error) = kept {
+        eprintln!("release card {}: {error}", generation.display());
     }
 }
 
