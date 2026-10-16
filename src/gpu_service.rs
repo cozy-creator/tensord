@@ -2471,10 +2471,14 @@ impl GpuPool {
                 }
             }
         };
-        let facts = crate::journal::ExecutorFacts::observed(
-            session.executor.birth.pid, session.executor.hello.runtime_version.clone(),
-            session.executor.hello.tensorfs_version.clone(),
-        );
+        // A development Runtime build is named by its build, not only its version.
+        let hello = &session.executor.hello;
+        let build = &held.record.runtime_build;
+        let runtime = match build.split_once('+') {
+            Some((version, _)) if version == hello.runtime_version => build.clone(),
+            _ => hello.runtime_version.clone(),
+        };
+        let facts = crate::journal::ExecutorFacts::observed(session.executor.birth.pid, runtime, hello.tensorfs_version.clone());
         if !engine.authorize_managed(id, Some(facts))? {
             engine.finish_stopped(id)?;
             self.keep_idle(session);
