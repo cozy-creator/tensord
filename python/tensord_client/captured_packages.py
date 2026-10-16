@@ -280,7 +280,7 @@ def install_captured(*, project: Path | None, wheels: list[Path], requirements: 
             else:
                 subprocess.run(["uv", "pip", "install", *COPY, "--python", str(interpreter), *map(str,wheels)], check=True)
 
-        capture({canonicalize_name(wheel.name.split("-")[0]) for wheel in sdk})
+        capture()
         fallback = machine_sdk(interpreter, sdk, capture) if sdk else ""
         add_client(interpreter, root / "captured-constraints.txt", client_wheel)
         return publish_generation(root, metadata, None, callees, fallback)
