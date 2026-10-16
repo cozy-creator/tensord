@@ -156,15 +156,6 @@ impl Named {
     pub(crate) fn object(&self) -> ObjectRef {
         ObjectRef { sha256: self.manifest.trim_start_matches("sha256:").into(), length: self.length }
     }
-
-    /// The ref a pull names: a release's lane pinned to its manifest, which the Hub checks is that
-    /// lane's, or the owner's checkpoint by hash.
-    fn refspec(&self) -> String {
-        match self.release.is_empty() {
-            true => format!("{}@{}", self.repository, self.manifest),
-            false => format!("{}@{}@{}", self.repository, self.release, self.manifest),
-        }
-    }
 }
 
 /// The caller's provider tokens; empty reads public sources anonymously.
@@ -1267,7 +1258,7 @@ impl Publisher {
                 .find(|c| c.parameter == grant.slot || c.parameter == parameter)
             {
                 let resolve = |named| self.resolve(service, &request.source, named, &request.catalog_revision);
-                apply_adapters(self, service, &request.source, &resolve, choice, grant, &request.providers, job)?;
+                apply_adapters(self, &request.source, &resolve, choice, grant, &request.providers, job)?;
             }
         }
         job.stage(format!("preparing {}", request.package));
@@ -1384,10 +1375,8 @@ fn refused(code: &'static str, refusal: tensorfs_core::err::Refusal) -> Failure 
 
 /// A slot's caller adapters applied to its resolved base: each adapter downloaded, then one
 /// adapter view composed (`adapter_views`); the grant then names the view.
-#[allow(clippy::too_many_arguments)]
 fn apply_adapters(
     publisher: &Publisher,
-    service: &Service,
     source: &hub::Source,
     resolve: &dyn Fn(Named) -> Result<Named, Failure>,
     choice: &domain::ModelChoice,
@@ -2406,12 +2395,7 @@ mod tests {
     }
 
     #[test]
-    fn a_checkpoint_pulls_pinned_to_its_release_or_by_the_owners_hash() {
-        let manifest = format!("sha256:{}", "ab".repeat(32));
-        let named = Named { repository: "o/m".into(), release: "1.0.0".into(), lane: "fp8".into(), manifest: manifest.clone(), length: 9 };
-        assert_eq!(named.refspec(), format!("o/m@1.0.0@{manifest}"));
-        let private = Named { release: String::new(), ..named };
-        assert_eq!(private.refspec(), format!("o/m@{manifest}"));
+    fn releases_order_by_version() {
         assert!(release_order("2.0.0") > release_order("10.0.0rc1"));
         assert!(release_order("10.0.0") > release_order("9.1.0"));
     }
