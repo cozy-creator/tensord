@@ -1534,7 +1534,7 @@ fn ensure_with(
     bytes: &(dyn Fn(u64, u64) + Sync),
 ) -> Result<Option<tensorfs_core::ensure::PartHold>, Failure> {
     requesting(store, source, checkpoint, keep, pull, cancellation, bytes, |request| {
-        if !(pull.part || !pull.components.is_empty()) {
+        if !pull.part && pull.components.is_empty() {
             return tensorfs_core::ensure::ensure(request).map(|_| None);
         }
         match tensorfs_core::ensure::ensure_part(request) {
