@@ -45,9 +45,23 @@ pub fn of(
     };
     let mut files: Vec<_> = files.iter().map(|f| json!([f.input_id, f.digest, f.media_type])).collect();
     files.sort_by_key(|file| file.to_string());
-    let computation = json!({"operation": operation, "request": request, "files": files,
+    let computation = json!({"operation": operation, "request": checkpoints(request), "files": files,
         "attention": attention, "models": models});
     Memo::Key(format!("sha256:{}", sha256::hex_digest(&crate::boundary_json::exact(&computation))))
+}
+
+/// The request with each model artifact it carries as its checkpoint's manifest: the run that
+/// produced a checkpoint is provenance, never part of a consumer's computation.
+fn checkpoints(value: &Value) -> Value {
+    const ARTIFACT: [&str; 4] = ["manifest", "output_slot", "producer_request_id", "tensorfs_receipt_digest"];
+    match value {
+        Value::Object(fields) if fields.len() == ARTIFACT.len() && ARTIFACT.iter().all(|k| fields.contains_key(*k)) => {
+            json!({"manifest": fields["manifest"]})
+        }
+        Value::Object(fields) => Value::Object(fields.iter().map(|(k, v)| (k.clone(), checkpoints(v))).collect()),
+        Value::Array(items) => Value::Array(items.iter().map(checkpoints).collect()),
+        other => other.clone(),
+    }
 }
 
 /// The models a call runs with: each slot's checkpoints and adapters once resolved (its raw
