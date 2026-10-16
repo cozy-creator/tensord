@@ -1,5 +1,5 @@
 //! The machine's caches manage themselves, with no purge verb. Each expires a TTL after its
-//! last use. A disk is low when no more than its reserve is free (TensorFS `ensure::Disk`).
+//! last use. A disk is low when no more than its reserve is free (TensorFS `admission::Disk`).
 //! On a low disk a sweep frees what lifts it back above the reserve, but only when what it may
 //! drop together covers that; otherwise it drops only the store's garbage. The plan drops, in
 //! order: collected result copies, settled logs, memoized stages, downloaded wheels no
@@ -22,7 +22,7 @@ use std::{
 };
 use tensorfs_core::store::Store;
 
-pub use tensorfs_core::ensure::Disk;
+pub use tensorfs_core::admission::Disk;
 
 pub const TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Installed or used within one sweep period counts as in use, even on a low disk: an
@@ -486,7 +486,7 @@ pub fn sweep(caches: &Caches) -> io::Result<Swept> {
     // A store on its own filesystem is relieved under TensorFS's rule for it.
     let shared = match store {
         Some(store) if fs::metadata(store.store.root())?.dev() != filesystem => {
-            let relief = tensorfs_core::ensure::relieve(store.store, &store.keep);
+            let relief = tensorfs_core::admission::relieve(store.store, &store.keep);
             swept.store_bytes += relief.map_err(io::Error::other)?.collected_bytes;
             None
         }

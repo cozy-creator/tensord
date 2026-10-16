@@ -1715,13 +1715,11 @@ mod v1_api {
         assert_eq!(result["release"], "1.0.0");
         assert_eq!((&row["release"], &row["lane"], &row["manifest"]), (&"1.0.0".into(), &"bf16".into(), &manifest.id().into()));
         let cold = take();
-        let pinned = format!("POST /v1/tensorfs/closure acme/model@1.0.0@{} bf16", manifest.id());
         for asked in [
             "GET /v1/packages/acme/pkg",
             "GET /v1/packages/acme/pkg/releases/1.0.0",
             "GET /v1/packages/acme/pkg/releases/1.0.0/locked-requirements",
             "POST /v1/tensorfs/closure acme/model@1.0.0 bf16",
-            &pinned,
             "POST /v1/tensorfs/presign",
         ] {
             assert!(cold.iter().any(|heard| heard == asked), "{asked} not in {cold:?}");

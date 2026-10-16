@@ -413,20 +413,17 @@ impl Publisher {
         made
     }
 
-    /// `named` downloaded whole (TensorFS `ensure`, on the Store's fetcher) under its access,
-    /// beside what no store GC may evict (`protected`): what a caller asked for whole (`cozy
-    /// model download`, an adapter).
-    fn ensure(&self, service: &Service, source: &hub::Source, named: &Named, stop: Option<&PullCancellation>,
+    /// `named` downloaded whole on the Store's fetcher, as a request's weights are, and
+    /// recorded so the GC keeps it: what a caller asked for whole (`cozy model download`, an
+    /// adapter).
+    fn ensure(&self, source: &hub::Source, named: &Named, stop: Option<&PullCancellation>,
         bytes: &(dyn Fn(u64, u64) + Sync)) -> Result<(u64, u64), Failure> {
-        let mut keep = self.protected(service).map_err(io_failure)?;
-        keep.push(named.manifest.clone());
-        let refspec = named.refspec();
-        let catalog = access::of(source, &crate::access::origin(source, &named.repository, &named.release, &named.lane, &named.object()))?;
-        let on_event = |event: &tensorfs_core::ensure::Event| bytes(event.bytes_done, event.bytes_total);
-        let mut request = tensorfs_core::ensure::Request::new(&self.store, &source.origin, &refspec, catalog.clone());
-        (request.lane, request.keep, request.cancellation) = (&named.lane, &keep, stop.cloned());
-        request.on_event = Some(&on_event);
-        tensorfs_core::ensure::ensure(&request).map(|e| (e.bytes_fetched, e.bytes_cached)).map_err(|e| match stop.is_some_and(PullCancellation::is_cancelled) {
+        let origin = crate::access::origin(source, &named.repository, &named.release, &named.lane, &named.object());
+        let catalog = access::of(source, &origin)?;
+        let fetcher = tensorfs_core::fetch::Fetcher::of(&self.store).map_err(|e| refused("model_download_failed", e))?;
+        let stop = stop.cloned().unwrap_or_default();
+        let at = tensorfs_core::fetch::Priority::Now;
+        tensorfs_core::fetch::whole(&fetcher, &origin, catalog.clone(), at, &stop, bytes).map_err(|e| match stop.is_cancelled() {
             true => canceled(),
             false => {
                 let (code, message) = refused("model_download_failed", e);
@@ -522,7 +519,7 @@ impl Publisher {
         // A checkpoint this store already holds whole, in that repository, moves nothing.
         let mut moved = (0, 0);
         if tensorfs_core::checkpoint_root::check_source(&self.store, &named.repository, &named.object()).is_err() {
-            moved = self.ensure(service, source, &named, stop, bytes).map_err(failed)?;
+            moved = self.ensure(source, &named, stop, bytes).map_err(failed)?;
         }
         Ok((named, moved))
     }
@@ -1378,7 +1375,7 @@ fn apply_adapters(
                 length: 0,
             })?;
             // An adapter is small and its view composes from all of it: it comes whole.
-            publisher.ensure(service, source, &named, job.stop.as_ref(), &|d, t| job.bytes(d, t))?;
+            publisher.ensure(source, &named, job.stop.as_ref(), &|d, t| job.bytes(d, t))?;
             named.manifest
         } else {
             // A provider-source LoRA (civitai://, hf://) is made here, normalized at ingest.

@@ -87,7 +87,7 @@ impl Objects {
     /// or for `IDLE` while the store's disk is low. Their bytes are then the store GC's.
     pub fn sweep(&self) -> io::Result<usize> {
         let disk =
-            tensorfs_core::ensure::Disk::measure(self.store.root()).map_err(io::Error::other)?;
+            tensorfs_core::admission::Disk::measure(self.store.root()).map_err(io::Error::other)?;
         self.release(match disk.short() {
             Some(_) => crate::reclaim::IDLE,
             None => crate::reclaim::TTL,
