@@ -1243,7 +1243,7 @@ impl Publisher {
             let tolerances = precision::Slot::of(slot);
             request.bits == 0 && tolerances.min_bits == 4 && !tolerances.decode
         };
-        if slots.iter().any(|slot| shrinks(slot)) {
+        if slots.iter().any(&shrinks) {
             let bytes: u64 = checkpoints.iter().map(|named| self.bytes(named)).sum();
             let measured: Vec<String> = service
                 .engine
@@ -1255,7 +1255,7 @@ impl Publisher {
                 .map(|plan| plan.construction)
                 .collect();
             if gpu.budget(degree, &measured).is_some_and(|budget| bytes > budget) {
-                for (slot, chosen) in slots.iter().zip(&mut picked).filter(|(slot, _)| shrinks(*slot)) {
+                for (slot, chosen) in slots.iter().zip(&mut picked).filter(|(slot, _)| shrinks(slot)) {
                     *chosen = pick(slot, true)?;
                 }
                 land(&picked)?;
@@ -2651,7 +2651,7 @@ mod tests {
                 "device_name": "GPU", "device_uuid": format!("GPU-{at}"), "driver_version": "1", "memory_bytes": memory,
                 "pci_bus_id": format!("{at}"), "compute_cap": cc})).collect();
             let devices: Vec<String> = (0..gpus.len()).map(|at| at.to_string()).collect();
-            let config = json!({"devices": devices.join(","), "gpus": inventory, "authorized_device_limit_bytes": null, "prespawn": false});
+            let config = json!({"devices": devices.join(","), "inventory": inventory, "authorized_device_limit_bytes": null, "prespawn": false});
             service.configure_pool(Pool::new(&root.join("gpu"), serde_json::from_value(config).unwrap(), store).unwrap()).unwrap();
             let identity = "cd".repeat(16);
             let dir = service.catalog.root().join(&identity);

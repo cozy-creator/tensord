@@ -32,7 +32,12 @@ with a self-signed leaf; the CLI does not use it. Caller: the `cozy run play` li
 all package-code model slots on the machine. A positive value requests exactly that many
 GPUs; unsupported operations fail instead of reducing the count. This includes GPU child
 calls of a deviceless root, whose explicit count reserves one subset while it runs. Checkpoint identity and weight
-ladder GPU hints never select parallelism. Busy GPUs cause queuing, not a smaller group.
+lanes never select parallelism. Busy GPUs cause queuing, not a smaller group.
+
+`RunSpec.bits` and `WarmItem.bits` (16, 8 or 4) set the run's weight precision; children inherit
+it and Runtime gets it with each request. Zero: the lane rule (`precision.rs`, tracker design
+`precision-tiers.md` §2.2) picks each slot's lane from its GPUs' compute capability, its declared
+`min_bits`, `phase` and `encoded_leaves`, and the memory budget. Each fallback step is a run warning.
 
 
 ## What disappears
@@ -55,9 +60,10 @@ ladder GPU hints never select parallelism. Busy GPUs cause queuing, not a smalle
   work is never re-run.
 - **Names** (th-245): the machine resolves them at the run's Hub. A release (`org/name`, its
   release or none for the newest) installs from the card and locked requirements it reads there
-  by name. A model slot is `repository` at `release` (none: the newest) in its `lane`, else the
-  widest rung of its binding its GPUs fit, else the release's only lane: one anonymous closure
-  call names its manifest, then the pull is pinned to that lane's checkpoint. `manifest` names a
+  by name. A model slot is the run's choice, else its declared `default` release (a callee's
+  too): `repository` at `release` (none: the newest) in its `lane`, else in the first lane of the
+  rule's order its release publishes, else in its only lane. Anonymous closure calls name its
+  manifest, then the pull is pinned to that lane's checkpoint. `manifest` names a
   checkpoint by hash only: the owner's (under the capability) or one the machine holds. Name
   resolutions and held preparations are kept per `catalog_revision`, so a warm run reads nothing
   at a Hub and a revision the caller moved resolves once more; there is no TTL guess or forget verb.

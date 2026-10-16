@@ -86,7 +86,7 @@ pub struct GpuConfig {
     /// The receipt's inventory (`nvidia-smi`): each GPU's compute capability and memory, matched
     /// to envelope entries by index or UUID, for the lane rule (`precision`).
     #[serde(default)]
-    pub gpus: Vec<crate::machine::receipt::Gpu>,
+    pub inventory: Vec<crate::machine::receipt::Gpu>,
     /// Load's device limit where NVML cannot read the device total.
     pub authorized_device_limit_bytes: Option<u64>,
     #[serde(default)]
@@ -907,7 +907,7 @@ impl Pool {
         Some(memory.saturating_sub(peak.unwrap_or(memory / 4)))
     }
     fn inventory(&self, entry: &str) -> Option<&crate::machine::receipt::Gpu> {
-        self.config.gpus.iter().find(|g| g.device_index.to_string() == entry || g.device_uuid == entry)
+        self.config.inventory.iter().find(|g| g.device_index.to_string() == entry || g.device_uuid == entry)
     }
     /// The `degree` GPUs from envelope index `start`: a group's are the first ones; none for a
     /// deviceless call.

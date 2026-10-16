@@ -142,7 +142,7 @@ mod tests {
             .unwrap()
         };
         let key = |generation: &Generation, application: &str, invocable: &Value| {
-            match of(generation, application, invocable, &json!({"value": 3}), &[], "", json!([])) {
+            match of(generation, application, invocable, &json!({"value": 3}), &[], ("", 0), json!([])) {
                 Memo::Key(key) => key,
                 _ => panic!("not memoizable"),
             }
@@ -160,7 +160,7 @@ mod tests {
         // The root's declared identity is not this machine's reading: its files key it.
         let own = invocable("root", "own", Some(&same));
         assert_ne!(key(&before, "", &own), key(&generation("sha256:one", "sha256:moved"), "", &own));
-        assert!(matches!(of(&generation("sha256:one", ""), "", &own, &json!({}), &[], "", json!([])), Memo::Off));
+        assert!(matches!(of(&generation("sha256:one", ""), "", &own, &json!({}), &[], ("", 0), json!([])), Memo::Off));
     }
 
     /// An author's condition names parameters a request must give: absent or null, the call is
@@ -189,6 +189,6 @@ mod tests {
         assert_eq!(key(fox.clone(), &[file("sha256:a")]), key(fox.clone(), &[file("sha256:a")]));
         assert_ne!(key(fox.clone(), &[file("sha256:a")]), key(fox, &[file("sha256:b")]));
         let plain = json!({"module": "p", "export": "paint"});
-        assert!(matches!(of(&generation, "", &plain, &json!({}), &[], "", json!([])), Memo::Off));
+        assert!(matches!(of(&generation, "", &plain, &json!({}), &[], ("", 0), json!([])), Memo::Off));
     }
 }

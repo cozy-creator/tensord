@@ -230,7 +230,7 @@ fn run_machine(
         std::fs::create_dir_all(&home)?;
         let mut config = serde_json::json!({
             "devices": devices.join(","),
-            "gpus": gpus,
+            "inventory": gpus,
             "authorized_device_limit_bytes": null,
             "pinned_budget_bytes": 4i64 << 30,
             "environment": {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": home, "COZY_HOME": home},

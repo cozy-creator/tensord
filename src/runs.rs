@@ -1291,7 +1291,7 @@ mod tests {
         let mut warm = spec(Source::Models, true, "set");
         warm.set = Some(vec![SetItem {
             source: Source::Installation("installed".into()), entrypoint: "steps".into(),
-            models: vec![], level: Level::Host, sent: vec![],
+            models: vec![], bits: 0, level: Level::Host, sent: vec![],
         }]);
         assert_eq!(runs.prepare("alice", "set", warm, &runs.service.engine.stoppable("set")).err().unwrap().code, "callable_internal");
         let _ = fs::remove_dir_all(root);
