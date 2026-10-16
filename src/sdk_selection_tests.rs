@@ -1,4 +1,4 @@
-use super::image_sdk;
+use tensord::published::PackageSdk;
 use tensord::machine::update::Paths;
 use std::{fs, os::unix::fs::symlink, path::Path};
 
@@ -24,7 +24,7 @@ fn an_activated_sdk_selection_survives_a_same_filename_link_switch() {
     let link = engine.join("sdk/current");
     symlink(&first, &link).unwrap();
     let paths = Paths::new(&engine, &root);
-    let before = image_sdk(&paths.sdk(), &root, "uv".into());
+    let before = PackageSdk::selected(&paths.sdk(), &root, "uv".into());
     let before_runtime = before
         .requirements
         .iter()
@@ -37,7 +37,7 @@ fn an_activated_sdk_selection_survives_a_same_filename_link_switch() {
     let replacement = engine.join("sdk/next");
     symlink(&second, &replacement).unwrap();
     fs::rename(replacement, &link).unwrap();
-    let after = image_sdk(&paths.sdk(), &root, "uv".into());
+    let after = PackageSdk::selected(&paths.sdk(), &root, "uv".into());
     // Both the local installer and published installer consume these exact paths;
     // their cache keys must describe the bytes the helper will later open.
     assert_ne!(
@@ -58,7 +58,7 @@ fn an_activated_sdk_selection_survives_a_same_filename_link_switch() {
     assert_eq!(fs::read(after_runtime).unwrap(), b"second Runtime build");
     assert_eq!(before.find_links, Some(first.canonicalize().unwrap()));
     assert_eq!(after.find_links, Some(second.canonicalize().unwrap()));
-    let repeated = image_sdk(&paths.sdk(), &root, "uv".into());
+    let repeated = PackageSdk::selected(&paths.sdk(), &root, "uv".into());
     assert_eq!(repeated.requirements, after.requirements);
     assert_eq!(repeated.find_links, after.find_links);
     fs::remove_dir_all(root).unwrap();
@@ -71,16 +71,16 @@ fn image_sdk_selection_preserves_baked_and_absent_pair_behavior() {
         .join(uuid::Uuid::new_v4().to_string());
     let engine = root.join("var/lib/cozy/tensord");
     let baked = root.join("opt/cozy/machine/wheels");
-    let missing = image_sdk(&baked, &root, "uv".into());
+    let missing = PackageSdk::selected(&baked, &root, "uv".into());
     assert!(missing.requirements.is_empty());
     assert!(missing.find_links.is_none());
     pair(&baked, b"baked Runtime");
     let paths = Paths::new(&engine, &root);
-    let selected = image_sdk(&paths.sdk(), &root, "uv".into());
+    let selected = PackageSdk::selected(&paths.sdk(), &root, "uv".into());
     assert_eq!(selected.find_links, Some(baked.canonicalize().unwrap()));
     assert_eq!(selected.requirements.len(), 2);
     fs::remove_file(baked.join(TENSORFS)).unwrap();
-    let incomplete = image_sdk(&paths.sdk(), &root, "uv".into());
+    let incomplete = PackageSdk::selected(&paths.sdk(), &root, "uv".into());
     assert!(incomplete.requirements.is_empty());
     assert!(incomplete.find_links.is_none());
     fs::remove_dir_all(root).unwrap();
@@ -161,7 +161,7 @@ fn same_filename_activation_installs_new_runtime_and_retains_old_generation() {
         .as_bytes(),
     );
     let manifest = manifest["digest"].as_str().unwrap();
-    let selected = || image_sdk(&paths.sdk(), &root, "uv".into());
+    let selected = || PackageSdk::selected(&paths.sdk(), &root, "uv".into());
     let local = |sdk: &tensord::published::PackageSdk| {
         LocalSources::new(
             objects.clone(),

@@ -297,7 +297,7 @@ fn run_machine(
         helper,
         Some(wheel),
         "3.12".into(),
-        image_sdk(&paths.sdk(), &layout.root, uv),
+        tensord::published::PackageSdk::selected(&paths.sdk(), &layout.root, uv),
         // A run naming no Hub reads this rental's own Hub's public content.
         grant.hub.clone().filter(|_| rental),
     )?;
@@ -313,8 +313,6 @@ fn run_machine(
     serve(owner, service, control)
 }
 
-/// Executors use the machine's own Runtime/TensorFS pair (the wheels its root ships), so they
-/// speak its protocol; without a pair, each release's locked SDK.
 /// The image's Runtime interpreter and the executors' Runtime wheel, when both are here: the
 /// machine compiles its kernels with them as it starts.
 fn image_kernels(root: &std::path::Path, sdk: &std::path::Path) -> Option<serde_json::Value> {
@@ -326,37 +324,6 @@ fn image_kernels(root: &std::path::Path, sdk: &std::path::Path) -> Option<serde_
         })
     })?;
     python.is_file().then(|| serde_json::json!({"python": python, "runtime_wheel": wheel}))
-}
-
-fn image_sdk(
-    wheels: &std::path::Path,
-    root: &std::path::Path,
-    uv: PathBuf,
-) -> tensord::published::PackageSdk {
-    // An activation replaces sdk/current, not the immutable candidate directory.
-    // Freeze that selection once: both cache identity and the helper's actual wheel
-    // inputs must name the same build even when filenames/version labels repeat.
-    let wheels = wheels.canonicalize().unwrap_or_else(|_| wheels.to_path_buf());
-    let mut pair: Vec<String> = std::fs::read_dir(&wheels)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|e| e == "whl"))
-        .map(|path| path.display().to_string())
-        .collect();
-    pair.sort();
-    let complete = pair.iter().any(|w| w.contains("/cozy_runtime-"))
-        && pair.iter().any(|w| w.contains("/tensorfs-"));
-    let seed = root.join("opt/cozy/dependency-seed/uv-cache");
-    tensord::published::PackageSdk {
-        uv,
-        python: "3.12".into(),
-        find_links: complete.then_some(wheels),
-        requirements: if complete { pair } else { vec![] },
-        client_wheel: None,
-        seed_cache: seed.is_dir().then_some(seed),
-    }
 }
 
 #[cfg(test)]
