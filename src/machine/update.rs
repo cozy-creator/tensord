@@ -19,6 +19,10 @@ use std::{
 use crate::process::Supervised;
 use tensorfs_core::{store::Store, transport::PullCancellation};
 
+/// The file in a selected pair naming its development Runtime build (`0.24.6+e9baf7a4`),
+/// which runs report: a named wheel file is not a published release.
+pub const RUNTIME_BUILD: &str = "runtime-build";
+
 /// The service's exit status asking its parent to exec the selected application.
 pub const REPLACE_EXIT: i32 = 75;
 const MAX_WHEEL_BYTES: u64 = 256 << 20;
@@ -583,6 +587,9 @@ impl Updates {
             let prepared = candidate.join(&name);
             fs::copy(&wheel, &prepared)?;
             fs::File::open(prepared)?.sync_all()?;
+            if let Some(file) = choice.as_ref().filter(|c| distribution == "cozy_runtime" && !c.file.is_empty()) {
+                fs::write(candidate.join(RUNTIME_BUILD), build(&wheel, &file.sha256)?)?;
+            }
             if let Some(binary) = bundled.filter(|_| request.agent != "explicit") {
                 agent = bundled_tensord(&binary, candidate)?;
             }
@@ -718,6 +725,21 @@ fn verify_wheel(path: &Path, distribution: &str) -> io::Result<Option<Vec<u8>>> 
     let mut binary = Vec::new();
     entry.read_to_end(&mut binary)?;
     Ok(Some(binary))
+}
+
+/// A development Runtime wheel's version and build: the source commit it embeds, else its
+/// bytes' digest.
+fn build(path: &Path, sha256: &str) -> io::Result<String> {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let (_, version) = wheel_name(name).ok_or_else(|| invalid("not a Runtime wheel"))?;
+    let mut archive = zip::ZipArchive::new(fs::File::open(path)?).map_err(io::Error::other)?;
+    let mut provenance = String::new();
+    if let Ok(mut file) = archive.by_name("cozy_runtime/_build_provenance.py") {
+        file.read_to_string(&mut provenance)?;
+    }
+    let commit = provenance.lines().find_map(|l| l.strip_prefix("COMMIT = ")).map(|c| c.trim().trim_matches('"'));
+    let id = commit.filter(|c| c.len() >= 8 && c.chars().all(|c| c.is_ascii_hexdigit())).unwrap_or(sha256);
+    Ok(format!("{version}+{}", &id[..8]))
 }
 
 /// The bundled executable when it is TensorD (its `version --json` says so). A wheel bundling
@@ -899,6 +921,12 @@ mod tests {
             "METADATA must agree with the file name"
         );
         assert_eq!(pair_in(&dir).runtime, "0.18.103");
+        let built = dir.join("cozy_runtime-0.18.104-py3-none-any.whl");
+        let mut zip = zip::ZipWriter::new(fs::File::create(&built).unwrap());
+        zip.start_file("cozy_runtime/_build_provenance.py", zip::write::SimpleFileOptions::default()).unwrap();
+        zip.write_all(b"COMMIT = \"e9baf7a4fe4b855009b2eb288c6dda336c1fe2f0\"\n").unwrap();
+        zip.finish().unwrap();
+        assert_eq!(build(&built, &"0".repeat(64)).unwrap(), "0.18.104+e9baf7a4", "a build names its commit");
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1313,6 +1341,9 @@ mod tests {
         assert_eq!((installed.from.runtime.as_str(), installed.to.runtime.as_str()), ("0.1.0", "0.1.0"));
         assert_ne!(installed.from, installed.to, "a rebuilt wheel at the running version reads unchanged");
         assert_eq!(installed.to.runtime_sha256, hex(&Sha256::digest(fs::read(&candidate).unwrap())));
+        // A named wheel is a development build its runs name: by its bytes, without provenance.
+        let build = fs::read_to_string(transaction.paths.sdk().join(RUNTIME_BUILD)).unwrap();
+        assert_eq!(build, format!("0.1.0+{}", &installed.to.runtime_sha256[..8]));
         assert_eq!(installed.from.tensorfs_sha256, installed.to.tensorfs_sha256);
         let request = update_request(&updates, "again", &candidate);
         updates.request(request, |_| panic!("the running wheel restarted the service")).unwrap();

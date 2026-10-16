@@ -926,7 +926,11 @@ impl Publisher {
             Some(_) => describe_environment(&py, &split.distribution, &hub_packages(&split.exact, org, source))?,
             None => (String::new(), vec![]),
         };
-        let record = json!({"identity":identity,"package":split.distribution,"version":release,"application":application,"python":interpreter,"dependencies":installed_sdk(&env),"interface":interface,"sdk":sdk_choice,"sdk_fallback":sdk_fallback,"source_digest":source_digest,"callees":callees});
+        let runtime_build = match (sdk_choice, &self.sdk.find_links) {
+            ("machine", Some(sdk)) => fs::read_to_string(sdk.join(crate::machine::update::RUNTIME_BUILD)).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let record = json!({"identity":identity,"package":split.distribution,"version":release,"application":application,"python":interpreter,"dependencies":installed_sdk(&env),"interface":interface,"sdk":sdk_choice,"sdk_fallback":sdk_fallback,"runtime_build":runtime_build,"source_digest":source_digest,"callees":callees});
         let staged = dir.join(".generation.json.new");
         let mut file = OpenOptions::new()
             .create_new(true)
