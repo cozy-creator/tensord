@@ -134,7 +134,7 @@ fn invoke(
 ) -> Frame {
     let spool = root.join(id);
     fs::create_dir(&spool).unwrap();
-    let prepared=executor.command(&DeviceCommand::PrepareRequest{attention_kernel:String::new(),input_metadata:Default::default(),request_id:id.into(),construction:"classifier".into(),entrypoint:"classify".into(),payload:json!({"samples":[[5.1,3.5,1.4,0.2],[6.,2.7,5.1,1.6],[6.7,3.1,4.7,1.5]],"iterations":iterations,"seed":19})},&mut Baseline).unwrap();
+    let prepared=executor.command(&DeviceCommand::PrepareRequest{attention_kernel:String::new(),bits:0,input_metadata:Default::default(),request_id:id.into(),construction:"classifier".into(),entrypoint:"classify".into(),payload:json!({"samples":[[5.1,3.5,1.4,0.2],[6.,2.7,5.1,1.6],[6.7,3.1,4.7,1.5]],"iterations":iterations,"seed":19})},&mut Baseline).unwrap();
     assert!(prepared.ok, "{prepared:?}");
     executor
         .command(

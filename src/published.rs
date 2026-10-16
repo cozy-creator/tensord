@@ -1209,7 +1209,7 @@ impl Publisher {
             let tolerances = precision::Slot::of(slot);
             let bits = tolerances.bits(request.bits, short);
             let ruled = named.lane.is_empty() && named.manifest.is_empty();
-            let lanes = if ruled { tolerances.lanes(bits, gpus.row) } else { vec![] };
+            let lanes = if ruled { tolerances.lanes(bits, &gpus) } else { vec![] };
             let named = self.resolve(service, &request.source, named, &lanes, &request.catalog_revision)?;
             let model = format!("{}@{}", named.repository, named.release);
             let warnings = if ruled { tolerances.warnings(bits, &gpus, &model, &named.lane) } else { vec![] };
@@ -1323,9 +1323,9 @@ impl Publisher {
     }
 }
 
-/// The machine's GPUs as a held resolution is keyed by: how many, and their row.
+/// The machine's GPUs as a held resolution is keyed by: how many, and what they run.
 fn machine_row(gpu: &Pool) -> String {
-    format!("{}x{:?}", gpu.width(), gpu.gpus(gpu.width() as u32).row)
+    format!("{}x{:?}", gpu.width(), gpu.gpus(gpu.width() as u32))
 }
 
 /// Where a held resolution's precision warnings are journaled.
