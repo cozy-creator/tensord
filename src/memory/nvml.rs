@@ -20,6 +20,7 @@ type Uuid = unsafe extern "C" fn(Handle, *mut c_char, c_uint) -> c_int;
 type DriverVersion = unsafe extern "C" fn(*mut c_char, c_uint) -> c_int;
 
 const SUCCESS: c_int = 0;
+const NOT_SUPPORTED: c_int = 3;
 const INSUFFICIENT_SIZE: c_int = 7;
 /// `NVML_VALUE_NOT_AVAILABLE`: the driver does not account this process.
 const NOT_AVAILABLE: u64 = u64::MAX;
@@ -135,8 +136,18 @@ impl Device {
         };
         // SAFETY: documented NVML calls on a live handle with owned out-parameters.
         unsafe {
-            if (self.memory)(self.handle, &mut memory) != SUCCESS {
-                return Err(io::Error::other("nvmlDeviceGetMemoryInfo failed"));
+            match (self.memory)(self.handle, &mut memory) {
+                SUCCESS => {}
+                // An integrated GPU (GB10) has no framebuffer: its memory is the host's.
+                NOT_SUPPORTED => {
+                    let total = crate::host_memory::total();
+                    let free = crate::host_memory::read().mem_available;
+                    if total <= 0 || free < 0 {
+                        return Err(io::Error::other("host memory is unreadable"));
+                    }
+                    (memory.total, memory.free) = (total as u64, free as u64);
+                }
+                _ => return Err(io::Error::other("nvmlDeviceGetMemoryInfo failed")),
             }
             let mut state: c_int = 0;
             let display = (self.display)(self.handle, &mut state) == SUCCESS && state == 1;

@@ -201,7 +201,10 @@ pub fn gpus() -> io::Result<Vec<Gpu>> {
         }
         Ok(output) => output,
     };
-    let mut rows = parse_gpus(&String::from_utf8_lossy(&output.stdout))?;
+    let mut rows = parse_gpus(
+        &String::from_utf8_lossy(&output.stdout),
+        crate::host_memory::total(),
+    )?;
     if let Some(visible) = visible {
         let named: Vec<&str> = visible.split(',').map(str::trim).collect();
         rows.retain(|g| {
@@ -212,7 +215,9 @@ pub fn gpus() -> io::Result<Vec<Gpu>> {
     Ok(rows)
 }
 
-fn parse_gpus(text: &str) -> io::Result<Vec<Gpu>> {
+/// `host_total` is the host's `MemTotal`: an integrated GPU's memory (GB10, Jetson), for which
+/// nvidia-smi answers `[N/A]` because it has no framebuffer of its own.
+fn parse_gpus(text: &str, host_total: i64) -> io::Result<Vec<Gpu>> {
     let mut rows = Vec::new();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         let fields: Vec<&str> = line.split(',').map(str::trim).collect();
@@ -225,10 +230,11 @@ fn parse_gpus(text: &str) -> io::Result<Vec<Gpu>> {
                     device_name: (*name).into(),
                     device_uuid: (*uuid).into(),
                     driver_version: (*driver).into(),
-                    memory_bytes: memory
-                        .parse::<u64>()
-                        .map_err(|_| invalid("nvidia-smi returned invalid memory"))?
-                        << 20,
+                    memory_bytes: match memory.parse::<u64>() {
+                        Ok(mib) => mib << 20,
+                        Err(_) if memory.contains("N/A") && host_total > 0 => host_total as u64,
+                        Err(_) => return Err(invalid("nvidia-smi returned invalid memory")),
+                    },
                     pci_bus_id: (*bus).into(),
                     compute_cap: (*cc).into(),
                 }
@@ -431,12 +437,17 @@ mod tests {
 
     #[test]
     fn nvidia_smi_rows_parse_as_the_runtime_reads_them() {
-        let rows = parse_gpus("1, NVIDIA A40, GPU-b, 00000000:02:00.0, 46068, 580.65.06, 8.6\n0, NVIDIA A40, GPU-a, 00000000:01:00.0, 46068, 580.65.06, 8.6\n").unwrap();
+        let rows = parse_gpus("1, NVIDIA A40, GPU-b, 00000000:02:00.0, 46068, 580.65.06, 8.6\n0, NVIDIA A40, GPU-a, 00000000:01:00.0, 46068, 580.65.06, 8.6\n", 1 << 40).unwrap();
         assert_eq!(
             rows.iter().map(|g| g.device_index).collect::<Vec<_>>(),
             [0, 1]
         );
         assert_eq!((rows[0].memory_bytes, rows[0].compute_cap.as_str()), (46068 << 20, "8.6"));
-        assert!(parse_gpus("0, NVIDIA A40, , 00:01.0, 1, 1, 8.6").is_err());
+        assert!(parse_gpus("0, NVIDIA A40, , 00:01.0, 1, 1, 8.6", 1 << 40).is_err());
+        // GB10 shares the host's memory: nvidia-smi has no framebuffer total to report.
+        let gb10 = "0, NVIDIA GB10, GPU-c, 0000000F:01:00.0, [N/A], 580.95.05, 12.1\n";
+        assert_eq!(parse_gpus(gb10, 128 << 30).unwrap()[0].memory_bytes, 128 << 30);
+        assert!(parse_gpus(gb10, -1).is_err());
+        assert!(parse_gpus("0, NVIDIA A40, GPU-a, 00:01.0, lots, 1, 8.6", 1 << 40).is_err());
     }
 }
