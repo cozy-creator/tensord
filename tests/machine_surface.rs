@@ -2609,6 +2609,28 @@ mod v1_api {
         let (source, quantized) = (result["source"].as_str().unwrap(), result["result"].as_str().unwrap());
         assert!(source.starts_with("sha256:") && quantized.starts_with("sha256:"), "{result}");
         assert_ne!(source, quantized, "quantize wrote a model of its own");
+        // A writer's checkpoint handed to a memoized consumer: each job writes it again as a new
+        // producer, and the consumer, keyed on the checkpoint's manifest, is answered from memo.
+        let weighed = machine.root.join("weighed");
+        let mut derived = vec![];
+        for id in ["weigh-1", "weigh-2"] {
+            let mut spec = spec.clone();
+            spec.entrypoint = "derive_and_weigh".into();
+            spec.payload = serde_json::to_vec(&serde_json::json!({"values": [], "counter": weighed})).unwrap();
+            let events = collect(client.run(authorized(v1::RunRequest { id: id.into(), after: 0, spec: Some(spec) }, &all))
+                .await.unwrap().into_inner()).await.unwrap();
+            let done = outcome(&events);
+            assert_eq!(done.status, "succeeded", "{done:?}");
+            let calls: Vec<_> = events.iter().filter_map(|e| match &e.event {
+                Some(v1::run_event::Event::Call(call)) => Some((call.function.clone(), call.memoized)),
+                _ => None,
+            }).collect();
+            derived.push((serde_json::from_slice::<serde_json::Value>(&done.result).unwrap(), calls));
+        }
+        assert_ne!(derived[0].0["producer"], derived[1].0["producer"], "{derived:?}");
+        assert_eq!(derived[0].0["length"], derived[1].0["length"], "{derived:?}");
+        assert_eq!(derived[1].1, [("produce".to_string(), false), ("weigh".to_string(), true)], "{derived:?}");
+        assert_eq!(fs::read_to_string(&weighed).unwrap(), "1", "the consumer ran once");
         // A memoized call whose result is a file is answered from this machine's own memo while
         // it holds the file, for any later job of its signer; once the file is gone, it runs.
         let noted = machine.root.join("noted");

@@ -6,7 +6,7 @@ import msgspec
 
 from cozy_runtime.author import App, Context, FileAsset, ImageAsset, Outputs, Telemetry
 from cozy_runtime.derive.operations import QuantizationPlan, quantize
-from cpu_memo import Probe, greet, measure, nested, note, paint, produce, restricted
+from cpu_memo import Probe, Weigh, greet, measure, nested, note, paint, produce, restricted, weigh
 
 app = App()
 
@@ -111,3 +111,18 @@ async def annotate(ctx: Context, payload: Relay) -> Notes:
 
 
 app.entrypoint(annotate, accelerator=False)
+
+
+class Derived(msgspec.Struct):
+    producer: str
+    length: int
+
+
+async def derive_and_weigh(ctx: Context, payload: Relay) -> Derived:
+    """A writer's checkpoint handed to a memoized consumer: each run writes it again (as a new
+    producer), and the consumer is keyed on the checkpoint, not on the run that wrote it."""
+    source = await produce()
+    return Derived(source.producer_request_id, (await weigh(payload=Weigh(source, payload.counter))).length)
+
+
+app.entrypoint(derive_and_weigh, accelerator=False)

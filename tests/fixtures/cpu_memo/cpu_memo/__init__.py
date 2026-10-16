@@ -152,3 +152,23 @@ async def note(ctx: Context, *, payload: Probe, out: Outputs) -> Noted:
 
 
 app.entrypoint(note, accelerator=False)
+
+
+class Weigh(msgspec.Struct):
+    source: ModelArtifact
+    counter: str
+
+
+class Weighed(msgspec.Struct):
+    length: int
+
+
+@invocable(memoize=True)
+async def weigh(ctx: Context, *, payload: Weigh) -> Weighed:
+    """A memoized consumer of a checkpoint another run wrote: counted each time it truly runs."""
+    counter = Path(payload.counter)
+    counter.write_text(str(int(counter.read_text()) + 1 if counter.exists() else 1))
+    return Weighed(payload.source.manifest.length)
+
+
+app.entrypoint(weigh, accelerator=False)
