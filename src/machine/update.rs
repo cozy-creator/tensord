@@ -11,10 +11,12 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{self, Read, Write},
-    os::unix::fs::{symlink, PermissionsExt},
+    os::unix::{fs::{symlink, PermissionsExt}, process::CommandExt},
     path::{Path, PathBuf},
+    process::Stdio,
     sync::{Arc, Mutex},
 };
+use crate::process::Supervised;
 use tensorfs_core::{store::Store, transport::PullCancellation};
 
 /// The service's exit status asking its parent to exec the selected application.
@@ -101,6 +103,7 @@ struct Pending {
 pub struct Paths {
     engine: PathBuf,
     image_wheels: PathBuf,
+    uv: PathBuf,
 }
 impl Paths {
     pub fn new(engine: &Path, root: &Path) -> Self {
@@ -114,6 +117,7 @@ impl Paths {
         Self {
             engine: engine.into(),
             image_wheels,
+            uv: super::client::uv(root),
         }
     }
     fn update(&self, name: &str) -> PathBuf {
@@ -449,7 +453,7 @@ impl Updates {
                 if let Err(error) = updates.run(&request, exit) {
                     let failed = updates.set(|s| {
                         if !s.terminal() {
-                            s.error = error.to_string();
+                            s.error = format!("{error}; it keeps Runtime {} and TensorFS {}", s.from.runtime, s.from.tensorfs);
                             s.enter("failed");
                         }
                     });
@@ -583,6 +587,7 @@ impl Updates {
                 agent = bundled_tensord(&binary, candidate)?;
             }
         }
+        self.resolves(candidate)?;
         fs::File::open(candidate)?.sync_all()?;
         let to = identified(candidate)?;
         self.set(|s| s.to = to.clone())?;
@@ -600,6 +605,43 @@ impl Updates {
             }
         }
         Ok((agent, to, activation))
+    }
+
+    /// The pair resolves as a package environment installs it (uv, over the index), or the
+    /// update fails with uv's reason: the machine never selects a pair its environments would
+    /// set aside for a release's locked Runtime.
+    fn resolves(&self, candidate: &Path) -> io::Result<()> {
+        let pair: Vec<String> = wheels(candidate).into_iter().map(|(_, _, p)| p.display().to_string() + "\n").collect();
+        let mut child = std::process::Command::new(&self.paths.uv)
+            .args(["pip", "compile", "--quiet", "--no-config", "--no-cache", "--no-header", "--python", "3.12", "-"])
+            .current_dir(candidate)
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        // uv's own exit says why, should it stop before reading the pair.
+        let _ = child.stdin.take().expect("piped stdin").write_all(pair.concat().as_bytes());
+        let mut stderr = child.stderr.take().expect("piped stderr");
+        let stop = self.stop.lock().unwrap().clone();
+        let (ended, reason) = std::thread::scope(|scope| {
+            let drained = scope.spawn(move || {
+                let mut text = String::new();
+                let _ = stderr.read_to_string(&mut text);
+                text
+            });
+            (crate::process::supervise(&mut child, Some(&stop), "uv", &|_| ()), drained.join().unwrap_or_default())
+        });
+        match ended? {
+            Supervised::Exited(status) if status.success() => Ok(()),
+            Supervised::Canceled => Err(io::Error::new(io::ErrorKind::Interrupted, "the update was canceled")),
+            Supervised::Wedged(verdict) => Err(io::Error::other(format!("uv pip compile: {verdict}"))),
+            Supervised::Exited(_) => {
+                let reason: Vec<&str> = reason.split_whitespace().filter(|w| !matches!(*w, "×" | "╰─▶")).collect();
+                let names: Vec<String> = wheels(candidate).into_iter().map(|(d, v, _)| format!("{d} {v}")).collect();
+                Err(invalid(&format!("{} do not install together: {}", names.join(" and "), reason.join(" ").trim_end_matches('.'))))
+            }
+        }
     }
 
     /// A staged {file, sha256} or a published {version} fetched from PyPI with its digest checked.
@@ -803,6 +845,10 @@ mod tests {
 
     /// A minimal wheel: METADATA, optionally a bundled script.
     fn wheel(dir: &Path, distribution: &str, version: &str, script: Option<&[u8]>) -> PathBuf {
+        requiring(dir, distribution, version, script, "")
+    }
+
+    fn requiring(dir: &Path, distribution: &str, version: &str, script: Option<&[u8]>, requires: &str) -> PathBuf {
         let path = dir.join(format!("{distribution}-{version}-py3-none-any.whl"));
         let mut zip = zip::ZipWriter::new(fs::File::create(&path).unwrap());
         let options = zip::write::SimpleFileOptions::default();
@@ -813,7 +859,7 @@ mod tests {
         .unwrap();
         zip.write_all(
             format!(
-                "Metadata-Version: 2.1\nName: {}\nVersion: {version}\n",
+                "Metadata-Version: 2.1\nName: {}\nVersion: {version}\n{requires}",
                 distribution.replace('_', "-")
             )
             .as_bytes(),
@@ -1274,6 +1320,31 @@ mod tests {
         let again = updates.update("again").unwrap();
         assert_eq!(again.from, again.to);
         assert_eq!(again.to, installed.to);
+    }
+
+    /// A pair that does not resolve fails its update with uv's reason and selects nothing.
+    #[test]
+    fn a_pair_that_does_not_resolve_fails_with_the_resolvers_reason() {
+        let root = std::env::temp_dir().join(format!("cm-unresolved-update-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::new(&root.join("engine"), &root);
+        fs::create_dir_all(&paths.image_wheels).unwrap();
+        wheel(&paths.image_wheels, "cozy_runtime", "0.1.0", None);
+        wheel(&paths.image_wheels, "tensorfs", "0.1.0", None);
+        let updates = Updates::open(paths.clone(), Box::new(|| true), None, None).unwrap();
+        let candidate = requiring(&root, "cozy_runtime", "0.2.0", None, "Requires-Dist: tensorfs>=0.2\n");
+        updates.request(update_request(&updates, "u1", &candidate), |_| panic!("an unresolved pair activated")).unwrap();
+        let failed = loop {
+            match updates.update("u1").unwrap() {
+                status if status.terminal() => break status,
+                _ => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        };
+        assert_eq!(failed.state, "failed");
+        assert!(failed.error.starts_with("cozy_runtime 0.2.0 and tensorfs 0.1.0 do not install together: "), "{}", failed.error);
+        assert!(failed.error.contains("tensorfs>=0.2"), "{}", failed.error);
+        assert!(failed.error.ends_with("; it keeps Runtime 0.1.0 and TensorFS 0.1.0"), "{}", failed.error);
+        assert!(fs::symlink_metadata(paths.current_sdk_link()).is_err(), "an unresolved pair was selected");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
