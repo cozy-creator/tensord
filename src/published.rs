@@ -46,6 +46,43 @@ pub struct PackageSdk {
     pub client_wheel: Option<PathBuf>,
     /// An image's baked uv cache (expanded wheels, index records), linked rather than copied.
     pub seed_cache: Option<PathBuf>,
+    /// The development Runtime an update named by its wheel file (`0.24.6+e9baf7a4`): the
+    /// operator's choice, which runs every package whatever its own bounds on the pair.
+    pub runtime_build: String,
+}
+
+impl PackageSdk {
+    /// Executors use the selected Runtime/TensorFS pair (an update's, else the image's), so they
+    /// speak this machine's protocol; without a complete pair, each release's locked SDK.
+    pub fn selected(wheels: &Path, root: &Path, uv: PathBuf) -> Self {
+        // An activation replaces sdk/current, not the immutable candidate directory. Freeze
+        // that selection once: both cache identity and the installer's actual wheel inputs
+        // must name the same build even when filenames/version labels repeat.
+        let wheels = wheels.canonicalize().unwrap_or_else(|_| wheels.to_path_buf());
+        let mut pair: Vec<String> = fs::read_dir(&wheels)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|e| e == "whl"))
+            .map(|path| path.display().to_string())
+            .collect();
+        pair.sort();
+        let complete = pair.iter().any(|w| w.contains("/cozy_runtime-")) && pair.iter().any(|w| w.contains("/tensorfs-"));
+        let seed = root.join("opt/cozy/dependency-seed/uv-cache");
+        Self {
+            uv,
+            python: "3.12".into(),
+            runtime_build: match complete {
+                true => fs::read_to_string(wheels.join(crate::machine::update::RUNTIME_BUILD)).unwrap_or_default(),
+                false => String::new(),
+            },
+            find_links: complete.then_some(wheels),
+            requirements: if complete { pair } else { vec![] },
+            client_wheel: None,
+            seed_cache: seed.is_dir().then_some(seed),
+        }
+    }
 }
 
 pub struct Prepared {
@@ -834,11 +871,6 @@ impl Publisher {
         let exact = self.hub_files(&split.exact, source, &dir, job)?;
         write("requirements.txt", &exact)?;
         write("constraints.txt", &split.constraints)?;
-        let mut sdk_choice = if self.sdk.requirements.is_empty() {
-            "locked"
-        } else {
-            "machine"
-        };
         let env = dir.join("env");
         let interpreter = env.join("bin/python");
         let py = interpreter.to_string_lossy().to_string();
@@ -886,12 +918,11 @@ impl Publisher {
             job.stop.as_ref(),
             &|read| job.bytes(read, 0),
         )?;
-        let mut sdk_fallback = String::new();
+        let (mut sdk_choice, mut sdk_fallback) = ("locked", String::new());
         if sdk {
             job.stage("installing the machine's Runtime and TensorFS".into());
-            sdk_fallback = self.install_sdk(&py, &dir, &split.sdk, compile(!client), job.stop.as_ref())?;
+            (sdk_choice, sdk_fallback) = self.install_sdk(&py, &dir, &split.sdk, compile(!client), job.stop.as_ref())?;
             if !sdk_fallback.is_empty() {
-                sdk_choice = "locked";
                 eprintln!("package {} {release}: {sdk_fallback}", split.distribution);
                 job.stage(format!("warning: {sdk_fallback}"));
             }
@@ -923,10 +954,7 @@ impl Publisher {
             Some(_) => describe_environment(&py, &split.distribution, &hub_packages(&split.exact, org, source))?,
             None => (String::new(), vec![]),
         };
-        let runtime_build = match (sdk_choice, &self.sdk.find_links) {
-            ("machine", Some(sdk)) => fs::read_to_string(sdk.join(crate::machine::update::RUNTIME_BUILD)).unwrap_or_default(),
-            _ => String::new(),
-        };
+        let runtime_build = if sdk_choice == "machine" { self.sdk.runtime_build.as_str() } else { "" };
         let record = json!({"identity":identity,"package":split.distribution,"version":release,"application":application,"python":interpreter,"dependencies":installed_sdk(&env),"interface":interface,"sdk":sdk_choice,"sdk_fallback":sdk_fallback,"runtime_build":runtime_build,"source_digest":source_digest,"callees":callees});
         let staged = dir.join(".generation.json.new");
         let mut file = OpenOptions::new()
@@ -1036,9 +1064,11 @@ impl Publisher {
 
     /// This machine's own Runtime and TensorFS in an environment holding a release's locked
     /// requirements, where the package's bounds admit them (uv's check of every installed
-    /// requirement); else the release's locked SDK. A package's bounds are never overridden.
-    /// Returns "" for the machine's pair, else why it fell back and to what: never silent.
-    fn install_sdk(&self, py: &str, dir: &Path, locked: &str, compile: &str, stop: Option<&PullCancellation>) -> Result<String, Failure> {
+    /// requirement); else the release's locked SDK, and why. A development Runtime an update
+    /// named (`--runtime-wheel`) is the operator's choice: it runs whatever the package's bounds
+    /// on the pair, which the warning names, and one that cannot install refuses the release.
+    /// Returns which SDK the environment holds and its run warning, if any: never silent.
+    fn install_sdk(&self, py: &str, dir: &Path, locked: &str, compile: &str, stop: Option<&PullCancellation>) -> Result<(&'static str, String), Failure> {
         let constraints = dir.join("constraints.txt").to_string_lossy().to_string();
         let mut args = vec!["pip", "install", "--no-config", "--python", py, compile, "--constraints", &constraints];
         let links = self.sdk.find_links.as_ref().map(|p| p.to_string_lossy().to_string());
@@ -1048,12 +1078,21 @@ impl Publisher {
         args.extend(self.sdk.requirements.iter().map(String::as_str));
         // uv's failure names its step (`uv pip install` or `uv pip check`) and its output.
         let own = self.uv(&args, stop).and_then(|()| self.uv(&["pip", "check", "--no-config", "--python", py], stop));
-        if own.as_ref().is_err_and(|(code, _)| *code == CANCELED) {
-            return own.map(|()| String::new());
-        }
         let Err((code, detail)) = own else {
-            return Ok(String::new());
+            return Ok(("machine", String::new()));
         };
+        let build = &self.sdk.runtime_build;
+        if code == CANCELED {
+            return Err((code, detail));
+        } else if !build.is_empty() {
+            // uv's check names each requirement the installed pair misses; any other failure
+            // (the pair's own dependencies against the lock's) leaves nothing it could run.
+            let missed: Vec<&str> = detail.lines().map(str::trim).filter(|l| l.starts_with("The package `")).collect();
+            if missed.is_empty() || !missed.iter().all(|l| pair_bound(l)) {
+                return Err((code, format!("this machine's development Runtime {build} cannot run this release: {detail}")));
+            }
+            return Ok(("machine", format!("{}; this machine's development Runtime {build} (`--runtime-wheel`) runs it regardless", missed.join("; "))));
+        }
         let rows: Vec<&str> = locked
             .lines()
             .filter(|l| !l.starts_with("--"))
@@ -1067,11 +1106,11 @@ impl Publisher {
         self.uv(&["pip", "install", "--no-config", "--python", py, compile, "--require-hashes", "--no-deps", "--requirements", &sdk], stop)?;
         let detail: Vec<&str> = detail.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
         let detail = detail[detail.len().saturating_sub(12)..].join(" | ");
-        Ok(format!(
+        Ok(("locked", format!(
             "this machine's own Runtime and TensorFS did not install ({code}: {}); it runs the release's locked {}",
             crate::triage::ends(&detail, 2000),
             rows.join(", ")
-        ))
+        )))
     }
 
     fn uv(&self, args: &[&str], stop: Option<&PullCancellation>) -> Result<(), Failure> {
@@ -1756,6 +1795,16 @@ pub fn describe_environment(
     }
 }
 
+/// uv's check line for a bound on the machine's own pair that the installed pair misses:
+/// "The package `anima` requires `cozy-runtime[media]>=0.24.7`, but `0.24.6` is installed".
+fn pair_bound(line: &str) -> bool {
+    let required = line.split_once("` requires `").and_then(|(_, rest)| rest.split_once("`, but `")).map(|(r, _)| r);
+    required.is_some_and(|r| {
+        let end = r.find(|c: char| !(c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))).unwrap_or(r.len());
+        matches!(normalized(&r[..end]).as_str(), "cozy-runtime" | "tensorfs")
+    })
+}
+
 /// The Runtime and TensorFS an environment holds, by their installed distribution names.
 fn installed_sdk(env: &Path) -> Vec<Value> {
     let mut found: Vec<Value> = fs::read_dir(env.join("lib"))
@@ -2115,15 +2164,82 @@ mod tests {
         };
         let (dir, env) = environment("admits", &open);
         let py = env.join("bin/python").to_string_lossy().to_string();
-        assert_eq!(publisher.install_sdk(&py, &dir, &lock, "--no-compile-bytecode", None).unwrap(), "");
+        assert_eq!(publisher.install_sdk(&py, &dir, &lock, "--no-compile-bytecode", None).unwrap(), ("machine", String::new()));
         assert_eq!(installed_sdk(&env), vec![json!({"name": "cozy-runtime", "version": "9.0"})]);
 
         let (dir, env) = environment("refuses", &bounded);
         let py = env.join("bin/python").to_string_lossy().to_string();
-        let why = publisher.install_sdk(&py, &dir, &lock, "--no-compile-bytecode", None).unwrap();
+        let (sdk, why) = publisher.install_sdk(&py, &dir, &lock, "--no-compile-bytecode", None).unwrap();
+        assert_eq!(sdk, "locked");
         assert!(why.contains("uv pip check") && why.contains("needs-old"), "{why}");
         assert!(why.ends_with("it runs the release's locked cozy-runtime==1.0"), "{why}");
         assert_eq!(installed_sdk(&env), vec![json!({"name": "cozy-runtime", "version": "1.0"})]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A Runtime wheel an update named (`cozy rental update --runtime-wheel`) runs every
+    /// package: one whose floor it meets without a word, one whose floor it misses regardless,
+    /// its runs warned with that floor and the build. Real update and uv, no network.
+    #[test]
+    fn a_named_runtime_wheel_runs_a_package_whose_floor_it_misses_and_says_so() {
+        use crate::machine::update::{Choice, Paths, Request, Updates};
+        let root = std::env::temp_dir().join(format!("cm-sdk-override-{}", uuid::Uuid::new_v4()));
+        let (image, dev, wheels) = (root.join("opt/cozy/wheels"), root.join("dev"), root.join("wheels"));
+        for dir in [&image, &dev, &wheels] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        tiny_wheel(&image, "cozy-runtime", "2.0", &[]);
+        tiny_wheel(&image, "tensorfs", "1.0", &[]);
+        let named = tiny_wheel(&dev, "cozy-runtime", "2.1", &[]);
+        let paths = Paths::new(&root.join("engine"), &root);
+        let updates = Updates::open(paths.clone(), Box::new(|| true), None, None).unwrap();
+        let file = named.file_name().unwrap().to_string_lossy().to_string();
+        let (digest, _) = updates.stage(&file, &mut File::open(&named).unwrap()).unwrap();
+        let runtime = Some(Choice { file, sha256: digest.clone(), ..Default::default() });
+        let request = Request { operation: "dev".into(), agent: "explicit".into(), pin: None, runtime, tensorfs: None };
+        updates.request(request, |_| ()).unwrap();
+        loop {
+            let status = updates.update("dev").unwrap();
+            if status.state == "starting" {
+                break;
+            }
+            assert!(!status.terminal(), "{}: {}", status.state, status.error);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        updates.commit().unwrap();
+        let build = format!("2.1+{}", &digest[..8]);
+        let sdk = PackageSdk::selected(&paths.sdk(), &root, "uv".into());
+        assert_eq!(sdk.runtime_build, build);
+
+        let store = Arc::new(Store::ensure(&root.join("tensorfs")).unwrap());
+        let publisher = Publisher::new(&root.join("published"), sdk, store).unwrap();
+        let source = hub::Source::new("http://127.0.0.1:9", None, vec![], None).unwrap();
+        let generations = root.join("generations");
+        fs::create_dir_all(&generations).unwrap();
+        let locked = tiny_wheel(&wheels, "cozy-runtime", "3.0", &[]);
+        let hash = |wheel: &Path| sha256::hex_digest(&fs::read(wheel).unwrap());
+        for (package, floor, warning) in [
+            ("meets", "cozy-runtime>=2.1", String::new()),
+            ("misses", "cozy-runtime[media]>=3", format!(
+                "The package `misses` requires `cozy-runtime[media]>=3`, but `2.1` is installed; \
+                 this machine's development Runtime {build} (`--runtime-wheel`) runs it regardless"
+            )),
+        ] {
+            let wheel = tiny_wheel(&wheels, package, "1.0", &[floor]);
+            let lock = format!(
+                "--no-index\n--find-links {}\n{package}==1.0 --hash=sha256:{}\ncozy-runtime==3.0 --hash=sha256:{}\n",
+                wheels.display(), hash(&wheel), hash(&locked),
+            );
+            let split = split_lock(&lock, package, "1.0", true).unwrap();
+            let interface = json!({"application": format!("{package}:app")});
+            let wanted = Environment { split: &split, org: "acme", python: "3.12", interface: &interface, release: "1.0", source: &source };
+            publisher.generation(&generations, package, &wanted, &Job::default()).unwrap();
+            let record: crate::catalog::Generation =
+                serde_json::from_slice(&fs::read(generations.join(package).join("generation.json")).unwrap()).unwrap();
+            let held: Vec<_> = record.dependencies.iter().map(|d| (d.name.as_str(), d.version.as_str())).collect();
+            assert_eq!(held, [("cozy-runtime", "2.1"), ("tensorfs", "1.0")], "{package}");
+            assert_eq!((record.runtime_build.as_str(), record.sdk_fallback), (build.as_str(), warning), "{package}");
+        }
         let _ = fs::remove_dir_all(root);
     }
 
