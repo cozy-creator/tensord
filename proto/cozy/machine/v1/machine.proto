@@ -52,12 +52,13 @@ message WarmItem {
     string installation = 2;
   }
   string entrypoint = 3;
-  repeated ModelChoice models = 4;  // none: the owner's bindings, as for a run
+  repeated ModelChoice models = 4;  // none: the slots' defaults, as for a run
   WarmLevel level = 5;
   // Status only: the level it holds now (installed, downloaded, imported, host, gpu) and why
   // that is lower than `level`.
   string holds = 6;
   string held_back = 7;
+  uint32 bits = 8;  // as RunSpec.bits
 }
 message WarmSet {
   repeated WarmItem items = 1;
@@ -92,6 +93,9 @@ message RunSpec {
   // 0: widest group every model slot supports on this machine. Positive: at most this many
   // GPUs, for the run and its children. Model/weight choices never change this request.
   uint32 gpus = 20;
+  // The run's weight precision: 16, 8 or 4. 0: the machine's rules choose each slot's lane from
+  // the GPUs' family, the slot's declared tolerances and the memory budget. Children inherit it.
+  uint32 bits = 21;
 }
 
 // The caller's provider tokens, for models a run makes from a provider source.
@@ -130,11 +134,10 @@ message InputFile {
   uint32 order = 5;
 }
 // One model slot's choice, by name (th-245: the machine resolves it at the Hub). A Hub model is
-// `repository` at `release` (empty: the newest) in `lane`, else the widest rung of `rungs` its GPUs
-// fit, else the release's only lane. `manifest` names a checkpoint by hash only: the owner's
-// private one at the Hub (with `repository`; the run's capability names it) or one this machine
-// holds (without). The caller sends one for every model slot the run may load, a callee's
-// included (`<package>/<path>`).
+// `repository` at `release` (empty: the newest) in `lane`, else in the lane the machine's rules
+// pick (xs-042). `manifest` names a checkpoint by hash only: the owner's private one at the Hub
+// (with `repository`; the run's capability names it) or one this machine holds (without). A slot
+// with no choice takes its declared default release, a callee's included (`<package>/<path>`).
 message ModelChoice {
   string parameter = 1;  // a root slot parameter or full slot path
   string repository = 2;
@@ -148,14 +151,7 @@ message ModelChoice {
   // headers select); never with repository or manifest.
   string source = 8;
   repeated string profiles = 9;
-  repeated ModelRung rungs = 10;
-}
-// One rung of a binding: on GPUs matching `gpu`, `gpus` of them run the slot's `lane`.
-message ModelRung {
-  string gpu = 1;       // "*", or the tokens a GPU name contains, in order ("h100", "rtx 5090")
-  uint32 gpus = 2;
-  string lane = 3;
-  reserved 4, 5;        // the rung's checkpoint: the machine resolves the lane by name
+  reserved 10;  // rungs: the machine picks lanes by rule (xs-042)
 }
 message Adapter {
   string component = 1;
