@@ -8,10 +8,11 @@ const VOCABULARY: [&str; 5] = ["bf16", "fp16", "int8", "fp8", "nvfp4"];
 
 /// The GPUs a function runs on as the rule reads them (design §2.1, §2.7): the native formats
 /// every one runs (`mma`: cc 8.0 or later, where `nvfp4` serves at least weight-only; 10.3 has
-/// no int8) and how a warning names them (`sm90`, `sm86+sm89`).
+/// no int8; `bf16`: cc 8.0 or later, or no GPU) and how a warning names them (`sm90`, `sm86+sm89`).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Gpus {
     pub mma: bool,
+    pub bf16: bool,
     pub int8: bool,
     pub fp8: bool,
     pub name: String,
@@ -27,7 +28,13 @@ impl Gpus {
         names.dedup();
         let name = if names.is_empty() { "no GPU".into() } else { names.join("+") };
         // 12.1 (GB10) runs no fp8 until a card proves it (owner, 2026-10-16).
-        Self { mma: all(|cc| cc >= 80), int8: all(|cc| cc >= 80 && cc != 103), fp8: all(|cc| cc >= 89 && cc != 121), name }
+        Self {
+            mma: all(|cc| cc >= 80),
+            bf16: ccs.is_empty() || all(|cc| cc >= 80),
+            int8: all(|cc| cc >= 80 && cc != 103),
+            fp8: all(|cc| cc >= 89 && cc != 121),
+            name,
+        }
     }
 }
 
@@ -65,7 +72,8 @@ impl Slot {
     }
 
     /// The lanes to ask for at `bits`, in order (§2.2): the width's native formats (4 bits: `nvfp4`
-    /// first, then the 8-bit order), then 16 bits. Encoded lanes go when the slot declines them.
+    /// first, then the 8-bit order), then 16 bits: `bf16`, and `fp16` first only where the GPUs
+    /// run no bf16 (owner, 2026-10-16). Encoded lanes go when the slot declines them.
     pub fn lanes(&self, bits: u32, gpus: &Gpus) -> Vec<&'static str> {
         let eight = [("int8", gpus.int8), ("fp8", gpus.fp8)];
         let native: Vec<_> = match bits {
@@ -74,11 +82,12 @@ impl Slot {
             _ => eight.to_vec(),
         };
         let native = native.into_iter().filter(|(_, runs)| *runs && self.encoded).map(|(lane, _)| lane);
-        native.chain(["bf16", "fp16"]).collect()
+        native.chain(if gpus.bf16 { ["bf16", "fp16"] } else { ["fp16", "bf16"] }).collect()
     }
 
     /// The run's warnings for `model` served in `served` (§2.8): one when it declined encoded
-    /// lanes the GPUs run, and one naming every lane asked before the one served.
+    /// lanes the GPUs run, one naming every lane asked before the one served, and fp16 served
+    /// because the GPUs run no bf16 says so.
     pub fn warnings(&self, bits: u32, gpus: &Gpus, model: &str, served: &str) -> Vec<String> {
         if self.raw || !VOCABULARY.contains(&served) {
             return vec![];
@@ -91,7 +100,8 @@ impl Slot {
             false => format!("{} or {last}", missing.join(", ")),
         });
         let missing = missing.map(|lanes| format!("precision {bits}: {model} has no {lanes} lane for {}; served {served}", gpus.name));
-        declined.into_iter().chain(missing).collect()
+        let no_bf16 = (served == "fp16" && !gpus.bf16).then(|| format!("precision {bits}: {} runs no bf16; served fp16", gpus.name));
+        declined.into_iter().chain(missing).chain(no_bf16).collect()
     }
 }
 
@@ -114,9 +124,10 @@ mod tests {
             assert_eq!(first(&compute, 4, &[cc]), "nvfp4", "{cc}");
             assert_eq!(first(&compute, 16, &[cc]), "bf16", "{cc}");
         }
-        for none in [&["7.5"][..], &[""], &[]] {
+        // bf16 everywhere it runs (cc 8.0 or later, or no GPU); fp16 first only below 8.0.
+        for (none, sixteen) in [(&["7.5"][..], "fp16"), (&[""], "fp16"), (&[], "bf16")] {
             for (slot, asked) in [(&compute, 0), (&decode, 0), (&compute, 4), (&compute, 16)] {
-                assert_eq!(first(slot, asked, none), "bf16", "{none:?}");
+                assert_eq!(first(slot, asked, none), sixteen, "{none:?}");
             }
         }
         assert_eq!(compute.lanes(8, &Gpus::of(&["9.0"])), ["int8", "fp8", "bf16", "fp16"]);
@@ -138,7 +149,7 @@ mod tests {
         assert_eq!(ampere_ada.name, "sm86+sm89");
         assert_eq!(slot.lanes(8, &ampere_ada), ["int8", "bf16", "fp16"]);
         assert_eq!(slot.lanes(8, &Gpus::of(&["10.0", "10.3"])), ["fp8", "bf16", "fp16"]);
-        assert_eq!(slot.lanes(8, &Gpus::of(&["9.0", "7.5"])), ["bf16", "fp16"]);
+        assert_eq!(slot.lanes(8, &Gpus::of(&["9.0", "7.5"])), ["fp16", "bf16"]);
         assert_eq!(Gpus::of(&["9.0", "9.0"]).name, "sm90");
     }
 
@@ -159,5 +170,10 @@ mod tests {
         assert_eq!(declines.warnings(8, &hopper, "x@1", "bf16"), ["precision 8: x@1 declines encoded leaves; served bf16"]);
         assert!(declines.warnings(16, &hopper, "x@1", "bf16").is_empty());
         assert!(declines.warnings(8, &Gpus::of(&[]), "x@1", "bf16").is_empty());
+        // fp16 says why: the GPUs run no bf16, or the release has no bf16 lane.
+        let turing = Gpus::of(&["7.5"]);
+        assert_eq!(slot.warnings(8, &turing, "x@1", "fp16"), ["precision 8: sm75 runs no bf16; served fp16"]);
+        assert_eq!(slot.warnings(8, &turing, "x@1", "bf16"), ["precision 8: x@1 has no fp16 lane for sm75; served bf16"]);
+        assert_eq!(slot.warnings(16, &hopper, "sdxl@1", "fp16"), ["precision 16: sdxl@1 has no bf16 lane for sm90; served fp16"]);
     }
 }
