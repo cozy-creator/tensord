@@ -73,16 +73,19 @@ impl Slot {
     }
 
     /// The run's warnings for `model` served in `served` (§2.8): one when it declined encoded
-    /// lanes the row runs, and one per lane asked before the one served.
+    /// lanes the GPUs run, and one naming every lane asked before the one served.
     pub fn warnings(&self, bits: u32, gpus: &Gpus, model: &str, served: &str) -> Vec<String> {
         if !VOCABULARY.contains(&served) {
             return vec![];
         }
         let declined = !self.encoded && Self { encoded: true, ..*self }.lanes(bits, gpus).len() > 2;
         let declined = declined.then(|| format!("precision {bits}: {model} declines encoded leaves; served {served}"));
-        let asked = self.lanes(bits, gpus);
-        let missing = asked.into_iter().take_while(|lane| *lane != served);
-        let missing = missing.map(|lane| format!("precision {bits}: {model} has no {lane} lane for {}; served {served}", gpus.name));
+        let mut missing: Vec<&str> = self.lanes(bits, gpus).into_iter().take_while(|lane| *lane != served).collect();
+        let missing = missing.pop().map(|last| match missing.is_empty() {
+            true => last.to_string(),
+            false => format!("{} or {last}", missing.join(", ")),
+        });
+        let missing = missing.map(|lanes| format!("precision {bits}: {model} has no {lanes} lane for {}; served {served}", gpus.name));
         declined.into_iter().chain(missing).collect()
     }
 }
@@ -129,15 +132,16 @@ mod tests {
         assert_eq!(Gpus::of(&["9.0", "9.0"]).name, "sm90");
     }
 
-    /// The fallback steps warn once each; a slot declining encoded leaves warns once; a served
-    /// lane outside the vocabulary and an exact slot say nothing.
+    /// A fallback warns once, naming every lane it lacked; a slot declining encoded leaves warns
+    /// once; a served lane outside the vocabulary and an exact slot say nothing.
     #[test]
     fn steps_and_declines_warn() {
         let (hopper, ada) = (Gpus::of(&["9.0"]), Gpus::of(&["8.9"]));
         let slot = Slot::of(&json!({"encoded_leaves": "accept"}));
         assert_eq!(slot.warnings(4, &ada, "fidika/sdxl@1.0.0", "int8"),
             ["precision 4: fidika/sdxl@1.0.0 has no nvfp4 lane for sm89; served int8"]);
-        assert_eq!(slot.warnings(8, &hopper, "x@1", "bf16").len(), 2);
+        assert_eq!(slot.warnings(8, &hopper, "x@1", "bf16"), ["precision 8: x@1 has no int8 or fp8 lane for sm90; served bf16"]);
+        assert_eq!(slot.warnings(4, &ada, "x@1", "fp16"), ["precision 4: x@1 has no nvfp4, int8, fp8 or bf16 lane for sm89; served fp16"]);
         assert!(slot.warnings(8, &hopper, "x@1", "int8").is_empty());
         assert!(slot.warnings(8, &hopper, "x@1", "pdd8").is_empty());
         let declines = Slot::of(&json!({}));

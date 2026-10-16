@@ -37,7 +37,7 @@ lanes never select parallelism. Busy GPUs cause queuing, not a smaller group.
 `RunSpec.bits` and `WarmItem.bits` (16, 8 or 4) set the run's weight precision; children inherit
 it and Runtime gets it with each request. Zero: the lane rule (`precision.rs`, tracker design
 `precision-tiers.md` §2.2) picks each slot's lane from its GPUs' compute capability, its declared
-`min_bits`, `phase` and `encoded_leaves`, and the memory budget. Each fallback step is a run warning.
+`min_bits`, `phase` and `encoded_leaves`, and the memory budget. A fallback is one run warning.
 
 
 ## What disappears
