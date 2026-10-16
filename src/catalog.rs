@@ -299,7 +299,7 @@ mod accelerator_tests {
             record: Generation {
                 identity: "a".repeat(32), package: "local/root".into(), version: "1".into(),
                 application: "root:app".into(), python: "/usr/bin/python3".into(), dependencies: vec![],
-                cpu_bridge: String::new(), source_digest: String::new(), sdk_fallback: String::new(),
+                cpu_bridge: String::new(), source_digest: String::new(), sdk_fallback: String::new(), runtime_build: String::new(),
                 interface: json!({"jobs":[{"name":"work","accelerator":false},{"name":"undeclared"}]}),
                 callees: vec![Callee {
                     distribution: "child".into(), version: "1".into(), application: "child:app".into(),
