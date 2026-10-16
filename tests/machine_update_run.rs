@@ -391,6 +391,13 @@ async fn an_update_run_activates_in_place_and_a_failing_candidate_ends_failed() 
 /// launch's readiness key (none: it cannot prove readiness).
 fn launch(root: &Path, port: u16, key: Option<[u8; 32]>, persistent: bool) -> Machine {
     let owner = SigningKey::from_bytes(&OWNER).verifying_key();
+    // The root's own uv, as an image provides it: an update resolves its pair with it.
+    let uv = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|dir| dir.join("uv"))
+        .find(|path| path.is_file())
+        .expect("uv is required");
+    std::fs::create_dir_all(root.join("usr/local/bin")).unwrap();
+    let _ = std::os::unix::fs::symlink(&uv, root.join("usr/local/bin/uv"));
     let mut command = Command::new(env!("CARGO_BIN_EXE_tensord"));
     command
         .env_clear()
