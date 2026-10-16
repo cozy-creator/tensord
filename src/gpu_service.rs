@@ -164,6 +164,10 @@ pub struct PlanSlot {
     pub binding: Binding,
     /// Native selected encoded source bytes; not a GPU-fit or full-memory charge.
     pub selected_encoded_bytes: u64,
+    /// Built and fetched when the function first uses it (`on_demand`): nothing of it is
+    /// fetched or warmed before then.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub on_demand: bool,
 }
 
 /// One `Weights[M]` argument: the checkpoint a call reads raw (never constructed), and the
@@ -240,27 +244,34 @@ impl Plan {
         constructed.chain(self.sources.iter().map(|source| source.manifest.clone())).collect()
     }
     pub fn selections(&self) -> Vec<SelectedManifest> {
-        let mut rows: Vec<SelectedManifest> = vec![];
-        for slot in &self.slots {
-            match rows
-                .iter_mut()
-                .find(|r| r.manifest == slot.binding.snapshot)
-            {
-                Some(row) => {
-                    for c in &slot.binding.components {
-                        if !row.components.contains(c) {
-                            row.components.push(c.clone());
-                        }
+        merged(&self.slots)
+    }
+    /// What a call reads before its function runs: every slot's components but an on-demand
+    /// one's, which Runtime fetches when a stage first uses it.
+    pub fn upfront(&self) -> Vec<(String, Vec<String>)> {
+        merged(self.slots.iter().filter(|slot| !slot.on_demand)).into_iter().map(|s| (s.manifest, s.components)).collect()
+    }
+}
+
+/// `slots`' checkpoints, one row per manifest with every component a slot of it reads.
+fn merged<'a>(slots: impl IntoIterator<Item = &'a PlanSlot>) -> Vec<SelectedManifest> {
+    let mut rows: Vec<SelectedManifest> = vec![];
+    for slot in slots {
+        match rows.iter_mut().find(|r| r.manifest == slot.binding.snapshot) {
+            Some(row) => {
+                for c in &slot.binding.components {
+                    if !row.components.contains(c) {
+                        row.components.push(c.clone());
                     }
                 }
-                None => rows.push(SelectedManifest {
-                    manifest: slot.binding.snapshot.clone(),
-                    components: slot.binding.components.clone(),
-                }),
             }
+            None => rows.push(SelectedManifest {
+                manifest: slot.binding.snapshot.clone(),
+                components: slot.binding.components.clone(),
+            }),
         }
-        rows
     }
+    rows
 }
 
 /// A model row of an interface entry that is constructed: not a `Weights[M]` argument.
@@ -1011,8 +1022,7 @@ impl Pool {
         for member in self.warm_set(actor) {
             // From `downloaded` up, what its constructions read comes behind every call's.
             if let (Some(plan), Some(fetch), true) = (&member.plan, &member.fetch, member.level >= Level::Downloaded) {
-                let selected: Vec<_> = plan.selections().into_iter().map(|s| (s.manifest, s.components)).collect();
-                if let Err(error) = fetch.keep(&selected) {
+                if let Err(error) = fetch.keep(&plan.upfront()) {
                     eprintln!("warm set: downloading {}: {error}", plan.construction);
                 }
             }
@@ -1213,10 +1223,9 @@ impl Pool {
             self.store.manifest_path(hex).exists()
         })
     }
-    /// Every object its constructions read is here: `downloaded`.
+    /// Every object its constructions read up front is here: `downloaded`.
     pub fn downloaded(&self, plan: &Plan) -> bool {
-        let selections = plan.selections();
-        selections.iter().all(|s| crate::access::whole(&self.store, &s.manifest, &s.components))
+        plan.upfront().iter().all(|(manifest, components)| crate::access::whole(&self.store, manifest, components))
     }
     /// The highest level each App of each generation holds now (keyed `(generation,
     /// application)`): an import-only parent, or an executor. A callee's executors in a
@@ -1560,6 +1569,7 @@ impl Pool {
             planned.push(PlanSlot {
                 binding,
                 selected_encoded_bytes,
+                on_demand: model.get("on_demand").and_then(serde_json::Value::as_bool) == Some(true),
             });
         }
         let digest = |value: serde_json::Value| -> io::Result<String> {

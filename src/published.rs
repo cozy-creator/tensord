@@ -2553,7 +2553,8 @@ mod tests {
 
     /// `--warm=downloaded` never starts an executor or imports, even where calls prespawn:
     /// the member wants its constructions' objects behind every run and reports `installed`
-    /// (downloading) until every one is here, then exactly `downloaded`.
+    /// (downloading) until every one is here, then exactly `downloaded`. An on-demand model
+    /// waits for its first use: none of its objects is fetched.
     #[test]
     fn a_member_warmed_to_downloaded_only_downloads() {
         use crate::gpu_service::{Level, Member, Plan, PlanSlot, Pool};
@@ -2561,6 +2562,10 @@ mod tests {
         let manifest = checkpoint(&bench.source, 16, 8);
         let (hub, named, heard) = bench.hub("acme/warmed", &manifest, 200);
         bench.publisher.structure(&hub, std::slice::from_ref(&named), &Job::default()).unwrap();
+        let later = checkpoint(&bench.source, 4, 18);
+        let (later_hub, later_named, later_heard) = bench.hub("acme/later", &later, 200);
+        bench.publisher.structure(&later_hub, std::slice::from_ref(&later_named), &Job::default()).unwrap();
+        let structure = count(&later_heard, "GET /o/");
         let store = bench.publisher.store().clone();
         let generations = crate::catalog::Catalog::new(&bench.root.join("generations")).unwrap();
         let identity = "ab".repeat(16);
@@ -2573,9 +2578,11 @@ mod tests {
         fs::write(dir.join("generation.json"), json!({"identity": identity, "package": "acme/pkg", "version": "1.0.0",
             "application": "pkg:app", "python": dir.join("env/bin/python"), "interface": interface}).to_string()).unwrap();
         let held = generations.resolve(&identity).unwrap();
-        let binding = crate::device_executor::Binding { snapshot: manifest.id(), components: vec!["model".into()], ..Default::default() };
+        let slot = |manifest: &ObjectRef, on_demand| PlanSlot { selected_encoded_bytes: 0, on_demand,
+            binding: crate::device_executor::Binding { snapshot: manifest.id(), components: vec!["model".into()], ..Default::default() } };
         let plan = Plan { id: "warm".into(), construction: "warm".into(), installation: "i".into(), generation: identity.clone(),
-            entrypoint: "render".into(), slots: vec![PlanSlot { binding, selected_encoded_bytes: 0 }], sources: vec![], degree: 1 };
+            entrypoint: "render".into(), slots: vec![slot(&manifest, false), slot(&later, true)], sources: vec![], degree: 1 };
+        assert_eq!(plan.upfront(), [(manifest.id(), vec!["model".to_string()])]);
         let config = serde_json::from_value(json!({"devices": "GPU-test-0", "authorized_device_limit_bytes": null, "prespawn": true})).unwrap();
         let pool = Pool::new(&bench.root.join("gpu"), config, store.clone()).unwrap();
         let engine = crate::execution::Engine::open(&bench.root.join("execution")).unwrap();
@@ -2593,6 +2600,7 @@ mod tests {
         assert_eq!(pool.members("alice"), [(Level::Downloaded, "")]);
         assert!(pool.levels().is_empty(), "nothing imports or starts");
         assert_eq!(count(&heard, "GET /o/"), 2 + 16, "each object once");
+        assert_eq!(count(&later_heard, "GET /o/"), structure, "the on-demand model: none");
         pool.stop().unwrap();
         let _ = fs::remove_dir_all(&bench.root);
     }

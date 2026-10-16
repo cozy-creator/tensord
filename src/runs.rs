@@ -552,8 +552,7 @@ impl Runs {
             ahead = plan.as_ref().zip(self.publisher.as_ref()).map(|(plan, publisher)| {
                 let order = self.service.engine.get(id).map_or(u64::MAX, |record| record.root_seq());
                 let fetch = crate::access::Fetch::new(publisher.store().clone(), hub.clone(), plan.manifests(), order);
-                let selected: Vec<_> = plan.selections().into_iter().map(|s| (s.manifest, s.components)).collect();
-                if let Err(error) = fetch.ahead(&selected) {
+                if let Err(error) = fetch.ahead(&plan.upfront()) {
                     eprintln!("run {id}: its weights' early fetch: {error}");
                 }
                 fetch
@@ -606,9 +605,8 @@ impl Runs {
             let mut moved = (0, 0);
             if let (Some(plan), Some(publisher)) = (&plan, &self.publisher) {
                 let fetch = crate::access::Fetch::new(publisher.store().clone(), hub.clone(), plan.manifests(), u64::MAX);
-                let selected: Vec<_> = plan.selections().into_iter().map(|s| (s.manifest, s.components)).collect();
                 let report = |done, total| observe("downloading its weights", done, total);
-                moved = fetch.download(&selected, &stoppable.stop, &report).map_err(|e| match stoppable.stop.is_cancelled() {
+                moved = fetch.download(&plan.upfront(), &stoppable.stop, &report).map_err(|e| match stoppable.stop.is_cancelled() {
                     true => refused(crate::published::CANCELED, "the run was canceled while it downloaded"),
                     false => {
                         let text = e.to_string();
