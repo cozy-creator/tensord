@@ -2038,7 +2038,7 @@ dependencies = [
 
 [[package]]
 name = "tensord"
-version = "0.5.30"
+version = "0.6.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2083,8 +2083,8 @@ dependencies = [
 
 [[package]]
 name = "tensorfs-core"
-version = "0.9.0"
-source = "git+https://github.com/cozy-creator/tensorfs.git?rev=d7b1a01#d7b1a011f385457c425524cc8d80ee3da587fd68"
+version = "0.10.0"
+source = "git+https://github.com/cozy-creator/tensorfs.git?tag=v0.10.0#40f63a18ee5c036ecdacfc021d4c4fecc842e7e1"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -2110,8 +2110,8 @@ dependencies = [
 
 [[package]]
 name = "tensorfs-plane"
-version = "0.9.0"
-source = "git+https://github.com/cozy-creator/tensorfs.git?rev=d7b1a01#d7b1a011f385457c425524cc8d80ee3da587fd68"
+version = "0.10.0"
+source = "git+https://github.com/cozy-creator/tensorfs.git?tag=v0.10.0#40f63a18ee5c036ecdacfc021d4c4fecc842e7e1"
 dependencies = [
  "libc",
  "libloading",
