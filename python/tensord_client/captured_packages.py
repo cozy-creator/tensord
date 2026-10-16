@@ -158,15 +158,18 @@ def install_editable(*, project: Path, environment: Path, wheels: list[Path], di
         shutil.rmtree(environment, ignore_errors=True)  # a build that never finished
         environment.parent.mkdir(parents=True, exist_ok=True)
 
-        def capture():
-            """The project's own selection. Run again, it restores what the machine's pair replaced."""
+        def capture(machine: set[str] = frozenset()):
+            """The project's own selection, without the `machine` SDK distributions the machine's pair
+            replaces next (the lock's may not install here: TensorFS has no aarch64 wheel on PyPI).
+            Run again with none, it restores what the machine's pair replaced."""
             if (project / "uv.lock").is_file():
                 # Each carried distribution at the version the lock selected, from its own
                 # files (uv picks the one this platform takes); the lock installs the rest,
                 # every dependency as an ordinary install: only the project itself is live.
                 carried = sorted({tuple(wheel.name.split("-")[:2]) for wheel in wheels})
                 sync = ["uv", "sync", "--frozen", "--no-dev", "--no-editable", "--no-install-project", "--no-python-downloads",
-                        "--project", str(project), "--python", python, *(f"--no-install-package={name}" for name, _ in carried),
+                        "--project", str(project), "--python", python,
+                        *(f"--no-install-package={name}" for name in sorted({name for name, _ in carried} | machine)),
                         *(f"--refresh-package={name}" for name in local_builds(project))]
                 placed = {**os.environ, "UV_PROJECT_ENVIRONMENT": str(environment)}
                 subprocess.run(sync, env=placed, check=True)
@@ -186,7 +189,7 @@ def install_editable(*, project: Path, environment: Path, wheels: list[Path], di
                 subprocess.run(["uv", "pip", "install", "--python", str(interpreter), *found, *named, "--editable", str(project)], check=True)
             live_paths(environment)
 
-        capture()
+        capture({canonicalize_name(wheel.name.split("-")[0]) for wheel in sdk})
         fallback = machine_sdk(interpreter, sdk, capture) if sdk else ""
         add_client(interpreter, environment.parent / (environment.name + ".constraints.txt"), client_wheel)
         ready.write_text(fallback)
@@ -277,7 +280,7 @@ def install_captured(*, project: Path | None, wheels: list[Path], requirements: 
             else:
                 subprocess.run(["uv", "pip", "install", *COPY, "--python", str(interpreter), *map(str,wheels)], check=True)
 
-        capture()
+        capture({canonicalize_name(wheel.name.split("-")[0]) for wheel in sdk})
         fallback = machine_sdk(interpreter, sdk, capture) if sdk else ""
         add_client(interpreter, root / "captured-constraints.txt", client_wheel)
         return publish_generation(root, metadata, None, callees, fallback)
