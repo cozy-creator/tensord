@@ -1,0 +1,112 @@
+name: platforms
+# Native builds on every desktop platform, Linux x86_64 as the control. Manual only: macOS
+# bills 10x and Windows 2x, so run it per question, never per push.
+#   gh workflow run platforms.yaml -R cozy-creator/tensord --ref <branch> [-f os='["macos-15"]'] [-f tensorfs_ref=<ref>] [-f test='cargo test --test machine_status']
+# Each job uploads build.txt (rustc short diagnostics) and a step summary of its errors.
+on:
+  workflow_dispatch:
+    inputs:
+      os:
+        description: JSON list of runner labels
+        type: string
+        default: '["ubuntu-24.04", "ubuntu-24.04-arm", "macos-15", "windows-2025"]'
+      tensorfs_ref:
+        description: TensorFS branch, tag or SHA patched in for the Cargo.toml pin; empty keeps the pinned tag
+        type: string
+        default: ''
+      test:
+        description: Optional command run with bash after the build; empty runs none
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    # Hang bound, not a work budget.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(inputs.os) }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v4
+
+      # TensorFS is private. A path patch instead of the git dependency keeps the fetch
+      # identical on every OS (no ssh config for cargo's git on Windows).
+      - id: pin
+        env:
+          REF: ${{ inputs.tensorfs_ref }}
+        run: echo "ref=${REF:-$(sed -n 's/^tensorfs-core = .*tag = "\([^"]*\)".*/\1/p' Cargo.toml)}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: cozy-creator/tensorfs
+          ref: ${{ steps.pin.outputs.ref }}
+          ssh-key: ${{ secrets.TENSORFS_READ_KEY }}
+          path: .tensorfs
+
+      - run: |
+          printf '\n[patch."https://github.com/cozy-creator/tensorfs.git"]\ntensorfs-core = { path = ".tensorfs/crates/tensorfs-core" }\ntensorfs-plane = { path = ".tensorfs/crates/tensorfs-plane" }\n' >> Cargo.toml
+          echo "TensorFS ${{ steps.pin.outputs.ref }} $(git -C .tensorfs rev-parse HEAD)"
+
+      - uses: dtolnay/rust-toolchain@1.91.1
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Every target
+        id: build
+        continue-on-error: true
+        run: cargo build --all-targets --keep-going --message-format=short 2>&1 | tee build.txt; exit "${PIPESTATUS[0]}"
+
+      - name: Binary runs
+        id: run
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        run: target/debug/tensord version --json 2>&1 | tee run.txt; exit "${PIPESTATUS[0]}"
+
+      - uses: astral-sh/setup-uv@v7
+        if: inputs.test != ''
+
+      - name: Test
+        if: inputs.test != ''
+        id: test
+        continue-on-error: true
+        env:
+          TEST: ${{ inputs.test }}
+        run: bash -euo pipefail -c "$TEST" 2>&1 | tee test.txt; exit "${PIPESTATUS[0]}"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## ${{ matrix.os }}"
+            echo "build=${{ steps.build.outcome }} run=${{ steps.run.outcome }} test=${{ steps.test.outcome }}"
+            echo "### $(grep -c ': error' build.txt || true) errors"
+            echo '```'
+            grep -E ': error|^error: could not compile' build.txt | sort | uniq | head -300 || true
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tensord-${{ matrix.os }}
+          path: |
+            build.txt
+            run.txt
+            test.txt
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Verdict
+        if: always()
+        run: test "${{ steps.build.outcome }}/${{ steps.run.outcome }}" = success/success
