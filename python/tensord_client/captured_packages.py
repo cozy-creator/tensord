@@ -72,12 +72,21 @@ def inventory(interpreter: Path) -> list[Dependency]:
     return msgspec.json.decode(subprocess.check_output(["uv", "pip", "list", "--python", str(interpreter), "--format", "json"]), type=list[Dependency])
 
 
+def incompatibilities(interpreter: Path, step: subprocess.CompletedProcess | None = None) -> set[str]:
+    """`uv pip check`'s findings, one line each."""
+    step = step or subprocess.run(["uv", "pip", "check", "--python", str(interpreter)], capture_output=True, text=True)
+    return {line.strip() for line in (step.stdout + step.stderr).splitlines() if line.strip().startswith("The package")}
+
+
 def machine_sdk(interpreter: Path, sdk: list[Path], capture) -> str:
     """The machine's own Runtime/TensorFS pair over the captured closure, every other selected
     version constrained, where every installed requirement admits it (uv's check). Else the
     capture's own pair (a vendored dev Runtime, say) is restored: a package's bounds are never
     overridden. Returns "" for the machine's pair, else why and what runs instead; never silent."""
     pair = {canonicalize_name(wheel.name.split("-")[0]) for wheel in sdk}
+    # What the capture already reports (NVIDIA's aarch64 cusparseLt wheel says sbsa, not aarch64)
+    # is not the pair's doing: the pair is refused only for an incompatibility it adds.
+    before = incompatibilities(interpreter)
     kept = interpreter.parents[2] / "sdk-constraints.txt"
     kept.write_text("".join(f"{row.name}=={row.version}\n" for row in inventory(interpreter)
                             if canonicalize_name(row.name) not in pair))
@@ -86,7 +95,7 @@ def machine_sdk(interpreter: Path, sdk: list[Path], capture) -> str:
     sys.stderr.write(step.stderr)
     if step.returncode == 0:
         step = subprocess.run(["uv", "pip", "check", "--python", str(interpreter)], capture_output=True, text=True)
-        if step.returncode == 0:
+        if step.returncode == 0 or incompatibilities(interpreter, step) <= before:
             return ""
     reason = [line.strip() for line in ((step.stdout or "") + step.stderr).splitlines()
               if line.strip() and not line.startswith(("Using Python", "Checked "))][-12:]
