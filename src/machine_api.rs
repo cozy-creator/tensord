@@ -1429,6 +1429,7 @@ print(json.dumps({"identity": generation.identity}))
                             entrypoint: entrypoint.into(),
                             payload: record.invocation.input,
                             attention_kernel: String::new(),
+                            bits: 0,
                             input_metadata: Default::default(),
                         },
                     )?;
@@ -1442,6 +1443,7 @@ print(json.dumps({"identity": generation.identity}))
                             spool: spool.clone(),
                             deadline_s: None,
                             attention_kernel: String::new(),
+                            bits: 0,
                             plane_budget_bytes: -1,
                             cap_bytes: None,
                             inputs: Default::default(),

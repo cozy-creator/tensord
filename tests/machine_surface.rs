@@ -1464,7 +1464,7 @@ mod v1_api {
         let release = |release: &str| names_hub::Package {
             name: format!("acme/{}", FIXTURE.1), release: release.into(), interface: interface.clone(),
             wheel: wheel.file_name().unwrap().to_str().unwrap().into(), bytes: fs::read(&wheel).unwrap(), callees: vec![],
-            pypi: String::from_utf8(pypi.stdout.clone()).unwrap(), bindings: serde_json::json!([]),
+            pypi: String::from_utf8(pypi.stdout.clone()).unwrap(),
         };
         let (origin, _) = names_hub::serve(&store, model, [release("0.1.0"), release("0.2.0")]);
         let spec = |kind: v1::RunKind, release: &str, entrypoint: &str| v1::RunSpec {
@@ -1691,7 +1691,6 @@ mod v1_api {
             bytes: wheel("pkg", "1.0.0"),
             callees: vec![],
             pypi: String::new(),
-            bindings: serde_json::json!([]),
         };
         let (origin, heard) = names_hub::serve(&store, model, Some(package));
         let machine = Machine::start().await;
@@ -1756,13 +1755,14 @@ mod v1_api {
         assert_eq!(done.status, "succeeded", "{done:?}");
         assert_eq!(take(), Vec::<String>::new());
 
-        // A name alone is the newest release's only lane: one closure, nothing to move.
+        // A name alone is the newest release in the lane this machine's GPUs run (none here:
+        // bf16): one closure, nothing to move.
         let bare = v1::ModelChoice { repository: "acme/model".into(), ..Default::default() };
         let done = settle(&mut client, &all, "names-3", spec(None, bare, "r1")).await;
         assert_eq!(done.status, "succeeded", "{done:?}");
         let result: serde_json::Value = serde_json::from_slice(&done.result).unwrap();
         assert_eq!((&result["models"][0]["release"], &result["models"][0]["lane"]), (&"1.0.0".into(), &"bf16".into()));
-        assert_eq!(take(), ["POST /v1/tensorfs/closure acme/model "]);
+        assert_eq!(take(), ["POST /v1/tensorfs/closure acme/model bf16"]);
 
         // A revision the caller moved resolves the name once more; the bytes are held.
         let done = settle(&mut client, &all, "names-4", spec(Some("1.0.0"), named.clone(), "r2")).await;
@@ -2797,7 +2797,6 @@ mod v1_api {
             name: "acme/tensord-cpu-caller".into(), release: "0.1.0".into(),
             interface: described["interface"].clone(), wheel: root, bytes: root_bytes, callees: vec![callee],
             pypi: String::from_utf8(pypi.stdout).unwrap(),
-            bindings: serde_json::json!([]),
         };
         let (origin, _) = names_hub::serve(&store, model, Some(package));
         let counter = machine.root.join("published-measured");

@@ -181,11 +181,6 @@ fn choices(sent: Vec<v1::ModelChoice>) -> Result<Vec<domain::ModelChoice>, Statu
                 },
                 source: choice.source,
                 profiles: choice.profiles,
-                rungs: choice
-                    .rungs
-                    .into_iter()
-                    .map(|rung| domain::ModelRung { gpu: rung.gpu, gpus: rung.gpus, lane: rung.lane })
-                    .collect(),
                 adapters: choice
                     .adapters
                     .into_iter()
@@ -236,6 +231,7 @@ fn member(mut item: v1::WarmItem) -> Result<crate::runs::SetItem, Status> {
         source,
         entrypoint: item.entrypoint,
         models: choices(item.models)?,
+        bits: item.bits,
         level,
         sent,
     })
@@ -319,6 +315,7 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<(crate::runs::Spec, Option<v1::HubAc
         models,
         attention_kernel: spec.attention_kernel,
         gpus: spec.gpus,
+        bits: spec.bits,
         hub: None,
         providers: providers
             .map(|p| crate::published::Providers {
@@ -1153,12 +1150,13 @@ mod tests {
         });
         resent.providers = None;
         assert_eq!(spec_of(resent).unwrap().0.digest, digest);
-        let changes: [fn(&mut v1::RunSpec); 7] = [
+        let changes: [fn(&mut v1::RunSpec); 8] = [
             |s| s.payload = br#"{"seed":9007199254740992,"nested":{"a":1,"b":2}}"#.to_vec(),
             |s| s.payload = br#"{"seed":9007199254740993.0,"nested":{"a":1,"b":2}}"#.to_vec(),
             |s| s.inputs.reverse(),
             |s| s.models.reverse(),
             |s| s.gpus = 2,
+            |s| s.bits = 4,
             |s| s.entrypoint = "other".into(),
             |s| s.hub.as_mut().unwrap().origin = "https://other.example.test".into(),
         ];

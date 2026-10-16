@@ -1,6 +1,7 @@
 //! Published packages and their models, prepared from a Hub by name (th-245) and reused: a
-//! run whose installation and model resolution are held reads nothing from the Hub. Port of the Python worker's release-root preparation (package set from the
-//! release's locked requirements with uv; model by owner binding ladder, then a TensorFS
+//! run whose installation and model resolution are held reads nothing from the Hub. Port of the
+//! Python worker's release-root preparation (package set from the release's locked
+//! requirements with uv; each model's lane by the lane rule (`precision`), then a TensorFS
 //! download) with its `release_root_preparing` progress answers.
 use crate::{
     access,
@@ -9,6 +10,7 @@ use crate::{
     hub::{self, Catalog},
     journal::{Installation, Preparation},
     objects::Refused,
+    precision,
     process::Supervised,
     service::Service,
 };
@@ -88,6 +90,8 @@ impl PackageSdk {
 pub struct Prepared {
     pub installation: Installation,
     pub plan: Option<Plan>,
+    /// The lane rule's warnings for the run (`precision`), held with its resolution.
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -118,13 +122,15 @@ pub struct Request {
     pub choices: Vec<domain::ModelChoice>,
     /// 0 selects the widest supported machine group; otherwise exactly this many GPUs.
     pub gpus: u32,
+    /// The request's weight precision (16, 8 or 4); 0 lets the lane rule choose per slot.
+    pub bits: u32,
     /// A call's: its imports start as soon as it installs. A warm run imports only when its
     /// level asks (`downloaded` never does).
     pub imports: bool,
 }
 
 /// A Hub checkpoint as a run names it (th-245): `repository` at `release` (empty: the newest) in
-/// `lane` (empty: the release's only one), or the owner's checkpoint by hash (`manifest` and no
+/// `lane` (empty: the lane rule's), or the owner's checkpoint by hash (`manifest` and no
 /// release). Resolved, it carries the release, lane and manifest the Hub named.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Named {
@@ -138,16 +144,23 @@ pub(crate) struct Named {
 }
 
 impl Named {
-    /// The checkpoint the Hub names it: one anonymous closure call.
-    fn at_hub(mut self, source: &hub::Source) -> Result<Self, Failure> {
+    /// The checkpoint the Hub names it: the first of `asked` its release publishes (an empty
+    /// lane: its only one). TensorFS's closure client names one lane, so it is one anonymous
+    /// closure call per lane until one answers.
+    fn at_hub(mut self, source: &hub::Source, asked: &[String]) -> Result<Self, Failure> {
         let refspec = match self.release.is_empty() {
             true => self.repository.clone(),
             false => format!("{}@{}", self.repository, self.release),
         };
-        let closure = Catalog::new(source)
-            .map_err(|e| ("catalog_read_failed", e.0))?
-            .closure(&refspec, &self.lane)
-            .map_err(|e| refused("model_resolution_failed", e))?;
+        let catalog = Catalog::new(source).map_err(|e| ("catalog_read_failed", e.0))?;
+        let mut answer = catalog.closure(&refspec, &asked[0]);
+        for lane in &asked[1..] {
+            if !matches!(&answer, Err(e) if e.code == Code::REF_NOT_FOUND) {
+                break;
+            }
+            answer = catalog.closure(&refspec, lane);
+        }
+        let closure = answer.map_err(|e| refused("model_resolution_failed", e))?;
         (self.release, self.lane, self.manifest, self.length) =
             (closure.release, closure.lane, closure.manifest.id(), closure.manifest.length);
         Ok(self)
@@ -489,61 +502,45 @@ impl Publisher {
         Ok(())
     }
 
-    /// The checkpoint `named` is: a hash as given, a name as the Hub answers it (one closure
-    /// call), journaled per catalog revision so a warm run, across restarts too, asks the Hub
-    /// nothing (th-245).
-    pub(crate) fn resolve(&self, service: &Service, source: &hub::Source, named: Named, revision: &str) -> Result<Named, Failure> {
+    /// The checkpoint `named` is: a hash as given, a name as the Hub answers it in its lane,
+    /// else in the first of `lanes` its release publishes, else in its only lane. Journaled per
+    /// catalog revision so a warm run, across restarts too, asks the Hub nothing (th-245).
+    pub(crate) fn resolve(&self, service: &Service, source: &hub::Source, named: Named, lanes: &[&str], revision: &str) -> Result<Named, Failure> {
         if !named.manifest.is_empty() {
             return Ok(named);
         }
+        let asked: Vec<String> = match named.lane.is_empty() {
+            true => lanes.iter().chain(&[""]).map(|lane| lane.to_string()).collect(),
+            false => vec![named.lane.clone()],
+        };
         let origin = hub::origin_key(&source.origin).unwrap_or_default();
-        let name = json!([origin, named.repository, named.release, named.lane]).to_string();
+        let name = json!([origin, named.repository, named.release, asked]).to_string();
         let held = service.engine.with_journal(|j| j.named(&name, revision)).map_err(io_failure)?;
         if let Some((release, lane, manifest, length)) = held.and_then(|held| serde_json::from_str(&held).ok()) {
             return Ok(Named { release, lane, manifest, length, ..named });
         }
-        let resolved = named.at_hub(source)?;
+        let resolved = named.at_hub(source, &asked)?;
         let answer = json!([resolved.release, resolved.lane, resolved.manifest, resolved.length]).to_string();
         service.engine.with_journal(|j| j.bind_named(&name, revision, &answer)).map_err(io_failure)?;
         Ok(resolved)
     }
 
-    /// The owner's bindings of `package`'s slots (`cozy package bind`), read at its Hub once per
-    /// catalog revision and journaled: a warm run asks the Hub nothing. Local code has none.
-    fn bindings(&self, service: &Service, source: &hub::Source, package: &str, revision: &str) -> Result<Vec<Value>, Failure> {
-        let Some((org, name)) = package.split_once('/').filter(|(org, _)| *org != "local") else {
-            return Ok(vec![]);
-        };
-        let key = json!([hub::origin_key(&source.origin).unwrap_or_default(), "bindings", package]).to_string();
-        let held = service.engine.with_journal(|j| j.named(&key, revision)).map_err(io_failure)?;
-        if let Some(rows) = held.and_then(|held| serde_json::from_str(&held).ok()) {
-            return Ok(rows);
-        }
-        let path = format!("/v1/packages/{}/{}/bindings", hub::escape(org), hub::escape(name));
-        let read = Catalog::new(source).map_err(|e| ("catalog_read_failed", e.0))?.json(&path);
-        let rows = match read {
-            Ok(read) => read["bindings"].as_array().cloned().unwrap_or_default(),
-            Err(refusal) if refusal.0.contains("HTTP 404") => vec![],
-            Err(refusal) => return Err(("catalog_read_failed", refusal.0)),
-        };
-        service.engine.with_journal(|j| j.bind_named(&key, revision, &Value::Array(rows.clone()).to_string())).map_err(io_failure)?;
-        Ok(rows)
-    }
-
-    /// A Hub checkpoint resolved and downloaded whole into the store (a warm run's model
-    /// choice: `cozy model download`); answers what the Hub named and the bytes that came from
-    /// the Hub and from the datacenter volume.
+    /// A Hub checkpoint resolved (`resolve`) and downloaded whole into the store (a warm run's
+    /// model choice: `cozy model download`); answers what the Hub named and the bytes that came
+    /// from the Hub and from the datacenter volume.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn download(
         &self,
         service: &Service,
         source: &hub::Source,
         named: Named,
+        lanes: &[&str],
         revision: &str,
         stop: Option<&PullCancellation>,
         bytes: &(dyn Fn(u64, u64) + Sync),
     ) -> Result<(Named, (u64, u64)), Refused> {
         let failed = |(code, message)| Refused { code, message };
-        let named = self.resolve(service, source, named, revision).map_err(failed)?;
+        let named = self.resolve(service, source, named, lanes, revision).map_err(failed)?;
         // A checkpoint this store already holds whole, in that repository, moves nothing.
         let mut moved = (0, 0);
         if tensorfs_core::checkpoint_root::check_source(&self.store, &named.repository, &named.object()).is_err() {
@@ -630,7 +627,9 @@ impl Publisher {
         format!("hub-{}", &sha256::hex_digest(key.as_bytes())[..32])
     }
 
-    fn resolution_key(alias: &str, request: &Request, gpu: &str) -> String {
+    /// A held resolution's key: the request, under the machine's GPUs as the lane rule reads
+    /// them (`gpus`), never a card's name.
+    fn resolution_key(alias: &str, request: &Request, gpus: &str) -> String {
         let choices: Vec<_> = request
             .choices
             .iter()
@@ -645,7 +644,6 @@ impl Publisher {
                         .map(|m| (sha256::hex(&m.digest), m.length)),
                     c.source,
                     c.profiles,
-                    c.rungs.iter().map(|r| (&r.gpu, r.gpus, &r.lane)).collect::<Vec<_>>(),
                     // Adapter order and scale are part of what the slot runs.
                     c.adapters
                         .iter()
@@ -666,7 +664,7 @@ impl Publisher {
         let origin = hub::origin_key(&request.source.origin).unwrap_or_default();
         let package = request.installed.as_ref().map(|i| i.package.as_str()).unwrap_or(&request.package);
         let release = request.installed.as_ref().map(|i| i.release.as_str()).unwrap_or(&request.release);
-        let key = json!({"installation":alias,"package":package,"release":release,"hub":origin,"owner":request.owner,"catalog":request.catalog_revision,"entrypoint":request.entrypoint,"choices":choices,"gpu":gpu,"gpus":request.gpus});
+        let key = json!({"installation":alias,"package":package,"release":release,"hub":origin,"owner":request.owner,"catalog":request.catalog_revision,"entrypoint":request.entrypoint,"choices":choices,"row":gpus,"gpus":request.gpus,"bits":request.bits});
         format!("hub-{}", sha256::hex_digest(key.to_string().as_bytes()))
     }
 
@@ -691,16 +689,13 @@ impl Publisher {
             return Ok(Some(Prepared {
                 installation,
                 plan: None,
+                warnings: vec![],
             }));
         }
         let Some(gpu) = service.pool() else {
             return Ok(None);
         };
-        let key = Self::resolution_key(
-            &installation.alias,
-            request,
-            &format!("{}x{}", gpu.width(), gpu.config().envelope().first().map(|d| gpu_name(d)).unwrap_or_default()),
-        );
+        let key = Self::resolution_key(&installation.alias, request, &machine_row(&gpu));
         let Some(id) = service.engine.with_journal(|j| j.resolution(actor, &key))? else {
             return Ok(None);
         };
@@ -713,9 +708,11 @@ impl Publisher {
         if !gpu.holds(&plan) {
             return Ok(None);
         }
+        let warnings = service.engine.with_journal(|j| j.named(&warnings_key(&key), &request.catalog_revision))?;
         Ok(Some(Prepared {
             installation,
             plan: Some(plan),
+            warnings: warnings.and_then(|held| serde_json::from_str(&held).ok()).unwrap_or_default(),
         }))
     }
 
@@ -747,16 +744,18 @@ impl Publisher {
             return Ok(Prepared {
                 installation,
                 plan: None,
+                warnings: vec![],
             });
         }
         let gpu = service.pool().ok_or((
             "capability_unavailable",
             "this machine runs no functions".to_string(),
         ))?;
-        let plan = self.model(service, &gpu, actor, &installation, request, job)?;
+        let (plan, warnings) = self.model(service, &gpu, actor, &installation, request, job)?;
         Ok(Prepared {
             installation,
             plan: Some(plan),
+            warnings,
         })
     }
 
@@ -1160,10 +1159,11 @@ impl Publisher {
         }
     }
 
-    /// The run's model grants, every Hub slot exact as its choice names it (th-241): a
-    /// pinned checkpoint, or the widest rung of its binding this machine's GPUs fit. The
-    /// request's GPU count chooses the group independently of the weight lane; 0 uses the
-    /// widest group every slot supports on the machine. A slot with no choice is refused.
+    /// The run's model grants and its precision warnings. Each slot takes the run's choice, else
+    /// its declared default; a Hub one is exact as its choice names it (th-241), else in the
+    /// first lane of the rule's order its release publishes (`precision`). The request's GPU
+    /// count chooses the group independently of the weight lane; 0 uses the widest group every
+    /// slot supports on the machine. A slot with neither is refused.
     fn model(
         &self,
         service: &Service,
@@ -1172,7 +1172,7 @@ impl Publisher {
         installation: &Installation,
         request: &Request,
         job: &Job,
-    ) -> Result<Plan, Failure> {
+    ) -> Result<(Plan, Vec<String>), Failure> {
         let interface: Value = serde_json::from_slice(&installation.interface).map_err(|_| {
             (
                 "package_prepare_interface_invalid",
@@ -1185,49 +1185,35 @@ impl Publisher {
                 "package_prepare_interface_invalid",
                 "declared model slot absent".to_string(),
             ))?;
-        let gpu_model = gpu.config().envelope().first().map(|d| gpu_name(d)).unwrap_or_default();
-        let width = gpu.width();
-        let degree = crate::gpu_service::group_degree(&slots, request.gpus, width);
-        let (mut grants, mut checkpoints) = (vec![], Vec::<Named>::new());
-        let mut bound: Option<Vec<Value>> = None;
-        for slot in &slots {
-            let path = slot
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
+        let degree = crate::gpu_service::group_degree(&slots, request.gpus, gpu.width());
+        let gpus = gpu.gpus(degree);
+        // One slot's grant, its Hub checkpoint and its warnings, `short` of memory or not.
+        let pick = |slot: &Value, short: bool| -> Result<(ModelGrant, Option<Named>, Vec<String>), Failure> {
+            let path = slot.get("path").and_then(Value::as_str).unwrap_or_default().to_string();
             let parameter = path.rsplit('.').next().unwrap_or_default().to_string();
             job.stage(format!("choosing the model for {path}"));
-            // The run's choice, else the package owner's binding, else the declared default.
             let asked = request.choices.iter().find(|c| c.parameter == path || c.parameter == parameter);
-            let owners = match (asked, &mut bound) {
-                (Some(_), _) => None,
-                (None, Some(rows)) => bound_choice(rows, &path, &installation.package),
-                (None, unread) => {
-                    let rows = unread.insert(self.bindings(service, &request.source, &installation.package, &request.catalog_revision)?);
-                    bound_choice(rows, &path, &installation.package)
-                }
-            };
             let declared = default_choice(slot, &path, &installation.package, &request.owner);
-            let choice = asked
-                .or(owners.as_ref())
-                .or(declared.as_ref())
-                .ok_or_else(|| choice_absent(&path, &installation.package))?;
+            let choice = asked.or(declared.as_ref()).ok_or_else(|| choice_absent(&path, &installation.package))?;
             if !choice.source.is_empty() {
-                grants.push(self.source_grant(installation, &path, choice, &request.providers, job)?);
-                continue;
+                return Ok((self.source_grant(installation, &path, choice, &request.providers, job)?, None, vec![]));
             }
             if let (Some(reference), true) = (
                 choice.manifest.as_ref().filter(|m| m.digest.len() == 32),
                 choice.repository.is_empty(),
             ) {
                 // A model passed by value (a ModelArtifact a run here produced): held here.
-                grants.push(self.held_grant(installation, &path, reference)?);
-                continue;
+                return Ok((self.held_grant(installation, &path, reference)?, None, vec![]));
             }
-            let named = choose(choice, &path, (&gpu_model, degree as usize))?;
-            let named = self.resolve(service, &request.source, named, &request.catalog_revision)?;
-            grants.push(ModelGrant {
+            let named = choose(choice, &path)?;
+            let tolerances = precision::Slot::of(slot);
+            let bits = tolerances.bits(request.bits, short);
+            let ruled = named.lane.is_empty() && named.manifest.is_empty();
+            let lanes = if ruled { tolerances.lanes(bits, gpus.row) } else { vec![] };
+            let named = self.resolve(service, &request.source, named, &lanes, &request.catalog_revision)?;
+            let model = format!("{}@{}", named.repository, named.release);
+            let warnings = if ruled { tolerances.warnings(bits, &gpus, &model, &named.lane) } else { vec![] };
+            let grant = ModelGrant {
                 package: installation.package.clone(),
                 slot: path,
                 repository: named.repository.clone(),
@@ -1235,13 +1221,51 @@ impl Publisher {
                 lane: named.lane.clone(),
                 manifest: named.manifest.clone(),
                 components: vec![],
-            });
-            if !named.repository.starts_with("local/") && !checkpoints.iter().any(|c| c.manifest == named.manifest) {
-                checkpoints.push(named);
+            };
+            Ok((grant, (!named.repository.starts_with("local/")).then_some(named), warnings))
+        };
+        // Each checkpoint lands as its structure: what of it comes, and when, its calls direct.
+        let land = |picked: &[(ModelGrant, Option<Named>, Vec<String>)]| -> Result<Vec<Named>, Failure> {
+            let mut checkpoints = Vec::<Named>::new();
+            for named in picked.iter().filter_map(|(_, named, _)| named.as_ref()) {
+                if !checkpoints.iter().any(|c| c.manifest == named.manifest) {
+                    checkpoints.push(named.clone());
+                }
+            }
+            self.structure(&request.source, &checkpoints, job)?;
+            Ok(checkpoints)
+        };
+        let mut picked: Vec<_> = slots.iter().map(|slot| pick(slot, false)).collect::<Result<_, _>>()?;
+        let checkpoints = land(&picked)?;
+        // Memory short (design §2.2): a `min_bits=4` compute slot takes 4 bits when the function's
+        // weights exceed the budget, its last measured activations on these GPUs taken out.
+        let shrinks = |slot: &Value| {
+            let tolerances = precision::Slot::of(slot);
+            request.bits == 0 && tolerances.min_bits == 4 && !tolerances.decode
+        };
+        if slots.iter().any(|slot| shrinks(slot)) {
+            let bytes: u64 = checkpoints.iter().map(|named| self.bytes(named)).sum();
+            let measured: Vec<String> = service
+                .engine
+                .with_journal(|j| j.preparations_of(actor, &installation.alias))
+                .map_err(io_failure)?
+                .iter()
+                .filter_map(|preparation| Plan::of(preparation).ok())
+                .filter(|plan| plan.entrypoint == request.entrypoint)
+                .map(|plan| plan.construction)
+                .collect();
+            if gpu.budget(degree, &measured).is_some_and(|budget| bytes > budget) {
+                for (slot, chosen) in slots.iter().zip(&mut picked).filter(|(slot, _)| shrinks(*slot)) {
+                    *chosen = pick(slot, true)?;
+                }
+                land(&picked)?;
             }
         }
-        // Each checkpoint lands as its structure: what of it comes, and when, its calls direct.
-        self.structure(&request.source, &checkpoints, job)?;
+        let (mut grants, mut warnings) = (vec![], vec![]);
+        for (grant, _, said) in picked {
+            grants.push(grant);
+            warnings.extend(said);
+        }
         for grant in grants.iter_mut().filter(|g| g.components.is_empty() && !g.repository.is_empty()) {
             grant.components = self.components(&grant.manifest)?;
         }
@@ -1257,7 +1281,7 @@ impl Publisher {
                 .iter()
                 .find(|c| c.parameter == grant.slot || c.parameter == parameter)
             {
-                let resolve = |named| self.resolve(service, &request.source, named, &request.catalog_revision);
+                let resolve = |named| self.resolve(service, &request.source, named, &[], &request.catalog_revision);
                 apply_adapters(self, &request.source, &resolve, choice, grant, &request.providers, job)?;
             }
         }
@@ -1280,47 +1304,44 @@ impl Publisher {
                 document: serde_json::to_vec(&plan).map_err(|e| io_failure(io::Error::other(e)))?,
             })
             .map_err(io_failure)?;
-        let key = Self::resolution_key(
-            &installation.alias,
-            request,
-            &format!("{width}x{gpu_model}"),
-        );
+        let key = Self::resolution_key(&installation.alias, request, &machine_row(gpu));
+        let said = Value::from(warnings.clone()).to_string();
         service
             .engine
-            .with_journal(|j| j.bind_resolution(actor, &key, &installation.package, &plan.id))
+            .with_journal(|j| {
+                j.bind_resolution(actor, &key, &installation.package, &plan.id)?;
+                j.bind_named(&warnings_key(&key), &request.catalog_revision, &said)
+            })
             .map_err(io_failure)?;
-        Ok(plan)
+        Ok((plan, warnings))
+    }
+
+    /// A landed checkpoint's bytes: its manifest and every object its header names.
+    fn bytes(&self, named: &Named) -> u64 {
+        let header = access::header(&self.store, &named.object());
+        named.length + header.map_or(0, |header| access::objects(&header, &[]).iter().map(|o| o.length).sum())
     }
 }
 
-/// The GPU this machine's ladders are read for, and how many it groups (none: "", 0).
-pub(crate) fn machine_gpu(service: &Service) -> (String, usize) {
-    service.gpu().map_or((String::new(), 0), |gpu| {
-        (gpu_name(&gpu.config().envelope()[0]), gpu.width())
-    })
+/// The machine's GPUs as a held resolution is keyed by: how many, and their row.
+fn machine_row(gpu: &Pool) -> String {
+    format!("{}x{:?}", gpu.width(), gpu.gpus(gpu.width() as u32).row)
+}
+
+/// Where a held resolution's precision warnings are journaled.
+fn warnings_key(resolution: &str) -> String {
+    json!(["warnings", resolution]).to_string()
 }
 
 /// A Hub model slot's checkpoint as its choice names it (th-245): the owner's by hash, else
-/// `repository` at `release` in the choice's lane, else the widest rung of its binding this
-/// machine's GPUs fit, else the release's only lane. A weight rung never sets execution width.
-pub(crate) fn choose(choice: &domain::ModelChoice, path: &str, (gpu, width): (&str, usize)) -> Result<Named, Failure> {
+/// `repository` at `release` in the choice's lane; no lane is the lane rule's (`resolve`).
+pub(crate) fn choose(choice: &domain::ModelChoice, path: &str) -> Result<Named, Failure> {
     if choice.repository.is_empty() {
         return Err(("model_choice_absent", format!("{path}'s choice names no model repository")));
     }
     let manifest = choice.manifest.as_ref().map(|m| format!("sha256:{}", sha256::hex(&m.digest))).unwrap_or_default();
-    let lane = match choice.lane.is_empty() && manifest.is_empty() && !choice.rungs.is_empty() {
-        true => {
-            let rung = rung(&choice.rungs, gpu, width).ok_or((
-                "model_binding_absent",
-                format!("no rung of {path}'s binding fits {width}x {gpu:?}"),
-            ))?;
-            rung.lane.clone()
-        }
-        false => choice.lane.clone(),
-    };
     let length = choice.manifest.as_ref().map_or(0, |m| m.length);
-    let named = Named { repository: choice.repository.clone(), release: choice.release.clone(), lane, manifest, length };
-    Ok(named)
+    Ok(Named { repository: choice.repository.clone(), release: choice.release.clone(), lane: choice.lane.clone(), manifest, length })
 }
 
 fn make_source(
@@ -1612,50 +1633,21 @@ fn io_failure(error: io::Error) -> Failure {
     ("release_root_preparation_failed", error.to_string())
 }
 
-/// A slot's declared default as a choice (its `default_ladder`: rungs of
-/// `[org/]model@release/lane`, one model and release): what a run that names no model for the
-/// slot gets, with no binding read anywhere. An org-relative model is the package's account's:
-/// the package's org, or for unpublished code the run's `owner`.
+/// A slot's declared default as a choice (its `default`: `[org/]model@release`): what a run
+/// that names no model for the slot gets, in the lane rule's lane. An org-relative model is the
+/// package's account's: the package's org, or for unpublished code the run's `owner`.
 pub(crate) fn default_choice(slot: &Value, path: &str, package: &str, owner: &str) -> Option<domain::ModelChoice> {
     let account = match package.split_once('/') {
         Some((org, _)) if org != "local" => org,
         _ => owner,
     };
-    let mut choice = domain::ModelChoice { parameter: path.into(), ..Default::default() };
-    for rung in slot.get("default_ladder")?.as_array()? {
-        let (reference, lane) = rung.get("lane")?.as_str()?.rsplit_once('/')?;
-        let (model, release) = reference.split_once('@')?;
-        choice.repository = match model.contains('/') {
-            true => model.into(),
-            false if account.is_empty() => return None,
-            false => format!("{account}/{model}"),
-        };
-        choice.release = release.into();
-        choice.rungs.push(domain::ModelRung {
-            gpu: rung.get("gpu").and_then(Value::as_str).unwrap_or("*").into(),
-            gpus: rung.get("gpus").and_then(Value::as_u64).unwrap_or(0) as u32,
-            lane: lane.into(),
-        });
-    }
-    (!choice.rungs.is_empty()).then_some(choice)
-}
-
-/// A slot's choice as its owner bound it (`cozy package bind`): a model release and its ladder.
-fn bound_choice(rows: &[Value], path: &str, package: &str) -> Option<domain::ModelChoice> {
-    let row = rows.iter().find(|row| row["slot"] == path)?;
-    let model = row["model"].as_str()?;
-    let repository = match (model.contains('/'), package.split_once('/')) {
-        (true, _) => model.to_string(),
-        (false, Some((org, _))) => format!("{org}/{model}"),
-        (false, None) => return None,
+    let (model, release) = slot.get("default")?.as_str()?.split_once('@')?;
+    let repository = match model.contains('/') {
+        true => model.into(),
+        false if account.is_empty() => return None,
+        false => format!("{account}/{model}"),
     };
-    let rung = |rung: &Value| {
-        let gpus = rung["gpus"].as_u64().unwrap_or(0) as u32;
-        Some(domain::ModelRung { gpu: rung["gpu"].as_str().unwrap_or("*").into(), gpus, lane: rung["lane"].as_str()?.into() })
-    };
-    let rungs: Vec<_> = row["ladder"].as_array()?.iter().map(rung).collect::<Option<_>>()?;
-    let release = row["release"].as_str()?.to_string();
-    (!rungs.is_empty()).then(|| domain::ModelChoice { parameter: path.into(), repository, release, rungs, ..Default::default() })
+    Some(domain::ModelChoice { parameter: path.into(), repository, release: release.into(), ..Default::default() })
 }
 
 /// A slot with neither a choice nor a declared default.
@@ -1679,60 +1671,6 @@ pub fn declares_models(installation: &Installation, entrypoint: &str) -> bool {
         .ok()
         .and_then(|i: Value| model_slots(&i, entrypoint))
         .is_some_and(|m| !m.is_empty())
-}
-
-/// The widest rung this machine holds (its GPU pattern fits the device and it asks for at
-/// most `available` of them; the first among equals): its lane and GPU count (0 unstated).
-/// The rung `available` GPUs named `gpu` run: the widest that fits, the owner's first among
-/// equals. A rung's `gpu` is "*" (or empty), or tokens the GPU's name holds in order.
-fn rung<'a>(rungs: &'a [domain::ModelRung], gpu: &str, available: usize) -> Option<&'a domain::ModelRung> {
-    let fits = |pattern: &str| {
-        if pattern.is_empty() || pattern == "*" {
-            return true;
-        }
-        let have: Vec<String> = gpu
-            .to_lowercase()
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|t| !t.is_empty())
-            .map(String::from)
-            .collect();
-        let mut rest = have.iter();
-        pattern
-            .to_lowercase()
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|t| !t.is_empty())
-            .all(|token| rest.any(|t| t == token))
-    };
-    rungs
-        .iter()
-        .rev()
-        .filter(|r| r.gpus as usize <= available)
-        .filter(|r| fits(&r.gpu))
-        .max_by_key(|r| r.gpus)
-}
-
-/// The configured device's model name from the NVIDIA driver's proc files (no CUDA/NVML).
-fn gpu_name(device: &str) -> String {
-    let mut rows: Vec<(String, String)> = fs::read_dir("/proc/driver/nvidia/gpus")
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|entry| {
-            let text = fs::read_to_string(entry.path().join("information")).ok()?;
-            let field = |name: &str| {
-                text.lines()
-                    .find_map(|l| l.strip_prefix(name))
-                    .map(|v| v.trim_start_matches(':').trim().to_string())
-            };
-            Some((field("GPU UUID")?, field("Model")?))
-        })
-        .collect();
-    rows.sort();
-    match device.parse::<usize>() {
-        Ok(index) => rows.get(index).map(|r| r.1.clone()),
-        Err(_) => rows.iter().find(|r| r.0 == device).map(|r| r.1.clone()),
-    }
-    .unwrap_or_default()
 }
 
 struct Lock {
@@ -2281,114 +2219,65 @@ mod tests {
         );
     }
 
-    fn rungs(ladder: &[(&str, u32, &str)]) -> Vec<domain::ModelRung> {
-        ladder
-            .iter()
-            .map(|(gpu, gpus, lane)| domain::ModelRung { gpu: gpu.to_string(), gpus: *gpus, lane: lane.to_string() })
-            .collect()
-    }
-
-    #[test]
-    fn rung_is_the_widest_group_the_machine_holds() {
-        let lane = |ladder: &[domain::ModelRung], gpu, width| rung(ladder, gpu, width).map(|r| (r.lane.clone(), r.gpus));
-        let ladder = rungs(&[("*", 0, "bf16"), ("rtx 4090", 0, "fp8"), ("h100", 4, "bf16")]);
-        assert_eq!(lane(&ladder, "NVIDIA GeForce RTX 4090", 1), Some(("bf16".into(), 0)));
-        let ladder = rungs(&[("rtx 4090", 0, "fp8")]);
-        assert_eq!(lane(&ladder, "NVIDIA GeForce RTX 4090", 1), Some(("fp8".into(), 0)));
-        assert_eq!(lane(&ladder, "NVIDIA A40", 2), None);
-        let h3 = rungs(&[("H100", 2, "fp8-pruned"), ("H100", 4, "fp8-pruned"), ("H200", 1, "fp8-pruned")]);
-        assert_eq!(lane(&h3, "NVIDIA H100 80GB HBM3", 1), None);
-        assert_eq!(lane(&h3, "NVIDIA H100 80GB HBM3", 2), Some(("fp8-pruned".into(), 2)));
-        assert_eq!(lane(&h3, "NVIDIA H100 80GB HBM3", 8), Some(("fp8-pruned".into(), 4)));
-    }
-
-    /// A Hub slot's checkpoint is a name (its lane, else the rung this machine fits, else the
-    /// release's only one) or the owner's hash; a choice naming no repository is absent.
+    /// A Hub slot's checkpoint is a name (in its lane, else the lane rule's) or the owner's
+    /// hash; a choice naming no repository is absent.
     #[test]
     fn a_hub_choice_is_a_name_or_the_owners_hash() {
-        let choose = |choice: &domain::ModelChoice, gpu| self::choose(choice, "touch.models.source", gpu);
+        let choose = |choice: &domain::ModelChoice| self::choose(choice, "touch.models.source");
         let pinned = domain::ModelChoice {
             repository: "proof/probe".into(),
             lane: "bf16".into(),
             manifest: Some(domain::Ref { digest: vec![7; 32], length: 9 }),
             ..Default::default()
         };
-        let got = choose(&pinned, ("", 0)).unwrap();
+        let got = choose(&pinned).unwrap();
         assert_eq!((got.manifest, got.release), (format!("sha256:{}", "07".repeat(32)), String::new()));
-        let laddered = domain::ModelChoice {
-            repository: "proof/probe".into(),
-            release: "1.0.0".into(),
-            rungs: rungs(&[("h100", 2, "fp8"), ("*", 0, "bf16")]),
-            ..Default::default()
-        };
-        let got = choose(&laddered, ("NVIDIA H100 80GB HBM3", 2)).unwrap();
-        assert_eq!((got.lane.as_str(), got.release.as_str(), got.manifest.as_str()), ("fp8", "1.0.0", ""));
-        assert_eq!(choose(&laddered, ("NVIDIA A40", 1)).unwrap().lane, "bf16");
-        let only = domain::ModelChoice { repository: "proof/probe".into(), rungs: rungs(&[("h100", 0, "fp8")]), ..Default::default() };
-        assert_eq!(choose(&only, ("NVIDIA A40", 1)).err().unwrap().0, "model_binding_absent");
-        let named = domain::ModelChoice { repository: "proof/probe".into(), ..Default::default() };
-        let got = choose(&named, ("", 0)).unwrap();
-        assert_eq!((got.release.as_str(), got.lane.as_str(), got.manifest.as_str()), ("", "", ""));
+        let named = domain::ModelChoice { repository: "proof/probe".into(), release: "1.0.0".into(), ..Default::default() };
+        let got = choose(&named).unwrap();
+        assert_eq!((got.release.as_str(), got.lane.as_str(), got.manifest.as_str()), ("1.0.0", "", ""));
         let unnamed = domain::ModelChoice { manifest: pinned.manifest.clone(), ..Default::default() };
-        assert_eq!(choose(&unnamed, ("", 0)).err().unwrap().0, "model_choice_absent");
+        assert_eq!(choose(&unnamed).err().unwrap().0, "model_choice_absent");
     }
 
     #[test]
-    fn model_identity_and_ladder_do_not_choose_the_execution_width() {
-        let path = "render.models.base";
-        let slot = json!({"path": path, "sequence_parallel": {"degrees": [2, 4, 7, 8]},
-            "default_ladder": [{"gpu": "*", "gpus": 1, "lane": "base@1.0/fp8"}]});
-        let default = default_choice(&slot, path, "org/package", "").unwrap();
-        let mut lane = default.clone();
-        lane.lane = "bf16".into();
-        let mut pinned = default.clone();
-        pinned.manifest = Some(domain::Ref { digest: vec![7; 32], length: 9 });
-        for (requested, expected) in [(0, 4), (1, 1), (2, 2), (4, 4)] {
-            let degree = crate::gpu_service::group_degree(std::slice::from_ref(&slot), requested, 4);
-            assert_eq!(degree, expected);
-            for choice in [&default, &lane, &pinned] {
-                let named = choose(choice, path, ("NVIDIA H100", degree as usize)).unwrap();
-                assert_eq!(named.repository, "org/base");
-            }
+    fn model_identity_does_not_choose_the_execution_width() {
+        let slot = json!({"path": "render.models.base", "sequence_parallel": {"degrees": [2, 4, 7, 8]}});
+        for (requested, expected) in [(0, 4), (1, 1), (2, 2), (4, 4), (3, 2)] {
+            assert_eq!(crate::gpu_service::group_degree(std::slice::from_ref(&slot), requested, 4), expected);
         }
-        assert_eq!(choose(&lane, path, ("NVIDIA H100", 2)).unwrap().lane, "bf16");
-        assert_eq!(choose(&pinned, path, ("NVIDIA H100", 2)).unwrap().manifest, format!("sha256:{}", "07".repeat(32)));
-        assert_eq!(crate::gpu_service::group_degree(&[slot], 3, 4), 2);
     }
 
     #[test]
-    fn an_explicit_gpu_count_has_its_own_preparation_cache_key() {
+    fn an_explicit_gpu_count_and_bits_have_their_own_preparation_cache_key() {
         let mut request = Request {
             source: hub::Source::new("https://hub.example", None, vec![], None).unwrap(),
             package: "org/package".into(), release: "1".into(), installed: None,
             owner: "org".into(), catalog_revision: String::new(), providers: Providers::default(),
-            entrypoint: "render".into(), choices: vec![], gpus: 0, imports: true,
+            entrypoint: "render".into(), choices: vec![], gpus: 0, bits: 0, imports: true,
         };
-        let default = Publisher::resolution_key("installed", &request, "4xH100");
-        request.gpus = 2;
-        let two = Publisher::resolution_key("installed", &request, "4xH100");
-        request.gpus = 1;
-        let one = Publisher::resolution_key("installed", &request, "4xH100");
-        assert_ne!(default, two);
-        assert_ne!(two, one);
-        assert_ne!(one, default);
+        let mut keys = vec![Publisher::resolution_key("installed", &request, "4xrow")];
+        for (gpus, bits) in [(2, 0), (1, 0), (1, 4)] {
+            (request.gpus, request.bits) = (gpus, bits);
+            keys.push(Publisher::resolution_key("installed", &request, "4xrow"));
+        }
+        keys.push(Publisher::resolution_key("installed", &request, "4xother"));
+        let distinct: std::collections::BTreeSet<_> = keys.iter().collect();
+        assert_eq!(distinct.len(), keys.len());
     }
 
-    /// A slot the run names no model for takes its declared default ladder, with no binding
-    /// read anywhere (run 5327's `generate_image.models.model` failed `model_choice_absent`).
-    /// An org-relative model is the package's account's: its org, or unpublished code's owner.
+    /// A slot the run names no model for takes its declared default release (run 5327's
+    /// `generate_image.models.model` failed `model_choice_absent`). An org-relative model is
+    /// the package's account's: its org, or unpublished code's owner.
     #[test]
     fn an_unchosen_slot_takes_its_declared_default() {
         let path = "generate_image.models.model";
-        let slot = json!({"path": path, "default_ladder": [
-            {"gpu": "H100", "gpus": 2, "lane": "qwen-image-2@1.0.0/fp8"}, {"gpu": "*", "lane": "qwen-image-2@1.0.0/bf16"}]});
+        let slot = json!({"path": path, "default": "qwen-image-2@1.0.0"});
         let published = default_choice(&slot, path, "paul/qwen-image-2", "").unwrap();
-        assert_eq!((published.parameter.as_str(), published.repository.as_str(), published.release.as_str()), (path, "paul/qwen-image-2", "1.0.0"));
-        assert_eq!(published.rungs, rungs(&[("H100", 2, "fp8"), ("*", 0, "bf16")]));
-        assert_eq!(choose(&published, path, ("NVIDIA RTX A4000", 1)).unwrap().lane, "bf16");
+        assert_eq!((published.parameter.as_str(), published.repository.as_str(), published.release.as_str(), published.lane.as_str()),
+            (path, "paul/qwen-image-2", "1.0.0", ""));
         assert_eq!(default_choice(&slot, path, "local/qwen-copy", "fidika").unwrap().repository, "fidika/qwen-image-2");
         assert!(default_choice(&slot, path, "local/qwen-copy", "").is_none(), "an org-relative default needs its account");
-        let explicit = json!({"default_ladder": [{"gpu": "*", "lane": "proof/probe@2.1/bf16"}]});
+        let explicit = json!({"default": "proof/probe@2.1"});
         assert_eq!(default_choice(&explicit, path, "local/qwen-copy", "").unwrap().repository, "proof/probe");
         assert!(default_choice(&json!({"path": path}), path, "paul/qwen-image-2", "").is_none());
         assert_eq!(choice_absent(path, "paul/qwen-image-2").0, "model_choice_absent");
@@ -2709,41 +2598,6 @@ mod tests {
         let _ = fs::remove_dir_all(&bench.root);
     }
 
-    /// A slot no run chooses takes its package owner's binding (`cozy package bind`) over the
-    /// declared default: read once per catalog revision and journaled, so a second run asks the
-    /// Hub nothing and a moved revision reads it again. Local code has no bindings.
-    #[test]
-    fn an_owners_binding_chooses_an_unchosen_slot_once_per_revision() {
-        let root = std::env::temp_dir().join(format!("cm-bound-{}", uuid::Uuid::new_v4()));
-        let source = Store::ensure(&root.join("source")).unwrap();
-        let manifest = checkpoint(&source, 1, 9);
-        let service = Service::open(&root.join("state"), &root.join("g"), 1).unwrap();
-        let store = Arc::new(Store::ensure_owned(&root.join("store")).unwrap());
-        let publisher = Publisher::new(&root.join("published"), PackageSdk::default(), store).unwrap();
-        let model = names_hub::Model { repository: "acme/model".into(), release: "1.0.0".into(), lane: "bf16".into(), manifest };
-        let ladder = json!([{"gpu": "RTX 3060", "lane": "fp8"}, {"gpu": "*", "lane": "bf16"}]);
-        let package = names_hub::Package { name: "acme/pkg".into(), release: "1.0.0".into(), interface: json!({}),
-            wheel: "pkg-1.0.0-py3-none-any.whl".into(), bytes: vec![], callees: vec![], pypi: String::new(),
-            bindings: json!([{"slot": "render.models.model", "model": "acme/model", "release": "1.0.0", "ladder": ladder, "revision": 2}]) };
-        let (origin, heard) = names_hub::serve(&source, model, Some(package));
-        let hub = hub::Source::new(&origin, None, vec!["localhost".into()], None).unwrap();
-        let reads = || count(&heard, "GET /v1/packages/acme/pkg/bindings");
-        let path = "render.models.model";
-        let rows = publisher.bindings(&service, &hub, "acme/pkg", "r1").unwrap();
-        let bound = bound_choice(&rows, path, "acme/pkg").unwrap();
-        assert_eq!((bound.repository.as_str(), bound.release.as_str()), ("acme/model", "1.0.0"));
-        assert_eq!(choose(&bound, path, ("NVIDIA GeForce RTX 3060", 1)).unwrap().lane, "fp8");
-        assert_eq!(choose(&bound, path, ("NVIDIA H100 80GB HBM3", 1)).unwrap().lane, "bf16");
-        assert!(bound_choice(&rows, "render.models.other", "acme/pkg").is_none(), "an unbound slot keeps its default");
-        assert_eq!(publisher.bindings(&service, &hub, "acme/pkg", "r1").unwrap(), rows);
-        assert_eq!(reads(), 1, "a second run under the same revision asks the Hub nothing");
-        publisher.bindings(&service, &hub, "acme/pkg", "r2").unwrap();
-        assert_eq!(reads(), 2, "a moved revision reads the bindings again");
-        assert!(publisher.bindings(&service, &hub, "local/pkg", "r2").unwrap().is_empty());
-        assert_eq!(heard.lock().unwrap().len(), 2, "nothing else was asked: {heard:?}");
-        let _ = fs::remove_dir_all(&root);
-    }
-
     /// A call's weights come from its preparation on (Next, smallest component first) before its
     /// executor can ask, and keep coming while its first channel is open: nothing is dropped as
     /// the executor takes over. Once that channel closes, the preparation's fetches end.
@@ -2772,5 +2626,140 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         let _ = fs::remove_dir_all(&bench.root);
+    }
+
+    /// A machine on the GPUs its inventory names (compute capability, memory) holding `acme/pkg`,
+    /// whose `render` declares `slots`, and a Hub publishing `acme/model@1.0.0` in `lanes`.
+    struct Machine {
+        root: PathBuf,
+        service: Arc<Service>,
+        publisher: Arc<Publisher>,
+        installation: Installation,
+        hub: hub::Source,
+        heard: names_hub::Heard,
+        /// Each published manifest's lane.
+        lanes: HashMap<String, String>,
+    }
+
+    impl Machine {
+        fn new(gpus: &[(&str, u64)], slots: Value, lanes: &[&str]) -> Self {
+            let root = std::env::temp_dir().join(format!("cm-precision-{}", uuid::Uuid::new_v4()));
+            let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
+            let store = Arc::new(Store::ensure_owned(&root.join("store")).unwrap());
+            let publisher = Publisher::new(&root.join("published"), PackageSdk::default(), store.clone()).unwrap();
+            let inventory: Vec<Value> = gpus.iter().enumerate().map(|(at, (cc, memory))| json!({"device_index": at,
+                "device_name": "GPU", "device_uuid": format!("GPU-{at}"), "driver_version": "1", "memory_bytes": memory,
+                "pci_bus_id": format!("{at}"), "compute_cap": cc})).collect();
+            let devices: Vec<String> = (0..gpus.len()).map(|at| at.to_string()).collect();
+            let config = json!({"devices": devices.join(","), "gpus": inventory, "authorized_device_limit_bytes": null, "prespawn": false});
+            service.configure_pool(Pool::new(&root.join("gpu"), serde_json::from_value(config).unwrap(), store).unwrap()).unwrap();
+            let identity = "cd".repeat(16);
+            let dir = service.catalog.root().join(&identity);
+            fs::create_dir_all(dir.join("env/bin")).unwrap();
+            fs::write(dir.join("env/bin/python"), "").unwrap();
+            File::create(dir.join(".hold")).unwrap();
+            let interface = json!({"application": "pkg:app", "entrypoints": [{"name": "render", "models": slots}]});
+            fs::write(dir.join("generation.json"), json!({"identity": identity, "package": "acme/pkg", "version": "1.0.0",
+                "application": "pkg:app", "python": dir.join("env/bin/python"), "interface": interface}).to_string()).unwrap();
+            let installation = service.engine.bind_installation(Installation { actor: "alice".into(), alias: "held".into(),
+                generation: identity, package: "acme/pkg".into(), release: "1.0.0".into(),
+                interface: serde_json::to_vec(&interface).unwrap(), hub: String::new() }).unwrap();
+            let source = Store::ensure(&root.join("source")).unwrap();
+            let models: Vec<_> = lanes.iter().zip(30u8..).map(|(lane, tag)| names_hub::Model { repository: "acme/model".into(),
+                release: "1.0.0".into(), lane: lane.to_string(), manifest: checkpoint(&source, 4, tag) }).collect();
+            let lanes = models.iter().map(|model| (model.manifest.id(), model.lane.clone())).collect();
+            let (origin, heard) = names_hub::models(&source, models);
+            let hub = hub::Source::new(&origin, None, vec!["localhost".into()], None).unwrap();
+            Self { root, service, publisher, installation, hub, heard, lanes }
+        }
+
+        /// A run of `render` at `bits`: each slot's lane, the run's warnings and what it asked
+        /// the Hub.
+        fn run(&self, bits: u32) -> (Vec<String>, Vec<String>, Vec<String>) {
+            let request = Request { source: self.hub.clone(), package: "acme/pkg".into(), release: "1.0.0".into(),
+                installed: Some(self.installation.clone()), owner: "alice".into(), catalog_revision: "r1".into(),
+                providers: Providers::default(), entrypoint: "render".into(), choices: vec![], gpus: 0, bits, imports: false };
+            let prepared = self.publisher.prepare_now(&self.service, "alice", &request, None, None).unwrap();
+            let lanes = prepared.plan.unwrap().slots.iter().map(|slot| self.lanes[&slot.binding.snapshot].clone()).collect();
+            (lanes, prepared.warnings, std::mem::take(&mut *self.heard.lock().unwrap()))
+        }
+    }
+
+    /// The lanes closure reads named (resolving, then landing what resolved).
+    fn closed(asked: &[String]) -> std::collections::BTreeSet<&str> {
+        asked.iter().filter_map(|heard| heard.strip_prefix("POST /v1/tensorfs/closure acme/model@1.0.0 ")).collect()
+    }
+
+    impl Drop for Machine {
+        fn drop(&mut self) {
+            let _ = self.service.pool().unwrap().stop();
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    const GIB: u64 = 1 << 30;
+
+    /// A compute slot takes its row's 8-bit lane and a `min_bits=4` decode slot `nvfp4`, each
+    /// one closure read; a warm run asks the Hub nothing; `--bits=16` is another resolution.
+    #[test]
+    fn each_slot_takes_its_rows_lane_and_a_warm_run_asks_the_hub_nothing() {
+        let slots = json!([
+            {"path": "render.models.model", "class": "M", "default": "model@1.0.0", "encoded_leaves": "accept"},
+            {"path": "render.models.text", "class": "T", "default": "model@1.0.0", "encoded_leaves": "accept",
+                "min_bits": 4, "phase": "decode"}]);
+        let hopper = Machine::new(&[("9.0", 80 * GIB)], slots.clone(), &["bf16", "fp8", "int8", "nvfp4"]);
+        let (lanes, warnings, asked) = hopper.run(0);
+        assert_eq!((lanes, warnings), (vec!["int8".to_string(), "nvfp4".into()], vec![]));
+        assert_eq!(closed(&asked), std::collections::BTreeSet::from(["int8", "nvfp4"]), "no lane past the first published one");
+        let (lanes, _, asked) = hopper.run(0);
+        assert_eq!((lanes, asked), (vec!["int8".to_string(), "nvfp4".into()], vec![]), "a warm run asks the Hub nothing");
+        let (lanes, warnings, _) = hopper.run(16);
+        assert_eq!((lanes, warnings), (vec!["bf16".to_string(), "bf16".into()], vec![]));
+        let blackwell_ultra = Machine::new(&[("10.3", 288 * GIB)], slots, &["bf16", "fp8", "int8", "nvfp4"]);
+        assert_eq!(blackwell_ultra.run(0).0, ["fp8", "nvfp4"]);
+    }
+
+    /// Only a `min_bits=4` compute slot drops to 4 bits, and only when the function's 8-bit
+    /// weights exceed the GPU's memory less its activations (a quarter before any measured).
+    #[test]
+    fn a_memory_short_function_drops_to_4_bits_only_where_min_bits_allows() {
+        let slots = json!([
+            {"path": "render.models.model", "class": "M", "default": "model@1.0.0", "encoded_leaves": "accept", "min_bits": 4},
+            {"path": "render.models.other", "class": "O", "default": "model@1.0.0", "encoded_leaves": "accept"}]);
+        let lanes = ["int8", "nvfp4", "bf16"];
+        let short = Machine::new(&[("8.9", 64 << 10)], slots.clone(), &lanes);
+        assert_eq!(short.run(0).0, ["nvfp4", "int8"]);
+        assert_eq!(short.run(8).0, ["int8", "int8"], "the request's bits win");
+        let ample = Machine::new(&[("8.9", 24 * GIB)], slots, &lanes);
+        assert_eq!(ample.run(0).0, ["int8", "int8"]);
+    }
+
+    /// A release without the wanted lane serves the next with one warning per step; a slot
+    /// declining encoded leaves skips them with one warning; a warm run says the same again.
+    #[test]
+    fn a_fallback_and_a_declined_encoding_each_warn() {
+        let slots = json!([{"path": "render.models.model", "class": "M", "default": "model@1.0.0", "encoded_leaves": "accept"}]);
+        let ada = Machine::new(&[("8.9", 24 * GIB)], slots, &["int8", "bf16"]);
+        let warned = ["precision 4: acme/model@1.0.0 has no nvfp4 lane for sm89; served int8".to_string()];
+        let (lanes, warnings, asked) = ada.run(4);
+        assert_eq!((lanes, warnings), (vec!["int8".to_string()], warned.to_vec()));
+        assert_eq!(closed(&asked), std::collections::BTreeSet::from(["int8", "nvfp4"]));
+        let (_, warnings, asked) = ada.run(4);
+        assert_eq!((warnings, asked), (warned.to_vec(), vec![]), "a warm run warns again and asks nothing");
+        let declines = json!([{"path": "render.models.model", "class": "M", "default": "model@1.0.0", "encoded_leaves": "refuse"}]);
+        let ada = Machine::new(&[("8.9", 24 * GIB)], declines, &["int8", "bf16"]);
+        let (lanes, warnings, _) = ada.run(0);
+        assert_eq!((lanes, warnings), (vec!["bf16".to_string()], vec!["precision 8: acme/model@1.0.0 declines encoded leaves; served bf16".to_string()]));
+    }
+
+    /// A mixed local set runs what every GPU in it runs: an Ampere and an Ada card share no fp8.
+    #[test]
+    fn a_mixed_local_set_takes_the_lane_every_gpu_runs() {
+        let slots = json!([{"path": "render.models.model", "class": "M", "default": "model@1.0.0", "encoded_leaves": "accept",
+            "sequence_parallel": {"degrees": [2]}}]);
+        let mixed = Machine::new(&[("8.6", 24 * GIB), ("8.9", 24 * GIB)], slots, &["fp8", "bf16"]);
+        let (lanes, warnings, _) = mixed.run(0);
+        assert_eq!((lanes, warnings), (vec!["bf16".to_string()],
+            vec!["precision 8: acme/model@1.0.0 has no int8 lane for sm86+sm89; served bf16".to_string()]));
     }
 }

@@ -29,6 +29,9 @@ pub struct Invocation {
     /// An explicit run GPU group; zero selects the package's widest supported group.
     #[serde(default)]
     pub gpus: u32,
+    /// The request's weight precision (16, 8 or 4), passed to the executor; zero: the rules'.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub bits: u32,
     /// File inputs the caller imported, verified at acceptance.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<InputFile>,
@@ -923,16 +926,6 @@ impl Journal {
         record
             .map(|record| serde_json::from_str(&record).map_err(db_error))
             .transpose()
-    }
-    /// Drops cached model resolutions of a package: the next run reads its bindings again.
-    pub fn forget_resolutions(&mut self, actor: &str, package: &str) -> io::Result<()> {
-        self.connection
-            .execute(
-                "DELETE FROM resolutions WHERE actor=?1 AND package=?2",
-                params![actor, package],
-            )
-            .map_err(db_error)?;
-        Ok(())
     }
     /// The accepted public execution a submission or request already names, if any.
     pub fn accepted_public(

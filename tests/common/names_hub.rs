@@ -1,5 +1,5 @@
 //! A loopback Hub that answers by name (th-245): one package's card, each release's card, locked
-//! requirements and file door, and one model's closure by name, release and lane (its hash only
+//! requirements and file door, and its models' closures by name, release and lane (a hash only
 //! to a credentialed caller), presign and objects, with ranges. It records every request.
 #![allow(dead_code)]
 use axum::{
@@ -34,13 +34,11 @@ pub struct Package {
     pub callees: Vec<(String, Vec<u8>)>,
     /// The lock's other rows (PyPI's), verbatim.
     pub pypi: String,
-    /// Its owner's slot bindings (`cozy package bind`), as the Hub lists them.
-    pub bindings: Value,
 }
 
 struct Served {
-    model: Model,
-    objects: Vec<ObjectRef>,
+    /// Each model with the objects its closure names.
+    models: Vec<(Model, Vec<ObjectRef>)>,
     bytes: HashMap<String, Vec<u8>>,
     /// Releases of one package.
     packages: Vec<Package>,
@@ -65,22 +63,38 @@ pub fn paced(
     packages: impl IntoIterator<Item = Package>,
     pace: std::time::Duration,
 ) -> (String, Heard) {
-    let document = store.read_manifest(&model.manifest).unwrap();
-    let walked = tensorfs_core::checkpoint::walk_cozytensors(store, &document).unwrap();
-    let objects: Vec<ObjectRef> =
-        walked.distinct().into_iter().filter(|o| o.sha256 != model.manifest.sha256).cloned().collect();
+    start(store, vec![model], packages, pace)
+}
+
+/// Several models, or several lanes of one release.
+pub fn models(store: &Store, models: Vec<Model>) -> (String, Heard) {
+    start(store, models, None, std::time::Duration::ZERO)
+}
+
+fn start(
+    store: &Store,
+    models: Vec<Model>,
+    packages: impl IntoIterator<Item = Package>,
+    pace: std::time::Duration,
+) -> (String, Heard) {
     let mut bytes = HashMap::new();
-    for object in &objects {
-        bytes.insert(object.sha256.clone(), std::fs::read(store.blob_path(&object.sha256)).unwrap());
-    }
-    bytes.insert(model.manifest.sha256.clone(), std::fs::read(store.manifest_path(&model.manifest.sha256)).unwrap());
+    let models = models.into_iter().map(|model| {
+        let document = store.read_manifest(&model.manifest).unwrap();
+        let walked = tensorfs_core::checkpoint::walk_cozytensors(store, &document).unwrap();
+        let objects: Vec<ObjectRef> =
+            walked.distinct().into_iter().filter(|o| o.sha256 != model.manifest.sha256).cloned().collect();
+        for object in &objects {
+            bytes.insert(object.sha256.clone(), std::fs::read(store.blob_path(&object.sha256)).unwrap());
+        }
+        bytes.insert(model.manifest.sha256.clone(), std::fs::read(store.manifest_path(&model.manifest.sha256)).unwrap());
+        (model, objects)
+    }).collect();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
     let heard: Heard = Default::default();
     let served = Arc::new(Served {
-        model,
-        objects,
+        models,
         bytes,
         packages: packages.into_iter().collect(),
         origin: format!("http://127.0.0.1:{port}"),
@@ -156,7 +170,6 @@ async fn answer(State(served): State<Arc<Served>>, method: Method, uri: Uri, hea
         heard.push_str(" +credential");
     }
     served.heard.lock().unwrap().push(heard);
-    let model = &served.model;
     let first = served.packages.first();
     let release_path = |p: &Package| format!("/v1/packages/{}/releases/{}", p.name, p.release);
     let release = served.packages.iter().find(|p| path == release_path(p));
@@ -167,9 +180,6 @@ async fn answer(State(served): State<Arc<Served>>, method: Method, uri: Uri, hea
             let mut releases: Vec<Value> = served.packages.iter().map(|p| json!({"release": p.release})).collect();
             releases.extend([json!({"release": "0.9.0"}), json!({"release": "9.0.0", "yanked": true})]);
             json(json!({"package": first.unwrap().name, "releases": releases}))
-        }
-        (Method::GET, p) if first.is_some_and(|package| p == format!("/v1/packages/{}/bindings", package.name)) => {
-            json(json!({"bindings": first.unwrap().bindings}))
         }
         (Method::GET, _) if release.is_some() => {
             let package = release.unwrap();
@@ -200,15 +210,21 @@ async fn answer(State(served): State<Arc<Served>>, method: Method, uri: Uri, hea
                     false => release = part,
                 }
             }
-            let named = repository == model.repository
-                && (release.is_empty() || release == model.release)
-                && (lane.is_empty() || lane == model.lane)
-                && (digest.is_empty() || digest == model.manifest.id());
+            let named: Vec<_> = served.models.iter().filter(|(model, _)| {
+                repository == model.repository
+                    && (release.is_empty() || release == model.release)
+                    && (lane.is_empty() || lane == model.lane)
+                    && (digest.is_empty() || digest == model.manifest.id())
+            }).collect();
+            // No lane names a release's only one.
+            let Some((model, objects)) = named.first().filter(|_| !lane.is_empty() || named.len() == 1) else {
+                return absent();
+            };
             // A hash alone is the owner's: answered only to a credentialed caller.
-            if !named || release.is_empty() && !digest.is_empty() && !credentialed {
+            if release.is_empty() && !digest.is_empty() && !credentialed {
                 return absent();
             }
-            let rows: Vec<_> = served.objects.iter().map(|o| json!({"length": o.length, "sha256": o.sha256})).collect();
+            let rows: Vec<_> = objects.iter().map(|o| json!({"length": o.length, "sha256": o.sha256})).collect();
             let (release, lane) = match release.is_empty() && !digest.is_empty() {
                 true => ("", ""),
                 false => (model.release.as_str(), model.lane.as_str()),

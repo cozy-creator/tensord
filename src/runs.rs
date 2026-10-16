@@ -43,6 +43,8 @@ pub struct SetItem {
     pub source: Source,
     pub entrypoint: String,
     pub models: Vec<domain::ModelChoice>,
+    /// As `Spec::bits`, for this member's slots.
+    pub bits: u32,
     pub level: Level,
     /// The item as the caller sent it, for Status.
     pub sent: Vec<u8>,
@@ -64,6 +66,8 @@ pub struct Spec {
     pub models: Vec<domain::ModelChoice>,
     pub attention_kernel: String,
     pub gpus: u32,
+    /// The run's weight precision (16, 8 or 4); 0 lets the lane rule choose each slot's.
+    pub bits: u32,
     /// The Hub the run reads and publishes to, under this machine's authority there.
     pub hub: Option<hub::Source>,
     /// Provider tokens for source models, held in memory only.
@@ -95,7 +99,7 @@ pub struct Runs {
 }
 
 /// What a run's children prepare with: its installation, Hub access, owner, catalog revision,
-/// attention pin and the model choices addressed to its callables (`<entrypoint>.models.<p>`).
+/// attention pin, bits and the model choices addressed to its callables (`<entrypoint>.models.<p>`).
 #[derive(Clone, Default)]
 pub struct RunContext {
     pub(crate) installation: String,
@@ -105,6 +109,7 @@ pub struct RunContext {
     pub(crate) catalog_revision: String,
     pub(crate) attention_kernel: String,
     pub(crate) gpus: u32,
+    pub(crate) bits: u32,
     pub(crate) models: Vec<domain::ModelChoice>,
     pub(crate) weights_destination: String,
     /// What its weights come under before its call's executor asks (`Fetch::ahead`).
@@ -253,6 +258,7 @@ impl Runs {
             input: spec.input.clone(),
             attention_kernel: spec.attention_kernel.clone(),
             gpus: spec.gpus,
+            bits: spec.bits,
             inputs: spec.inputs.clone(),
             parent: spec.parent.clone(),
             ..Default::default() // root and family: stamped at acceptance
@@ -375,12 +381,15 @@ impl Runs {
                 let row = json!({"parameter": choice.parameter, "manifest": format!("sha256:{sha256}")});
                 (ObjectRef { sha256, length: length.len() }, row)
             } else {
-                // A Hub checkpoint by name, or the owner's by hash.
-                let (gpu, width) = crate::published::machine_gpu(&self.service);
-                let named = crate::published::choose(choice, &choice.parameter, (&gpu, width))
+                // A Hub checkpoint by name, or the owner's by hash; no lane is the one this
+                // machine's GPUs would run at the run's bits (`precision`).
+                let named = crate::published::choose(choice, &choice.parameter)
                     .map_err(|(code, message)| refused(code, message))?;
+                let row = self.service.gpu().map(|gpu| gpu.gpus(gpu.width() as u32).row).unwrap_or_default();
+                let any = crate::precision::Slot { min_bits: 8, decode: false, encoded: true };
+                let lanes = any.lanes(any.bits(spec.bits, false), row);
                 let stage = format!("downloading {}", choice.repository);
-                let (named, (hub, volume)) = publisher.download(&self.service, hub_access()?, named, &spec.catalog_revision, stop, &|done, total| {
+                let (named, (hub, volume)) = publisher.download(&self.service, hub_access()?, named, &lanes, &spec.catalog_revision, stop, &|done, total| {
                     observe(&stage, done, total)
                 })?;
                 let sha256 = named.manifest.trim_start_matches("sha256:").to_string();
@@ -527,7 +536,7 @@ impl Runs {
             true => vec![],
             false => spec.models.iter().filter(|c| own_choice(c, &spec.entrypoint)).cloned().collect(),
         };
-        let (installation, plan) = self.resolve(
+        let (installation, plan, precision) = self.resolve(
             actor,
             held,
             release,
@@ -535,6 +544,7 @@ impl Runs {
             &spec,
             &spec.entrypoint,
             &own,
+            spec.bits,
             Some(Box::new({
                 let observe = observe.clone();
                 move |stage: &str, done: u64, total: u64| observe(stage, done, total)
@@ -559,8 +569,9 @@ impl Runs {
             });
             gpu.prespawn(generation.clone());
         }
-        if !generation.record.sdk_fallback.is_empty() {
-            let warning = format!("{} {}: {}", installation.package, installation.release, generation.record.sdk_fallback);
+        let fallback = (!generation.record.sdk_fallback.is_empty())
+            .then(|| format!("{} {}: {}", installation.package, installation.release, generation.record.sdk_fallback));
+        for warning in fallback.into_iter().chain(precision) {
             if let Err(error) = self.service.engine.append_log(id, "warning", &warning) {
                 eprintln!("run {id}: {warning} ({error})");
             }
@@ -638,7 +649,7 @@ impl Runs {
                 &entry["invocable"],
                 &spec.input,
                 &spec.inputs,
-                &spec.attention_kernel,
+                (&spec.attention_kernel, spec.bits),
                 call_memo::models(plan.as_ref(), &own),
             ),
             true => Memo::Off,
@@ -661,6 +672,7 @@ impl Runs {
                 catalog_revision: spec.catalog_revision.clone(),
                 attention_kernel: spec.attention_kernel.clone(),
                 gpus: spec.gpus,
+                bits: spec.bits,
                 models: spec.models.clone(),
                 weights_destination: spec.weights_destination.clone(),
                 ahead,
@@ -675,6 +687,7 @@ impl Runs {
                 input: spec.input,
                 attention_kernel: spec.attention_kernel,
                 gpus: spec.gpus,
+                bits: spec.bits,
                 inputs: spec.inputs,
                 degree,
                 parent: spec.parent,
@@ -720,7 +733,7 @@ impl Runs {
                 _ => (item.entrypoint.as_str(), &item.models[..]),
             };
             let report = observe.clone();
-            let (installation, plan) = self.resolve(
+            let (installation, plan, _) = self.resolve(
                 actor,
                 held,
                 release,
@@ -728,6 +741,7 @@ impl Runs {
                 spec,
                 entrypoint,
                 choices,
+                item.bits,
                 Some(Box::new(move |stage: &str, done: u64, total: u64| report(stage, done, total))),
                 Some(&stoppable.stop),
             )?;
@@ -859,9 +873,10 @@ impl Runs {
         Ok(())
     }
 
-    /// The run's installation and model plan: through the Hub when it needs one (a release,
-    /// or held code declaring models), else held code with the operator's configured grants.
-    /// Unobserved, it is a hint's: its downloads go behind the ones calls wait on.
+    /// The run's installation, model plan and precision warnings: through the Hub when it needs
+    /// one (a release, or held code declaring models), else held code with the operator's
+    /// configured grants. Unobserved, it is a hint's: its downloads go behind the ones calls
+    /// wait on.
     #[allow(clippy::too_many_arguments)]
     fn resolve(
         &self,
@@ -872,9 +887,10 @@ impl Runs {
         spec: &Spec,
         entrypoint: &str,
         choices: &[domain::ModelChoice],
+        bits: u32,
         observe: Option<crate::published::Observer>,
         stop: Option<&PullCancellation>,
-    ) -> Result<(Installation, Option<crate::gpu_service::Plan>), Refused> {
+    ) -> Result<(Installation, Option<crate::gpu_service::Plan>, Vec<String>), Refused> {
         let needs_hub = held
             .as_ref()
             .is_none_or(|installed| declares_models(installed, entrypoint));
@@ -892,12 +908,13 @@ impl Runs {
                     entrypoint: entrypoint.into(),
                     choices: choices.to_vec(),
                     gpus: spec.gpus,
+                    bits,
                     imports: !spec.warm,
                 };
                 let prepared = publisher
                     .prepare_now(&self.service, actor, &request, observe, stop)
                     .map_err(|(code, message)| refused(code, message))?;
-                Ok((prepared.installation.clone(), prepared.plan.clone()))
+                Ok((prepared.installation, prepared.plan, prepared.warnings))
             }
             _ => {
                 let installed = held.ok_or_else(|| {
@@ -907,7 +924,7 @@ impl Runs {
                     )
                 })?;
                 let plan = self.configured(actor, &installed, entrypoint, choices, spec.gpus)?;
-                Ok((installed, plan))
+                Ok((installed, plan, vec![]))
             }
         }
     }
@@ -1003,6 +1020,8 @@ impl Runs {
             attention_kernel: context.attention_kernel,
             // The caller's count caps a child's group; the child's own declaration picks within it.
             gpus: context.gpus,
+            // One request has one precision: its children inherit it.
+            bits: context.bits,
             hub: context.hub,
             providers: context.providers,
             weights_destination: String::new(),
@@ -1051,10 +1070,10 @@ impl Runs {
                         None => None,
                     };
                     let (hub, models) = (spec.hub.clone(), spec.models.clone());
-                    runs.resolve(&actor, held, None, hub, &spec, &spec.entrypoint, &models, None, None)
+                    runs.resolve(&actor, held, None, hub, &spec, &spec.entrypoint, &models, spec.bits, None, None)
                 })();
             match prepared {
-                Ok((installation, Some(plan))) if plan.degree > 0 && !plan.slots.is_empty() => {
+                Ok((installation, Some(plan), _)) if plan.degree > 0 && !plan.slots.is_empty() => {
                     match runs.service.catalog.resolve(&installation.generation)
                         .and_then(|held| held.application(&application)) {
                         Ok(held) => {
@@ -1223,6 +1242,7 @@ mod tests {
             models: vec![],
             attention_kernel: String::new(),
             gpus: 0,
+            bits: 0,
             hub: None,
             providers: Default::default(),
             weights_destination: String::new(),
@@ -1336,6 +1356,7 @@ mod tests {
             source: Source::Installation(alias.clone()),
             entrypoint: "steps".into(),
             models: vec![],
+            bits: 0,
             level: Level::Imported,
             sent: b"as sent".to_vec(),
         };
@@ -1674,7 +1695,7 @@ mod tests {
 
         let source = hub::Source::new("https://hub.example", None, vec![], None).unwrap();
         runs.contexts.lock().unwrap().insert("7".into(), RunContext {
-            installation:"caller".into(),hub:Some(source),owner:"alice".into(),gpus:2,
+            installation:"caller".into(),hub:Some(source),owner:"alice".into(),gpus:2,bits:4,
             models:vec![
                 domain::ModelChoice { parameter:"second/callee/render.models.network".into(),repository:"second/chosen".into(),..Default::default() },
                 domain::ModelChoice { parameter:"render.models.absent".into(),repository:"second/nowhere".into(),..Default::default() },
@@ -1682,7 +1703,7 @@ mod tests {
             ..Default::default()
         });
         let child = runs.child_spec("alice","7","callee:app","render",json!({}),vec![],"child",&[]).unwrap();
-        assert_eq!(child.gpus, 2);
+        assert_eq!((child.gpus, child.bits), (2, 4), "a child inherits its caller's GPU cap and bits");
         let chosen: Vec<_> = child.models.iter().map(|c| (c.parameter.as_str(), c.repository.as_str())).collect();
         assert_eq!(chosen, [("render.models.network", "second/chosen")],
             "a choice addressed to the callee's package reaches its declared slot, by that slot's path");

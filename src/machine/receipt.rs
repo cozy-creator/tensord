@@ -172,6 +172,9 @@ pub struct Gpu {
     pub driver_version: String,
     pub memory_bytes: u64,
     pub pci_bus_id: String,
+    /// `"9.0"`: the lane rule's row (`precision`). Absent from envelopes sealed before it.
+    #[serde(default)]
+    pub compute_cap: String,
 }
 
 /// The driver's inventory through the Runtime's fixed query; this process never loads CUDA or
@@ -183,7 +186,7 @@ pub fn gpus() -> io::Result<Vec<Gpu>> {
     }
     let output = match Command::new("nvidia-smi")
         .args([
-            "--query-gpu=index,name,uuid,pci.bus_id,memory.total,driver_version",
+            "--query-gpu=index,name,uuid,pci.bus_id,memory.total,driver_version,compute_cap",
             "--format=csv,noheader,nounits",
         ])
         .output()
@@ -214,7 +217,7 @@ fn parse_gpus(text: &str) -> io::Result<Vec<Gpu>> {
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         let fields: Vec<&str> = line.split(',').map(str::trim).collect();
         let row = match fields.as_slice() {
-            [index, name, uuid, bus, memory, driver] if fields.iter().all(|f| !f.is_empty()) => {
+            [index, name, uuid, bus, memory, driver, cc] if fields.iter().all(|f| !f.is_empty()) => {
                 Gpu {
                     device_index: index
                         .parse()
@@ -227,6 +230,7 @@ fn parse_gpus(text: &str) -> io::Result<Vec<Gpu>> {
                         .map_err(|_| invalid("nvidia-smi returned invalid memory"))?
                         << 20,
                     pci_bus_id: (*bus).into(),
+                    compute_cap: (*cc).into(),
                 }
             }
             _ => return Err(invalid("nvidia-smi returned an invalid row")),
@@ -383,6 +387,7 @@ mod tests {
                 driver_version: "580.65.06".into(),
                 memory_bytes: 1 << 30,
                 pci_bus_id: "00000000:01:00.0".into(),
+                compute_cap: "8.6".into(),
             }],
             listener_bound: true,
             foreign_credential_refused: true,
@@ -426,12 +431,12 @@ mod tests {
 
     #[test]
     fn nvidia_smi_rows_parse_as_the_runtime_reads_them() {
-        let rows = parse_gpus("1, NVIDIA A40, GPU-b, 00000000:02:00.0, 46068, 580.65.06\n0, NVIDIA A40, GPU-a, 00000000:01:00.0, 46068, 580.65.06\n").unwrap();
+        let rows = parse_gpus("1, NVIDIA A40, GPU-b, 00000000:02:00.0, 46068, 580.65.06, 8.6\n0, NVIDIA A40, GPU-a, 00000000:01:00.0, 46068, 580.65.06, 8.6\n").unwrap();
         assert_eq!(
             rows.iter().map(|g| g.device_index).collect::<Vec<_>>(),
             [0, 1]
         );
-        assert_eq!(rows[0].memory_bytes, 46068 << 20);
-        assert!(parse_gpus("0, NVIDIA A40, , 00:01.0, 1, 1").is_err());
+        assert_eq!((rows[0].memory_bytes, rows[0].compute_cap.as_str()), (46068 << 20, "8.6"));
+        assert!(parse_gpus("0, NVIDIA A40, , 00:01.0, 1, 1, 8.6").is_err());
     }
 }

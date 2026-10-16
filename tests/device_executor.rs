@@ -146,6 +146,7 @@ fn invoke(
                 spool,
                 deadline_s: None,
                 attention_kernel: String::new(),
+                bits: 0,
                 plane_budget_bytes: -1,
                 cap_bytes: None,
                 inputs: Default::default(),
@@ -222,6 +223,7 @@ fn credential_refusal_and_result_mutation_are_operation_local() {
         .command(
             &DeviceCommand::PrepareRequest {
                 attention_kernel: String::new(),
+                bits: 0,
                 input_metadata: Default::default(),
                 request_id: "rejected".into(),
                 construction: "classifier".into(),
@@ -265,6 +267,7 @@ fn stock_executor_deferred_webp_reuses_sdk_encoder_and_exact_asset_binding() {
         .command(
             &DeviceCommand::PrepareRequest {
                 attention_kernel: String::new(),
+                bits: 0,
                 input_metadata: Default::default(),
                 request_id: "image".into(),
                 construction: "classifier".into(),
@@ -285,6 +288,7 @@ fn stock_executor_deferred_webp_reuses_sdk_encoder_and_exact_asset_binding() {
                 spool: spool.clone(),
                 deadline_s: None,
                 attention_kernel: String::new(),
+                bits: 0,
                 plane_budget_bytes: -1,
                 cap_bytes: None,
                 inputs: Default::default(),

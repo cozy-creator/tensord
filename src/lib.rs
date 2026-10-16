@@ -30,6 +30,7 @@ pub mod objects;
 pub mod os;
 pub mod owner;
 pub mod output_capacity;
+pub mod precision;
 pub mod process;
 pub mod products;
 pub mod protocol;

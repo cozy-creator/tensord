@@ -97,18 +97,6 @@ pub struct ModelChoice {
     pub profiles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(message, repeated, tag = "8")]
     pub adapters: ::prost::alloc::vec::Vec<DownloadAdapterRef>,
-    #[prost(message, repeated, tag = "9")]
-    pub rungs: ::prost::alloc::vec::Vec<ModelRung>,
-}
-
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ModelRung {
-    #[prost(string, tag = "1")]
-    pub gpu: ::prost::alloc::string::String,
-    #[prost(uint32, tag = "2")]
-    pub gpus: u32,
-    #[prost(string, tag = "3")]
-    pub lane: ::prost::alloc::string::String,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -313,15 +301,6 @@ impl From<domain::ModelChoice> for ModelChoice {
             source: value.source,
             profiles: value.profiles,
             adapters: value.adapters.into_iter().map(Into::into).collect(),
-            rungs: value
-                .rungs
-                .into_iter()
-                .map(|rung| ModelRung {
-                    gpu: rung.gpu,
-                    gpus: rung.gpus,
-                    lane: rung.lane,
-                })
-                .collect(),
         }
     }
 }
@@ -337,15 +316,6 @@ impl From<ModelChoice> for domain::ModelChoice {
             source: value.source,
             profiles: value.profiles,
             adapters: value.adapters.into_iter().map(Into::into).collect(),
-            rungs: value
-                .rungs
-                .into_iter()
-                .map(|rung| domain::ModelRung {
-                    gpu: rung.gpu,
-                    gpus: rung.gpus,
-                    lane: rung.lane,
-                })
-                .collect(),
         }
     }
 }

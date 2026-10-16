@@ -250,6 +250,9 @@ pub enum DeviceCommand {
         /// Checked before entry, so a bad pin is the request's refusal, not a fault.
         #[serde(skip_serializing_if = "String::is_empty")]
         attention_kernel: String,
+        /// The request's weight precision (16, 8 or 4); 16 holds every attention site exact.
+        #[serde(skip_serializing_if = "is_zero")]
+        bits: u32,
         /// File inputs by field path (identity only; the bytes arrive with Invoke).
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         input_metadata: BTreeMap<String, Value>,
@@ -264,6 +267,8 @@ pub enum DeviceCommand {
         deadline_s: Option<f64>,
         #[serde(skip_serializing_if = "String::is_empty")]
         attention_kernel: String,
+        #[serde(skip_serializing_if = "is_zero")]
+        bits: u32,
         plane_budget_bytes: i64,
         #[serde(skip_serializing_if = "Option::is_none")]
         cap_bytes: Option<u64>,
@@ -2170,8 +2175,8 @@ pub fn read_result(spool: &Path, reply: &Frame) -> io::Result<Value> {
     }
     serde_json::from_slice(&bytes).map_err(io::Error::other)
 }
-fn is_zero(value: &u64) -> bool {
-    *value == 0
+fn is_zero<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
 }
 fn is_false(value: &bool) -> bool {
     !*value

@@ -83,6 +83,10 @@ pub struct GpuConfig {
     pub identity: Option<crate::launch_identity::LaunchIdentity>,
     /// The GPU envelope, `"0"` or `"0,1,..."`: a degree-K plan occupies K contiguous devices.
     pub devices: String,
+    /// The receipt's inventory (`nvidia-smi`): each GPU's compute capability and memory, matched
+    /// to envelope entries by index or UUID, for the lane rule (`precision`).
+    #[serde(default)]
+    pub gpus: Vec<crate::machine::receipt::Gpu>,
     /// Load's device limit where NVML cannot read the device total.
     pub authorized_device_limit_bytes: Option<u64>,
     #[serde(default)]
@@ -885,6 +889,25 @@ impl Pool {
     /// GPUs this machine may group.
     pub fn width(&self) -> usize {
         self.devices.len()
+    }
+    /// The first `degree` GPUs as the lane rule reads them; one the inventory does not name
+    /// runs no native format.
+    pub fn gpus(&self, degree: u32) -> crate::precision::Gpus {
+        let ccs: Vec<&str> = self.devices.iter().take(degree as usize)
+            .map(|d| self.inventory(&d.entry).map_or("", |g| g.compute_cap.as_str())).collect();
+        crate::precision::Gpus::of(&ccs)
+    }
+    /// The lane rule's budget on the first `degree` GPUs (design §2.1): the smallest one's memory
+    /// less the largest activation peak `constructions` measured on them, a quarter of that
+    /// memory before any. None when the inventory names no memory.
+    pub fn budget(&self, degree: u32, constructions: &[String]) -> Option<u64> {
+        let lane = &self.devices[..self.devices.len().min(degree as usize)];
+        let memory = lane.iter().map(|d| self.inventory(&d.entry).map(|g| g.memory_bytes)).min()??;
+        let peak = lane.iter().flat_map(|d| constructions.iter().filter_map(|c| d.memory.with(|g| g.learned.peak(c)))).max();
+        Some(memory.saturating_sub(peak.unwrap_or(memory / 4)))
+    }
+    fn inventory(&self, entry: &str) -> Option<&crate::machine::receipt::Gpu> {
+        self.config.gpus.iter().find(|g| g.device_index.to_string() == entry || g.device_uuid == entry)
     }
     /// The `degree` GPUs from envelope index `start`: a group's are the first ones; none for a
     /// deviceless call.
@@ -3076,6 +3099,7 @@ impl Pool {
                 entrypoint: plan.entrypoint.clone(),
                 payload: record.invocation.input.clone(),
                 attention_kernel: record.invocation.attention_kernel.clone(),
+                bits: record.invocation.bits,
                 input_metadata: record
                     .invocation
                     .inputs
@@ -3219,6 +3243,7 @@ impl Pool {
                 spool: spool.clone(),
                 deadline_s: None,
                 attention_kernel: record.invocation.attention_kernel.clone(),
+                bits: record.invocation.bits,
                 plane_budget_bytes,
                 cap_bytes,
                 inputs: inputs.inputs,
