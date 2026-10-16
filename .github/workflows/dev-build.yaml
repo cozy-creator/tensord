@@ -107,7 +107,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: tensord-${{ steps.sha.outputs.sha }}${{ steps.tensorfs.outputs.suffix }}
-          path: dist/tensord-linux-x86_64
+          path: dist/tensord-linux-*
           if-no-files-found: error
           retention-days: 7
       # The machine tests drive uv, and with runtime_ref, a dev Runtime as the machine's own.
