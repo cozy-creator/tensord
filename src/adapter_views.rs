@@ -694,17 +694,17 @@ pub fn evict(store: &Store, keep: &[String]) -> io::Result<usize> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn f32s(values: &[f32]) -> Vec<u8> {
+    pub(crate) fn f32s(values: &[f32]) -> Vec<u8> {
         values.iter().flat_map(|v| v.to_le_bytes()).collect()
     }
 
     type Tensors<'a> = [(&'a str, Vec<u64>, Vec<u8>)];
 
     /// A real one-component checkpoint written through the TensorFS derived writer.
-    fn checkpoint(
+    pub(crate) fn checkpoint(
         store: &Store,
         meta: &Meta,
         component: &str,

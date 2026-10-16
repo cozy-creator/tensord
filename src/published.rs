@@ -1160,8 +1160,9 @@ impl Publisher {
     }
 
     /// The run's model grants and its precision warnings. Each slot takes the run's choice, else
-    /// its declared default; a Hub one is exact as its choice names it (th-241), else in the
-    /// first lane of the rule's order its release publishes (`precision`). The request's GPU
+    /// its declared default (also under a choice of adapters alone); a Hub one is exact as its
+    /// choice names it (th-241), else in the first lane of the rule's order its release
+    /// publishes (`precision`). The request's GPU
     /// count chooses the group independently of the weight lane; 0 uses the widest group every
     /// slot supports on the machine. A slot with neither is refused.
     fn model(
@@ -1192,7 +1193,8 @@ impl Publisher {
             let path = slot.get("path").and_then(Value::as_str).unwrap_or_default().to_string();
             let parameter = path.rsplit('.').next().unwrap_or_default().to_string();
             job.stage(format!("choosing the model for {path}"));
-            let asked = request.choices.iter().find(|c| c.parameter == path || c.parameter == parameter);
+            let asked = request.choices.iter().find(|c| c.parameter == path || c.parameter == parameter)
+                .filter(|c| !c.repository.is_empty() || c.manifest.is_some() || !c.source.is_empty());
             let declared = default_choice(slot, &path, &installation.package, &request.owner);
             let choice = asked.or(declared.as_ref()).ok_or_else(|| choice_absent(&path, &installation.package))?;
             if !choice.source.is_empty() {
@@ -1225,25 +1227,20 @@ impl Publisher {
             Ok((grant, (!named.repository.starts_with("local/")).then_some(named), warnings))
         };
         // Each checkpoint lands as its structure: what of it comes, and when, its calls direct.
-        let land = |picked: &[(ModelGrant, Option<Named>, Vec<String>)]| -> Result<Vec<Named>, Failure> {
-            let mut checkpoints = Vec::<Named>::new();
-            for named in picked.iter().filter_map(|(_, named, _)| named.as_ref()) {
-                if !checkpoints.iter().any(|c| c.manifest == named.manifest) {
-                    checkpoints.push(named.clone());
-                }
-            }
-            self.structure(&request.source, &checkpoints, job)?;
-            Ok(checkpoints)
+        let land = |picked: &[(ModelGrant, Option<Named>, Vec<String>)]| {
+            self.structure(&request.source, &distinct(picked.iter().filter_map(|(_, named, _)| named.as_ref())), job)
         };
         let mut picked: Vec<_> = slots.iter().map(|slot| pick(slot, false)).collect::<Result<_, _>>()?;
-        let checkpoints = land(&picked)?;
-        // Memory short (design §2.2): a `min_bits=4` compute slot takes 4 bits when the function's
-        // weights exceed the budget, its last measured activations on these GPUs taken out.
+        land(&picked)?;
+        // Memory short (design §2.2): a `min_bits=4` compute slot takes 4 bits when the weights it
+        // constructs exceed the budget, its last measured activations on these GPUs taken out.
         let shrinks = |slot: &Value| {
             let tolerances = precision::Slot::of(slot);
-            request.bits == 0 && tolerances.min_bits == 4 && !tolerances.decode
+            request.bits == 0 && tolerances.min_bits == 4 && !tolerances.decode && !tolerances.raw
         };
         if slots.iter().any(&shrinks) {
+            let constructed = slots.iter().zip(&picked).filter(|(slot, _)| crate::gpu_service::constructed(slot));
+            let checkpoints = distinct(constructed.filter_map(|(_, (_, named, _))| named.as_ref()));
             let bytes: u64 = checkpoints.iter().map(|named| self.bytes(named)).sum();
             let measured: Vec<String> = service
                 .engine
@@ -1321,6 +1318,17 @@ impl Publisher {
         let header = access::header(&self.store, &named.object());
         named.length + header.map_or(0, |header| access::objects(&header, &[]).iter().map(|o| o.length).sum())
     }
+}
+
+/// Each checkpoint once.
+fn distinct<'a>(named: impl Iterator<Item = &'a Named>) -> Vec<Named> {
+    let mut checkpoints = Vec::<Named>::new();
+    for named in named {
+        if !checkpoints.iter().any(|c| c.manifest == named.manifest) {
+            checkpoints.push(named.clone());
+        }
+    }
+    checkpoints
 }
 
 /// The machine's GPUs as a held resolution is keyed by: how many, and what they run.
@@ -2628,8 +2636,9 @@ mod tests {
         let _ = fs::remove_dir_all(&bench.root);
     }
 
-    /// A machine on the GPUs its inventory names (compute capability, memory) holding `acme/pkg`,
-    /// whose `render` declares `slots`, and a Hub publishing `acme/model@1.0.0` in `lanes`.
+    /// A machine on the GPUs its inventory names (compute capability, memory) holding `package`,
+    /// whose `render` declares `slots`, and a Hub publishing `acme/model@1.0.0` in `lanes` and the
+    /// LoRA `acme/lora@1.0.0`.
     struct Machine {
         root: PathBuf,
         service: Arc<Service>,
@@ -2642,7 +2651,8 @@ mod tests {
     }
 
     impl Machine {
-        fn new(gpus: &[(&str, u64)], slots: Value, lanes: &[&str]) -> Self {
+        fn new(package: &str, gpus: &[(&str, u64)], slots: Value, lanes: &[&str]) -> Self {
+            use crate::adapter_views::tests::{checkpoint as tensors, f32s};
             let root = std::env::temp_dir().join(format!("cm-precision-{}", uuid::Uuid::new_v4()));
             let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
             let store = Arc::new(Store::ensure_owned(&root.join("store")).unwrap());
@@ -2659,28 +2669,41 @@ mod tests {
             fs::write(dir.join("env/bin/python"), "").unwrap();
             File::create(dir.join(".hold")).unwrap();
             let interface = json!({"application": "pkg:app", "entrypoints": [{"name": "render", "models": slots}]});
-            fs::write(dir.join("generation.json"), json!({"identity": identity, "package": "acme/pkg", "version": "1.0.0",
+            fs::write(dir.join("generation.json"), json!({"identity": identity, "package": package, "version": "1.0.0",
                 "application": "pkg:app", "python": dir.join("env/bin/python"), "interface": interface}).to_string()).unwrap();
             let installation = service.engine.bind_installation(Installation { actor: "alice".into(), alias: "held".into(),
-                generation: identity, package: "acme/pkg".into(), release: "1.0.0".into(),
+                generation: identity, package: package.into(), release: "1.0.0".into(),
                 interface: serde_json::to_vec(&interface).unwrap(), hub: String::new() }).unwrap();
             let source = Store::ensure(&root.join("source")).unwrap();
-            let models: Vec<_> = lanes.iter().zip(30u8..).map(|(lane, tag)| names_hub::Model { repository: "acme/model".into(),
-                release: "1.0.0".into(), lane: lane.to_string(), manifest: checkpoint(&source, 4, tag) }).collect();
+            let meta = tensorfs_core::meta::Meta::open(&source).unwrap();
+            let model = |repository: &str, lane: &str, manifest| names_hub::Model { repository: repository.into(),
+                release: "1.0.0".into(), lane: lane.into(), manifest };
+            let mut models: Vec<_> = lanes.iter().zip(30u8..).map(|(lane, tag)| {
+                model("acme/model", lane, tensors(&source, &meta, "unet", &[("proj.weight", vec![4, 3], f32s(&[tag.into(); 12]))], tag))
+            }).collect();
             let lanes = models.iter().map(|model| (model.manifest.id(), model.lane.clone())).collect();
+            let lora = [("proj.lora_A.weight", vec![2, 3], f32s(&[0.25; 6])), ("proj.lora_B.weight", vec![4, 2], f32s(&[0.75; 8]))];
+            models.push(model("acme/lora", "bf16", tensors(&source, &meta, "adapter", &lora, 0xa0)));
             let (origin, heard) = names_hub::models(&source, models);
             let hub = hub::Source::new(&origin, None, vec!["localhost".into()], None).unwrap();
             Self { root, service, publisher, installation, hub, heard, lanes }
         }
 
-        /// A run of `render` at `bits`: each slot's lane, the run's warnings and what it asked
-        /// the Hub.
+        /// `render` prepared for `acme`'s run at `bits` with `choices`.
+        fn prepare(&self, bits: u32, choices: Vec<domain::ModelChoice>) -> Prepared {
+            let request = Request { source: self.hub.clone(), package: self.installation.package.clone(), release: "1.0.0".into(),
+                installed: Some(self.installation.clone()), owner: "acme".into(), catalog_revision: "r1".into(),
+                providers: Providers::default(), entrypoint: "render".into(), choices, gpus: 0, bits, imports: false };
+            self.publisher.prepare_now(&self.service, "alice", &request, None, None).unwrap()
+        }
+
+        /// A run of `render` at `bits`: each slot's lane (constructed, then raw), the run's
+        /// warnings and what it asked the Hub.
         fn run(&self, bits: u32) -> (Vec<String>, Vec<String>, Vec<String>) {
-            let request = Request { source: self.hub.clone(), package: "acme/pkg".into(), release: "1.0.0".into(),
-                installed: Some(self.installation.clone()), owner: "alice".into(), catalog_revision: "r1".into(),
-                providers: Providers::default(), entrypoint: "render".into(), choices: vec![], gpus: 0, bits, imports: false };
-            let prepared = self.publisher.prepare_now(&self.service, "alice", &request, None, None).unwrap();
-            let lanes = prepared.plan.unwrap().slots.iter().map(|slot| self.lanes[&slot.binding.snapshot].clone()).collect();
+            let prepared = self.prepare(bits, vec![]);
+            let plan = prepared.plan.unwrap();
+            let constructed = plan.slots.iter().map(|slot| self.lanes[&slot.binding.snapshot].clone());
+            let lanes = constructed.chain(plan.sources.iter().map(|source| source.lane.clone())).collect();
             (lanes, prepared.warnings, std::mem::take(&mut *self.heard.lock().unwrap()))
         }
     }
@@ -2707,7 +2730,7 @@ mod tests {
             {"path": "render.models.model", "class": "M", "default": "model@1.0.0", "encoded_leaves": "accept"},
             {"path": "render.models.text", "class": "T", "default": "model@1.0.0", "encoded_leaves": "accept",
                 "min_bits": 4, "phase": "decode"}]);
-        let hopper = Machine::new(&[("9.0", 80 * GIB)], slots.clone(), &["bf16", "fp8", "int8", "nvfp4"]);
+        let hopper = Machine::new("acme/pkg", &[("9.0", 80 * GIB)], slots.clone(), &["bf16", "fp8", "int8", "nvfp4"]);
         let (lanes, warnings, asked) = hopper.run(0);
         assert_eq!((lanes, warnings), (vec!["int8".to_string(), "nvfp4".into()], vec![]));
         assert_eq!(closed(&asked), std::collections::BTreeSet::from(["int8", "nvfp4"]), "no lane past the first published one");
@@ -2715,7 +2738,7 @@ mod tests {
         assert_eq!((lanes, asked), (vec!["int8".to_string(), "nvfp4".into()], vec![]), "a warm run asks the Hub nothing");
         let (lanes, warnings, _) = hopper.run(16);
         assert_eq!((lanes, warnings), (vec!["bf16".to_string(), "bf16".into()], vec![]));
-        let blackwell_ultra = Machine::new(&[("10.3", 288 * GIB)], slots, &["bf16", "fp8", "int8", "nvfp4"]);
+        let blackwell_ultra = Machine::new("acme/pkg", &[("10.3", 288 * GIB)], slots, &["bf16", "fp8", "int8", "nvfp4"]);
         assert_eq!(blackwell_ultra.run(0).0, ["fp8", "nvfp4"]);
     }
 
@@ -2727,10 +2750,10 @@ mod tests {
             {"path": "render.models.model", "class": "M", "default": "model@1.0.0", "encoded_leaves": "accept", "min_bits": 4},
             {"path": "render.models.other", "class": "O", "default": "model@1.0.0", "encoded_leaves": "accept"}]);
         let lanes = ["int8", "nvfp4", "bf16"];
-        let short = Machine::new(&[("8.9", 64 << 10)], slots.clone(), &lanes);
+        let short = Machine::new("acme/pkg", &[("8.9", 64)], slots.clone(), &lanes);
         assert_eq!(short.run(0).0, ["nvfp4", "int8"]);
         assert_eq!(short.run(8).0, ["int8", "int8"], "the request's bits win");
-        let ample = Machine::new(&[("8.9", 24 * GIB)], slots, &lanes);
+        let ample = Machine::new("acme/pkg", &[("8.9", 24 * GIB)], slots, &lanes);
         assert_eq!(ample.run(0).0, ["int8", "int8"]);
     }
 
@@ -2739,7 +2762,7 @@ mod tests {
     #[test]
     fn a_fallback_and_a_declined_encoding_each_warn() {
         let slots = json!([{"path": "render.models.model", "class": "M", "default": "model@1.0.0", "encoded_leaves": "accept"}]);
-        let ada = Machine::new(&[("8.9", 24 * GIB)], slots, &["int8", "bf16"]);
+        let ada = Machine::new("acme/pkg", &[("8.9", 24 * GIB)], slots, &["int8", "bf16"]);
         let warned = ["precision 4: acme/model@1.0.0 has no nvfp4 lane for sm89; served int8".to_string()];
         let (lanes, warnings, asked) = ada.run(4);
         assert_eq!((lanes, warnings), (vec!["int8".to_string()], warned.to_vec()));
@@ -2747,7 +2770,7 @@ mod tests {
         let (_, warnings, asked) = ada.run(4);
         assert_eq!((warnings, asked), (warned.to_vec(), vec![]), "a warm run warns again and asks nothing");
         let declines = json!([{"path": "render.models.model", "class": "M", "default": "model@1.0.0", "encoded_leaves": "refuse"}]);
-        let ada = Machine::new(&[("8.9", 24 * GIB)], declines, &["int8", "bf16"]);
+        let ada = Machine::new("acme/pkg", &[("8.9", 24 * GIB)], declines, &["int8", "bf16"]);
         let (lanes, warnings, _) = ada.run(0);
         assert_eq!((lanes, warnings), (vec!["bf16".to_string()], vec!["precision 8: acme/model@1.0.0 declines encoded leaves; served bf16".to_string()]));
     }
@@ -2757,9 +2780,43 @@ mod tests {
     fn a_mixed_local_set_takes_the_lane_every_gpu_runs() {
         let slots = json!([{"path": "render.models.model", "class": "M", "default": "model@1.0.0", "encoded_leaves": "accept",
             "sequence_parallel": {"degrees": [2]}}]);
-        let mixed = Machine::new(&[("8.6", 24 * GIB), ("8.9", 24 * GIB)], slots, &["fp8", "bf16"]);
+        let mixed = Machine::new("acme/pkg", &[("8.6", 24 * GIB), ("8.9", 24 * GIB)], slots, &["fp8", "bf16"]);
         let (lanes, warnings, _) = mixed.run(0);
         assert_eq!((lanes, warnings), (vec!["bf16".to_string()],
             vec!["precision 8: acme/model@1.0.0 has no int8 lane for sm86+sm89; served bf16".to_string()]));
+    }
+
+    /// `--lora` on a slot naming no model: the slot's default, in the rule's lane, under the
+    /// adapters.
+    #[test]
+    fn an_adapter_only_choice_takes_the_slots_default() {
+        let slots = json!([{"path": "render.models.model", "class": "M", "default": "model@1.0.0", "encoded_leaves": "accept"}]);
+        let hopper = Machine::new("acme/pkg", &[("9.0", 80 * GIB)], slots, &["bf16", "int8"]);
+        let adapter = domain::DownloadAdapterRef { model: "acme/lora".into(), release: "1.0.0".into(), ..Default::default() };
+        let lora = domain::ModelChoice { parameter: "model".into(), adapters: vec![adapter], ..Default::default() };
+        let plan = hopper.prepare(0, vec![lora]).plan.unwrap();
+        let asked = std::mem::take(&mut *hopper.heard.lock().unwrap());
+        assert_eq!(closed(&asked), std::collections::BTreeSet::from(["int8"]));
+        assert!(asked.iter().any(|heard| heard == "POST /v1/tensorfs/closure acme/lora@1.0.0 "), "{asked:?}");
+        assert!(plan.slots[0].binding.model.starts_with("local/adapters-"), "{:?}", plan.slots[0].binding);
+    }
+
+    /// Unpublished code's org-less default is the run owner's model.
+    #[test]
+    fn a_local_packages_default_is_its_owners() {
+        let slots = json!([{"path": "render.models.model", "class": "M", "default": "model@1.0.0", "encoded_leaves": "accept"}]);
+        assert_eq!(Machine::new("local/script", &[("8.9", 24 * GIB)], slots, &["int8"]).run(0).0, ["int8"]);
+    }
+
+    /// Raw weights (`weights: true`) are data: 16-bit lanes whatever their class declares and
+    /// the request asks, else the release's only lane, with no precision warning.
+    #[test]
+    fn a_raw_weights_slot_asks_16_bits_only() {
+        let source = json!({"path": "render.models.source", "class": "M", "weights": true, "default": "model@1.0.0",
+            "encoded_leaves": "accept", "min_bits": 4, "phase": "decode"});
+        let blackwell = Machine::new("acme/pkg", &[("10.0", 180 * GIB)], json!([source]), &["nvfp4", "int8", "fp16"]);
+        assert_eq!(blackwell.run(4).0, ["fp16"]);
+        let (lanes, warnings, _) = Machine::new("acme/pkg", &[("10.0", 180 * GIB)], json!([source]), &["nvfp4"]).run(0);
+        assert_eq!((lanes, warnings), (vec!["nvfp4".to_string()], vec![]));
     }
 }

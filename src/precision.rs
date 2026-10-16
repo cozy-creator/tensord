@@ -30,13 +30,15 @@ impl Gpus {
     }
 }
 
-/// A slot's declared tolerances (package interface): `min_bits` (8 when omitted), its phase and
-/// whether its class takes encoded leaves.
+/// A slot's declared tolerances (package interface): `min_bits` (8 when omitted), its phase,
+/// whether its class takes encoded leaves, and whether it is raw weights (`Weights[M]`, read as
+/// data: always 16 bits, whatever its class declares).
 #[derive(Clone, Copy, Debug)]
 pub struct Slot {
     pub min_bits: u64,
     pub decode: bool,
     pub encoded: bool,
+    pub raw: bool,
 }
 
 impl Slot {
@@ -45,6 +47,7 @@ impl Slot {
             min_bits: slot["min_bits"].as_u64().unwrap_or(8),
             decode: slot["phase"] == "decode",
             encoded: slot["encoded_leaves"] == "accept",
+            raw: slot["weights"] == true,
         }
     }
 
@@ -52,6 +55,7 @@ impl Slot {
     /// decode slot or a function whose 8-bit weights exceed the budget (`short`); else 8.
     pub fn bits(&self, asked: u32, short: bool) -> u32 {
         match asked {
+            _ if self.raw => 16,
             4 | 8 | 16 => asked,
             _ if self.min_bits == 16 => 16,
             _ if self.min_bits == 4 && (self.decode || short) => 4,
@@ -75,7 +79,7 @@ impl Slot {
     /// The run's warnings for `model` served in `served` (§2.8): one when it declined encoded
     /// lanes the GPUs run, and one naming every lane asked before the one served.
     pub fn warnings(&self, bits: u32, gpus: &Gpus, model: &str, served: &str) -> Vec<String> {
-        if !VOCABULARY.contains(&served) {
+        if self.raw || !VOCABULARY.contains(&served) {
             return vec![];
         }
         let declined = !self.encoded && Self { encoded: true, ..*self }.lanes(bits, gpus).len() > 2;
@@ -118,6 +122,9 @@ mod tests {
         assert_eq!(compute.lanes(4, &Gpus::of(&["8.6"])), ["nvfp4", "int8", "bf16", "fp16"]);
         let exact = Slot::of(&json!({"encoded_leaves": "accept", "min_bits": 16}));
         assert_eq!((exact.bits(0, true), exact.bits(8, false)), (16, 8), "the request's bits win");
+        let raw = Slot::of(&json!({"encoded_leaves": "accept", "min_bits": 4, "phase": "decode", "weights": true}));
+        assert_eq!((raw.bits(4, true), raw.lanes(raw.bits(8, false), &Gpus::of(&["10.0"]))), (16, vec!["bf16", "fp16"]), "raw weights are data");
+        assert!(raw.warnings(16, &Gpus::of(&["9.0"]), "x@1", "fp16").is_empty());
     }
 
     /// A set's row is each column ANDed: a mixed local machine runs only what every GPU runs.

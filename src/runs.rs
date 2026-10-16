@@ -386,7 +386,7 @@ impl Runs {
                 let named = crate::published::choose(choice, &choice.parameter)
                     .map_err(|(code, message)| refused(code, message))?;
                 let gpus = self.service.gpu().map(|gpu| gpu.gpus(gpu.width() as u32)).unwrap_or_default();
-                let any = crate::precision::Slot { min_bits: 8, decode: false, encoded: true };
+                let any = crate::precision::Slot { min_bits: 8, decode: false, encoded: true, raw: false };
                 let lanes = any.lanes(any.bits(spec.bits, false), &gpus);
                 let stage = format!("downloading {}", choice.repository);
                 let (named, (hub, volume)) = publisher.download(&self.service, hub_access()?, named, &lanes, &spec.catalog_revision, stop, &|done, total| {
