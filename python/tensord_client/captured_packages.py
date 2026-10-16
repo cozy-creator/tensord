@@ -121,16 +121,15 @@ def interpreter_for(python: str, python_requires: str, python_version: str) -> s
 def add_client(interpreter: Path, constraints: Path, client_wheel: Path) -> None:
     """The machine client beside a selected closure: it may add its own dependencies only
     without changing one already selected package or SDK version (uv reports any conflict)."""
-    locked = inventory(interpreter)
+    locked, before = inventory(interpreter), incompatibilities(interpreter)
     constraints.write_text("".join(f"{row.name}=={row.version}\n" for row in locked))
     subprocess.run(["uv", "pip", "install", *COPY, "--python", str(interpreter), "-c", str(constraints), str(client_wheel)], check=True)
     after = {canonicalize_name(row.name): row.version for row in inventory(interpreter)}
     if any(after.get(canonicalize_name(row.name)) != row.version for row in locked):
         raise PackageError("package_lock_changed", "client installation changed the captured dependency closure")
-    check = subprocess.run(["uv", "pip", "check", "--python", str(interpreter)], capture_output=True, text=True)
-    if check.returncode != 0:
-        conflicts = [line.strip() for line in (check.stdout + check.stderr).splitlines() if "requires" in line or "not installed" in line]
-        raise PackageError("package_dependency_conflict", "; ".join(conflicts)[:2000] or f"uv pip check exited {check.returncode}")
+    # Only what the client adds refuses; the selected closure's own findings stand as captured.
+    if added := sorted(incompatibilities(interpreter) - before):
+        raise PackageError("package_dependency_conflict", "; ".join(added)[:2000])
 
 
 def live_paths(environment: Path) -> None:
