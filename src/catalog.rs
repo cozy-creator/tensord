@@ -39,7 +39,8 @@ pub struct Generation {
     #[serde(default)]
     pub callees: Vec<Callee>,
     /// Empty when this machine's own Runtime and TensorFS installed; else why the release's
-    /// locked SDK runs instead, and which (every run of it says so).
+    /// locked SDK runs instead, and which, or the package's bounds the machine's development
+    /// Runtime overrides (every run of it says so).
     #[serde(default)]
     pub sdk_fallback: String,
     /// The machine's development Runtime build this environment holds (`0.24.6+e9baf7a4`);
