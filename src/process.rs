@@ -267,13 +267,22 @@ pub fn burn(pid: u32) -> Option<u64> {
     meter(pid).map(|(cpu, moved)| cpu.saturating_add(moved))
 }
 
-/// `burn`'s two parts: CPU nanoseconds, and bytes moved.
+/// `burn`'s two parts: CPU nanoseconds used or owed, and bytes moved. Owed is the time its live
+/// threads waited runnable for a CPU (`schedstat` run delay): busy cores or a container's spent
+/// CPU quota (a boot kernel compile beside it) slow a working process, never still it.
 fn meter(pid: u32) -> Option<(u64, u64)> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let fields: Vec<_> = stat.rsplit_once(") ")?.1.split_whitespace().collect();
     let ticks = fields.get(11)?.parse::<u64>().ok()? + fields.get(12)?.parse::<u64>().ok()?;
     let hertz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
-    let cpu = ticks.saturating_mul(1_000_000_000 / hertz);
+    let waited: u64 = fs::read_dir(format!("/proc/{pid}/task"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|task| fs::read_to_string(task.path().join("schedstat")).ok())
+        .filter_map(|line| line.split_whitespace().nth(1)?.parse::<u64>().ok())
+        .sum();
+    let cpu = ticks.saturating_mul(1_000_000_000 / hertz).saturating_add(waited);
     let moved = fs::read_to_string(format!("/proc/{pid}/io"))
         .ok()
         .and_then(|io| {
@@ -668,8 +677,9 @@ pub fn supervise(
             continue;
         }
         let now = Instant::now();
-        // Bytes moved are progress, and CPU at a tenth of a core or more. An idle process's
-        // timer wakeups are not: uv waiting on its build spends one 10 ms tick in about 10 s.
+        // Bytes moved are progress, and CPU used or owed at a tenth of a core or more (`meter`).
+        // An idle process's timer wakeups are not: uv waiting on its build spends one 10 ms
+        // tick in about 10 s.
         let members = group_members(&exact.birth).into_iter().map(|member| member.pid);
         let reading = std::iter::once(exact.birth.pid).chain(members).filter_map(meter)
             .fold((0u64, 0u64), |(cpu, moved), (c, m)| (cpu + c, moved + m));

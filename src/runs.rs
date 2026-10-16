@@ -1545,6 +1545,72 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// An install starved of CPU is working, not wedged: its build runs at 1% of a core (its
+    /// own cgroup, quota 1 ms per 100 ms, as a container's spent quota beside a boot kernel
+    /// compile) for longer than the stall floor, moving no byte, and the run completes.
+    #[test]
+    fn a_starved_install_completes() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = std::env::temp_dir().join(format!("cm-starved-{}", uuid::Uuid::new_v4()));
+        let (runs, objects) = local_runs(&root);
+        let report = root.join("starved.json");
+        let backend = format!(
+            "import json, os, time, uv_build\nfrom pathlib import Path\n\
+             def __getattr__(name):\n    return getattr(uv_build, name)\n\
+             def build_wheel(*args, **kwargs):\n\
+             \x20   own = Path('/sys/fs/cgroup', Path('/proc/self/cgroup').read_text().split('::', 1)[1].strip().lstrip('/'))\n\
+             \x20   starved = own.parent / f'starved-{{os.getpid()}}'\n\
+             \x20   try:\n\
+             \x20       (own.parent / 'cgroup.subtree_control').write_text('+cpu')\n\
+             \x20       starved.mkdir()\n\
+             \x20       (starved / 'cpu.max').write_text('1000 100000')\n\
+             \x20       (starved / 'cgroup.procs').write_text(str(os.getpid()))\n\
+             \x20       wall, cpu = time.monotonic(), time.process_time()\n\
+             \x20       while time.process_time() - cpu < 0.4:\n            pass\n\
+             \x20       report = {{'wall': time.monotonic() - wall, 'cpu': time.process_time() - cpu}}\n\
+             \x20       (own / 'cgroup.procs').write_text(str(os.getpid()))\n\
+             \x20       starved.rmdir()\n\
+             \x20   except OSError as error:\n\
+             \x20       report = {{'unstarved': str(error)}}\n\
+             \x20   Path({report:?}).write_text(json.dumps(report))\n\
+             \x20   return uv_build.build_wheel(*args, **kwargs)\n"
+        );
+        let fixture = repo.join("tests/fixtures/cpu_lifecycle");
+        let pyproject = fs::read_to_string(fixture.join("pyproject.toml"))
+            .unwrap()
+            .replace("build-backend = \"uv_build\"", "build-backend = \"starved\"\nbackend-path = [\".\"]");
+        let mut archive = tar::Builder::new(Vec::new());
+        for (name, body) in [
+            ("pyproject.toml", pyproject),
+            ("package.toml", fs::read_to_string(fixture.join("package.toml")).unwrap()),
+            ("cpu_lifecycle/__init__.py", fs::read_to_string(fixture.join("cpu_lifecycle/__init__.py")).unwrap()),
+            ("starved.py", backend),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, name, body.as_bytes()).unwrap();
+        }
+        let (source, length) = write(&objects, "alice", &archive.into_inner().unwrap());
+        let manifest = json!({"package": "local/tensord-cpu-lifecycle", "release": "0.1.0",
+            "python_version": "3.12", "source": {"digest": source, "length": length}});
+        let (manifest, _) = write(&objects, "alice", manifest.to_string().as_bytes());
+        let accepted = runs.submit("alice", "warm-1", spec(Source::Local(manifest), true, "w1")).unwrap();
+        let done = settled(&runs.service.engine, &accepted.id);
+        assert_eq!(done.state, State::Completed, "{:?}", done.failure);
+        let starved: serde_json::Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+        if let Some(reason) = starved.get("unstarved") {
+            eprintln!("no delegated cgroup-v2 parent ({reason}): the starved build is not proved here");
+        } else {
+            let (wall, cpu) = (starved["wall"].as_f64().unwrap(), starved["cpu"].as_f64().unwrap());
+            let floor = crate::process::Liveness::default().floor().as_secs_f64();
+            assert!(wall > floor && cpu < wall / 10.0, "the build was not starved past the floor: {starved}");
+            eprintln!("starved build: {cpu:.2} s of CPU over {wall:.1} s");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
     /// A callee's child runs with its own model slots in its caller's environment, and takes
     /// the choices its caller carries for them.
     #[test]
