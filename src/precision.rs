@@ -34,13 +34,12 @@ impl Gpus {
         names.sort();
         names.dedup();
         let name = if names.is_empty() { "no GPU".into() } else { names.join("+") };
-        // 12.1 (GB10) runs no fp8 until a card proves it (owner, 2026-10-16).
         Self {
             mma: all(|cc| cc >= 80),
             // fp16 first only where a GPU is known to run no bf16: an unread cc, or no GPU, runs bf16.
             bf16: !ccs.iter().any(|cc| matches!(number(cc), Some(n) if n < 80)),
             int8: all(|cc| cc >= 80 && cc != 103),
-            fp8: all(|cc| cc >= 89 && cc != 121),
+            fp8: all(|cc| cc >= 89),
             name,
         }
     }
@@ -141,7 +140,7 @@ mod tests {
         assert_eq!(compute.lanes(8, &Gpus::of(&["9.0"])), ["int8", "fp8", "bf16", "fp16"]);
         assert_eq!(compute.lanes(4, &Gpus::of(&["8.6"])), ["nvfp4", "int8", "bf16", "fp16"]);
         assert_eq!(compute.lanes(4, &Gpus::of(&["12.0"])), ["nvfp4", "int8", "fp8", "bf16", "fp16"]);
-        assert_eq!(compute.lanes(4, &Gpus::of(&["12.1"])), ["nvfp4", "int8", "bf16", "fp16"], "12.1 runs no fp8 yet");
+        assert_eq!(compute.lanes(4, &Gpus::of(&["12.1"])), ["nvfp4", "int8", "fp8", "bf16", "fp16"], "GB10 proved fp8");
         let exact = Slot::of(&json!({"encoded_leaves": "accept", "min_bits": 16}));
         assert_eq!((exact.bits(0, true), exact.bits(8, false)), (16, 8), "the request's bits win");
         let raw = Slot::of(&json!({"encoded_leaves": "accept", "min_bits": 4, "phase": "decode", "weights": true}));
