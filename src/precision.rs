@@ -8,7 +8,7 @@ const VOCABULARY: [&str; 5] = ["bf16", "fp16", "int8", "fp8", "nvfp4"];
 
 /// The GPUs a function runs on as the rule reads them (design §2.1, §2.7): the native formats
 /// every one runs (`mma`: cc 8.0 or later, where `nvfp4` serves at least weight-only; 10.3 has
-/// no int8; `bf16`: cc 8.0 or later, or no GPU) and how a warning names them (`sm90`, `sm86+sm89`).
+/// no int8; `bf16`: unless a GPU is known below cc 8.0) and how a warning names them (`sm90`, `sm86+sm89`).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Gpus {
     pub mma: bool,
@@ -30,7 +30,8 @@ impl Gpus {
         // 12.1 (GB10) runs no fp8 until a card proves it (owner, 2026-10-16).
         Self {
             mma: all(|cc| cc >= 80),
-            bf16: ccs.is_empty() || all(|cc| cc >= 80),
+            // fp16 first only where a GPU is known to run no bf16: an unread cc, or no GPU, runs bf16.
+            bf16: !ccs.iter().any(|cc| matches!(number(cc), Some(n) if n < 80)),
             int8: all(|cc| cc >= 80 && cc != 103),
             fp8: all(|cc| cc >= 89 && cc != 121),
             name,
@@ -125,7 +126,7 @@ mod tests {
             assert_eq!(first(&compute, 16, &[cc]), "bf16", "{cc}");
         }
         // bf16 everywhere it runs (cc 8.0 or later, or no GPU); fp16 first only below 8.0.
-        for (none, sixteen) in [(&["7.5"][..], "fp16"), (&[""], "fp16"), (&[], "bf16")] {
+        for (none, sixteen) in [(&["7.5"][..], "fp16"), (&[""], "bf16"), (&[], "bf16")] {
             for (slot, asked) in [(&compute, 0), (&decode, 0), (&compute, 4), (&compute, 16)] {
                 assert_eq!(first(slot, asked, none), sixteen, "{none:?}");
             }
