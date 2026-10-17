@@ -9,13 +9,20 @@ const VOCABULARY: [&str; 5] = ["bf16", "fp16", "int8", "fp8", "nvfp4"];
 /// The GPUs a function runs on as the rule reads them (design §2.1, §2.7): the native formats
 /// every one runs (`mma`: cc 8.0 or later, where `nvfp4` serves at least weight-only; 10.3 has
 /// no int8; `bf16`: unless a GPU is known below cc 8.0) and how a warning names them (`sm90`, `sm86+sm89`).
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Gpus {
     pub mma: bool,
     pub bf16: bool,
     pub int8: bool,
     pub fp8: bool,
     pub name: String,
+}
+
+/// No GPU: the CPU, which runs bf16 and no encoded format.
+impl Default for Gpus {
+    fn default() -> Self {
+        Self::of(&[])
+    }
 }
 
 impl Gpus {
@@ -171,6 +178,7 @@ mod tests {
         assert_eq!(declines.warnings(8, &hopper, "x@1", "bf16"), ["precision 8: x@1 declines encoded leaves; served bf16"]);
         assert!(declines.warnings(16, &hopper, "x@1", "bf16").is_empty());
         assert!(declines.warnings(8, &Gpus::of(&[]), "x@1", "bf16").is_empty());
+        assert_eq!(Gpus::default(), Gpus::of(&[]), "no GPU service is the CPU: bf16 first");
         // fp16 says why: the GPUs run no bf16, or the release has no bf16 lane.
         let turing = Gpus::of(&["7.5"]);
         assert_eq!(slot.warnings(8, &turing, "x@1", "fp16"), ["precision 8: sm75 runs no bf16; served fp16"]);
